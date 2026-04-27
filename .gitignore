@@ -1,0 +1,27 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Project data — never commit
+output/
+.checkpoints/
+
+# Secrets — NEVER commit
+.env
+
+# Local databases
+team_actions.db
+*.db
+*.duckdb
+*.sqlite
+
+# OS / IDE
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
