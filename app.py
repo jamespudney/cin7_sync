@@ -456,6 +456,254 @@ BOM_CHILDREN = _bom_idx["children_of"]
 BOM_FAMILY = _bom_idx["family_of"]
 
 
+def render_demand_breakdown(
+    sku: str,
+    sale_lines_df: pd.DataFrame,
+    products_df: pd.DataFrame,
+    bom_children: dict,
+    bom_parents: dict,
+    engine_row: Optional[pd.Series] = None,
+) -> None:
+    """Render a buyer-friendly breakdown of where demand comes from for a SKU.
+
+    Used by:
+      - Ordering page (PO editor) — drives the "🔍 Drill into demand"
+        expander, helping the buyer see WHY a 100m roll is being suggested
+        for reorder when the master itself has zero direct sales.
+      - Product Detail page — inline section showing reorder math and the
+        family rollup so the buyer doesn't have to leave the page to make
+        sense of the suggestion.
+
+    The function renders five sections:
+      1. Header strip — OnHand, Suggest, daily rates, Trend (when engine_row
+         is provided) OR direct-sales counters (when called without it).
+      2. Demand sources — table of children that roll up into this master,
+         each with their 12mo / 90d / 45d sales, BOM ratio, and contribution.
+      3. Family monthly sales chart — combined master + children, last 12
+         months. Lets the buyer eyeball whether the family is still active.
+      4. Recent activity feed — last 10 sale lines across the whole family
+         so the buyer can spot which child is actually driving demand.
+      5. Parents — what this SKU is built FROM (when applicable). Useful
+         for non-master SKUs to see their upstream master.
+    """
+    if not sku:
+        st.info("Select a SKU to see its demand breakdown.")
+        return
+
+    prod_match = products_df[products_df["SKU"].astype(str) == str(sku)]
+    if prod_match.empty:
+        st.warning(f"SKU '{sku}' not found in products.")
+        return
+    prod_row = prod_match.iloc[0]
+
+    st.markdown(f"### :mag: Demand breakdown — `{sku}`")
+    st.caption(str(prod_row.get("Name") or "")[:120])
+
+    today = pd.Timestamp(datetime.now().date())
+    cutoff_45 = today - pd.Timedelta(days=45)
+    cutoff_90 = today - pd.Timedelta(days=90)
+    cutoff_365 = today - pd.Timedelta(days=365)
+
+    # Defensive copy + date coercion (sale_lines may already be parsed but
+    # this is cheap insurance against caller variability).
+    sl = sale_lines_df.copy()
+    sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
+    sl["Quantity"] = pd.to_numeric(sl["Quantity"], errors="coerce").fillna(0)
+
+    # Direct sales of the master itself (independent of rollup)
+    sl_master = sl[sl["SKU"].astype(str) == str(sku)]
+    own_12mo = float(
+        sl_master[sl_master["InvoiceDate"] >= cutoff_365]["Quantity"].sum())
+    own_90d = float(
+        sl_master[sl_master["InvoiceDate"] >= cutoff_90]["Quantity"].sum())
+    own_45d = float(
+        sl_master[sl_master["InvoiceDate"] >= cutoff_45]["Quantity"].sum())
+    last_sale_date = (sl_master["InvoiceDate"].max()
+                      if not sl_master.empty else None)
+
+    children = bom_children.get(sku, [])
+    parents = bom_parents.get(sku, [])
+
+    # === Section 1: Header strip ===========================================
+    cols = st.columns(5)
+    if engine_row is not None:
+        # Rich header with engine-computed numbers (PO editor context)
+        onhand = float(engine_row.get("OnHand", 0) or 0)
+        suggest = float(engine_row.get("reorder_qty", 0) or 0)
+        avg_daily_base = float(engine_row.get("avg_daily_base", 0) or 0)
+        eff_90d = float(engine_row.get("effective_units_90d", 0) or 0)
+        rate_90d = eff_90d / 90.0
+        trend = str(engine_row.get("trend_flag") or "Stable")
+        cols[0].metric("OnHand", f"{onhand:.0f}")
+        cols[1].metric("Suggest", f"{suggest:.2f}")
+        cols[2].metric("12mo daily", f"{avg_daily_base:.3f}")
+        cols[3].metric("90d daily", f"{rate_90d:.3f}")
+        cols[4].metric("Trend", trend)
+    else:
+        # Direct-sales header (Product Detail context where engine isn't
+        # available — still informative without the reorder math).
+        cols[0].metric("12mo direct", f"{int(own_12mo)}")
+        cols[1].metric("90d direct", f"{int(own_90d)}")
+        cols[2].metric("45d direct", f"{int(own_45d)}")
+        cols[3].metric("Last sale",
+                       last_sale_date.strftime("%Y-%m-%d")
+                       if last_sale_date is not None
+                       and pd.notna(last_sale_date) else "—")
+        cols[4].metric("Children", len(children))
+
+    # === Section 2: Demand sources (children rolling up) ===================
+    if children:
+        st.markdown(
+            f"#### :bar_chart: Demand sources — {len(children)} child SKU(s) "
+            f"roll up into this master")
+        rows = []
+        for child in children:
+            child_sku = child.get("AssemblySKU")
+            if not child_sku:
+                continue
+            qty_per = float(child.get("Quantity") or 0)
+            child_sl = sl[sl["SKU"].astype(str) == str(child_sku)]
+            c_12mo = float(
+                child_sl[child_sl["InvoiceDate"]
+                          >= cutoff_365]["Quantity"].sum())
+            c_90d = float(
+                child_sl[child_sl["InvoiceDate"]
+                          >= cutoff_90]["Quantity"].sum())
+            c_45d = float(
+                child_sl[child_sl["InvoiceDate"]
+                          >= cutoff_45]["Quantity"].sum())
+            last = (child_sl["InvoiceDate"].max()
+                    if not child_sl.empty else None)
+            rows.append({
+                "Child SKU": child_sku,
+                "Name": str(child.get("AssemblyName") or "")[:40],
+                "12mo units": int(c_12mo),
+                "90d units": int(c_90d),
+                "45d units": int(c_45d),
+                "Last sale": (last.strftime("%Y-%m-%d")
+                              if last is not None and pd.notna(last)
+                              else "—"),
+                "BOM ratio": qty_per,
+                "Contrib 12mo": round(c_12mo * qty_per, 2),
+                "Contrib 90d": round(c_90d * qty_per, 2),
+            })
+        if rows:
+            df_rows = pd.DataFrame(rows).sort_values(
+                "12mo units", ascending=False)
+            st.dataframe(
+                df_rows, hide_index=True, width="stretch",
+                column_config={
+                    "BOM ratio":
+                        st.column_config.NumberColumn(format="%.4g"),
+                    "Contrib 12mo":
+                        st.column_config.NumberColumn(format="%.2f"),
+                    "Contrib 90d":
+                        st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+            total_contrib_12 = sum(r["Contrib 12mo"] for r in rows)
+            total_contrib_90 = sum(r["Contrib 90d"] for r in rows)
+            st.caption(
+                f"Total rollup contribution: "
+                f"**{total_contrib_12:.2f} master units / 12mo** · "
+                f"**{total_contrib_90:.2f} master units / 90d**. "
+                f"Plus direct sales of master "
+                f"({int(own_12mo)} / 12mo, {int(own_90d)} / 90d). "
+                f"Effective demand = direct + rollup.")
+    else:
+        st.info(
+            ":information_source: No children roll up into this SKU. "
+            "Either it's a leaf product (direct demand only) or the BOM "
+            "doesn't yet model how this SKU is consumed.")
+
+    # === Section 3: Family-wide monthly trend ==============================
+    # Critically, the chart normalises everything to MASTER-ROLL EQUIVALENTS
+    # using each child's BOM ratio. Without this, summing raw Quantity values
+    # across master + per-foot + 5m mixes physical units (rolls + feet +
+    # rolls) into a meaningless total. With normalisation, the chart shows
+    # "this family consumed N master-rolls of demand last month" — the only
+    # meaningful aggregate for a multi-variant family.
+    family_skus = [sku] + [c.get("AssemblySKU") for c in children
+                            if c.get("AssemblySKU")]
+    sku_to_master_ratio = {str(sku): 1.0}  # master itself = 1.0 by definition
+    for c in children:
+        c_sku = c.get("AssemblySKU")
+        c_qty = c.get("Quantity")
+        if c_sku and c_qty is not None and pd.notna(c_qty):
+            sku_to_master_ratio[str(c_sku)] = float(c_qty)
+    family_sl = sl[sl["SKU"].astype(str).isin(
+        [str(s) for s in family_skus])].copy()
+    family_sl = family_sl.dropna(subset=["InvoiceDate"])
+    if not family_sl.empty:
+        st.markdown(
+            "#### :chart_with_upwards_trend: Family monthly demand — "
+            "master-roll equivalents (last 12 months)")
+        st.caption(
+            "Each child SKU's units are multiplied by its BOM ratio to "
+            "this master, so the chart is in a single unit (master rolls) "
+            "regardless of how the family sells. "
+            f"Master = `{sku}` = 1 unit per row.")
+        cutoff_12mo = today - pd.Timedelta(days=365)
+        recent_sl = family_sl[family_sl["InvoiceDate"] >= cutoff_12mo].copy()
+        if not recent_sl.empty:
+            recent_sl["master_units"] = recent_sl.apply(
+                lambda r: (float(r["Quantity"] or 0)
+                            * sku_to_master_ratio.get(str(r["SKU"]), 1.0)),
+                axis=1,
+            )
+            recent_sl["month"] = (recent_sl["InvoiceDate"]
+                                   .dt.to_period("M").astype(str))
+            monthly = recent_sl.groupby("month")["master_units"].sum()
+            all_months = (pd.period_range(end=today, periods=12, freq="M")
+                          .astype(str))
+            monthly = monthly.reindex(all_months, fill_value=0)
+            st.bar_chart(monthly)
+        else:
+            st.caption(
+                "No family sales in the last 12 months — confirms a fully "
+                "dormant family.")
+
+    # === Section 4: Recent activity feed ===================================
+    if not family_sl.empty:
+        st.markdown(
+            "#### :clipboard: Recent activity — last 10 sales "
+            "across the family")
+        recent_10 = (family_sl.sort_values("InvoiceDate", ascending=False)
+                     .head(10)).copy()
+        cols_to_show = [c for c in
+                        ["InvoiceDate", "SKU", "Customer",
+                          "Quantity", "Total"]
+                        if c in recent_10.columns]
+        if cols_to_show:
+            display = recent_10[cols_to_show].copy()
+            if "InvoiceDate" in display.columns:
+                display["InvoiceDate"] = (
+                    pd.to_datetime(display["InvoiceDate"], errors="coerce")
+                      .dt.strftime("%Y-%m-%d"))
+            if "Total" in display.columns:
+                display["Total"] = pd.to_numeric(
+                    display["Total"], errors="coerce")
+            st.dataframe(display, hide_index=True, width="stretch")
+
+    # === Section 5: Parents (where this SKU is built from) =================
+    if parents:
+        st.markdown(
+            f"#### :arrow_up: Built from — {len(parents)} parent SKU(s)")
+        prows = []
+        for p in parents:
+            prows.append({
+                "Parent SKU": p.get("ComponentSKU"),
+                "Name": str(p.get("ComponentName") or "")[:40],
+                "Qty per unit": float(p.get("Quantity") or 0),
+            })
+        st.dataframe(
+            pd.DataFrame(prows), hide_index=True, width="stretch",
+            column_config={
+                "Qty per unit":
+                    st.column_config.NumberColumn(format="%.4g"),
+            })
+
+
 def parent_sku_for(sku: str) -> Optional[str]:
     """Return the primary parent/master SKU for a given SKU, or None."""
     parents = BOM_PARENTS.get(sku)
@@ -4180,6 +4428,32 @@ engine shows every input and how it got to the suggestion.
             if 0 <= months_ago < 24:
                 b24 = 23 - int(months_ago)
                 monthly_24[sku_r][b24] += q
+
+        # --- Roll up children's monthly buckets onto master SKUs -----------
+        # Without this, "Last 6 months" and "12mo trend" sparkline columns
+        # show ONLY direct master sales — and for cut-source masters
+        # (100m/5m rolls) those are usually zero because customers don't
+        # buy whole rolls; demand is the per-foot variants. This pass
+        # adds each child's monthly bucket × BOM ratio to its master's
+        # monthly bucket, so the master's trend reflects family-wide
+        # demand expressed in master-roll equivalents (matches the
+        # demand-breakdown chart's normalisation).
+        for master_sku, ch_list in BOM_CHILDREN.items():
+            for ch in ch_list:
+                ch_sku = ch.get("AssemblySKU")
+                ratio = float(ch.get("Quantity") or 0)
+                if not ch_sku or ratio <= 0:
+                    continue
+                # Use sku_r presence — only roll up if the child has any sales
+                if ch_sku in monthly_12:
+                    for i in range(12):
+                        monthly_12[master_sku][i] += (
+                            monthly_12[ch_sku][i] * ratio)
+                if ch_sku in monthly_24:
+                    for i in range(24):
+                        monthly_24[master_sku][i] += (
+                            monthly_24[ch_sku][i] * ratio)
+
         df["trend_12m"] = df["SKU"].apply(
             lambda s: list(monthly_12.get(s, [0.0] * 12)))
         df["trend_24m"] = df["SKU"].apply(
@@ -4187,13 +4461,18 @@ engine shows every input and how it got to the suggestion.
         # Last 6 months total (sum of most recent 6 monthly buckets)
         df["last_6mo"] = df["trend_12m"].apply(
             lambda buckets: float(sum(buckets[-6:])) if buckets else 0.0)
-        # Last 6 months as a readable "oldest … newest" sequence of integers,
-        # e.g. "5  4  2  1  7  4" — lets the buyer spot trend direction at a
-        # glance without leaving the row.
+        # Last 6 months as a readable "oldest … newest" sequence.
+        # Show 1 decimal place when values include rolled-up fractional
+        # contributions (e.g. master rolls absorbing per-foot demand —
+        # 100 cuts × 0.0035 ratio = 0.35 rolls). For SKUs whose values
+        # are all whole numbers (typical leaf products), keep the
+        # cleaner integer format the buyer is used to.
         def _fmt_6mo_series(buckets):
             if not buckets:
                 return ""
             last6 = buckets[-6:]
+            if any(abs(v - round(v)) > 0.05 for v in last6):
+                return "  ".join(f"{v:.1f}" for v in last6)
             return "  ".join(f"{int(round(v))}" for v in last6)
         df["last_6mo_series"] = df["trend_12m"].apply(_fmt_6mo_series)
 
@@ -5105,10 +5384,13 @@ engine shows every input and how it got to the suggestion.
                     cfg_rows.append({
                         "Supplier": name,
                         "Sea LT": c.get("lead_time_sea_days"),
-                        "Air LT": c.get("lead_time_air_days") or "—",
+                        "Air LT": (str(c.get("lead_time_air_days"))
+                                    if c.get("lead_time_air_days") else "—"),
                         "Air elig.": "Yes" if c.get("air_eligible_default") else "No",
-                        "Air max len": c.get("air_max_length_mm") or "—",
-                        "MOQ": c.get("moq_units") or "—",
+                        "Air max len": (str(c.get("air_max_length_mm"))
+                                         if c.get("air_max_length_mm") else "—"),
+                        "MOQ": (str(c.get("moq_units"))
+                                 if c.get("moq_units") else "—"),
                         "MOV": (f"{c.get('mov_currency') or ''}"
                                 f"{c.get('mov_amount') or '—'}"),
                         "Pref freight": c.get("preferred_freight"),
@@ -5388,7 +5670,7 @@ engine shows every input and how it got to the suggestion.
     # ignored and newly-added columns appear the next time the user hits
     # "Reset layout" or adds them back.
     default_editor_cols = [
-        "Include?", "SKU", "Name", "ABC", "Status", "Category",
+        "Include?", "🔍", "SKU", "Name", "ABC", "Status", "Category",
         "trend_flag",
         "trend_12m", "last_6mo_series", "units_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
@@ -5867,6 +6149,12 @@ engine shows every input and how it got to the suggestion.
     _work["Order qty"] = _work.apply(_order_qty_cast, axis=1)
     _work["Line value"] = (_work["Order qty"] * _work["POCost"]).round(2)
     _work["Include?"] = _work["Order qty"] > 0
+    # 🔍 Inspect — tick to open the demand-breakdown expander below the
+    # table. Lets the buyer drill into any row's reasoning without
+    # leaving the PO editor. The breakdown reads the FIRST ticked SKU,
+    # so ticking another row switches the inspection (untick the prior
+    # one to keep the table tidy).
+    _work["🔍"] = False
     _work["Source"] = "Auto"
     # Note = latest saved note body for this SKU (blank if none). Editable
     # in-grid; saved to notes table on "Save edits" below.
@@ -5966,6 +6254,13 @@ engine shows every input and how it got to the suggestion.
     # per-column width overrides (see "Column widths" in the layout editor).
     _po_col_cfg = {
             "Include?": st.column_config.CheckboxColumn("✓", width="small"),
+            "🔍": st.column_config.CheckboxColumn(
+                "🔍",
+                width="small",
+                help="Tick to drill into this SKU's demand breakdown "
+                     "(family rollup, monthly trend, recent activity). "
+                     "Section appears below the table.",
+            ),
             "Source": st.column_config.TextColumn(
                 "Source",
                 help="Auto = engine-suggested; Manual = added by buyer.",
@@ -6362,6 +6657,48 @@ engine shows every input and how it got to the suggestion.
         key=f"po_editor_ord_{sel_sup}",
         column_config=_po_col_cfg,
     )
+
+    # --- Drill into demand for any ticked SKU -------------------------
+    # The :mag: column in the editor is a one-click toggle: tick a row
+    # to inspect, untick to close. If multiple rows are ticked, we
+    # render the FIRST one (and tell the buyer to untick others). This
+    # replaces the dropdown picker — the SKU is right there next to
+    # what they're looking at, no second navigation needed.
+    _drill_sku = ""
+    if "🔍" in edited.columns:
+        _ticked = edited[edited["🔍"].fillna(False).astype(bool)]
+        if len(_ticked) > 0:
+            _drill_sku = str(_ticked.iloc[0].get("SKU") or "")
+            if len(_ticked) > 1:
+                st.info(
+                    f":information_source: {len(_ticked)} rows ticked — "
+                    f"showing breakdown for **{_drill_sku}**. Untick the "
+                    "others to inspect a different one."
+                )
+
+    if _drill_sku:
+        with st.expander(
+            f":mag: Demand breakdown — `{_drill_sku}`",
+            expanded=True,
+        ):
+            _engine_match = engine_df[
+                engine_df["SKU"].astype(str) == str(_drill_sku)]
+            _engine_row = (_engine_match.iloc[0]
+                            if not _engine_match.empty else None)
+            render_demand_breakdown(
+                sku=_drill_sku,
+                sale_lines_df=sale_lines,
+                products_df=products,
+                bom_children=BOM_CHILDREN,
+                bom_parents=BOM_PARENTS,
+                engine_row=_engine_row,
+            )
+    else:
+        st.caption(
+            ":mag: **Tip:** tick the 🔍 column on any row above to "
+            "see where its demand comes from (children, monthly trend, "
+            "recent sales)."
+        )
 
     # --- Save edits button (Exclude? + Dropship? + Note) --------------
     # Side-by-side with a status line so the buyer can see what will be
@@ -8226,6 +8563,28 @@ elif page == "Product Detail":
                                              "Quantity": "Qty per unit"}),
                             width="stretch", hide_index=True)
 
+        # --- Demand breakdown -----------------------------------------------
+        # Same component used in PO editor — shows where demand for this
+        # SKU comes from (direct sales + rolled-up children), with monthly
+        # trend chart and recent activity feed. Engine-computed columns
+        # (Suggest, daily rates, dormancy) aren't available on this page
+        # without re-running the engine, so the header strip falls back
+        # to direct-sales counters; everything else (rollup table,
+        # monthly chart, activity feed) renders identically.
+        with st.expander(
+            ":mag: Demand breakdown — where does demand for this SKU "
+            "come from?",
+            expanded=True,
+        ):
+            render_demand_breakdown(
+                sku=sku,
+                sale_lines_df=sale_lines,
+                products_df=products,
+                bom_children=BOM_CHILDREN,
+                bom_parents=BOM_PARENTS,
+                engine_row=None,
+            )
+
         # --- Product master header ------------------------------------------
         st.subheader(str(prod_row.get("Name") or sku))
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -9224,7 +9583,6 @@ elif page == "Kits & Fixtures":
                         "Quantity": "Qty per kit",
                         "ComponentOnHand": "Comp OnHand (phys)",
                         "ComponentAvailable": "Comp Available",
-                        "MaxBuildableFromThis": "Buildable from this alone",
                     }).sort_values("Buildable from this alone"),
                     width="stretch", hide_index=True,
                 )
@@ -9422,7 +9780,6 @@ elif page == "Data Health":
 
     rows = []
     for label, prefix, rowcount in datasets:
-        mt = file_mtime(prefix)
         rows.append({
             "Dataset": label,
             "File prefix": prefix,
