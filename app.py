@@ -140,6 +140,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
+    st.caption("🟢 v2.1 — recency-aware velocity + fractional rolls (Apr 27)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -3356,15 +3357,22 @@ engine shows every input and how it got to the suggestion.
         today_ts = pd.Timestamp(datetime.now().date())
         cutoff_recent = today_ts - pd.Timedelta(days=45)
         cutoff_prior = today_ts - pd.Timedelta(days=90)
+        cutoff_90 = today_ts - pd.Timedelta(days=90)
         sl_recent = sl[sl["InvoiceDate"] >= cutoff_recent]
         sl_prior = sl[(sl["InvoiceDate"] >= cutoff_prior)
                        & (sl["InvoiceDate"] < cutoff_recent)]
+        sl_90d = sl[sl["InvoiceDate"] >= cutoff_90]
 
         u45 = sl_recent.groupby("SKU")["Quantity"].sum().rename("units_45d")
         uprior = sl_prior.groupby("SKU")["Quantity"].sum().rename(
             "units_prior_45d")
         c45 = sl_recent.groupby("SKU")["CustomerID"].nunique().rename(
             "customers_45d")
+        # 90-day units — used for dormancy detection. A SKU with strong
+        # 12mo history but zero 90d activity is treated as dormant; the
+        # engine uses the 90d rate (≈0) instead of the inflated 12mo rate
+        # to avoid suggesting reorders against demand that's stopped.
+        u90 = sl_90d.groupby("SKU")["Quantity"].sum().rename("units_90d")
 
         # Top customer(s) per SKU in 45d:
         #   top_cust_pct       — share going to the single biggest buyer
@@ -3422,9 +3430,11 @@ engine shows every input and how it got to the suggestion.
         vel = vel.merge(u45, on="SKU", how="left")
         vel = vel.merge(uprior, on="SKU", how="left")
         vel = vel.merge(c45, on="SKU", how="left")
+        vel = vel.merge(u90, on="SKU", how="left")
         vel = vel.merge(top_df, on="SKU", how="left")
         vel["units_45d"] = vel["units_45d"].fillna(0)
         vel["units_prior_45d"] = vel["units_prior_45d"].fillna(0)
+        vel["units_90d"] = vel["units_90d"].fillna(0)
         vel["customers_45d"] = vel["customers_45d"].fillna(0).astype(int)
         vel["top_cust_pct"] = vel["top_cust_pct"].fillna(0)
         vel["top_cust_units_12mo"] = vel["top_cust_units_12mo"].fillna(0)
@@ -3603,7 +3613,8 @@ engine shows every input and how it got to the suggestion.
                   # Trend-detection fields — NaN for products with no sales
                   # in the recent window. Must be numeric-0 for downstream
                   # int() casts in _compute_target_and_reorder.
-                  "units_45d", "units_prior_45d", "customers_45d",
+                  "units_45d", "units_prior_45d", "units_90d",
+                  "customers_45d",
                   "top_cust_pct", "top_2_cust_pct", "non_top_avg_units",
                   "top_cust_units_12mo", "momentum"]:
             if c not in df.columns:
@@ -3728,6 +3739,10 @@ engine shows every input and how it got to the suggestion.
         # Rule priority: parsed AdditionalAttribute1 → BOM lookup → default.
         master_rollup_notes: dict = {}
         master_rollup_inflow: dict = {}
+        # Parallel 90d rollup tracking — used for dormancy detection on
+        # masters whose own 90d sales are zero but whose children's 90d
+        # sales tell us whether the family still has active demand.
+        master_rollup_inflow_90d: dict = {}
 
         # Index: SKU -> sourcing rule dict
         rule_by_sku: dict = {}
@@ -3911,6 +3926,8 @@ engine shows every input and how it got to the suggestion.
             if not targets:
                 continue
             own_units = float(vel.loc[vel["SKU"] == sku, "units_12mo"].sum())
+            own_units_90d = float(
+                vel.loc[vel["SKU"] == sku, "units_90d"].sum())
             # Apply migration share if retiring
             fam = None
             if not tube_df.empty:
@@ -3921,7 +3938,8 @@ engine shows every input and how it got to the suggestion.
                 saved = saved_migrations.get(sku, {})
                 share = float(saved.get("share_pct", 100.0)) / 100.0
                 own_units *= share
-            if own_units == 0:
+                own_units_90d *= share
+            if own_units == 0 and own_units_90d == 0:
                 continue
             # Roll up to EACH master independently
             for target in targets:
@@ -3931,8 +3949,12 @@ engine shows every input and how it got to the suggestion.
                 if not master_sku or not qty_per:
                     continue
                 consumption = own_units * qty_per
+                consumption_90d = own_units_90d * qty_per
                 master_rollup_inflow[master_sku] = (
                     master_rollup_inflow.get(master_sku, 0) + consumption
+                )
+                master_rollup_inflow_90d[master_sku] = (
+                    master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
                 )
                 master_rollup_notes.setdefault(master_sku, []).append(
                     f"{sku}: {own_units:.0f} × {qty_per:g} = {consumption:.1f}"
@@ -3946,8 +3968,14 @@ engine shows every input and how it got to the suggestion.
         # alternate masters (don't roll them up).
         strip_rollup_notes: dict = {}
         strip_rollup_inflow: dict = {}
+        strip_rollup_inflow_90d: dict = {}
         strip_non_master_skus: set = set()
         strip_master_skus: set = set()
+        # Track each strip master's roll length in metres — used to flag
+        # bulk masters (≥50m) where the engine can suggest fractional
+        # reorder qtys. e.g. 0.40 of a 100m roll instead of rounding up
+        # to a full 100m roll when only 40m is needed.
+        bulk_master_lengths: dict = {}
 
         # Build base-family index: {base: [(sku, length_m, name, purchased_bool)]}
         strip_family_index: dict = {}
@@ -3972,6 +4000,7 @@ engine shows every input and how it got to the suggestion.
             sorted_members = sorted(members, key=lambda x: -x[1])
             bulk_sku, bulk_len, bulk_name, bulk_purchased = sorted_members[0]
             strip_master_skus.add(bulk_sku)
+            bulk_master_lengths[bulk_sku] = float(bulk_len or 0)
             if bulk_len <= 0:
                 continue
             # Additional masters: any intermediate with direct PO history
@@ -3980,6 +4009,7 @@ engine shows every input and how it got to the suggestion.
                 if purchased and length_m >= 1.0:
                     alternate_masters.add(sku_m)
                     strip_master_skus.add(sku_m)
+                    bulk_master_lengths[sku_m] = float(length_m or 0)
 
             # Roll up each non-master's sales. CRITICAL: convert consumption
             # from METRES to the master's UNIT count. 1 × 100m roll = 1 unit
@@ -3992,15 +4022,23 @@ engine shows every input and how it got to the suggestion.
                     continue
                 own_units = float(vel.loc[vel["SKU"] == sku_m,
                                            "units_12mo"].sum())
-                if own_units == 0 or length_m == 0:
+                own_units_90d = float(vel.loc[vel["SKU"] == sku_m,
+                                               "units_90d"].sum())
+                if (own_units == 0 and own_units_90d == 0) or length_m == 0:
                     strip_non_master_skus.add(sku_m)
                     continue
                 consumption_m = own_units * length_m
+                consumption_m_90d = own_units_90d * length_m
                 # Convert metres → master rolls
                 consumption_in_master_units = consumption_m / bulk_len
+                consumption_in_master_units_90d = consumption_m_90d / bulk_len
                 strip_rollup_inflow[bulk_sku] = (
                     strip_rollup_inflow.get(bulk_sku, 0)
                     + consumption_in_master_units
+                )
+                strip_rollup_inflow_90d[bulk_sku] = (
+                    strip_rollup_inflow_90d.get(bulk_sku, 0)
+                    + consumption_in_master_units_90d
                 )
                 strip_rollup_notes.setdefault(bulk_sku, []).append(
                     f"{sku_m}: {own_units:.0f} × {length_m:g}m "
@@ -4019,10 +4057,28 @@ engine shows every input and how it got to the suggestion.
                 existing = master_rollup_notes.setdefault(master_sku, [])
                 existing.extend(notes)
 
+        # Same merge for the 90d parallel rollup
+        for master_sku, consumption_90d in strip_rollup_inflow_90d.items():
+            master_rollup_inflow_90d[master_sku] = (
+                master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
+            )
+
         df["tube_rollup_in"] = df["SKU"].apply(
             lambda s: float(master_rollup_inflow.get(s, 0))).fillna(0)
+        df["tube_rollup_in_90d"] = df["SKU"].apply(
+            lambda s: float(master_rollup_inflow_90d.get(s, 0))).fillna(0)
         df["tube_rollup_notes"] = df["SKU"].apply(
             lambda s: "; ".join(master_rollup_notes.get(s, []))[:500])
+
+        # Bulk-master length + fractional-eligibility flag.
+        # is_bulk_master = strip master with ≥50m roll length. These SKUs
+        # are eligible for fractional reorder qtys (e.g. 0.40 × 100m roll
+        # instead of rounding up to a full roll). The threshold of 50m
+        # keeps small-roll masters (5m, 10m) on integer ordering since
+        # partial purchases on those are unusual.
+        df["bulk_length_m"] = df["SKU"].apply(
+            lambda s: float(bulk_master_lengths.get(s, 0)))
+        df["is_bulk_master"] = df["bulk_length_m"] >= 50.0
 
         # 5e. IsMaster flag on df. A SKU is non-master if:
         #  - flagged by _global_is_master as non-master, OR
@@ -4050,6 +4106,43 @@ engine shows every input and how it got to the suggestion.
                     + float(row["tube_rollup_in"]))
 
         df["effective_units_12mo"] = df.apply(_effective_units, axis=1)
+
+        # --- Recency-aware effective demand (last 90 days) ---------------
+        # effective_units_90d mirrors effective_units_12mo but only sums
+        # the last 90 days of activity. We deliberately skip migration on
+        # the 90d view (mig_in / mig_out are typically tied to long-term
+        # successor decisions; recent activity is what matters here).
+        # Used to detect dormant SKUs whose 12mo number is dominated by
+        # stale demand that has since dried up.
+        def _effective_units_90d(row):
+            if row["is_non_master_tube"]:
+                return 0.0
+            base90 = float(row.get("units_90d") or 0)
+            rollup90 = float(row.get("tube_rollup_in_90d") or 0)
+            return base90 + rollup90
+
+        df["effective_units_90d"] = df.apply(_effective_units_90d, axis=1)
+
+        # Dormancy detection: a SKU is dormant when it has meaningful
+        # 12mo demand but the recent 90d daily rate is < 20% of the 12mo
+        # daily rate. The 20% threshold catches "demand fell off a cliff"
+        # cases like a discontinued product family or seasonal SKU after
+        # season-end. Active SKUs with normal lull-vs-burst patterns
+        # (≥20% of normal rate) keep using the 12mo velocity.
+        def _is_dormant(row):
+            eff_12mo = float(row.get("effective_units_12mo") or 0)
+            eff_90d = float(row.get("effective_units_90d") or 0)
+            if eff_12mo <= 0:
+                return False  # no historical demand to be dormant against
+            rate_12mo_daily = eff_12mo / 365.0
+            rate_90d_daily = eff_90d / 90.0
+            # Avoid div-by-zero noise — if 12mo rate is tiny (<0.05/day),
+            # the SKU is barely moving anyway; don't flag.
+            if rate_12mo_daily < 0.05:
+                return False
+            return rate_90d_daily < (0.20 * rate_12mo_daily)
+
+        df["is_dormant"] = df.apply(_is_dormant, axis=1)
 
         # 6. Length for air-eligibility (parse from SKU's last numeric part)
         def _length_of(sku: str) -> Optional[int]:
@@ -4134,7 +4227,12 @@ engine shows every input and how it got to the suggestion.
         df["avg_daily"] = df["effective_units_12mo"] / max(window_days, 1)
 
         # --- Trend-aware avg_daily adjustment -------------------------
-        # If a SKU is in 📈 Trend or 🎯 Project, override avg_daily:
+        # Override avg_daily based on detected demand patterns:
+        #   💤 Dormant → demand has fallen off a cliff (90d rate <20% of
+        #                12mo rate). Use the 90d rate (≈ 0) to avoid
+        #                ordering against stale historical demand. Takes
+        #                precedence — if a SKU is dormant, it doesn't
+        #                matter what trend_flag says.
         #   📈 Trend   → use last-45d velocity — this catches
         #                acceleration fast so the engine builds stock
         #                before the next PO cycle.
@@ -4145,13 +4243,19 @@ engine shows every input and how it got to the suggestion.
             base = r["avg_daily"]
             flag = r.get("trend_flag", "Stable")
             if pd.isna(flag):
-                return base
+                flag = "Stable"
             def _safe(v, default=0.0):
                 try:
                     v = float(v)
                     return default if pd.isna(v) else v
                 except (ValueError, TypeError):
                     return default
+            # Dormancy override — highest priority. If the family hasn't
+            # moved in 90 days, use the 90d rate (which will be ≈0)
+            # regardless of how much 12mo history the SKU has.
+            if bool(r.get("is_dormant", False)):
+                eff_90d = _safe(r.get("effective_units_90d"))
+                return eff_90d / 90.0
             if flag == "📈 Trend":
                 u45 = _safe(r.get("units_45d"))
                 if u45 > 0:
@@ -4167,6 +4271,21 @@ engine shows every input and how it got to the suggestion.
 
         df["avg_daily_base"] = df["avg_daily"]
         df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)
+
+        # Promote is_dormant into trend_flag display so the buyer sees
+        # 💤 Dormant in the PO editor's Trend column. We override Stable
+        # only — preserve any existing acceleration/project/decline flag
+        # if one was already set (those signals took priority before
+        # dormancy was added; keeping that contract avoids surprises).
+        def _promote_dormant_flag(r):
+            cur = r.get("trend_flag", "Stable")
+            if pd.isna(cur):
+                cur = "Stable"
+            if bool(r.get("is_dormant", False)) and cur == "Stable":
+                return "💤 Dormant"
+            return cur
+
+        df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)
         df["DoC_days"] = df.apply(
             lambda r: (r["OnHand"] / r["avg_daily"])
             if r["avg_daily"] > 0 else None, axis=1)
@@ -4348,7 +4467,20 @@ engine shows every input and how it got to the suggestion.
         # yet reflected in Allocated.
         effective_pos = available + on_order - unfulfilled
         shortfall = max(0, target - effective_pos)
-        reorder = int(round(shortfall))
+
+        # Fractional ordering — for bulk-roll masters where the supplier
+        # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
+        # rounding up to 1 full 100m roll). The supplier-level
+        # `allow_fractional_qty` config flag gates this — defaults to
+        # True, but suppliers like Topmet that only sell full rolls can
+        # set it to False to keep integer ordering.
+        is_bulk = bool(row.get("is_bulk_master", False))
+        supplier_allows_frac = bool(cfg.get("allow_fractional_qty", True))
+        use_fractional = is_bulk and supplier_allows_frac
+        if use_fractional:
+            reorder = round(float(shortfall), 2)
+        else:
+            reorder = int(round(shortfall))
 
         # --- Stockout recovery boost ---------------------------------
         # When we're truly out (effective_pos ≤ 0), simply ordering
@@ -4364,20 +4496,30 @@ engine shows every input and how it got to the suggestion.
         # velocity, that customer-specific spike is irrelevant to
         # recovery — what matters is the broad baseline of demand we
         # want back on the shelf.
+        #
+        # Exception: skip the boost for 💤 Dormant SKUs. If the family
+        # hasn't moved in 90 days, "recovery" doesn't apply — there's
+        # nothing to recover to. Boosting based on stale 12mo demand
+        # would defeat the dormancy detection.
         stockout_boost_applied = False
-        if effective_pos <= 0:
+        is_dormant_row = bool(row.get("is_dormant", False))
+        if effective_pos <= 0 and not is_dormant_row:
             base_avg = float(row.get("avg_daily_base") or 0) or avg_daily
             recovery_days = int(
                 cfg.get("stockout_min_cover_days") or 60)
             stockout_min = base_avg * (lead_time_days + recovery_days)
-            stockout_qty = int(round(stockout_min))
+            stockout_qty = (round(float(stockout_min), 2)
+                            if use_fractional
+                            else int(round(stockout_min)))
             if stockout_qty > reorder:
                 stockout_boost_applied = True
                 reorder = stockout_qty
 
-        # MOQ
+        # MOQ — skipped for fractional bulk SKUs (a "1 unit minimum"
+        # doesn't apply to "0.4 of a 100m roll" — fractional ordering
+        # is the whole point of the feature, MOQ would defeat it).
         moq = cfg.get("moq_units") or 0
-        if reorder > 0 and moq and reorder < moq:
+        if reorder > 0 and moq and reorder < moq and not use_fractional:
             reorder = int(moq)
 
         # Excess = OnHand beyond target
@@ -4423,13 +4565,37 @@ engine shows every input and how it got to the suggestion.
                     f"(see tube_rollup_notes)\n"
                 )
 
+        # Dormancy note — surface when this SKU has been classified
+        # dormant. Shows the buyer exactly why the suggestion is what
+        # it is (or zero) — direct comparison of 90d vs 12mo daily rate.
+        _is_dormant_row = bool(row.get("is_dormant", False))
+        if _is_dormant_row:
+            eff_12mo_d = float(row.get("effective_units_12mo") or 0)
+            eff_90d_d = float(row.get("effective_units_90d") or 0)
+            rate_12mo_daily = eff_12mo_d / 365.0 if eff_12mo_d else 0.0
+            rate_90d_daily = eff_90d_d / 90.0 if eff_90d_d else 0.0
+            ratio_pct = (rate_90d_daily / rate_12mo_daily * 100.0
+                          if rate_12mo_daily > 0 else 0.0)
+            demand_lines.append(
+                f"\n**💤 Dormant detection**:\n"
+                f"- 12mo effective rate: **{rate_12mo_daily:.2f} units/day** "
+                f"(based on {eff_12mo_d:.0f} units over 365d)\n"
+                f"- Last 90d effective rate: **{rate_90d_daily:.3f} units/day** "
+                f"(based on {eff_90d_d:.0f} units over 90d)\n"
+                f"- Ratio: **{ratio_pct:.1f}%** of historical rate "
+                f"(threshold for dormancy: <20%)\n"
+                f"- **Engine override**: using 90d rate instead of 12mo rate, "
+                f"so reorder suggestion reflects actual recent demand. "
+                f"Stockout-recovery boost is also suppressed for dormant SKUs.\n"
+            )
+
         # Trend classification note — always included when the flag is
         # anything other than "Stable" so the buyer knows the engine
         # spotted something.
         _tf = row.get("trend_flag") or "Stable"
         if pd.isna(_tf):
             _tf = "Stable"
-        if _tf != "Stable":
+        if _tf != "Stable" and not _is_dormant_row:
             # Defensive NaN-handling — any of these can arrive as NaN
             # for SKUs with no recent sales that got flagged by another
             # signal (rare, but possible after a cache refresh).
@@ -4511,8 +4677,15 @@ engine shows every input and how it got to the suggestion.
             f"- **Effective position**: {available:.0f} + {on_order:.0f} "
             f"- {unfulfilled:.0f} = **{effective_pos:.0f}**\n\n"
             f"**Suggested reorder**: max(0, {target:.1f} - "
-            f"{effective_pos:.0f}) = {reorder} units"
-            + (f" (rounded up to MOQ {moq:g})" if moq and reorder == int(moq) else "")
+            f"{effective_pos:.0f}) = "
+            + (f"**{reorder:.2f}** rolls "
+               f"(fractional — supplier accepts decimal qtys; "
+               f"bulk master is {row.get('bulk_length_m', 0):g}m)"
+               if use_fractional
+               else f"{reorder} units")
+            + (f" (rounded up to MOQ {moq:g})"
+               if moq and not use_fractional and reorder == int(moq)
+               else "")
             + f"\n\n"
             f"**Excess stock** (over target): {excess_units:.0f} units × "
             f"${row['AverageCost']:.2f} = **${excess_value:,.0f} tied up**"
@@ -5681,7 +5854,17 @@ engine shows every input and how it got to the suggestion.
     # column layout can position them anywhere (or hide them). Always add all
     # — editor_cols then selects / orders what the user wants shown.
     _work = s_df.copy()
-    _work["Order qty"] = _work["reorder_qty"].astype(int)
+    # Order qty preserves fractional values for bulk-master rows
+    # (is_bulk_master=True with allow_fractional_qty supplier flag);
+    # casts to int for everything else.
+    def _order_qty_cast(r):
+        if bool(r.get("is_bulk_master", False)):
+            return round(float(r.get("reorder_qty") or 0), 2)
+        try:
+            return int(r.get("reorder_qty") or 0)
+        except (ValueError, TypeError):
+            return 0
+    _work["Order qty"] = _work.apply(_order_qty_cast, axis=1)
     _work["Line value"] = (_work["Order qty"] * _work["POCost"]).round(2)
     _work["Include?"] = _work["Order qty"] > 0
     _work["Source"] = "Auto"
@@ -5788,7 +5971,12 @@ engine shows every input and how it got to the suggestion.
                 help="Auto = engine-suggested; Manual = added by buyer.",
                 disabled=True, width="small"),
             "Order qty": st.column_config.NumberColumn(
-                "Order qty", min_value=0, step=1),
+                "Order qty", min_value=0, step=0.01, format="%.2f",
+                help="Editable order qty. Whole numbers for regular SKUs. "
+                     "Decimals (e.g. 0.40) accepted for bulk-roll masters "
+                     "where the supplier accepts fractional ordering — "
+                     "lets you order exactly the metres needed instead "
+                     "of rounding up to a full roll."),
             "Line value": st.column_config.NumberColumn(
                 format="$%.0f", disabled=True,
                 help="Order qty × FixedCost (supplier PO price). "
@@ -5854,7 +6042,15 @@ engine shows every input and how it got to the suggestion.
             "target_stock": st.column_config.NumberColumn(
                 "Target", format="%.0f", disabled=True),
             "reorder_qty": st.column_config.NumberColumn(
-                "Suggest", disabled=True),
+                "Suggest",
+                disabled=True,
+                format="%.2f",
+                help="Engine-suggested reorder qty. Whole numbers for "
+                     "regular SKUs (e.g. 19.00 = 19 units). Decimals "
+                     "appear for bulk-roll masters (e.g. 0.40 of a "
+                     "100m roll) when the supplier accepts fractional "
+                     "ordering — saves capital vs rounding up.",
+            ),
             "freight_mode": st.column_config.SelectboxColumn(
                 "Freight",
                 help="Air or Sea. Defaults to the engine's choice (air for "
@@ -5910,7 +6106,9 @@ engine shows every input and how it got to the suggestion.
                      "velocity). 🎯 Project = one-off concentrated to "
                      "1 customer (engine discounts the spike). "
                      "🔀 Mixed = watch. 📉 Decline = down 50%+. "
-                     "Stable = normal. See glossary.",
+                     "💤 Dormant = had history but no activity in 90d "
+                     "(engine drops reorder to 0 — confirm before manual "
+                     "override). Stable = normal. See glossary.",
                 disabled=True, width="small",
             ),
             "units_45d": st.column_config.NumberColumn(
