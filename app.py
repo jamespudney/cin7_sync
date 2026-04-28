@@ -140,7 +140,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.1 — recency-aware velocity + fractional rolls (Apr 27)")
+    st.caption("🟢 v2.13 — alt-stock banner: any sibling with stock (Apr 28)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -463,6 +463,8 @@ def render_demand_breakdown(
     bom_children: dict,
     bom_parents: dict,
     engine_row: Optional[pd.Series] = None,
+    engine_df_full: Optional[pd.DataFrame] = None,
+    stock_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """Render a buyer-friendly breakdown of where demand comes from for a SKU.
 
@@ -550,6 +552,58 @@ def render_demand_breakdown(
                        if last_sale_date is not None
                        and pd.notna(last_sale_date) else "—")
         cols[4].metric("Children", len(children))
+
+    # === Substitution-opportunity alert (early visibility) =================
+    # Quick scan for family siblings with idle stock BEFORE the buyer
+    # scrolls through the full breakdown. Loud red banner so they can't
+    # miss the "we have alternatives" signal. Trigger is intentionally
+    # broad — fires whenever ANY sibling has stock, regardless of recent
+    # sales performance. The buyer decides whether the alternative is
+    # worth using; we just make sure they know one exists.
+    _sub_candidate_count = 0
+    _sku_parts_check = str(sku).split("-")
+    if len(_sku_parts_check) >= 3:
+        _fam_prefix = "-".join(_sku_parts_check[:-1])
+        _bom_chx = {str(c.get("AssemblySKU")) for c in children
+                     if c.get("AssemblySKU")}
+        _bom_pax = {str(p.get("ComponentSKU")) for p in parents
+                     if p.get("ComponentSKU")}
+        _excl = _bom_chx | _bom_pax | {str(sku)}
+        _sib_check = products_df[
+            products_df["SKU"].astype(str).str.startswith(_fam_prefix + "-")
+            & ~products_df["SKU"].astype(str).isin(_excl)
+        ]
+        for _, _sb in _sib_check.iterrows():
+            _sib_sku = str(_sb.get("SKU"))
+            # Quick OnHand lookup — engine_df_full preferred (Ordering
+            # page), stock_df fallback (Product Detail page).
+            _oh = 0.0
+            if engine_df_full is not None and not engine_df_full.empty:
+                _em = engine_df_full[
+                    engine_df_full["SKU"].astype(str) == _sib_sku]
+                if not _em.empty:
+                    _val = _em.iloc[0].get("OnHand", 0)
+                    _oh = float(_val) if pd.notna(_val) else 0.0
+            elif stock_df is not None and not stock_df.empty:
+                _sm = stock_df[stock_df["SKU"].astype(str) == _sib_sku]
+                if not _sm.empty:
+                    _oh = float(pd.to_numeric(
+                        _sm["OnHand"], errors="coerce").sum() or 0)
+            if _oh > 0:
+                _sub_candidate_count += 1
+    if _sub_candidate_count > 0:
+        st.error(
+            f":arrows_counterclockwise: **HEY — "
+            f"{_sub_candidate_count} alternative variant"
+            f"{'s' if _sub_candidate_count != 1 else ''} with stock!**  \n"
+            "This SKU has family sibling"
+            f"{'s' if _sub_candidate_count != 1 else ''} with **idle "
+            "inventory on hand** — possible substitution"
+            f"{'s' if _sub_candidate_count != 1 else ''} before "
+            "reordering. "
+            "**Scroll down to the :twisted_rightwards_arrows: Family "
+            "siblings section** to review."
+        )
 
     # === Section 2: Demand sources (children rolling up) ===================
     if children:
@@ -702,6 +756,240 @@ def render_demand_breakdown(
                 "Qty per unit":
                     st.column_config.NumberColumn(format="%.4g"),
             })
+
+    # === Section 6: Family siblings (same product, alternative form) =======
+    # Heuristic match: SKUs sharing the prefix (everything up to the last
+    # hyphen-suffix) but NOT in the BOM children/parents list. Surfaces
+    # alternatives the BOM doesn't capture. Use case: 100m roll buyer
+    # sees that the 5m sibling has 8 units OnHand sitting idle for 90+
+    # days → consume those before reordering more 100m rolls.
+    #
+    # Status icons help the buyer scan quickly:
+    #   ⚠️ Dead stock — has OnHand AND no recent sales (great substitute)
+    #   💤 Dormant   — no recent sales, no OnHand (no substitution help)
+    #   ✅ Active    — selling normally (don't displace)
+    #   ⚪ Empty     — zero OnHand, possibly active elsewhere
+    sku_parts = str(sku).split("-")
+    if len(sku_parts) >= 3:
+        family_prefix = "-".join(sku_parts[:-1])
+        bom_child_set = {str(c.get("AssemblySKU"))
+                          for c in children if c.get("AssemblySKU")}
+        bom_parent_set = {str(p.get("ComponentSKU"))
+                           for p in parents if p.get("ComponentSKU")}
+        excluded_set = bom_child_set | bom_parent_set | {str(sku)}
+        sibs_mask = (
+            products_df["SKU"].astype(str).str.startswith(family_prefix + "-")
+            & ~products_df["SKU"].astype(str).isin(excluded_set)
+        )
+        family_sibs = products_df[sibs_mask].copy()
+        if not family_sibs.empty:
+            st.markdown(
+                f"#### :twisted_rightwards_arrows: Family siblings — "
+                f"alternative variants (not BOM-linked)")
+            st.caption(
+                f"Other SKUs matching `{family_prefix}-*` that aren't "
+                "wired to this one via the BOM. Useful when buyer wants "
+                "to consume idle stock of an alternative form (e.g. 5m "
+                "roll for a 100m master) before reordering this SKU.")
+            sib_rows = []
+            for _, sib in family_sibs.iterrows():
+                sib_sku = str(sib.get("SKU"))
+                sib_sl = sl[sl["SKU"].astype(str) == sib_sku]
+                s_12mo = float(sib_sl[
+                    sib_sl["InvoiceDate"] >= cutoff_365]["Quantity"].sum())
+                s_90d = float(sib_sl[
+                    sib_sl["InvoiceDate"] >= cutoff_90]["Quantity"].sum())
+                last = (sib_sl["InvoiceDate"].max()
+                        if not sib_sl.empty else None)
+                # Look up OnHand: prefer engine_df_full (richer), fall back
+                # to stock_df (raw stock data, available in Product Detail
+                # page where the engine isn't directly accessible).
+                onhand_str = "—"
+                onhand_num = 0.0
+                if engine_df_full is not None and not engine_df_full.empty:
+                    em = engine_df_full[
+                        engine_df_full["SKU"].astype(str) == sib_sku]
+                    if not em.empty:
+                        onhand_num = float(em.iloc[0].get("OnHand", 0) or 0)
+                        onhand_str = f"{onhand_num:.2f}"
+                elif stock_df is not None and not stock_df.empty:
+                    sm = stock_df[
+                        stock_df["SKU"].astype(str) == sib_sku]
+                    if not sm.empty:
+                        onhand_num = float(pd.to_numeric(
+                            sm["OnHand"], errors="coerce").sum() or 0)
+                        onhand_str = f"{onhand_num:.2f}"
+                # Trend column — categorise the sibling's recent
+                # performance vs its 12mo baseline so the buyer can
+                # decide whether to push it as a substitute. The ratio
+                # (90d daily rate / 12mo daily rate) tells the story:
+                # > 1.2x = accelerating; 0.8-1.2x = stable; 0.2-0.8x =
+                # slowing; < 0.2x = lagging/stale; 0 = no recent
+                # activity at all. Lagging items with high OnHand are
+                # exactly the substitution candidates.
+                rate_12 = s_12mo / 365.0
+                rate_90 = s_90d / 90.0
+                if s_12mo == 0 and s_90d == 0:
+                    trend = "⚪ No history"
+                elif s_90d == 0:
+                    trend = "💤 Stale (no 90d sales)"
+                elif rate_12 == 0 and s_90d > 0:
+                    trend = "🆕 New (no 12mo baseline)"
+                else:
+                    ratio = rate_90 / rate_12 if rate_12 > 0 else 0
+                    if ratio >= 1.2:
+                        trend = f"📈 Up ({ratio:.1f}x)"
+                    elif ratio >= 0.8:
+                        trend = f"→ Stable ({ratio:.1f}x)"
+                    elif ratio >= 0.2:
+                        trend = f"📉 Slowing ({ratio:.1f}x)"
+                    else:
+                        trend = f"📉 Lagging ({ratio:.1f}x)"
+                # Substitution-priority signal: sibling has stock + lagging
+                # trend → top candidate. Used for sorting + the warning.
+                is_substitution_candidate = (
+                    onhand_num > 0 and
+                    ("Lagging" in trend or "Slowing" in trend
+                     or "Stale" in trend))
+                sib_rows.append({
+                    "Sibling SKU": sib_sku,
+                    "Variant name": str(sib.get("Name") or "")[:40],
+                    "OnHand": onhand_str,
+                    "12mo units": int(s_12mo),
+                    "90d units": int(s_90d),
+                    "Last sale": (last.strftime("%Y-%m-%d")
+                                   if last is not None
+                                   and pd.notna(last) else "—"),
+                    "Trend": trend,
+                    "_sub_candidate": is_substitution_candidate,
+                })
+            if sib_rows:
+                # Sort substitution candidates first (high OnHand + lagging
+                # trend), then by 12mo units descending. That puts the
+                # most useful "consume this idle alternative first" rows
+                # at the top of the list.
+                sib_df = pd.DataFrame(sib_rows)
+                sib_df = sib_df.sort_values(
+                    ["_sub_candidate", "12mo units"],
+                    ascending=[False, False]).drop(columns=["_sub_candidate"])
+                st.dataframe(
+                    sib_df, hide_index=True, width="stretch",
+                    column_config={
+                        "OnHand": st.column_config.TextColumn(
+                            help="Current OnHand of this sibling. "
+                                  "Higher = more substitution potential."),
+                    })
+                # Substitution-candidate banner: items with stock AND
+                # lagging/slowing trend are prime candidates to consume
+                # before reordering the parent. The trend ratio (90d
+                # rate vs 12mo) directly tells us whether the alternate
+                # is "doing well" (don't displace it) or "lagging"
+                # (great candidate to push as a substitute).
+                _sub_count = sum(1 for s in sib_rows
+                                  if (s.get("OnHand") not in ("—", "0.00")
+                                       and ("Lagging" in s["Trend"]
+                                            or "Slowing" in s["Trend"]
+                                            or "Stale" in s["Trend"])))
+                if _sub_count:
+                    st.warning(
+                        f":warning: **{_sub_count} sibling(s) have "
+                        "stock AND a lagging trend** — consider "
+                        "consuming those before ordering more of "
+                        "this SKU. They're shown at the top of the "
+                        "table.")
+
+    # === Section 7: Redirect to successor (discontinued SKUs only) =========
+    # When a SKU is "[Discontinued]" or has Status="Discontinued", offer the
+    # buyer a quick way to map it to a successor SKU. The mapping is saved
+    # via db.set_migration() — same backend as the dedicated Migrations page,
+    # but accessible directly from the drill-down so the buyer doesn't have
+    # to navigate elsewhere.
+    #
+    # Effect after save:
+    #   - engine.migrated_out increases for this SKU → reorder_qty drops to 0
+    #   - engine.migrated_in increases for successor → its reorder bumps
+    #   - persists in DB across Streamlit restarts
+    prod_name = str(prod_row.get("Name") or "")
+    prod_status = str(prod_row.get("Status") or "")
+    is_discontinued = ("[discontinued]" in prod_name.lower()
+                        or prod_status.lower() == "discontinued")
+    if is_discontinued:
+        st.markdown("#### :arrow_right: Redirect demand to a successor SKU")
+        st.caption(
+            "This SKU is flagged Discontinued. To preserve its demand "
+            "history, map it to a successor — that SKU's reorder will "
+            "increase by the migrated share, and this one drops to 0.")
+        try:
+            existing = db.get_migration(sku) if hasattr(db, "get_migration") else {}
+        except Exception:
+            existing = {}
+        _all_skus = sorted(set(products_df["SKU"].astype(str).tolist())
+                            - {str(sku)})
+        _default_idx = 0
+        _existing_succ = (existing or {}).get("successor_sku") or ""
+        if _existing_succ in _all_skus:
+            _default_idx = _all_skus.index(_existing_succ)
+        cols_mig = st.columns([3, 1, 2, 1])
+        succ_pick = cols_mig[0].selectbox(
+            "Successor SKU",
+            options=_all_skus,
+            index=_default_idx if _all_skus else 0,
+            key=f"db_redirect_succ_{sku}",
+            placeholder="Pick the successor product…",
+        )
+        share_pick = cols_mig[1].number_input(
+            "Share %",
+            min_value=0.0, max_value=100.0,
+            value=float((existing or {}).get("share_pct", 100.0)),
+            step=5.0,
+            key=f"db_redirect_share_{sku}",
+            help="What % of this SKU's demand to migrate (default 100%).",
+        )
+        note_pick = cols_mig[2].text_input(
+            "Note (optional)",
+            value=str((existing or {}).get("note") or ""),
+            key=f"db_redirect_note_{sku}",
+            placeholder="e.g. 'replaced 2026-04-15'",
+        )
+        with cols_mig[3]:
+            st.write("")
+            st.write("")
+            if st.button("Save", key=f"db_redirect_save_{sku}",
+                         width="stretch", type="primary"):
+                actor = (st.session_state.get("current_user", "")
+                         .strip() or "anonymous")
+                try:
+                    db.set_migration(sku, succ_pick, actor,
+                                      share_pick, note_pick)
+                    st.cache_data.clear()
+                    st.success(
+                        f"Redirected: **{sku}** → **{succ_pick}** "
+                        f"({share_pick:.0f}% of demand). "
+                        "Engine will reflect this on next refresh.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not save: {e}")
+        if existing:
+            cols_clear = st.columns([4, 1])
+            cols_clear[0].info(
+                f"Currently mapped to **{existing.get('successor_sku')}** "
+                f"at **{float(existing.get('share_pct', 100)):.0f}%** "
+                f"share."
+                + (f" Note: _{existing.get('note')}_"
+                    if existing.get("note") else ""))
+            with cols_clear[1]:
+                if st.button("Clear", key=f"db_redirect_clear_{sku}",
+                              width="stretch"):
+                    actor = (st.session_state.get("current_user", "")
+                             .strip() or "anonymous")
+                    try:
+                        if hasattr(db, "clear_migration"):
+                            db.clear_migration(sku, actor)
+                        st.cache_data.clear()
+                        st.success(f"Cleared mapping for {sku}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not clear: {e}")
 
 
 def parent_sku_for(sku: str) -> Optional[str]:
@@ -4167,9 +4455,18 @@ engine shows every input and how it got to the suggestion.
 
         for _, p in products.iterrows():
             sku = p["SKU"]
-            if _global_is_master(sku):
+            # Always roll up if the SKU has a BOM, even if _global_is_master
+            # returns True. Reason: the BOM is authoritative — if it says
+            # "this SKU is built from component X", the demand should
+            # cascade to X regardless of other classification heuristics
+            # (e.g. AdditionalAttribute1 saying "Purchased full length"
+            # by mistake, or supplier-assigned giving a misleading hint).
+            # This was the bug behind LED-WLNW-40K-IP20-100M showing
+            # zero rolled-up demand from its per-foot child.
+            has_bom = sku in bom_components_by_asm
+            if not has_bom and _global_is_master(sku):
                 continue
-            # Non-master: find ALL its masters and roll up demand
+            # Non-master (or has BOM): find ALL its masters and roll up demand
             targets = _find_all_masters_for_assembly(sku)
             if not targets:
                 continue
@@ -4324,8 +4621,31 @@ engine shows every input and how it got to the suggestion.
         # instead of rounding up to a full roll). The threshold of 50m
         # keeps small-roll masters (5m, 10m) on integer ordering since
         # partial purchases on those are unusual.
+        #
+        # Two detection passes:
+        # (1) Strip-family parser (above) — catches masters whose family
+        #     members share a clean prefix (e.g. all LEDIRIS6000-* live
+        #     in the same family).
+        # (2) SKU-suffix fallback (below) — catches masters like
+        #     LED-WLNW-40K-IP20-100M whose per-foot child uses a
+        #     different middle segment (LED-WLNW-40K-16-IP20-0305) so
+        #     prefix matching fails. Any SKU ending in "-NNNm" or
+        #     "-NNNM" with N >= 50 is treated as a bulk master.
+        import re as _re_bulk
+        _bulk_suffix_pat = _re_bulk.compile(r"-(\d+)[Mm]$")
+        for _s in df["SKU"]:
+            _s_str = str(_s)
+            if bulk_master_lengths.get(_s_str, 0) > 0:
+                continue  # already detected via strip-family parser
+            _m = _bulk_suffix_pat.search(_s_str)
+            if not _m:
+                continue
+            _n = int(_m.group(1))
+            if _n >= 50:
+                bulk_master_lengths[_s_str] = float(_n)
+
         df["bulk_length_m"] = df["SKU"].apply(
-            lambda s: float(bulk_master_lengths.get(s, 0)))
+            lambda s: float(bulk_master_lengths.get(str(s), 0)))
         df["is_bulk_master"] = df["bulk_length_m"] >= 50.0
 
         # 5e. IsMaster flag on df. A SKU is non-master if:
@@ -4371,21 +4691,45 @@ engine shows every input and how it got to the suggestion.
 
         df["effective_units_90d"] = df.apply(_effective_units_90d, axis=1)
 
-        # Dormancy detection: a SKU is dormant when it has meaningful
-        # 12mo demand but the recent 90d daily rate is < 20% of the 12mo
-        # daily rate. The 20% threshold catches "demand fell off a cliff"
-        # cases like a discontinued product family or seasonal SKU after
-        # season-end. Active SKUs with normal lull-vs-burst patterns
-        # (≥20% of normal rate) keep using the 12mo velocity.
+        # Dormancy detection (two-tier):
+        #   Tier 1: Hard dormant — effective_units_90d == 0 AND
+        #           effective_units_12mo > 0. The family had history but
+        #           hasn't sold a single unit in 90 days. Always flag.
+        #   Tier 2: Soft dormant — recent 90d rate is < 20% of 12mo rate
+        #           AND 12mo rate is meaningful (>0.05/day). Catches
+        #           "demand fell off a cliff" while not over-flagging
+        #           genuinely low-volume but still-active SKUs.
+        # The hard tier replaces the previous 0.05 threshold floor — that
+        # threshold was preventing legitimate stale-demand SKUs (no sales
+        # since 2023, e.g. LEDIRIS6000-180-100) from being flagged.
         def _is_dormant(row):
             eff_12mo = float(row.get("effective_units_12mo") or 0)
             eff_90d = float(row.get("effective_units_90d") or 0)
             if eff_12mo <= 0:
-                return False  # no historical demand to be dormant against
+                return False
+            # Tier 1: ~zero 90d activity. The threshold is expressed in
+            # PHYSICAL UNITS so master rolls and leaf SKUs are compared
+            # consistently:
+            #   - Bulk master (e.g. 100m roll): less than 5m of physical
+            #     strip flow in 90 days = dormant. 0.001 master rolls
+            #     × 100m = 0.1m → dormant. 0.546 × 100m = 54.6m → active.
+            #   - Leaf SKU (e.g. per-foot cut): less than 1 unit in 90
+            #     days = dormant.
+            # This replaces a strict <=0 check that missed near-zero
+            # rolled-up activity from per-foot children.
+            is_bulk = bool(row.get("is_bulk_master", False))
+            bulk_len = float(row.get("bulk_length_m", 0) or 0)
+            if is_bulk and bulk_len > 0:
+                if (eff_90d * bulk_len) < 5.0:
+                    return True
+            else:
+                if eff_90d < 1.0:
+                    return True
             rate_12mo_daily = eff_12mo / 365.0
             rate_90d_daily = eff_90d / 90.0
-            # Avoid div-by-zero noise — if 12mo rate is tiny (<0.05/day),
-            # the SKU is barely moving anyway; don't flag.
+            # Tier 2: recent rate dropped > 80% vs 12mo. Catches the
+            # "demand fell off a cliff" case for SKUs whose 12mo rate
+            # is meaningful (>0.05/day = 18 units/year).
             if rate_12mo_daily < 0.05:
                 return False
             return rate_90d_daily < (0.20 * rate_12mo_daily)
@@ -4500,6 +4844,41 @@ engine shows every input and how it got to the suggestion.
             sorted_df["ABC"] = "—"
         df = df.merge(sorted_df[["SKU", "ABC"]], on="SKU", how="left")
 
+        # Class-aware dormancy refinement (now that ABC is known).
+        # The base _is_dormant was conservative — flagged only items
+        # with effectively zero recent activity. C-class SKUs need a
+        # higher bar: they're low-priority by definition, so only
+        # genuinely meaningful 90d demand justifies keeping them
+        # active. Thresholds in physical units (metres for bulk
+        # masters, units for leaves):
+        #   A-class:  5m / 1 unit  (current — keep active easily)
+        #   B-class: 10m / 2 units
+        #   C-class: 25m / 5 units (high bar — slow-movers go dormant)
+        # This means an item with 9m of 90d strip flow (e.g., 2-3 ft of
+        # per-foot cuts/month) is "active" for an A-class SKU but
+        # "dormant" for a C-class SKU — letting attrition run down
+        # slow-moving inventory automatically.
+        def _refine_dormancy_by_class(row):
+            if bool(row.get("is_dormant", False)):
+                return True  # already flagged by base rules
+            abc = str(row.get("ABC") or "C")
+            eff_90d = float(row.get("effective_units_90d") or 0)
+            is_bulk = bool(row.get("is_bulk_master", False))
+            bulk_len = float(row.get("bulk_length_m", 0) or 0)
+            if is_bulk and bulk_len > 0:
+                threshold_m = {"A": 5.0, "B": 10.0,
+                                "C": 25.0}.get(abc, 10.0)
+                if (eff_90d * bulk_len) < threshold_m:
+                    return True
+            else:
+                threshold_u = {"A": 1.0, "B": 2.0,
+                                "C": 5.0}.get(abc, 2.0)
+                if eff_90d < threshold_u:
+                    return True
+            return False
+
+        df["is_dormant"] = df.apply(_refine_dormancy_by_class, axis=1)
+
         # 9. Daily demand, DoC — use EFFECTIVE units (direct + migrated +
         # tube rollup) so Sierra masters reflect Smokies/Cascade migration
         # and their MP/cut variant consumption.
@@ -4533,8 +4912,13 @@ engine shows every input and how it got to the suggestion.
             # moved in 90 days, use the 90d rate (which will be ≈0)
             # regardless of how much 12mo history the SKU has.
             if bool(r.get("is_dormant", False)):
-                eff_90d = _safe(r.get("effective_units_90d"))
-                return eff_90d / 90.0
+                # Hard-zero for dormant: any positive avg_daily would
+                # produce a small positive target_stock, which then
+                # snaps up to 10m via the bulk-master 10m floor →
+                # spurious 0.10 suggestions for items the engine has
+                # explicitly classified as dormant. Returning 0 ensures
+                # target_stock = 0 → shortfall = 0 → reorder = 0.
+                return 0.0
             if flag == "📈 Trend":
                 u45 = _safe(r.get("units_45d"))
                 if u45 > 0:
@@ -4756,8 +5140,36 @@ engine shows every input and how it got to the suggestion.
         is_bulk = bool(row.get("is_bulk_master", False))
         supplier_allows_frac = bool(cfg.get("allow_fractional_qty", True))
         use_fractional = is_bulk and supplier_allows_frac
+        bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
+
+        def _snap_to_10m(value, length_m):
+            """Round a fractional reorder qty to the nearest 10m equivalent.
+            For a 100m roll, value 0.26 → 0.30 (= 30m). For a 50m roll,
+            value 0.45 → 0.40 (= 20m). Provides cleaner ordering than
+            arbitrary fractions like 0.42, while still being more capital-
+            efficient than always rounding to a full roll.
+
+            Demand <5m rounds to 0 (don't reorder for trivial demand).
+            Demand 5m-15m snaps up to 10m (smallest meaningful order).
+            Demand >15m rounds to nearest 10m increment."""
+            if not length_m or length_m <= 0 or value <= 0:
+                return value
+            metres = value * length_m
+            # Below 5m of demand: not worth ordering. This eliminates the
+            # spurious 0.10-roll suggestions for SKUs whose 12mo daily is
+            # near zero (e.g. items that haven't sold in years but have
+            # tiny rolled-up demand from a per-foot child).
+            if metres < 5.0:
+                return 0.0
+            rounded_metres = round(metres / 10.0) * 10.0
+            # 5-15m range snaps up to 10m (smallest meaningful order).
+            if rounded_metres < 10.0:
+                rounded_metres = 10.0
+            return rounded_metres / length_m
+
         if use_fractional:
-            reorder = round(float(shortfall), 2)
+            raw_reorder = round(float(shortfall), 2)
+            reorder = round(_snap_to_10m(raw_reorder, bulk_len_m), 2)
         else:
             reorder = int(round(shortfall))
 
@@ -4787,9 +5199,16 @@ engine shows every input and how it got to the suggestion.
             recovery_days = int(
                 cfg.get("stockout_min_cover_days") or 60)
             stockout_min = base_avg * (lead_time_days + recovery_days)
-            stockout_qty = (round(float(stockout_min), 2)
-                            if use_fractional
-                            else int(round(stockout_min)))
+            if use_fractional:
+                # Apply same 10m snap to stockout boost so it doesn't
+                # produce sub-5m fractional suggestions (e.g. 0.01 of a
+                # 100m roll = 1m). Was a bug — stockout boost previously
+                # bypassed the snap and surfaced absurdly small qtys for
+                # near-zero-velocity SKUs that had OnHand=0.
+                stockout_qty = round(_snap_to_10m(
+                    round(float(stockout_min), 2), bulk_len_m), 2)
+            else:
+                stockout_qty = int(round(stockout_min))
             if stockout_qty > reorder:
                 stockout_boost_applied = True
                 reorder = stockout_qty
@@ -5000,6 +5419,24 @@ engine shows every input and how it got to the suggestion.
         engine_df.loc[_ds_mask, "excess_units"] = 0
         engine_df.loc[_ds_mask, "excess_value"] = 0
         engine_df.loc[_ds_mask, "Status"] = "📦 Dropship"
+
+    # Discontinued override: any SKU with "[Discontinued]" in its Name
+    # (case-insensitive) OR Status="Discontinued" in CIN7 — force
+    # reorder_qty=0 and target_stock=0 so the engine never suggests
+    # ordering more of a product that's been retired. The buyer can
+    # still see direct sales history, OnHand, and excess for cleanup
+    # decisions. Trend is set to "🚫 Discontinued" (distinct from
+    # 💤 Dormant) so it's visually obvious in the PO editor.
+    _disc_name_mask = (engine_df["Name"].astype(str)
+                       .str.contains(r"\[Discontinued\]", case=False,
+                                      regex=True, na=False))
+    _disc_status_mask = (engine_df.get("Status", pd.Series(dtype=str))
+                          .astype(str).str.lower() == "discontinued")
+    _disc_mask = _disc_name_mask | _disc_status_mask
+    if _disc_mask.any():
+        engine_df.loc[_disc_mask, "target_stock"] = 0
+        engine_df.loc[_disc_mask, "reorder_qty"] = 0
+        engine_df.loc[_disc_mask, "trend_flag"] = "🚫 Discontinued"
     # OnHandValue: prefer CIN7's authoritative StockOnHand (FIFO-based
     # dollar value shown in CIN7's Product Availability screen).
     # Fall back to OnHand × AverageCost/FixedCost only when CIN7 returns 0.
@@ -6659,22 +7096,45 @@ engine shows every input and how it got to the suggestion.
     )
 
     # --- Drill into demand for any ticked SKU -------------------------
-    # The :mag: column in the editor is a one-click toggle: tick a row
-    # to inspect, untick to close. If multiple rows are ticked, we
-    # render the FIRST one (and tell the buyer to untick others). This
-    # replaces the dropdown picker — the SKU is right there next to
-    # what they're looking at, no second navigation needed.
+    # The :mag: column in the editor is a one-click toggle. Single-tick
+    # behaviour — clicking a new row auto-shows that one's breakdown
+    # (we detect which SKU's tick state TRANSITIONED False→True since
+    # the last render via session_state). If multiple rows end up
+    # ticked, we use the most-recently-toggled one. Buyers don't need
+    # to manually untick the previous row.
     _drill_sku = ""
+    _drill_state_key = f"po_drill_prior_ticks_{sel_sup}"
     if "🔍" in edited.columns:
-        _ticked = edited[edited["🔍"].fillna(False).astype(bool)]
-        if len(_ticked) > 0:
-            _drill_sku = str(_ticked.iloc[0].get("SKU") or "")
-            if len(_ticked) > 1:
-                st.info(
-                    f":information_source: {len(_ticked)} rows ticked — "
-                    f"showing breakdown for **{_drill_sku}**. Untick the "
-                    "others to inspect a different one."
-                )
+        _curr_ticked_set = set(
+            edited.loc[edited["🔍"].fillna(False).astype(bool), "SKU"]
+            .astype(str).tolist())
+        _prior_ticked_set = set(
+            st.session_state.get(_drill_state_key, []))
+        # Find SKUs that newly became ticked (False→True transitions)
+        _new_ticks = _curr_ticked_set - _prior_ticked_set
+        if _new_ticks:
+            # User just ticked a new row — focus on that one
+            _drill_sku = next(iter(_new_ticks))
+        elif _curr_ticked_set:
+            # No new tick this render, but something is still ticked —
+            # use last-known active SKU if it's still ticked, else any
+            _last_active = st.session_state.get(
+                f"po_drill_active_{sel_sup}", "")
+            if _last_active in _curr_ticked_set:
+                _drill_sku = _last_active
+            else:
+                _drill_sku = next(iter(_curr_ticked_set))
+        # Persist for next render
+        st.session_state[_drill_state_key] = list(_curr_ticked_set)
+        st.session_state[f"po_drill_active_{sel_sup}"] = _drill_sku
+        if len(_curr_ticked_set) > 1:
+            _other_skus = sorted(_curr_ticked_set - {_drill_sku})
+            st.caption(
+                f":information_source: {len(_curr_ticked_set)} rows ticked — "
+                f"showing **{_drill_sku}**. Untick others when convenient: "
+                f"{', '.join(f'`{s}`' for s in _other_skus[:5])}"
+                + (f" (+ {len(_other_skus)-5} more)" if len(_other_skus) > 5 else "")
+            )
 
     if _drill_sku:
         with st.expander(
@@ -6692,6 +7152,7 @@ engine shows every input and how it got to the suggestion.
                 bom_children=BOM_CHILDREN,
                 bom_parents=BOM_PARENTS,
                 engine_row=_engine_row,
+                engine_df_full=engine_df,
             )
     else:
         st.caption(
@@ -8583,6 +9044,7 @@ elif page == "Product Detail":
                 bom_children=BOM_CHILDREN,
                 bom_parents=BOM_PARENTS,
                 engine_row=None,
+                stock_df=stock,
             )
 
         # --- Product master header ------------------------------------------
@@ -9753,7 +10215,6 @@ elif page == "Kits & Fixtures":
                     f"signal — customers keep building that exact combo. "
                     f"Pre-building those saves the most fulfillment time."
                 )
-
 
 # ---------------------------------------------------------------------------
 # Page: Data Health
