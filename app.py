@@ -13298,23 +13298,23 @@ elif page == "AI Assistant":
                 if entry["role"] == "assistant" and entry.get("audit_id"):
                     fb_cols = st.columns([1, 1, 6])
                     if fb_cols[0].button(
-                            ":+1:",
+                            "👍",
                             key=f"fb_pos_{entry['audit_id']}",
                             help="This answer was helpful and accurate"):
                         db.record_ai_feedback(
                             entry["audit_id"], "positive",
                             user_id=current_user or "anonymous")
                         st.toast("Thanks — feedback recorded.",
-                                  icon=":+1:")
+                                  icon="👍")
                     if fb_cols[1].button(
-                            ":-1:",
+                            "👎",
                             key=f"fb_neg_{entry['audit_id']}",
                             help="This answer was wrong or unhelpful"):
                         db.record_ai_feedback(
                             entry["audit_id"], "negative",
                             user_id=current_user or "anonymous")
                         st.toast(
-                            "Thanks — flagged for review.", icon=":-1:")
+                            "Thanks — flagged for review.", icon="👎")
                     if entry.get("tool_calls"):
                         with fb_cols[2].popover(
                                 ":wrench: Why this answer"):
