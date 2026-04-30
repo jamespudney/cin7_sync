@@ -13048,6 +13048,9 @@ elif page == "Kits & Fixtures":
                         "Quantity": "Qty per kit",
                         "ComponentOnHand": "Comp OnHand (phys)",
                         "ComponentAvailable": "Comp Available",
+                        # MaxBuildableFromThis was missing from the
+                        # rename map — caused KeyError on the sort.
+                        "MaxBuildableFromThis": "Buildable from this alone",
                     }).sort_values("Buildable from this alone"),
                     width="stretch", hide_index=True,
                 )
