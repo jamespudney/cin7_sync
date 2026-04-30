@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.43 — AI Assistant (Phase 0): natural-language inventory Q&A page powered by Claude with tool-use against engine_df/sale_lines. db.ai_audit_logs records every interaction; thumbs up/down feedback. Foundation for the broader Commercial Intelligence System. (Apr 30)")
+    st.caption("🟢 v2.44 — AI Assistant gains a Knowledge Base layer: 6 starter docs in /docs (inventory-rules, reorder-engine, sync-cadences, migrations, po-workflow, glossary) plus root-level RULES/DEPLOY/SAAS_NOTES indexed by ai_kb.py. New tool `search_knowledge_base` lets Claude cite the actual rule when answering 'how/why' questions. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13301,14 +13301,18 @@ elif page == "AI Assistant":
                             ":+1:",
                             key=f"fb_pos_{entry['audit_id']}",
                             help="This answer was helpful and accurate"):
-                        db.record_ai_feedback(entry["audit_id"], "positive")
+                        db.record_ai_feedback(
+                            entry["audit_id"], "positive",
+                            user_id=current_user or "anonymous")
                         st.toast("Thanks — feedback recorded.",
                                   icon=":+1:")
                     if fb_cols[1].button(
                             ":-1:",
                             key=f"fb_neg_{entry['audit_id']}",
                             help="This answer was wrong or unhelpful"):
-                        db.record_ai_feedback(entry["audit_id"], "negative")
+                        db.record_ai_feedback(
+                            entry["audit_id"], "negative",
+                            user_id=current_user or "anonymous")
                         st.toast(
                             "Thanks — flagged for review.", icon=":-1:")
                     if entry.get("tool_calls"):
@@ -13337,17 +13341,41 @@ elif page == "AI Assistant":
             _client = anthropic.Anthropic(api_key=_anthropic_key)
             _messages = [{"role": "user", "content": _user_question}]
             _system_prompt = (
-                "You are an inventory analyst assistant for "
+                f"You are an inventory analyst assistant for "
                 f"{COMPANY_NAME}, a CIN7-using business that sells "
                 "LED lighting products (strips, channels, drivers, "
-                "tubes). Answer the user's question by calling the "
-                "available tools to fetch real data. Never invent "
-                "numbers, SKUs, or stock levels. Keep answers concise "
-                "(3-6 short bullet points or a small table) unless "
-                "the user asks for more detail. When citing a SKU, "
-                "include the name + on-hand quantity in parentheses. "
-                "If you can't answer confidently, say so and ask "
-                "for clarification (preferred SKU, time window, etc).")
+                "tubes). You have two kinds of tools available — use "
+                "them deliberately:\n\n"
+                "**Live data tools** (search_products, get_sku_details, "
+                "get_velocity, get_dead_stock, get_migration_chain) — "
+                "use for current numbers: stock levels, sales, "
+                "classifications, predecessor/successor mappings.\n\n"
+                "**Knowledge base tool** (search_knowledge_base) — "
+                "use for HOW or WHY questions. Examples: 'why is X "
+                "slow-moving?', 'how does the reorder engine "
+                "decide?', 'what's the LED tube family convention?'. "
+                "When users ask explanatory or process questions, "
+                "search the knowledge base FIRST so the answer is "
+                "grounded in the real business rules, not guessed. "
+                "When you cite a rule, name the source file and line "
+                "range that the search returned (e.g. "
+                "'docs/inventory-rules.md:12-28').\n\n"
+                "**Combined questions** (e.g. 'why is THIS SKU slow-"
+                "moving?') need BOTH: search the knowledge base for "
+                "the rule, AND look up the SKU's data, then explain "
+                "how the data triggers the rule.\n\n"
+                "**Hard rules** for every answer:\n"
+                "- Never invent numbers, SKUs, stock levels, or rules.\n"
+                "- If a tool returns no results, say so plainly.\n"
+                "- If the knowledge base doesn't cover something, "
+                "say 'the documentation doesn't explain this — please "
+                "ask an admin to add it'. Do not guess.\n"
+                "- Keep answers concise (3-6 short bullet points or a "
+                "small table) unless the user asks for more detail.\n"
+                "- When citing a SKU, include the name + on-hand "
+                "quantity in parentheses.\n"
+                "- If you can't answer confidently, say so and ask "
+                "for clarification (preferred SKU, time window, etc.).")
 
             _tool_calls_log: list = []
             _start_ts = datetime.now()

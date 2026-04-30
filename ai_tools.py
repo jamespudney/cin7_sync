@@ -187,6 +187,37 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["sku"],
         },
     },
+    {
+        "name": "search_knowledge_base",
+        "description": (
+            "Search the company's app documentation, business rules, "
+            "SOPs, and manuals. Use this when the user asks HOW or "
+            "WHY something works, or asks about company conventions "
+            "(e.g., 'why is this SKU marked slow-moving?', 'how does "
+            "the reorder calculation work?', 'what's the LED tube "
+            "family naming convention?'). Returns up to 5 relevant "
+            "paragraphs with file path + line range so you can cite "
+            "the source. If the search returns no results, tell the "
+            "user the documentation needs to be added — do NOT "
+            "guess or invent the rule."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language question or keywords. "
+                                   "Be specific — 'slow-moving classification "
+                                   "rule' beats 'slow stock'.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Max paragraphs to return (default 5, cap 10).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -391,6 +422,42 @@ def get_migration_chain(engine_df: pd.DataFrame,
     return {"sku": sku, "chain": chain}
 
 
+def search_knowledge_base(engine_df: pd.DataFrame,
+                            sale_lines_df: pd.DataFrame,
+                            args: dict) -> dict:
+    """Searches the on-disk knowledge base (markdown docs in docs/ +
+    a curated set of top-level .md files). Returns top paragraphs.
+    NOTE: we accept engine_df/sale_lines_df even though we don't use
+    them, so the tool dispatch signature stays uniform."""
+    import ai_kb
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    max_results = min(int(args.get("max_results", 5) or 5), 10)
+    results = ai_kb.search_knowledge_base(query, max_results=max_results)
+    if not results:
+        return {
+            "matched": 0,
+            "results": [],
+            "note": (
+                "No paragraphs in the knowledge base matched this query. "
+                "Tell the user the documentation needs to be added or "
+                "expanded — do NOT guess the answer."
+            ),
+        }
+    return {
+        "matched": len(results),
+        "results": [{
+            "source": p.source,
+            "title": p.title,
+            "lines": f"{p.start_line}-{p.end_line}",
+            "score": p.score,
+            "text": p.text[:1500],   # cap so a giant paragraph
+                                       # doesn't blow the context.
+        } for p in results],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table — maps tool name (from Claude) to implementation.
 # ---------------------------------------------------------------------------
@@ -400,6 +467,7 @@ TOOL_HANDLERS = {
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,
     "get_migration_chain": get_migration_chain,
+    "search_knowledge_base": search_knowledge_base,
 }
 
 

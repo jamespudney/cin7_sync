@@ -402,6 +402,29 @@ CREATE TABLE IF NOT EXISTS product_aliases (
 );
 CREATE INDEX IF NOT EXISTS ix_product_aliases_phrase
     ON product_aliases(phrase);
+
+-- Generic feedback events. Designed for the long-term commercial-
+-- intelligence vision: feedback comes from many sources (AI chats,
+-- Slack reactions, Gorgias resolutions, buyer dashboard clicks,
+-- weekly buyer summary emails). Source identifies origin; entity_type
+-- + entity_id point at what's being rated (an audit log row, a
+-- demand signal, a buyer warning, a SKU, a product family). Later
+-- pipelines (alias learning, prompt tuning, demand-signal scoring)
+-- mine this table.
+CREATE TABLE IF NOT EXISTS feedback_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source          TEXT NOT NULL,         -- 'ai_chat' | 'slack' | 'gorgias' | 'buyer_dashboard' | 'email' | 'manual'
+    entity_type     TEXT NOT NULL,         -- 'ai_audit_log' | 'demand_signal' | 'buyer_warning' | 'sku' | 'product_family' | etc
+    entity_id       TEXT NOT NULL,         -- ID of the entity (string for flexibility)
+    feedback        TEXT NOT NULL,         -- 'positive' | 'negative' | 'correction' | 'ignore' | 'useful' | etc
+    note            TEXT,                  -- free-text; e.g. corrected SKU, reason for negative
+    user_id         TEXT,
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_feedback_entity
+    ON feedback_events(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS ix_feedback_source
+    ON feedback_events(source, created_at DESC);
 """
 
 
@@ -2132,9 +2155,16 @@ def log_ai_query(*,
 
 
 def record_ai_feedback(audit_id: int, feedback: str,
-                        note: str = "") -> None:
+                        note: str = "",
+                        user_id: str = "") -> None:
     """Attach thumbs-up/down feedback to an existing audit log row.
-    feedback should be 'positive' or 'negative'."""
+    Feedback is written to two places:
+      - ai_audit_logs.feedback (quick filtering of a single chat)
+      - feedback_events (generic feedback stream — same pattern used
+        for Slack reactions, Gorgias resolutions, buyer dashboard
+        clicks etc when those land later).
+    Keeping both lets the AI page query is-this-row-rated quickly
+    while the cross-source analytics live in feedback_events."""
     if feedback not in ("positive", "negative"):
         raise ValueError("feedback must be 'positive' or 'negative'")
     with connect() as c:
@@ -2143,6 +2173,35 @@ def record_ai_feedback(audit_id: int, feedback: str,
             "WHERE id = ?",
             (feedback, note, audit_id),
         )
+        c.execute(
+            """
+            INSERT INTO feedback_events
+                (source, entity_type, entity_id, feedback, note, user_id)
+            VALUES ('ai_chat', 'ai_audit_log', ?, ?, ?, ?)
+            """,
+            (str(audit_id), feedback, note, user_id),
+        )
+
+
+def record_feedback_event(*,
+                            source: str,
+                            entity_type: str,
+                            entity_id: str,
+                            feedback: str,
+                            note: str = "",
+                            user_id: str = "") -> int:
+    """Generic feedback writer for non-AI sources (Slack reactions,
+    Gorgias outcomes, buyer dashboard, etc.). Returns the row id."""
+    with connect() as c:
+        cur = c.execute(
+            """
+            INSERT INTO feedback_events
+                (source, entity_type, entity_id, feedback, note, user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (source, entity_type, str(entity_id), feedback, note, user_id),
+        )
+        return int(cur.lastrowid)
 
 
 def list_ai_queries(user_id: Optional[str] = None,
