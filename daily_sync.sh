@@ -52,5 +52,16 @@ echo "[$(stamp)] sync_supplier_names" >> "$LOG"
 python sync_supplier_names.py --apply >> "$LOG" 2>&1 || \
   echo "[$(stamp)] sync_supplier_names FAILED (continuing)" >> "$LOG"
 
+# Shopify content sync — feeds the AI Assistant's knowledge base
+# with product descriptions, collections, pages, blog posts. Skipped
+# automatically if SHOPIFY_DOMAIN / SHOPIFY_ACCESS_TOKEN aren't set.
+if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
+    echo "[$(stamp)] shopify_sync" >> "$LOG"
+    python shopify_sync.py >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] shopify_sync FAILED (continuing)" >> "$LOG"
+else
+    echo "[$(stamp)] shopify_sync skipped (env vars not set)" >> "$LOG"
+fi
+
 echo "[$(stamp)] daily_sync.sh done" >> "$LOG"
 echo "" >> "$LOG"

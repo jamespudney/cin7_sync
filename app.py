@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.45 — AI Assistant Phase 0 complete: 5 live data tools, knowledge base over docs/ + RULES.md, audit log, thumbs up/down feedback. Shopify integration deferred to Phase 1 (will use modern Dev Dashboard OAuth + GraphQL Admin API). (Apr 30)")
+    st.caption("🟢 v2.47 — Today/MTD revenue now matches CIN7 (uses order-level InvoiceAmount including shipping + tax). New AI tool `get_sales_totals` for company-wide aggregates: 'total sales this month', 'last 90 days revenue', 'monthly trend' — works with grouping by day/week/month. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -515,6 +515,15 @@ def _load_longest_sale_lines() -> pd.DataFrame:
 sale_lines = _load_longest_sale_lines()
 if sale_lines.empty:
     sale_lines = sale_lines_30d if not sale_lines_30d.empty else sale_lines_3d
+
+
+# Order-level (header) sales for revenue calculations that need to
+# match CIN7's dashboard. The line-level `sale_lines.Total` excludes
+# shipping; `sales_full.InvoiceAmount` includes shipping + tax which
+# is what CIN7 shows on its own Revenue tile. We keep BOTH around:
+# - sale_lines for unit counts, velocity, customer rollup, ABC engine
+# - sales_full for revenue $ that the user can reconcile to CIN7
+sales_full = _load_longest_sales()
 
 
 @st.cache_data(persist="disk", show_spinner="Loading sales headers…")
@@ -2458,6 +2467,9 @@ if page == "Overview":
             "vs Sat). MTD comparison uses the same calendar date range "
             "across years.")
 
+        # df = sale_lines for UNITS/orders. We deliberately use
+        # line-level for unit counts because order-level headers
+        # don't carry per-line quantities.
         df = sale_lines.copy()
         df["InvoiceDate"] = _to_date(df["InvoiceDate"]).dt.tz_localize(None)
         df["Total"] = _to_num(df["Total"]).fillna(0)
@@ -2469,28 +2481,60 @@ if page == "Overview":
             _bad_stat = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
             df = df[~df["Status"].astype(str).str.upper().isin(_bad_stat)]
 
+        # hdf = sales_full headers for REVENUE $. CIN7's dashboard
+        # sums InvoiceAmount which INCLUDES shipping + tax — line-level
+        # Total doesn't, hence the gap users were seeing (today $6,253
+        # in our app vs $9,600 in CIN7). We pick the right column
+        # defensively: InvoiceAmount > GrandTotal > Total.
+        hdf = sales_full.copy() if not sales_full.empty else pd.DataFrame()
+        if not hdf.empty:
+            hdf["InvoiceDate"] = _to_date(
+                hdf["InvoiceDate"]).dt.tz_localize(None)
+            _rev_col = next(
+                (c for c in ("InvoiceAmount", "GrandTotal", "Total")
+                  if c in hdf.columns),
+                None)
+            if _rev_col is None:
+                hdf = pd.DataFrame()
+            else:
+                hdf["__rev"] = _to_num(hdf[_rev_col]).fillna(0)
+                hdf = hdf.dropna(subset=["InvoiceDate"])
+                # Same status filter as the line view.
+                if "Status" in hdf.columns:
+                    hdf = hdf[~hdf["Status"].astype(str).str.upper()
+                              .isin(_bad_stat)]
+
+        def _rev_for_dates(date_mask) -> float:
+            """Sum order-level revenue for dates matching the mask.
+            Falls back to line-level Total if header data isn't
+            available (first-deploy scenario)."""
+            if not hdf.empty:
+                return float(hdf[date_mask(hdf)]["__rev"].sum())
+            return float(df[date_mask(df)]["Total"].sum())
+
         today = pd.Timestamp(datetime.now().date())
         today_only = today.date()
         today_weekday = today.strftime("%a")  # 'Mon', 'Tue', etc.
 
-        # Today
-        today_mask = df["InvoiceDate"].dt.date == today_only
-        today_df = df[today_mask]
+        # Today — units from lines, revenue from headers
+        today_mask_lines = df["InvoiceDate"].dt.date == today_only
+        today_df = df[today_mask_lines]
         today_orders = today_df["SaleID"].nunique()
         today_units = float(today_df["Quantity"].sum())
-        today_rev = float(today_df["Total"].sum())
+        today_rev = _rev_for_dates(
+            lambda d: d["InvoiceDate"].dt.date == today_only)
 
         # Yesterday for delta context
         yesterday = today - pd.Timedelta(days=1)
-        yest_mask = df["InvoiceDate"].dt.date == yesterday.date()
-        yest_rev = float(df[yest_mask]["Total"].sum())
+        yest_rev = _rev_for_dates(
+            lambda d: d["InvoiceDate"].dt.date == yesterday.date())
 
         # Matching weekday 52 weeks ago (Shopify-style). 364 days = 52 × 7,
         # so subtracting it gives the same day-of-week one year back.
         # This avoids the Mon-vs-Sun mismatch you'd get from same-date YoY.
         match_last = today - pd.Timedelta(days=364)
-        match_last_mask = df["InvoiceDate"].dt.date == match_last.date()
-        match_last_rev = float(df[match_last_mask]["Total"].sum())
+        match_last_rev = _rev_for_dates(
+            lambda d: d["InvoiceDate"].dt.date == match_last.date())
 
         tc1, tc2, tc3, tc4 = st.columns(4)
         tc1.metric(f"Today ({today_weekday} {today_only.strftime('%b %d')})",
@@ -2508,13 +2552,16 @@ if page == "Overview":
         else:
             tc4.metric("YoY (matching weekday)", "—")
 
-        # Month-to-date: from 1st of current month up to today
+        # Month-to-date: from 1st of current month up to today.
+        # Revenue from headers (CIN7-aligned), units/orders from lines.
         mtd_start = today.replace(day=1)
         mtd_mask = (df["InvoiceDate"] >= mtd_start) & (df["InvoiceDate"] <= today)
         mtd_df = df[mtd_mask]
         mtd_orders = mtd_df["SaleID"].nunique()
         mtd_units = float(mtd_df["Quantity"].sum())
-        mtd_rev = float(mtd_df["Total"].sum())
+        mtd_rev = _rev_for_dates(
+            lambda d: (d["InvoiceDate"] >= mtd_start)
+                       & (d["InvoiceDate"] <= today))
         day_of_month = today.day
 
         st.markdown(f"**Month-to-date** — {today.strftime('%b 1')} to "
@@ -13267,6 +13314,11 @@ elif page == "AI Assistant":
 
     import ai_tools
 
+    # Hand the merged sales headers to the tool module so the
+    # get_sales_totals tool can read order-level revenue (which
+    # includes shipping + tax — matches CIN7's dashboard).
+    ai_tools.set_sales_full_headers(sales_full)
+
     # Lay out the page. Left column: chat input + transcript. Right:
     # a "what can I ask" cheatsheet so users know where to start.
     main_col, side_col = st.columns([3, 1])
@@ -13274,6 +13326,8 @@ elif page == "AI Assistant":
     with side_col:
         st.markdown("**Try asking:**")
         st.markdown(
+            "- *What have our sales been this month in total?*\n"
+            "- *Monthly revenue for the last 6 months*\n"
             "- *What 2700K LED strips are slow moving?*\n"
             "- *Show me dead stock SIERRA38 with stock value over $500*\n"
             "- *Velocity for LED-XRD-60W-24 last 90 days*\n"
@@ -13338,18 +13392,34 @@ elif page == "AI Assistant":
             # Build the Anthropic conversation. We keep the system
             # prompt small + tool-driven so Claude doesn't waste
             # tokens "understanding" the data — it asks via tools.
+            #
+            # Multi-turn memory: we keep _messages in session state so
+            # Claude sees the full conversation history each turn. Without
+            # this, every question is treated as fresh and the user has
+            # to keep repeating SKUs / context. With this, follow-ups
+            # like "and its velocity?" work because Claude knows what
+            # SKU we were just discussing.
             _client = anthropic.Anthropic(api_key=_anthropic_key)
-            _messages = [{"role": "user", "content": _user_question}]
+            if "_ai_messages" not in st.session_state:
+                st.session_state["_ai_messages"] = []
+            _messages = list(st.session_state["_ai_messages"])
+            _messages.append(
+                {"role": "user", "content": _user_question})
             _system_prompt = (
                 f"You are an inventory analyst assistant for "
                 f"{COMPANY_NAME}, a CIN7-using business that sells "
                 "LED lighting products (strips, channels, drivers, "
                 "tubes). You have two kinds of tools available — use "
                 "them deliberately:\n\n"
-                "**Live data tools** (search_products, get_sku_details, "
-                "get_velocity, get_dead_stock, get_migration_chain) — "
-                "use for current numbers: stock levels, sales, "
-                "classifications, predecessor/successor mappings.\n\n"
+                "**Live data tools**:\n"
+                "- search_products / get_sku_details / get_velocity / "
+                "get_dead_stock / get_migration_chain — for "
+                "single-SKU and product-level questions.\n"
+                "- get_sales_totals — for COMPANY-WIDE totals across "
+                "any period ('total sales this month', 'last 90 days "
+                "revenue', 'monthly trend for the last 6 months'). "
+                "Uses order-level data so the revenue figure matches "
+                "CIN7's dashboard (includes shipping + tax).\n\n"
                 "**Knowledge base tool** (search_knowledge_base) — "
                 "use for HOW or WHY questions. Examples: 'why is X "
                 "slow-moving?', 'how does the reorder engine "
@@ -13417,10 +13487,22 @@ elif page == "AI Assistant":
                             "\n\n".join(_final_text_parts))
 
                     if _resp.stop_reason == "end_turn" and not _tool_uses:
+                        # Final assistant message must be added to
+                        # _messages so the next user turn has it as
+                        # context (otherwise Claude forgets what we
+                        # were just discussing).
+                        _messages.append({
+                            "role": "assistant",
+                            "content": _resp.content,
+                        })
                         break  # done
 
                     if not _tool_uses:
                         # Stop reason wasn't end_turn but no tool — bail
+                        _messages.append({
+                            "role": "assistant",
+                            "content": _resp.content,
+                        })
                         break
 
                     # Run tools, build results to send back
@@ -13478,14 +13560,22 @@ elif page == "AI Assistant":
                 "audit_id": _audit_id,
                 "tool_calls": _tool_calls_log,
             })
+            # Persist the conversation history (including all tool-use
+            # rounds) so the next user turn has full context. Without
+            # this, the next message starts a fresh conversation and
+            # Claude has no memory of which SKU we were discussing.
+            st.session_state["_ai_messages"] = _messages
             st.rerun()
 
-        # Clear transcript button
+        # Clear transcript button — also clears Claude's memory of
+        # this conversation. Audit log rows in the DB are unaffected.
         if st.session_state["_ai_transcript"]:
             if st.button(":wastebasket: Clear conversation",
-                          help="Clears the on-screen transcript. "
-                               "Audit log entries are kept."):
+                          help="Clears the on-screen transcript AND the "
+                               "AI's memory of the conversation. Audit "
+                               "log entries are kept."):
                 st.session_state["_ai_transcript"] = []
+                st.session_state["_ai_messages"] = []
                 st.rerun()
 
 

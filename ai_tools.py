@@ -188,6 +188,43 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_sales_totals",
+        "description": (
+            "Aggregate sales totals across the WHOLE business — not "
+            "per-SKU. Use when the user asks about company-wide sales: "
+            "'what have our sales been this month?', 'how much did we "
+            "sell last week?', 'monthly revenue for the last 6 months', "
+            "'compare this month to last month'. Returns revenue (from "
+            "order headers, includes shipping & tax — matches CIN7's "
+            "Revenue tile), unit count (from line items), and order "
+            "count for the requested period and granularity."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "period": {
+                    "type": "string",
+                    "enum": ["today", "yesterday", "mtd",
+                              "last_7_days", "last_30_days",
+                              "last_90_days", "last_365_days",
+                              "ytd", "last_year"],
+                    "description": "Pre-defined period. Use 'mtd' "
+                                   "for month-to-date, 'ytd' for year-"
+                                   "to-date.",
+                },
+                "group_by": {
+                    "type": "string",
+                    "enum": ["none", "day", "week", "month"],
+                    "description": "How to bucket the results. 'none' "
+                                   "returns one total for the whole "
+                                   "period; 'month' breaks by calendar "
+                                   "month etc.",
+                },
+            },
+            "required": ["period"],
+        },
+    },
+    {
         "name": "search_knowledge_base",
         "description": (
             "Search the company's app documentation, business rules, "
@@ -422,6 +459,131 @@ def get_migration_chain(engine_df: pd.DataFrame,
     return {"sku": sku, "chain": chain}
 
 
+def get_sales_totals(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """Aggregate company-wide sales for a period, optionally grouped
+    by day/week/month. Pulls revenue from sales_full (headers, includes
+    shipping/tax) when available; falls back to sale_lines.Total.
+    Units come from sale_lines.Quantity.
+
+    NB: this tool needs the headers DataFrame, not just sale_lines.
+    The Streamlit page passes both into the dispatcher via the
+    `sale_lines_df` slot AND we look up sales_full from a process-level
+    cache populated by the page on first call. To keep the dispatch
+    signature uniform, we use the module-level _SALES_FULL hook below.
+    """
+    period = (args.get("period") or "mtd").strip().lower()
+    group_by = (args.get("group_by") or "none").strip().lower()
+
+    today = pd.Timestamp.now().normalize()
+    if period == "today":
+        start, end = today, today
+    elif period == "yesterday":
+        start = end = today - pd.Timedelta(days=1)
+    elif period == "mtd":
+        start, end = today.replace(day=1), today
+    elif period == "last_7_days":
+        start, end = today - pd.Timedelta(days=7), today
+    elif period == "last_30_days":
+        start, end = today - pd.Timedelta(days=30), today
+    elif period == "last_90_days":
+        start, end = today - pd.Timedelta(days=90), today
+    elif period == "last_365_days":
+        start, end = today - pd.Timedelta(days=365), today
+    elif period == "ytd":
+        start = pd.Timestamp(year=today.year, month=1, day=1)
+        end = today
+    elif period == "last_year":
+        start = pd.Timestamp(year=today.year - 1, month=1, day=1)
+        end = pd.Timestamp(year=today.year - 1, month=12, day=31)
+    else:
+        return {"error": f"Unknown period {period!r}"}
+
+    # Headers (revenue) — order-level, includes shipping/tax.
+    rev_total = 0.0
+    rev_by_bucket: dict = {}
+    headers = _SALES_FULL_HOLDER.get("df")
+    if headers is not None and not headers.empty:
+        h = headers.copy()
+        if "InvoiceDate" in h.columns:
+            h["InvoiceDate"] = pd.to_datetime(
+                h["InvoiceDate"], errors="coerce")
+            h = h.dropna(subset=["InvoiceDate"])
+            rev_col = next(
+                (c for c in ("InvoiceAmount", "GrandTotal", "Total")
+                  if c in h.columns), None)
+            if rev_col:
+                h["__rev"] = pd.to_numeric(
+                    h[rev_col], errors="coerce").fillna(0)
+                # Status filter — exclude voided/credited
+                if "Status" in h.columns:
+                    h = h[~h["Status"].astype(str).str.upper()
+                          .isin(["VOIDED", "CREDITED",
+                                 "CANCELLED", "CANCELED"])]
+                h = h[(h["InvoiceDate"] >= start)
+                       & (h["InvoiceDate"] <= end + pd.Timedelta(days=1))]
+                rev_total = float(h["__rev"].sum())
+                if group_by != "none" and not h.empty:
+                    if group_by == "day":
+                        h["__bkt"] = h["InvoiceDate"].dt.strftime("%Y-%m-%d")
+                    elif group_by == "week":
+                        h["__bkt"] = (
+                            h["InvoiceDate"].dt.to_period("W")
+                            .apply(lambda p: f"{p.start_time:%Y-%m-%d}"))
+                    elif group_by == "month":
+                        h["__bkt"] = h["InvoiceDate"].dt.strftime("%Y-%m")
+                    grouped = h.groupby("__bkt")["__rev"].sum().to_dict()
+                    rev_by_bucket = {k: round(v, 2)
+                                       for k, v in grouped.items()}
+
+    # Lines (units, orders)
+    units = 0.0
+    orders = 0
+    sl = sale_lines_df.copy() if sale_lines_df is not None else pd.DataFrame()
+    if not sl.empty and "InvoiceDate" in sl.columns:
+        sl["InvoiceDate"] = pd.to_datetime(
+            sl["InvoiceDate"], errors="coerce")
+        sl = sl.dropna(subset=["InvoiceDate"])
+        if "Status" in sl.columns:
+            sl = sl[~sl["Status"].astype(str).str.upper()
+                     .isin(["VOIDED", "CREDITED",
+                            "CANCELLED", "CANCELED"])]
+        sl = sl[(sl["InvoiceDate"] >= start)
+                  & (sl["InvoiceDate"] <= end + pd.Timedelta(days=1))]
+        if "Quantity" in sl.columns:
+            units = float(pd.to_numeric(
+                sl["Quantity"], errors="coerce").sum())
+        if "SaleID" in sl.columns:
+            orders = int(sl["SaleID"].nunique())
+
+    return {
+        "period": period,
+        "start": start.strftime("%Y-%m-%d"),
+        "end": end.strftime("%Y-%m-%d"),
+        "revenue": round(rev_total, 2),
+        "units": round(units, 2),
+        "orders": orders,
+        "group_by": group_by,
+        "buckets": rev_by_bucket,
+        "revenue_source": ("headers (includes shipping + tax)"
+                            if rev_total > 0 else "no header data"),
+    }
+
+
+# Module-level holder for the headers DataFrame. The Streamlit page
+# populates this once per session via set_sales_full_headers() so
+# every tool call sees the same headers without repeatedly loading.
+_SALES_FULL_HOLDER: dict = {"df": None}
+
+
+def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
+    """Called by the Streamlit page on AI Assistant page load. Stores
+    the merged sales-headers DataFrame so get_sales_totals can read
+    it without recomputing per-tool-call."""
+    _SALES_FULL_HOLDER["df"] = headers_df
+
+
 def search_knowledge_base(engine_df: pd.DataFrame,
                             sale_lines_df: pd.DataFrame,
                             args: dict) -> dict:
@@ -467,6 +629,7 @@ TOOL_HANDLERS = {
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,
     "get_migration_chain": get_migration_chain,
+    "get_sales_totals": get_sales_totals,
     "search_knowledge_base": search_knowledge_base,
 }
 

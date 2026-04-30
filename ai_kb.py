@@ -34,11 +34,18 @@ from typing import Optional
 from data_paths import DATA_DIR
 
 # Where docs live. We look in:
-#   1. <repo>/docs/ — the canonical knowledge base
-#   2. <repo>/ — top-level .md files (README, DEPLOY, SAAS_NOTES, RULES)
-# We deliberately do NOT search /data/ output CSVs or random places.
+#   1. <repo>/docs/         — canonical hand-written knowledge base
+#   2. <repo>/              — top-level .md files (README, DEPLOY etc)
+#   3. DATA_DIR/shopify/    — auto-synced Shopify content (products,
+#                              collections, pages, blog articles).
+#                              Populated by shopify_sync.py nightly.
+# We deliberately do NOT search /data/output/ CSVs or random places.
 APP_DIR = Path(__file__).resolve().parent
-DOCS_DIRS: list[Path] = [APP_DIR / "docs", APP_DIR]
+DOCS_DIRS: list[Path] = [
+    APP_DIR / "docs",
+    APP_DIR,
+    DATA_DIR / "shopify",
+]
 ALLOWED_TOP_LEVEL = {
     "README.md", "DEPLOY.md", "SAAS_NOTES.md", "RULES.md",
     "NEXT_STEPS.md",

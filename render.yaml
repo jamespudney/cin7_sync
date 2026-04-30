@@ -108,3 +108,11 @@ services:
       # message but the rest of the app keeps working.
       - key: ANTHROPIC_API_KEY
         sync: false
+      # Shopify Admin API token + store domain. Used by shopify_sync.py
+      # nightly to populate /data/shopify/ which feeds the AI knowledge
+      # base. Without these, shopify_sync.py is silently skipped in
+      # daily_sync.sh and the KB just doesn't have Shopify content.
+      - key: SHOPIFY_DOMAIN
+        sync: false       # e.g. wired4signs.myshopify.com
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false       # shpat_... from a custom app
