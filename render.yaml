@@ -76,17 +76,21 @@ services:
       - key: IP_ACCOUNT
         sync: false        # IP account number.
 
-  # ----- Cron job: daily sync ------------------------------------------
-  - type: cron
+  # ----- Background worker: daily sync ---------------------------------
+  # NOTE: Render Cron Jobs cannot mount persistent disks. Since our sync
+  # writes CSVs and updates the SQLite DB, it MUST have access to the
+  # persistent disk. So instead of a cron service, we run a background
+  # worker that runs a sleep-loop — wakes up once a day at 02:00 UTC,
+  # runs the sync, sleeps again. Background workers DO support disks.
+  - type: worker
     name: wired4signs-sync
     runtime: python
     plan: starter          # Small instance — sync is single-threaded I/O.
     region: ohio
     branch: main
-    schedule: "0 2 * * *"  # 02:00 UTC every day. Adjust if you prefer.
     rootDir: .
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: ./daily_sync.sh
+    startCommand: ./sync_loop.sh
     disk:
       name: w4s-data       # SAME disk name as the web service — they share.
       mountPath: /data
@@ -100,3 +104,5 @@ services:
         sync: false
       - key: CIN7_RATE_SECONDS
         value: "1.5"
+      - key: SYNC_HOUR_UTC
+        value: "2"         # Hour of the day (UTC) to run the daily sync.

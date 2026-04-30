@@ -15,7 +15,7 @@ in `render.yaml` and `start.sh`.
 4. Pick the `jamespudney/cin7_sync` repo
 5. Render reads `render.yaml` and shows you a preview of the services
    it'll create (`wired4signs-app` web service + `wired4signs-sync`
-   cron job + 5GB shared disk).
+   background worker + 5GB shared disk).
 6. Click **Apply**
 
 ### 2. Set secrets (env vars marked `sync: false` in render.yaml)
@@ -41,8 +41,8 @@ Render will prompt you for each secret on first apply. Have these ready:
 The first deploy starts with an EMPTY `/data` disk — no SQLite, no
 CSVs. Two options to seed:
 
-**Option A — let the cron job populate it (slow but clean):**
-1. Trigger the cron job manually in Render's UI: `wired4signs-sync` → **Trigger Run**.
+**Option A — let the background worker populate it (slow but clean):**
+1. Trigger the background worker manually in Render's UI: `wired4signs-sync` → **Trigger Run**.
 2. It'll run the CIN7 sync from scratch. First run takes 30-60 min
    because it pulls deep history (5 years of sale_lines).
 3. While that runs, the app shows blank/empty (no data yet).
@@ -136,7 +136,7 @@ after a deploy. Subsequent loads are fast.
 
 ### Need to wipe everything and start fresh
 - In Render UI: delete the disk via service → Settings → Disk → Delete
-- Re-trigger the cron job to repopulate
+- Re-trigger the background worker to repopulate
 - Lose: all draft POs, all migration mappings, all supplier configs
 - Don't do this lightly.
 
