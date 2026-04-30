@@ -13209,6 +13209,9 @@ elif page == "Data Health":
 
     rows = []
     for label, prefix, rowcount in datasets:
+        # mt = mtime of the latest CSV with this prefix, or None if none.
+        # Was previously a NameError — the variable was never defined.
+        mt = file_mtime(prefix)
         rows.append({
             "Dataset": label,
             "File prefix": prefix,
