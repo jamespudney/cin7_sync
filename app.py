@@ -516,14 +516,10 @@ sale_lines = _load_longest_sale_lines()
 if sale_lines.empty:
     sale_lines = sale_lines_30d if not sale_lines_30d.empty else sale_lines_3d
 
-
-# Order-level (header) sales for revenue calculations that need to
-# match CIN7's dashboard. The line-level `sale_lines.Total` excludes
-# shipping; `sales_full.InvoiceAmount` includes shipping + tax which
-# is what CIN7 shows on its own Revenue tile. We keep BOTH around:
-# - sale_lines for unit counts, velocity, customer rollup, ABC engine
-# - sales_full for revenue $ that the user can reconcile to CIN7
-sales_full = _load_longest_sales()
+# sales_full (order-level headers) is loaded LATER, after its
+# loader function is defined further down the file. See the line
+# `sales_full = _load_longest_sales()` after the purchase-lines
+# loader block.
 
 
 @st.cache_data(persist="disk", show_spinner="Loading sales headers…")
@@ -599,6 +595,17 @@ def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
 def _load_longest_purchase_lines() -> pd.DataFrame:
     return _load_longest_purchase_lines_cached(
         _dir_fingerprint("purchase_lines_last_*d_*.csv"))
+
+
+# Order-level (header) sales for revenue calculations that need to
+# match CIN7's dashboard. The line-level `sale_lines.Total` excludes
+# shipping; `sales_full.InvoiceAmount` includes shipping + tax which
+# is what CIN7 shows on its own Revenue tile. We keep BOTH around:
+# - sale_lines for unit counts, velocity, customer rollup, ABC engine
+# - sales_full for revenue $ that the user can reconcile to CIN7
+sales_full = _load_longest_sales()
+
+
 stock_adjustments = load("stock_adjustments_last_30d")
 stock_transfers = load("stock_transfers_last_30d")
 boms = load("boms")  # AssemblySKU, ComponentSKU, Quantity, BOMType, ...
