@@ -25,28 +25,68 @@ Last updated: 2026-04-30
 
 ## Active backlog (priority order)
 
-### Tier 1 — fix soon (next 1-2 sessions)
+### Strategic principle (ADDED 2026-04-30 EOD)
 
-1. **Auto-finalize submitted POs (Phase 3)** — when CIN7 sync detects
-   a submitted PO has flipped to `ORDERED`, auto-transition our
-   local `po_drafts.status` from `submitted` → `finalized`. The DB
-   function `db.mark_po_draft_finalized()` exists; the sync trigger
-   isn't wired into `cin7_sync.py` yet. ~30 min.
-2. **Master-1-per-draft session safeguard** — belt-and-braces in
-   `cin7_post_po.py`: track in session state whether a master POST
-   has been attempted for a given draft; refuse a second attempt
-   even if local `cin7_po_id` was somehow cleared. Prevents the
-   4-orphan-PO scenario. ~30 min.
-3. **Feedback review page + auto-alias learning** — new "Review AI
-   Q&A" page showing recent chats with feedback filter. For
-   thumbs-down rows, allow buyer to enter a corrected SKU + the
-   phrase that confused the AI. Writes to `product_aliases`. The
-   AI Assistant on its next call checks `db.lookup_aliases()` first
-   and uses the human-approved mapping. ~3 hours.
-4. **Inline charts in AI answers** — extend `get_velocity` (and
-   maybe `get_sales_totals`) with daily/weekly buckets; the
-   Streamlit page detects chartable tool results and renders an
-   inline `st.line_chart`. ~30 min.
+The AI Assistant is REACTIVE intelligence today (Q&A over data + KB).
+The bigger goal is PROACTIVE intelligence — automatic detection of
+patterns, signals, and warnings the buyer can act on.
+
+**The correct build order is:**
+
+```
+AI foundation ✅ DONE
+→ Demand signals (NEXT — Tier 1A)
+→ Buyer warnings (Tier 1B)
+→ Slack / Gorgias / SEO / Shopify advanced (Tier 3+)
+```
+
+DO NOT start Slack/Gorgias/SEO ingestion until demand_signals +
+reorder warnings are working. Slack messages without a signal
+storage system = noise. Slack WITH the signal system = intelligence.
+
+The AI must become a DECISION SYSTEM for the buyer, not a fancy
+search bar.
+
+### Tier 1A — Demand Signal Foundation (NEXT SESSION)
+
+1. **Build `demand_signals` table + manual entry UI** — schema:
+   source / sku / product_family / signal_type / quantity / customer
+   / salesperson / confidence / note / created_at. Add a "Capture
+   demand signal" form so anyone can log in 30 seconds. Manual
+   first; ingestion later. ~2 hours.
+2. **Feed signals into AI tools** — new tools `get_recent_signals`,
+   `get_rising_demand`, `get_signals_for_sku`,
+   `get_top_inquired_products`. AI can now answer "what's getting
+   attention?", "what's rising?", "any inquiries about X lately?".
+   ~2 hours.
+
+### Tier 1B — Buyer Warning Column (HIGH ROI)
+
+3. **Reorder warning column on Ordering page** — pure rule-based,
+   no LLM call per row. Rules: previously dead/slow now showing
+   demand → caution; long dormancy → caution; recent spike from one
+   customer/salesperson → caution; cancellation in last N days →
+   caution; signal logged but no sale conversion → watch. Each row
+   gets level (none/low/medium/high) + short text + click-through
+   to evidence. ~3 hours.
+4. **Document demand scoring formula** — not building yet, but
+   designing. Inputs: signal count + recency + sources + conversion
+   + concentration + classification history + promotion/return/
+   cancellation flags. Output: 0-100 score + confidence + "why"
+   explanation. Lives in `docs/demand-scoring.md` so future Slack/
+   Gorgias signals plug in without re-architecting. ~2 hours.
+
+### Tier 1C — Carry-overs from earlier (lower urgency now)
+
+5. **Auto-finalize submitted POs (Phase 3)** — when CIN7 sync
+   detects a submitted PO has flipped to `ORDERED`, auto-transition
+   `po_drafts.status` from `submitted` → `finalized`. ~30 min.
+6. **Master-1-per-draft session safeguard** — belt-and-braces in
+   `cin7_post_po.py` against the orphan-PO scenario. ~30 min.
+7. **Feedback review page + auto-alias learning** — turn AI thumbs-
+   down feedback into product_aliases mappings. ~3 hours.
+8. **Inline charts in AI answers** — sales-history line charts in
+   AI responses. ~30 min.
 
 ### Tier 2 — quality & performance
 
@@ -91,13 +131,15 @@ Last updated: 2026-04-30
 ### Tier 4 — Commercial Intelligence System (the big vision)
 
 This is the multi-month roadmap. Each is its own project, queued in
-priority order:
+priority order. **CRITICAL:** demand_signals + reorder warnings
+(Tier 1A/1B) must ship first — Slack messages without a signal
+system to land in are just noise.
 
 13. **Slack demand-signal capture** — bot with /stock, /askstock,
     /slowstock, /deadstock, /cancel, /return commands; LLM
-    extraction of demand signals from messages; AI clarification
-    loop in threads. Buyer warning column on Ordering page.
-    ~2 weeks.
+    extraction of demand signals from Slack messages; AI
+    clarification loop in threads. Records flow into the
+    demand_signals table built in Tier 1A. ~2 weeks.
 14. **Cancellation + return intelligence** — extract from Slack/
     Gorgias mentions; reduce demand-signal weight for cancelled
     orders; warn buyer before reordering returned products.
