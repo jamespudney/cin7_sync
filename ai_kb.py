@@ -133,7 +133,25 @@ def _index_one_file(path: Path) -> list[Paragraph]:
         return []
     lines = raw.splitlines()
     out: list[Paragraph] = []
-    rel = str(path.resolve().relative_to(APP_DIR))
+    # Compute a friendly relative path. Files in /data/shopify aren't
+    # under APP_DIR, so we try the most-specific roots first and fall
+    # back to the path tail. This keeps citations short without
+    # crashing on out-of-tree files.
+    abs_path = path.resolve()
+    rel: str
+    for root in (APP_DIR / "docs", DATA_DIR / "shopify", APP_DIR, DATA_DIR):
+        try:
+            candidate = abs_path.relative_to(root.resolve())
+        except (ValueError, OSError):
+            continue
+        # Prefix with the root's name so the source label is self-
+        # describing — e.g. "shopify/products/foo.md" not just
+        # "products/foo.md".
+        rel = f"{root.name}/{candidate}" if root.name else str(candidate)
+        break
+    else:
+        # Couldn't relativize to any known root — fall back to filename
+        rel = abs_path.name
     for text, start_line, end_line in _split_paragraphs(raw):
         # Skip pure code-fence blocks and pure heading-only paragraphs
         # (they're noise without context).
