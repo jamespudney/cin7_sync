@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.44 — AI Assistant gains a Knowledge Base layer: 6 starter docs in /docs (inventory-rules, reorder-engine, sync-cadences, migrations, po-workflow, glossary) plus root-level RULES/DEPLOY/SAAS_NOTES indexed by ai_kb.py. New tool `search_knowledge_base` lets Claude cite the actual rule when answering 'how/why' questions. (Apr 30)")
+    st.caption("🟢 v2.45 — AI Assistant Phase 0 complete: 5 live data tools, knowledge base over docs/ + RULES.md, audit log, thumbs up/down feedback. Shopify integration deferred to Phase 1 (will use modern Dev Dashboard OAuth + GraphQL Admin API). (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
