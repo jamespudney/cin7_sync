@@ -50,12 +50,11 @@ services:
       # Where data lives — must match the disk mountPath above.
       - key: DATA_DIR
         value: /data
-      # Streamlit prefs: bind to Render's $PORT, no CORS headaches.
+      # Streamlit prefs: bind to Render's $PORT in headless mode.
+      # CORS + XSRF use the Streamlit defaults (both true) — disabling
+      # CORS while keeping XSRF on is incompatible and produces a noisy
+      # warning, so we just take the defaults.
       - key: STREAMLIT_SERVER_HEADLESS
-        value: "true"
-      - key: STREAMLIT_SERVER_ENABLE_CORS
-        value: "false"
-      - key: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
         value: "true"
       # Persisted-cache home on the disk so caches survive restarts.
       - key: STREAMLIT_HOME
