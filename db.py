@@ -17,7 +17,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
-DB_PATH = Path(__file__).resolve().parent / "team_actions.db"
+# DB_PATH lives in DATA_DIR so the SQLite file follows the persistent
+# disk on Render. data_paths.py defaults to the project folder locally.
+from data_paths import DB_PATH  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +203,162 @@ CREATE TABLE IF NOT EXISTS ui_presets (
     created_at  TIMESTAMP NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (user, view, name)
 );
+
+-- =========================================================================
+-- Supplier Pricing — family-color tier model (Reeves-style)
+-- =========================================================================
+-- Some suppliers price by FAMILY (e.g., 'SIERRA38'), with quantity-break
+-- tiers, where TOTAL footage across multiple colors qualifies for the
+-- tier but each color is priced at its own per-tier rate. Plus a setup
+-- fee triggers when a single PO contains more than one color.
+--
+-- Three coordinated tables capture the full model:
+--   family_color_pricing       — the per-color tier price table
+--   family_setup_fees          — setup / changeover fees
+--   family_pricing_rules       — how tier qualification rolls up
+
+-- One row per (family, color, supplier, tier_qty) — the per-color price
+-- at each volume tier. tier_qty is the MINIMUM total qty (per the
+-- aggregation rule below) at which this row's unit_price applies.
+CREATE TABLE IF NOT EXISTS family_color_pricing (
+    family          TEXT    NOT NULL,    -- 'SIERRA38'
+    color           TEXT    NOT NULL,    -- 'White' | 'Black' | normalised label
+    supplier        TEXT    NOT NULL,    -- 'Reeves'
+    tier_qty        REAL    NOT NULL,    -- minimum qty triggering this tier
+    unit_price      REAL    NOT NULL,    -- per-foot (or per-unit) price
+    unit            TEXT    DEFAULT 'ft',-- 'ft' | 'unit' — what the qty/price is in
+    currency        TEXT    DEFAULT 'USD',
+    set_by          TEXT    NOT NULL,
+    set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    note            TEXT,
+    PRIMARY KEY (family, color, supplier, tier_qty)
+);
+CREATE INDEX IF NOT EXISTS ix_family_color_pricing_family
+    ON family_color_pricing(family, supplier);
+
+-- Setup / changeover fees that fire under specific PO-mix conditions.
+-- fee_type is a free string today ('color_change' is the main one for
+-- Reeves) but we leave it open for 'tooling_change', 'minimum_runtime'
+-- etc. as more suppliers come online.
+CREATE TABLE IF NOT EXISTS family_setup_fees (
+    family          TEXT    NOT NULL,
+    supplier        TEXT    NOT NULL,
+    fee_type        TEXT    NOT NULL,    -- 'color_change' | future types
+    fee_amount      REAL    NOT NULL,
+    currency        TEXT    DEFAULT 'USD',
+    description     TEXT,                 -- human-readable
+    set_by          TEXT    NOT NULL,
+    set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (family, supplier, fee_type)
+);
+
+-- How tier qualification rolls up. Two values today:
+--   'sum_across_colors' — sum demand across all colors of the family
+--                          (Reeves SIERRA38: White + Black qty combined
+--                          qualifies the tier; color change fee applies)
+--   'per_color'         — each color metered separately (default for
+--                          most suppliers; no color-change fee)
+-- Future rules can extend this enum.
+CREATE TABLE IF NOT EXISTS family_pricing_rules (
+    family          TEXT    NOT NULL,
+    supplier        TEXT    NOT NULL,
+    rule            TEXT    NOT NULL DEFAULT 'per_color',
+    nag_threshold_savings  REAL DEFAULT 200.0,   -- $ above which buyer gets nudged
+    nag_threshold_pct      REAL DEFAULT 25.0,    -- % of tier-gap to fire nudge
+    auto_pad_threshold_savings REAL,             -- NULL = ask, set = auto-pad
+    set_by          TEXT    NOT NULL,
+    set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    note            TEXT,
+    PRIMARY KEY (family, supplier)
+);
+
+-- Per-SKU pack quantity (e.g., MMA-M155-25A-M comes in packs of 10).
+-- Reorder qty rounds UP to nearest multiple. Independent of family
+-- pricing — a SKU may have a pack qty without being in any tier scheme.
+CREATE TABLE IF NOT EXISTS sku_pack_settings (
+    sku             TEXT    PRIMARY KEY,
+    pack_qty        REAL    NOT NULL,
+    moq             REAL,                 -- minimum order qty (overrides supplier default)
+    note            TEXT,
+    set_by          TEXT    NOT NULL,
+    set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
+-- =========================================================================
+-- PO draft persistence (legacy v1 — single anonymous draft per supplier)
+-- =========================================================================
+-- Kept for backward compatibility. Superseded by po_drafts + po_draft_lines
+-- below which support multi-draft per supplier with explicit lifecycle
+-- (editing → submitted → finalized) and pessimistic locking for multi-user.
+CREATE TABLE IF NOT EXISTS po_draft_edits (
+    supplier        TEXT    NOT NULL,
+    sku             TEXT    NOT NULL,
+    edited_qty      REAL    NOT NULL,
+    edited_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    set_by          TEXT,
+    note            TEXT,
+    PRIMARY KEY (supplier, sku)
+);
+CREATE INDEX IF NOT EXISTS ix_po_draft_supplier
+    ON po_draft_edits(supplier);
+
+-- =========================================================================
+-- PO drafts v2 — multi-draft per supplier with status lifecycle
+-- =========================================================================
+-- Buyer workflow:
+--   1. Create draft (status=editing) — only one buyer at a time can edit
+--      via the locked_by column (pessimistic lock with 30-min auto-timeout)
+--   2. Edit lines in po_draft_lines — qty changes saved to DB durably
+--   3. Push to CIN7 → creates a Draft PO via API, captures cin7_po_number
+--      and cin7_po_id, transitions our draft to status=submitted (locked
+--      from further edits in our app — buyer goes into CIN7 to finalize)
+--   4. Auto-finalize — when CIN7's PO status flips to ORDERED, sync
+--      detects and transitions our draft to status=finalized (archived)
+--
+-- Why multi-draft per supplier: a buyer often wants to push two POs
+-- simultaneously to the same supplier — e.g., one sea-freight bulk PO
+-- and an urgent air-freight PO. Each is a separate draft with its own
+-- name and freight_mode tag.
+CREATE TABLE IF NOT EXISTS po_drafts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier        TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    freight_mode    TEXT,                  -- 'sea' | 'air' | 'mixed' | NULL
+    status          TEXT    NOT NULL DEFAULT 'editing',
+                                            -- editing | submitted | finalized | cancelled
+    cin7_po_number  TEXT,                  -- assigned on submit
+    cin7_po_id      TEXT,                  -- CIN7 internal UUID
+    cin7_po_status  TEXT,                  -- last-seen CIN7 status
+    -- Pessimistic lock — only the locker can write to draft lines.
+    -- Auto-released after 30 minutes of inactivity (cleared on read
+    -- if locked_at is older than threshold).
+    locked_by       TEXT,
+    locked_at       TIMESTAMP,
+    -- Lifecycle
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    created_by      TEXT,
+    submitted_at    TIMESTAMP,
+    submitted_by    TEXT,
+    finalized_at    TIMESTAMP,
+    note            TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_po_drafts_supplier
+    ON po_drafts(supplier);
+CREATE INDEX IF NOT EXISTS ix_po_drafts_status
+    ON po_drafts(status);
+
+CREATE TABLE IF NOT EXISTS po_draft_lines (
+    draft_id        INTEGER NOT NULL,
+    sku             TEXT    NOT NULL,
+    edited_qty      REAL    NOT NULL,
+    last_edited_by  TEXT,
+    last_edited_at  TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    note            TEXT,
+    PRIMARY KEY (draft_id, sku),
+    FOREIGN KEY (draft_id) REFERENCES po_drafts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_po_draft_lines_draft
+    ON po_draft_lines(draft_id);
 """
 
 
@@ -1193,4 +1351,709 @@ def delete_user_preset(user: str, view: str, name: str) -> None:
             "INSERT INTO audit_log (event, actor, target, detail) "
             "VALUES (?, ?, ?, ?)",
             ("ui_presets.delete", user, f"{view}:{name}", ""),
+        )
+
+
+# =====================================================================
+# Family-color tier pricing (Reeves-style)
+# =====================================================================
+
+def set_family_color_pricing(
+    family: str,
+    color: str,
+    supplier: str,
+    tier_qty: float,
+    unit_price: float,
+    actor: str,
+    unit: str = "ft",
+    currency: str = "USD",
+    note: str = "",
+) -> None:
+    """Upsert one row of the family-color tier table."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO family_color_pricing
+                (family, color, supplier, tier_qty, unit_price,
+                 unit, currency, set_by, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(family, color, supplier, tier_qty) DO UPDATE SET
+                unit_price = excluded.unit_price,
+                unit = excluded.unit,
+                currency = excluded.currency,
+                set_by = excluded.set_by,
+                set_at = datetime('now'),
+                note = excluded.note
+            """,
+            (family, color, supplier, tier_qty, unit_price,
+             unit, currency, actor, note),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("family_pricing.set", actor,
+             f"{family}/{color}/{supplier}@{tier_qty}",
+             f"price={unit_price} {currency}/{unit}"),
+        )
+
+
+def delete_family_color_pricing(family: str, color: str, supplier: str,
+                                  tier_qty: float, actor: str) -> None:
+    with connect() as c:
+        c.execute(
+            "DELETE FROM family_color_pricing "
+            "WHERE family = ? AND color = ? AND supplier = ? AND tier_qty = ?",
+            (family, color, supplier, tier_qty),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("family_pricing.delete", actor,
+             f"{family}/{color}/{supplier}@{tier_qty}", ""),
+        )
+
+
+def all_family_color_pricing(
+    family: Optional[str] = None,
+    supplier: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    """Returns all tier rows. Filtered by family and/or supplier if given.
+    Sorted by family, supplier, color, tier_qty (ascending)."""
+    sql = "SELECT * FROM family_color_pricing"
+    where, args = [], []
+    if family:
+        where.append("family = ?")
+        args.append(family)
+    if supplier:
+        where.append("supplier = ?")
+        args.append(supplier)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY family, supplier, color, tier_qty"
+    with connect() as c:
+        return c.execute(sql, args).fetchall()
+
+
+def family_pricing_families() -> List[str]:
+    """Distinct families that have any pricing rows configured."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT DISTINCT family FROM family_color_pricing "
+            "ORDER BY family").fetchall()
+        return [r["family"] for r in rows]
+
+
+def set_family_setup_fee(family: str, supplier: str, fee_type: str,
+                          fee_amount: float, actor: str,
+                          currency: str = "USD",
+                          description: str = "") -> None:
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO family_setup_fees
+                (family, supplier, fee_type, fee_amount,
+                 currency, description, set_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(family, supplier, fee_type) DO UPDATE SET
+                fee_amount = excluded.fee_amount,
+                currency = excluded.currency,
+                description = excluded.description,
+                set_by = excluded.set_by,
+                set_at = datetime('now')
+            """,
+            (family, supplier, fee_type, fee_amount,
+             currency, description, actor),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("family_setup_fee.set", actor,
+             f"{family}/{supplier}/{fee_type}",
+             f"{fee_amount} {currency}"),
+        )
+
+
+def all_family_setup_fees(
+    family: Optional[str] = None,
+) -> List[sqlite3.Row]:
+    sql = "SELECT * FROM family_setup_fees"
+    args = []
+    if family:
+        sql += " WHERE family = ?"
+        args.append(family)
+    sql += " ORDER BY family, supplier, fee_type"
+    with connect() as c:
+        return c.execute(sql, args).fetchall()
+
+
+def delete_family_setup_fee(family: str, supplier: str,
+                              fee_type: str, actor: str) -> None:
+    with connect() as c:
+        c.execute(
+            "DELETE FROM family_setup_fees "
+            "WHERE family = ? AND supplier = ? AND fee_type = ?",
+            (family, supplier, fee_type),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("family_setup_fee.delete", actor,
+             f"{family}/{supplier}/{fee_type}", ""),
+        )
+
+
+def set_family_pricing_rule(
+    family: str, supplier: str, rule: str, actor: str,
+    nag_threshold_savings: float = 200.0,
+    nag_threshold_pct: float = 25.0,
+    auto_pad_threshold_savings: Optional[float] = None,
+    note: str = "",
+) -> None:
+    if rule not in ("per_color", "sum_across_colors"):
+        raise ValueError(
+            f"rule must be 'per_color' or 'sum_across_colors', got: {rule}")
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO family_pricing_rules
+                (family, supplier, rule, nag_threshold_savings,
+                 nag_threshold_pct, auto_pad_threshold_savings,
+                 set_by, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(family, supplier) DO UPDATE SET
+                rule = excluded.rule,
+                nag_threshold_savings = excluded.nag_threshold_savings,
+                nag_threshold_pct = excluded.nag_threshold_pct,
+                auto_pad_threshold_savings = excluded.auto_pad_threshold_savings,
+                set_by = excluded.set_by,
+                set_at = datetime('now'),
+                note = excluded.note
+            """,
+            (family, supplier, rule, nag_threshold_savings,
+             nag_threshold_pct, auto_pad_threshold_savings, actor, note),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("family_pricing_rule.set", actor,
+             f"{family}/{supplier}", rule),
+        )
+
+
+def get_family_pricing_rule(
+    family: str, supplier: str,
+) -> Optional[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM family_pricing_rules "
+            "WHERE family = ? AND supplier = ?",
+            (family, supplier),
+        ).fetchone()
+
+
+def all_family_pricing_rules() -> List[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM family_pricing_rules "
+            "ORDER BY family, supplier").fetchall()
+
+
+def delete_family_pricing_rule(family: str, supplier: str,
+                                 actor: str) -> None:
+    with connect() as c:
+        c.execute(
+            "DELETE FROM family_pricing_rules "
+            "WHERE family = ? AND supplier = ?",
+            (family, supplier),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("family_pricing_rule.delete", actor,
+             f"{family}/{supplier}", ""),
+        )
+
+
+# ----- Per-SKU pack settings ------------------------------------------
+
+def set_sku_pack(sku: str, pack_qty: float, actor: str,
+                  moq: Optional[float] = None, note: str = "") -> None:
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO sku_pack_settings
+                (sku, pack_qty, moq, note, set_by)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(sku) DO UPDATE SET
+                pack_qty = excluded.pack_qty,
+                moq = excluded.moq,
+                note = excluded.note,
+                set_by = excluded.set_by,
+                set_at = datetime('now')
+            """,
+            (sku, pack_qty, moq, note, actor),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("sku_pack.set", actor, sku,
+             f"pack={pack_qty} moq={moq}"),
+        )
+
+
+def get_sku_pack(sku: str) -> Optional[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM sku_pack_settings WHERE sku = ?",
+            (sku,)).fetchone()
+
+
+def all_sku_pack() -> List[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM sku_pack_settings ORDER BY sku").fetchall()
+
+
+def clear_sku_pack(sku: str, actor: str) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM sku_pack_settings WHERE sku = ?", (sku,))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("sku_pack.clear", actor, sku, ""),
+        )
+
+
+# ----- Tier resolution helper -----------------------------------------
+
+def resolve_tier_for_qty(family: str, color: str, supplier: str,
+                          qty: float) -> Optional[sqlite3.Row]:
+    """Given a qty, return the tier row whose tier_qty is the highest
+    value <= qty (i.e., the tier this qty qualifies for). Returns None
+    if no tiers configured or qty is below all tiers' minimums."""
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM family_color_pricing "
+            "WHERE family = ? AND color = ? AND supplier = ? "
+            "  AND tier_qty <= ? "
+            "ORDER BY tier_qty DESC LIMIT 1",
+            (family, color, supplier, qty),
+        ).fetchone()
+
+
+def next_tier_for_qty(family: str, color: str, supplier: str,
+                       qty: float) -> Optional[sqlite3.Row]:
+    """The next tier ABOVE the given qty (i.e., the cheaper-per-unit
+    tier the buyer could reach by adding more). Returns None if already
+    at the top tier."""
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM family_color_pricing "
+            "WHERE family = ? AND color = ? AND supplier = ? "
+            "  AND tier_qty > ? "
+            "ORDER BY tier_qty ASC LIMIT 1",
+            (family, color, supplier, qty),
+        ).fetchone()
+
+
+# =====================================================================
+# PO draft edits — persistent qty edits across sessions/restarts
+# =====================================================================
+
+def set_po_draft_edit(supplier: str, sku: str, edited_qty: float,
+                       actor: str = "", note: str = "") -> None:
+    """Save a per-supplier-per-SKU draft qty edit. Upserts."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO po_draft_edits
+                (supplier, sku, edited_qty, set_by, note)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(supplier, sku) DO UPDATE SET
+                edited_qty = excluded.edited_qty,
+                edited_at = datetime('now'),
+                set_by = excluded.set_by,
+                note = excluded.note
+            """,
+            (supplier, sku, edited_qty, actor, note),
+        )
+
+
+def clear_po_draft_edit(supplier: str, sku: str) -> None:
+    """Remove one draft entry."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM po_draft_edits "
+            "WHERE supplier = ? AND sku = ?",
+            (supplier, sku))
+
+
+def clear_po_draft_edits_for_supplier(supplier: str, actor: str = "") -> int:
+    """Wipe all drafts for a supplier. Returns count cleared."""
+    with connect() as c:
+        n = c.execute(
+            "DELETE FROM po_draft_edits WHERE supplier = ?",
+            (supplier,)).rowcount
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.clear_all", actor or "unknown",
+             supplier, f"cleared {n} draft edits"))
+        return n
+
+
+def get_po_draft_edits(supplier: str) -> dict:
+    """Returns {sku: edited_qty} for a supplier."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT sku, edited_qty FROM po_draft_edits "
+            "WHERE supplier = ?",
+            (supplier,)).fetchall()
+        return {r["sku"]: float(r["edited_qty"]) for r in rows}
+
+
+def all_po_draft_edits() -> List[sqlite3.Row]:
+    """All drafts across all suppliers — for an admin view."""
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM po_draft_edits "
+            "ORDER BY supplier, sku").fetchall()
+
+
+# =====================================================================
+# PO drafts v2 — multi-draft per supplier with lifecycle + locking
+# =====================================================================
+
+# Auto-release a lock after this many minutes of inactivity. Buyers
+# sometimes forget to release; without auto-timeout drafts get stuck.
+PO_DRAFT_LOCK_TIMEOUT_MIN = 30
+
+
+def create_po_draft(supplier: str, name: str, actor: str,
+                     freight_mode: Optional[str] = None,
+                     note: str = "") -> int:
+    """Create a new draft for a supplier. Returns the new draft id."""
+    with connect() as c:
+        cur = c.execute(
+            """
+            INSERT INTO po_drafts
+                (supplier, name, freight_mode, status,
+                 created_by, locked_by, locked_at, note)
+            VALUES (?, ?, ?, 'editing', ?, ?, datetime('now'), ?)
+            """,
+            (supplier, name, freight_mode, actor, actor, note),
+        )
+        draft_id = cur.lastrowid
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.create", actor, f"{supplier}/{draft_id}",
+             f"name={name!r} freight={freight_mode}"),
+        )
+        return draft_id
+
+
+def get_po_draft(draft_id: int) -> Optional[sqlite3.Row]:
+    """Fetch one draft (with auto-release if its lock has timed out)."""
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM po_drafts WHERE id = ?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        # Apply lock timeout
+        if row["locked_by"] and row["locked_at"]:
+            try:
+                lock_t = datetime.fromisoformat(
+                    str(row["locked_at"]).replace("Z", ""))
+                age_min = (datetime.utcnow() - lock_t).total_seconds() / 60
+                if age_min > PO_DRAFT_LOCK_TIMEOUT_MIN:
+                    c.execute(
+                        "UPDATE po_drafts SET locked_by = NULL, "
+                        "locked_at = NULL WHERE id = ?", (draft_id,))
+                    # Re-read
+                    row = c.execute(
+                        "SELECT * FROM po_drafts WHERE id = ?", (draft_id,)
+                    ).fetchone()
+            except (ValueError, TypeError):
+                pass
+        return row
+
+
+def list_po_drafts(supplier: Optional[str] = None,
+                    status: Optional[str] = None,
+                    include_archived: bool = False) -> List[sqlite3.Row]:
+    """List drafts, optionally filtered. By default hides finalized/cancelled
+    (set include_archived=True to see them). First applies any pending
+    lock auto-releases on the in-memory results."""
+    sql = "SELECT * FROM po_drafts"
+    where = []
+    args: list = []
+    if supplier:
+        where.append("supplier = ?")
+        args.append(supplier)
+    if status:
+        where.append("status = ?")
+        args.append(status)
+    elif not include_archived:
+        where.append("status IN ('editing', 'submitted')")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC"
+    with connect() as c:
+        rows = c.execute(sql, args).fetchall()
+    # Apply lock timeouts in a follow-up pass (not while iterating in
+    # the first connect block — we reopen briefly to release stale ones).
+    stale_ids = []
+    for r in rows:
+        if r["locked_by"] and r["locked_at"]:
+            try:
+                lock_t = datetime.fromisoformat(
+                    str(r["locked_at"]).replace("Z", ""))
+                age_min = (datetime.utcnow() - lock_t).total_seconds() / 60
+                if age_min > PO_DRAFT_LOCK_TIMEOUT_MIN:
+                    stale_ids.append(r["id"])
+            except (ValueError, TypeError):
+                pass
+    if stale_ids:
+        with connect() as c:
+            c.executemany(
+                "UPDATE po_drafts SET locked_by = NULL, "
+                "locked_at = NULL WHERE id = ?",
+                [(i,) for i in stale_ids])
+        # Re-fetch with the same filter so callers see fresh state
+        with connect() as c:
+            rows = c.execute(sql, args).fetchall()
+    return rows
+
+
+def lock_po_draft(draft_id: int, actor: str) -> bool:
+    """Attempt to lock a draft for editing by `actor`. Returns True if
+    the lock is now held by actor; False if someone else holds it (and
+    their lock isn't yet stale)."""
+    with connect() as c:
+        # Read current state
+        row = c.execute(
+            "SELECT locked_by, locked_at FROM po_drafts WHERE id = ?",
+            (draft_id,)).fetchone()
+        if row is None:
+            return False
+        cur_by = row["locked_by"]
+        cur_at = row["locked_at"]
+        # If held by someone else, check timeout
+        if cur_by and cur_by != actor:
+            try:
+                lock_t = datetime.fromisoformat(
+                    str(cur_at).replace("Z", "")) if cur_at else None
+                age_min = ((datetime.utcnow() - lock_t).total_seconds() / 60
+                            if lock_t else 0)
+            except (ValueError, TypeError):
+                age_min = 0
+            if age_min < PO_DRAFT_LOCK_TIMEOUT_MIN and lock_t is not None:
+                return False  # someone else holds it, not stale
+        # Take/refresh the lock
+        c.execute(
+            "UPDATE po_drafts SET locked_by = ?, "
+            "locked_at = datetime('now') WHERE id = ?",
+            (actor, draft_id))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.lock", actor, str(draft_id),
+             "took/refreshed lock"))
+        return True
+
+
+def release_po_draft_lock(draft_id: int, actor: str,
+                            force: bool = False) -> bool:
+    """Release the lock. Default: only the current locker can release.
+    Pass force=True to override (e.g., admin clearing a stuck lock)."""
+    with connect() as c:
+        row = c.execute(
+            "SELECT locked_by FROM po_drafts WHERE id = ?",
+            (draft_id,)).fetchone()
+        if row is None:
+            return False
+        if row["locked_by"] and row["locked_by"] != actor and not force:
+            return False
+        c.execute(
+            "UPDATE po_drafts SET locked_by = NULL, locked_at = NULL "
+            "WHERE id = ?", (draft_id,))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.release", actor, str(draft_id),
+             "force=true" if force else "released"))
+        return True
+
+
+def upsert_po_draft_line(draft_id: int, sku: str, edited_qty: float,
+                          actor: str, note: str = "") -> None:
+    """Save (insert or update) one line in a draft. Caller is expected
+    to have verified the lock is held by actor."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO po_draft_lines
+                (draft_id, sku, edited_qty, last_edited_by, note)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(draft_id, sku) DO UPDATE SET
+                edited_qty = excluded.edited_qty,
+                last_edited_by = excluded.last_edited_by,
+                last_edited_at = datetime('now'),
+                note = excluded.note
+            """,
+            (draft_id, sku, edited_qty, actor, note),
+        )
+
+
+def delete_po_draft_line(draft_id: int, sku: str) -> None:
+    """Remove one line from a draft (e.g., user reverted to engine default)."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM po_draft_lines WHERE draft_id = ? AND sku = ?",
+            (draft_id, sku))
+
+
+def get_po_draft_lines(draft_id: int) -> dict:
+    """Returns {sku: edited_qty} for a draft."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT sku, edited_qty FROM po_draft_lines "
+            "WHERE draft_id = ?", (draft_id,)).fetchall()
+        return {r["sku"]: float(r["edited_qty"]) for r in rows}
+
+
+def list_po_draft_lines(draft_id: int) -> List[sqlite3.Row]:
+    """Full row data for a draft's lines (for audit / admin view)."""
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM po_draft_lines WHERE draft_id = ? "
+            "ORDER BY sku", (draft_id,)).fetchall()
+
+
+def mark_po_draft_submitted(draft_id: int, actor: str,
+                              cin7_po_number: str = "",
+                              cin7_po_id: str = "",
+                              note: str = "") -> None:
+    """Transition a draft from editing → submitted. Records CIN7 PO
+    number/ID. Releases the lock."""
+    with connect() as c:
+        c.execute(
+            """
+            UPDATE po_drafts SET
+                status = 'submitted',
+                cin7_po_number = ?,
+                cin7_po_id = ?,
+                submitted_at = datetime('now'),
+                submitted_by = ?,
+                locked_by = NULL,
+                locked_at = NULL,
+                note = COALESCE(NULLIF(?, ''), note)
+            WHERE id = ?
+            """,
+            (cin7_po_number, cin7_po_id, actor, note, draft_id),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.submit", actor, str(draft_id),
+             f"cin7_po_number={cin7_po_number}"),
+        )
+
+
+def set_po_draft_cin7_ids(draft_id: int, *,
+                            cin7_po_id: str | None = None,
+                            cin7_po_number: str | None = None,
+                            cin7_status: str | None = None,
+                            actor: str = "system") -> None:
+    """Persist CIN7 identifiers on a draft without changing its status.
+    Used by the push flow's partial-success path: if the master POST
+    succeeds but the lines POST fails, we still want to remember the
+    CIN7 PO ID locally so the buyer can find it. Only non-None fields
+    are written, so this is also safe to call with just one of them."""
+    sets = []
+    params: list = []
+    if cin7_po_id is not None:
+        sets.append("cin7_po_id = ?")
+        params.append(cin7_po_id)
+    if cin7_po_number is not None:
+        sets.append("cin7_po_number = ?")
+        params.append(cin7_po_number)
+    if cin7_status is not None:
+        sets.append("cin7_po_status = ?")
+        params.append(cin7_status)
+    if not sets:
+        return
+    params.append(draft_id)
+    with connect() as c:
+        c.execute(
+            f"UPDATE po_drafts SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.cin7_ids_set", actor, str(draft_id),
+             f"id={cin7_po_id} num={cin7_po_number} status={cin7_status}"),
+        )
+
+
+def mark_po_draft_finalized(draft_id: int, actor: str = "auto-sync",
+                              cin7_po_status: str = "ORDERED") -> None:
+    """Transition submitted → finalized. Typically called by the sync
+    job when it detects the CIN7 PO has been confirmed."""
+    with connect() as c:
+        c.execute(
+            """
+            UPDATE po_drafts SET
+                status = 'finalized',
+                cin7_po_status = ?,
+                finalized_at = datetime('now')
+            WHERE id = ?
+            """,
+            (cin7_po_status, draft_id),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.finalize", actor, str(draft_id),
+             f"cin7_po_status={cin7_po_status}"),
+        )
+
+
+def cancel_po_draft(draft_id: int, actor: str, reason: str = "") -> None:
+    """Cancel a draft. If the draft was already submitted, this only
+    clears our local state — the CIN7 PO must be cancelled separately
+    in CIN7. Releases the pessimistic lock on the way out."""
+    with connect() as c:
+        c.execute(
+            """
+            UPDATE po_drafts SET
+                status = 'cancelled',
+                locked_by = NULL,
+                locked_at = NULL,
+                note = COALESCE(NULLIF(?, ''), note)
+            WHERE id = ?
+            """,
+            (reason, draft_id),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.cancel", actor, str(draft_id), reason),
+        )
+
+
+def rename_po_draft(draft_id: int, new_name: str, actor: str) -> None:
+    """Rename a draft. UI helper only — doesn't touch CIN7."""
+    with connect() as c:
+        c.execute(
+            "UPDATE po_drafts SET name = ? WHERE id = ?",
+            (new_name, draft_id))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("po_draft.rename", actor, str(draft_id),
+             f"-> {new_name!r}"),
         )

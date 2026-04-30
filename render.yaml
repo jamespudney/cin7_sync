@@ -1,0 +1,102 @@
+# render.yaml
+# ===========
+# Declarative deploy config for Render. Render reads this file when you
+# connect the GitHub repo and creates the services described below.
+#
+# Two services + one disk:
+#
+# 1. wired4signs-app (web service)  — the Streamlit app, served on HTTPS.
+# 2. wired4signs-sync (cron job)   — runs daily_sync.sh at 02:00 UTC every day.
+#
+# Both share a 5GB persistent disk mounted at /data. That disk holds:
+#   - /data/team_actions.db   (SQLite — the source of truth for migrations,
+#                              PO drafts, supplier configs, pricing, etc.)
+#   - /data/output/           (CSVs from each CIN7 sync; the app reads these
+#                              to populate the engine)
+#   - /data/.streamlit/cache/ (disk-persisted ABC engine + CSV caches)
+#
+# Secrets (CIN7 keys, IP token, app password) are NOT in this file. They
+# live in Render's encrypted env-var UI. The keys here have `sync: false`
+# which tells Render "don't sync this from the repo, prompt the operator
+# for it on first deploy."
+#
+# Custom domain: leave blank to get a free `<service>.onrender.com`
+# subdomain. To use a custom domain, add it via Render's Settings UI
+# AFTER the first deploy works.
+
+services:
+  # ----- Web service: the Streamlit app --------------------------------
+  - type: web
+    name: wired4signs-app
+    runtime: python
+    plan: standard          # 2GB RAM — plenty for ABC engine
+    region: ohio            # Closest to Florida; change if you prefer.
+    branch: main            # Deploy from main on push.
+    autoDeploy: true        # Auto-deploy on git push (you can toggle off later).
+    rootDir: .
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: ./start.sh
+    healthCheckPath: /_stcore/health
+    disk:
+      name: w4s-data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      # Where data lives — must match the disk mountPath above.
+      - key: DATA_DIR
+        value: /data
+      # Streamlit prefs: bind to Render's $PORT, no CORS headaches.
+      - key: STREAMLIT_SERVER_HEADLESS
+        value: "true"
+      - key: STREAMLIT_SERVER_ENABLE_CORS
+        value: "false"
+      - key: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
+        value: "true"
+      # Persisted-cache home on the disk so caches survive restarts.
+      - key: STREAMLIT_HOME
+        value: /data/.streamlit
+      # ---- Secrets (set in Render UI, not here) -----------------------
+      - key: APP_PASSWORD
+        sync: false        # Team's shared login password.
+      - key: CIN7_ACCOUNT_ID
+        sync: false
+      - key: CIN7_APPLICATION_KEY
+        sync: false
+      - key: CIN7_RATE_SECONDS
+        value: "1.5"       # API throttle; non-secret, fine to commit.
+      - key: CIN7_DEFAULT_LOCATION
+        value: "Main Warehouse"   # Override if your CIN7 location is named differently.
+      # Branding (env-driven so the app can be re-skinned without code changes).
+      - key: COMPANY_NAME
+        value: "Wired4Signs USA"
+      - key: APP_TITLE
+        value: "Cin7 Analytics — Wired4Signs"
+      - key: IP_API_KEY
+        sync: false        # Inventory Planner token.
+      - key: IP_ACCOUNT
+        sync: false        # IP account number.
+
+  # ----- Cron job: daily sync ------------------------------------------
+  - type: cron
+    name: wired4signs-sync
+    runtime: python
+    plan: starter          # Small instance — sync is single-threaded I/O.
+    region: ohio
+    branch: main
+    schedule: "0 2 * * *"  # 02:00 UTC every day. Adjust if you prefer.
+    rootDir: .
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: ./daily_sync.sh
+    disk:
+      name: w4s-data       # SAME disk name as the web service — they share.
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: CIN7_ACCOUNT_ID
+        sync: false
+      - key: CIN7_APPLICATION_KEY
+        sync: false
+      - key: CIN7_RATE_SECONDS
+        value: "1.5"

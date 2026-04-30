@@ -42,13 +42,22 @@ except ImportError:
     HAS_SORTABLE = False
 
 APP_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = APP_DIR / "output"
+# OUTPUT_DIR follows the DATA_DIR env var (set to /data on Render,
+# defaults to the project folder locally). See data_paths.py.
+from data_paths import OUTPUT_DIR  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
+# Branding is env-driven so the app can be re-skinned for other CIN7
+# customers without code changes. Defaults are the Wired4Signs values.
+# See SAAS_NOTES.md for the full list of company-specific touch points.
+COMPANY_NAME = os.environ.get("COMPANY_NAME", "Wired4Signs USA")
+APP_TITLE = os.environ.get(
+    "APP_TITLE", f"Cin7 Analytics — {COMPANY_NAME}")
+
 st.set_page_config(
-    page_title="Cin7 Analytics — Wired4Signs",
+    page_title=APP_TITLE,
     page_icon=":bar_chart:",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -56,27 +65,87 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
+# Password gate
+# ---------------------------------------------------------------------------
+# Reads expected password from APP_PASSWORD env var. If APP_PASSWORD is
+# NOT set (typical local dev), the gate is bypassed entirely so dev
+# experience stays the same. On Render we set APP_PASSWORD and every
+# new session has to enter it once.
+#
+# Why not Streamlit's experimental st.login(): we want zero external
+# auth dependencies for v1. A shared password is fine for a small
+# trusted team. We can swap to Google OAuth or Cloudflare Access later
+# without changing any other code in the app.
+def _require_password() -> None:
+    expected = os.environ.get("APP_PASSWORD", "").strip()
+    if not expected:
+        # No password configured → open access (local dev mode).
+        return
+    if st.session_state.get("_app_authed"):
+        return
+    # Centred prompt — the rest of the page is hidden until they auth.
+    st.markdown(
+        "<div style='max-width:420px;margin:80px auto;'>",
+        unsafe_allow_html=True)
+    st.markdown(f"### :lock: {COMPANY_NAME} Analytics")
+    st.caption(
+        "Enter the team password to continue. If you don't have it, "
+        "ask your administrator.")
+    with st.form("login_form", clear_on_submit=False):
+        pw = st.text_input(
+            "Password", type="password", key="_pw_input",
+            label_visibility="collapsed",
+            placeholder="Team password")
+        submitted = st.form_submit_button(
+            "Sign in", type="primary", use_container_width=True)
+    if submitted:
+        if pw == expected:
+            st.session_state["_app_authed"] = True
+            # Delete the password from session state so it isn't kept
+            # around longer than needed.
+            if "_pw_input" in st.session_state:
+                del st.session_state["_pw_input"]
+            st.rerun()
+        else:
+            st.error("Wrong password — try again.")
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+
+_require_password()
+
+
+# ---------------------------------------------------------------------------
 # Data loading (cached)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300, show_spinner=False)
+# NOT cached — globbing the directory is cheap, and we need it to
+# return fresh paths so the load() cache invalidates when a new CSV
+# arrives.
 def _latest_file(prefix: str) -> Optional[Path]:
     """Return the most recent CSV file in output/ with the given prefix."""
     files = sorted(OUTPUT_DIR.glob(f"{prefix}_*.csv"))
     return files[-1] if files else None
 
 
-@st.cache_data(ttl=300, show_spinner="Loading data…")
+@st.cache_data(persist="disk", show_spinner="Loading data…")
+def _read_csv_cached(path_str: str, mtime: float) -> pd.DataFrame:
+    """Disk-persisted CSV reader. Cache key = (path, mtime), so a new
+    CSV with a different mtime invalidates automatically — even though
+    the persistent cache has no TTL."""
+    try:
+        return pd.read_csv(path_str, low_memory=False)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not read {Path(path_str).name}: {exc}")
+        return pd.DataFrame()
+
+
 def load(prefix: str) -> pd.DataFrame:
+    """Find the latest CSV for this prefix and return it (cached)."""
     p = _latest_file(prefix)
     if p is None:
         return pd.DataFrame()
-    try:
-        df = pd.read_csv(p, low_memory=False)
-    except Exception as exc:  # noqa: BLE001
-        st.warning(f"Could not read {p.name}: {exc}")
-        return pd.DataFrame()
-    return df
+    return _read_csv_cached(str(p), p.stat().st_mtime)
 
 
 def file_mtime(prefix: str) -> Optional[datetime]:
@@ -140,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.13 — alt-stock banner: any sibling with stock (Apr 28)")
+    st.caption("🟢 v2.41 — Render deploy ready: data_paths.py centralises DATA_DIR; render.yaml + start.sh + daily_sync.sh in repo; APP_PASSWORD gate (env-driven); branding via COMPANY_NAME / APP_TITLE env vars (SaaS-friendly). See DEPLOY.md for cutover steps (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -164,6 +233,86 @@ with st.sidebar:
     else:
         st.markdown("⚪ **Last sync:** unknown (no stock file found)")
 
+    # --- SKU-rename pending indicator ------------------------------------
+    # When the team renames a SKU in CIN7 (catalog code prefix, version
+    # suffix, etc.), our local DB references go stale. This badge fires
+    # when the latest two products_*.csv files differ on any SKU AND the
+    # old SKU still has live references in our DB tables. Click-through
+    # tells the buyer exactly what to do.
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _detect_pending_renames() -> list:
+        """Compares two latest products CSVs by ProductID, returns list
+        of (old_sku, new_sku, name, has_db_refs) for renames that still
+        have references in our DB (i.e., not yet propagated)."""
+        files = sorted(OUTPUT_DIR.glob("products_*.csv"),
+                        key=lambda p: p.stat().st_mtime)
+        if len(files) < 2:
+            return []
+        try:
+            old_df = pd.read_csv(files[-2], low_memory=False)
+            new_df = pd.read_csv(files[-1], low_memory=False)
+        except Exception:
+            return []
+        old_idx = {str(r["ID"]): str(r["SKU"])
+                    for _, r in old_df.iterrows()
+                    if pd.notna(r.get("ID")) and pd.notna(r.get("SKU"))}
+        renames = []
+        for _, r in new_df.iterrows():
+            pid = str(r.get("ID") or "")
+            new_sku = str(r.get("SKU") or "")
+            if not pid or not new_sku:
+                continue
+            old_sku = old_idx.get(pid)
+            if old_sku and old_sku != new_sku:
+                # Check if old_sku still has references in DB
+                has_refs = False
+                try:
+                    with db.connect() as c:
+                        # Check the most likely tables
+                        for tbl, col in [
+                            ("sku_migrations", "retiring_sku"),
+                            ("sku_migrations", "successor_sku"),
+                            ("sku_supplier_overrides", "sku"),
+                            ("sku_policy_overrides", "sku"),
+                            ("sku_pack_settings", "sku"),
+                            ("notes", "sku"),
+                            ("flags", "sku"),
+                            ("family_critical_components", "component_sku"),
+                        ]:
+                            n = c.execute(
+                                f"SELECT COUNT(*) AS n FROM {tbl} "
+                                f"WHERE {col} = ?",
+                                (old_sku,)).fetchone()
+                            if n["n"] > 0:
+                                has_refs = True
+                                break
+                except Exception:
+                    has_refs = False
+                renames.append({
+                    "old": old_sku, "new": new_sku,
+                    "name": str(r.get("Name") or "")[:50],
+                    "has_db_refs": has_refs,
+                })
+        return renames
+
+    _pending = _detect_pending_renames()
+    if _pending:
+        _with_refs = [r for r in _pending if r["has_db_refs"]]
+        if _with_refs:
+            st.warning(
+                f":wrench: **{len(_with_refs)} SKU rename"
+                f"{'s' if len(_with_refs) != 1 else ''} pending** "
+                f"propagation to local DB.  \n"
+                f"CIN7 source-of-truth shifted; our DB still references "
+                f"the old SKU"
+                f"{'s' if len(_with_refs) != 1 else ''}.  \n"
+                f"Run: `python sync_sku_renames.py --apply`")
+        else:
+            st.caption(
+                f":sparkles: {len(_pending)} SKU rename"
+                f"{'s' if len(_pending) != 1 else ''} detected since last "
+                f"products sync (no DB references — informational only).")
+
     if st.button(":arrows_counterclockwise: Refresh data now",
                  use_container_width=True,
                  help="Re-reads CSV files from disk right now. Use this if "
@@ -186,6 +335,24 @@ with st.sidebar:
     if current_user:
         st.session_state["current_user"] = current_user.strip()
 
+    # Force-rebuild caches button. Useful after a daily sync drops fresh
+    # CSVs, or when engine logic has changed but the persisted cache is
+    # still serving the old result. Persisted caches normally invalidate
+    # automatically when their inputs change, but if you've edited the
+    # engine source itself you may want an immediate refresh.
+    if st.button(":arrows_counterclockwise: Refresh data caches",
+                  help="Clear the persisted ABC-engine + CSV-load caches "
+                       "and force a recompute on the next page render. "
+                       "Use after a fresh sync or after editing engine "
+                       "logic.",
+                  width="stretch"):
+        try:
+            st.cache_data.clear()
+            st.success("Caches cleared. Reloading…")
+            st.rerun()
+        except Exception as _exc:
+            st.error(f"Cache clear failed: {_exc}")
+
     page = st.radio(
         "View",
         [
@@ -196,6 +363,8 @@ with st.sidebar:
             "Product Detail",
             "Kits & Fixtures",
             "LED Tubes",
+            "Migrations",
+            "Supplier Pricing",
             "Stock Explorer",
             "Product Master",
             "Purchase Analysis",
@@ -278,13 +447,31 @@ purchase_lines = load("purchase_lines_last_90d")
 sale_lines_3d = load("sale_lines_last_3d")
 sale_lines_30d = load("sale_lines_last_30d")
 
+# Why this pattern: persist="disk" caches don't support ttl. To get
+# auto-invalidation on fresh data, the cache key must change when the
+# file list changes. _dir_fingerprint() returns a hashable tuple of
+# (name, mtime) pairs — used as a cache-busting argument so the inner
+# cached function rebuilds when the daily sync drops a new CSV.
+def _dir_fingerprint(pattern: str) -> tuple:
+    """Return a deterministic fingerprint of all files matching the
+    glob pattern in OUTPUT_DIR. Used as a cache key so persisted
+    caches invalidate automatically when files change."""
+    out = []
+    for p in sorted(OUTPUT_DIR.glob(pattern)):
+        try:
+            out.append((p.name, p.stat().st_mtime))
+        except OSError:
+            continue
+    return tuple(out)
+
+
 # Load the most comprehensive sale_lines picture:
 # 1. Start with the longest-window file (has deepest history)
 # 2. Union any more-recent shorter-window files (they contain today's data
 #    that the overnight long-window sync missed)
 # 3. Dedupe on line identity (SaleID+SKU+Qty), keeping the most-recent version
-@st.cache_data(ttl=300, show_spinner="Loading sales history…")
-def _load_longest_sale_lines() -> pd.DataFrame:
+@st.cache_data(persist="disk", show_spinner="Loading sales history…")
+def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     import re as _re
     files = []
     for p in OUTPUT_DIR.glob("sale_lines_last_*d_*.csv"):
@@ -304,7 +491,6 @@ def _load_longest_sale_lines() -> pd.DataFrame:
         return pd.DataFrame()
 
     # Union any file that was written MORE RECENTLY than the base
-    # (likely captures sales that happened after the base was written)
     for days, mtime, p in files[1:]:
         if mtime <= base_mtime:
             continue
@@ -315,7 +501,6 @@ def _load_longest_sale_lines() -> pd.DataFrame:
             continue
 
     # Dedupe keeping LAST occurrence (which is the more-recent file's data
-    # since we concatenated the older base first)
     dedupe_cols = [c for c in
                     ["SaleID", "SKU", "Quantity", "InvoiceDate",
                      "OrderNumber"]
@@ -324,15 +509,20 @@ def _load_longest_sale_lines() -> pd.DataFrame:
         base = base.drop_duplicates(subset=dedupe_cols, keep="last")
     return base.reset_index(drop=True)
 
+
+def _load_longest_sale_lines() -> pd.DataFrame:
+    return _load_longest_sale_lines_cached(
+        _dir_fingerprint("sale_lines_last_*d_*.csv"))
+
+
 sale_lines = _load_longest_sale_lines()
 if sale_lines.empty:
     sale_lines = sale_lines_30d if not sale_lines_30d.empty else sale_lines_3d
 
 
-# Same union-the-longest-window approach for sales HEADERS — needed for
-# the Monthly Metrics shipping derivation (InvoiceAmount − line totals − tax).
-@st.cache_data(ttl=300, show_spinner="Loading sales headers…")
-def _load_longest_sales() -> pd.DataFrame:
+@st.cache_data(persist="disk", show_spinner="Loading sales headers…")
+def _load_longest_sales_cached(fingerprint: tuple) -> pd.DataFrame:
+    """Headers version. fingerprint key: see _dir_fingerprint()."""
     import re as _re
     files = []
     for p in OUTPUT_DIR.glob("sales_last_*d_*.csv"):
@@ -361,10 +551,13 @@ def _load_longest_sales() -> pd.DataFrame:
     return base.reset_index(drop=True)
 
 
-# Same union-the-longest-window approach for purchase_lines — feeds the
-# FixedCost audit and vendor performance analyses.
-@st.cache_data(ttl=300, show_spinner="Loading purchase history…")
-def _load_longest_purchase_lines() -> pd.DataFrame:
+def _load_longest_sales() -> pd.DataFrame:
+    return _load_longest_sales_cached(
+        _dir_fingerprint("sales_last_*d_*.csv"))
+
+
+@st.cache_data(persist="disk", show_spinner="Loading purchase history…")
+def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     import re as _re
     files = []
     for p in OUTPUT_DIR.glob("purchase_lines_last_*d_*.csv"):
@@ -395,6 +588,11 @@ def _load_longest_purchase_lines() -> pd.DataFrame:
     if dedupe_cols:
         base = base.drop_duplicates(subset=dedupe_cols, keep="last")
     return base.reset_index(drop=True)
+
+
+def _load_longest_purchase_lines() -> pd.DataFrame:
+    return _load_longest_purchase_lines_cached(
+        _dir_fingerprint("purchase_lines_last_*d_*.csv"))
 stock_adjustments = load("stock_adjustments_last_30d")
 stock_transfers = load("stock_transfers_last_30d")
 boms = load("boms")  # AssemblySKU, ComponentSKU, Quantity, BOMType, ...
@@ -456,6 +654,251 @@ BOM_CHILDREN = _bom_idx["children_of"]
 BOM_FAMILY = _bom_idx["family_of"]
 
 
+def _load_ip_alternates() -> dict:
+    """Read the latest output/ip_alternates_*.csv into forward + reverse
+    indexes for the drill-down to consume.
+
+    The CSV is produced by ip_pull_alternates.py — one row per
+    "Combine sales/stock" link configured in Inventory Planner. Each
+    link is bidirectional in spirit (if A says B is its alternative,
+    a buyer looking at B benefits from knowing A points to it), so we
+    build BOTH directions in memory.
+
+    Returns:
+        {
+          "forward": {MasterSKU: [entry, ...]},   # this SKU has these alts
+          "reverse": {AlternativeSKU: [entry, ...]}, # SKUs that point at this
+        }
+    Where each entry is a dict with the original CSV row fields.
+    """
+    p = _latest_file("ip_alternates")
+    if p is None:
+        return {"forward": {}, "reverse": {}}
+    try:
+        df = pd.read_csv(p, low_memory=False)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not read {p.name}: {exc}")
+        return {"forward": {}, "reverse": {}}
+
+    forward: dict = {}
+    reverse: dict = {}
+    for _, row in df.iterrows():
+        master = str(row.get("MasterSKU") or "").strip()
+        alt = str(row.get("AlternativeSKU") or "").strip()
+        if not master or not alt:
+            continue
+        entry = {
+            "MasterSKU": master,
+            "AlternativeSKU": alt,
+            "Percent": row.get("Percent"),
+            "Source": str(row.get("Source") or ""),
+            "Title": str(row.get("AlternativeTitle") or ""),
+            "Barcode": str(row.get("AlternativeBarcode") or ""),
+            "MasterID": str(row.get("MasterID") or ""),
+            "AlternativeID": str(row.get("AlternativeID") or ""),
+        }
+        forward.setdefault(master, []).append(entry)
+        reverse.setdefault(alt, []).append(entry)
+    return {"forward": forward, "reverse": reverse}
+
+
+_ip_alts = _load_ip_alternates()
+IP_ALTS_FORWARD = _ip_alts["forward"]
+IP_ALTS_REVERSE = _ip_alts["reverse"]
+
+
+def _load_ip_notes() -> dict:
+    """Read the latest output/ip_notes_*.csv into {SKU: [note dicts]}.
+
+    Each note dict has: text, warehouse_id, tags. Multiple notes per SKU
+    are preserved (a variant can have a note per warehouse).
+    """
+    p = _latest_file("ip_notes")
+    if p is None:
+        return {}
+    try:
+        df = pd.read_csv(p, low_memory=False)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not read {p.name}: {exc}")
+        return {}
+
+    notes: dict = {}
+    for _, row in df.iterrows():
+        sku = str(row.get("SKU") or "").strip()
+        text = str(row.get("Note") or "").strip()
+        if not sku or not text:
+            continue
+        notes.setdefault(sku, []).append({
+            "text": text,
+            "warehouse_id": str(row.get("WarehouseID") or ""),
+            "tags": str(row.get("Tags") or ""),
+        })
+    return notes
+
+
+IP_NOTES = _load_ip_notes()
+
+
+def _load_cin7_alternatives() -> dict:
+    """Read the latest output/cin7_alternatives_*.csv produced by
+    cin7_ingest_attributes.py from the CIN7 AdditionalAttribute6
+    ('Alternative Product') field.
+
+    Returns a bidirectional dict: alternatives are symmetric in spirit
+    (if A says B is an alternative, viewing B should also surface A).
+
+    Returns:
+        {SKU: [AlternativeSKU, AlternativeSKU, ...]}
+    """
+    p = _latest_file("cin7_alternatives")
+    if p is None:
+        return {}
+    try:
+        df = pd.read_csv(p, low_memory=False)
+    except Exception:
+        return {}
+
+    bidir: dict = {}
+    for _, row in df.iterrows():
+        a = str(row.get("SKU") or "").strip()
+        b = str(row.get("AlternativeSKU") or "").strip()
+        if not a or not b or a == b:
+            continue
+        bidir.setdefault(a, set()).add(b)
+        bidir.setdefault(b, set()).add(a)
+    # Convert sets to sorted lists for stable display
+    return {k: sorted(v) for k, v in bidir.items()}
+
+
+CIN7_ALTERNATIVES = _load_cin7_alternatives()
+
+
+# Intent words that often appear next to SKU references in notes. We map
+# them to a structured "intent" so the UI can show "this is a replacement
+# pointer" vs "this is just a cross-reference" instead of dumping raw text.
+_NOTE_INTENT_WORDS = {
+    "REPLACEMENT": "🔁 marked as replacement",
+    "REPLACES": "🔁 replaces",
+    "REPLACED BY": "🔁 replaced by",
+    "ALTERNATIVE": "🔄 alternative",
+    "ALT": "🔄 alternative",
+    "USE": "👉 use instead",
+    "SEE": "👀 see also",
+    "CHECK": "🔍 check",
+}
+
+
+import re  # used by _parse_note_for_skus; safe to import at module scope
+
+
+def _parse_note_for_skus(note: str,
+                          products_df: pd.DataFrame,
+                          self_sku: str = "") -> list:
+    """Scan a free-text replenishment note for tokens that look like SKU
+    or model references, and match them to real SKUs in products_df.
+
+    Buyers typically write shorthand: a note on `LED-XRD-60W-24` saying
+    "E60L24DC REPLACEMENT" actually points at `LED-E60L24DC-KO`. So we
+    can't rely on exact SKU matches — we look for tokens that appear AS
+    SUBSTRINGS of real SKUs, and also scan product Names for the same
+    token (since the model name often appears in the product's name).
+
+    Heuristics for what counts as a "candidate token":
+      - Length 4–30 characters
+      - Contains at least one digit AND one letter (rules out plain words
+        like "REPLACEMENT" or "MOQ")
+      - Not an intent keyword itself
+
+    Returns:
+        [
+          {
+            "token": "E60L24DC",
+            "intent": "🔁 marked as replacement"  (or None),
+            "matches": ["LED-E60L24DC-KO", ...],  (real SKUs that match)
+          },
+          ...
+        ]
+    """
+    if not note or (isinstance(note, float) and pd.isna(note)):
+        return []
+    note_str = str(note).strip()
+    if not note_str:
+        return []
+
+    # Detect overall intent for the note (single intent per note is fine).
+    note_upper = note_str.upper()
+    detected_intent = None
+    for word, label in _NOTE_INTENT_WORDS.items():
+        if word in note_upper:
+            detected_intent = label
+            break
+
+    # Tokenize on common separators. We keep digits/letters in tokens.
+    tokens = re.split(r"[\s,/.()\[\]]+", note_str)
+
+    # Filter: must have digits + letters, length 4–30, not an intent word.
+    intent_words_upper = set(_NOTE_INTENT_WORDS.keys())
+    candidates = []
+    for tok in tokens:
+        tok = tok.strip().strip("-_")
+        if not (4 <= len(tok) <= 30):
+            continue
+        if not re.search(r"\d", tok):
+            continue
+        if not re.search(r"[A-Za-z]", tok):
+            continue
+        if tok.upper() in intent_words_upper:
+            continue
+        if tok.upper() == self_sku.upper():
+            continue
+        candidates.append(tok)
+
+    if not candidates:
+        return []
+
+    if products_df is None or products_df.empty or "SKU" not in products_df.columns:
+        return []
+
+    sku_strs = products_df["SKU"].astype(str)
+    sku_upper = sku_strs.str.upper()
+    has_name = "Name" in products_df.columns
+    if has_name:
+        name_upper = products_df["Name"].astype(str).str.upper()
+
+    matched_results = []
+    seen_tokens = set()
+    for tok in candidates:
+        tu = tok.upper()
+        if tu in seen_tokens:
+            continue
+        seen_tokens.add(tu)
+        # Substring match on SKU. re.escape so dots/dashes are literal.
+        try:
+            sku_mask = sku_upper.str.contains(re.escape(tu), na=False)
+        except re.error:
+            continue
+        sku_matches = set(sku_strs[sku_mask].tolist())
+        # Substring match on product Name (catches model names).
+        if has_name:
+            name_mask = name_upper.str.contains(re.escape(tu), na=False)
+            sku_matches.update(sku_strs[name_mask].tolist())
+
+        # Drop self-match
+        if self_sku:
+            sku_matches.discard(self_sku)
+        if not sku_matches:
+            continue
+        # Cap to 10 matches per token to avoid runaway noise on common
+        # short tokens (e.g. "100M" matches every roll).
+        matched_results.append({
+            "token": tok,
+            "intent": detected_intent,
+            "matches": sorted(sku_matches)[:10],
+        })
+
+    return matched_results
+
+
 def render_demand_breakdown(
     sku: str,
     sale_lines_df: pd.DataFrame,
@@ -465,6 +908,8 @@ def render_demand_breakdown(
     engine_row: Optional[pd.Series] = None,
     engine_df_full: Optional[pd.DataFrame] = None,
     stock_df: Optional[pd.DataFrame] = None,
+    ip_alts_forward: Optional[dict] = None,
+    ip_alts_reverse: Optional[dict] = None,
 ) -> None:
     """Render a buyer-friendly breakdown of where demand comes from for a SKU.
 
@@ -554,12 +999,74 @@ def render_demand_breakdown(
         cols[4].metric("Children", len(children))
 
     # === Substitution-opportunity alert (early visibility) =================
-    # Quick scan for family siblings with idle stock BEFORE the buyer
-    # scrolls through the full breakdown. Loud red banner so they can't
-    # miss the "we have alternatives" signal. Trigger is intentionally
-    # broad — fires whenever ANY sibling has stock, regardless of recent
-    # sales performance. The buyer decides whether the alternative is
-    # worth using; we just make sure they know one exists.
+    # Two-tier scan for alternatives BEFORE the buyer scrolls.
+    #   Tier 1 (authoritative): migration DB entries. Read live from
+    #     db.all_migrations() so manual additions (via inline form or
+    #     the dedicated Migrations page) show up immediately — not just
+    #     IP-imported ones. After ip_import_migrations.py runs, all IP
+    #     merges are also in this same DB, so DB is the single source.
+    #   Tier 2 (heuristic): family-prefix variants with idle stock —
+    #     informational only, since SKU-prefix matching can cluster
+    #     items that aren't actually interchangeable (e.g. different
+    #     voltages share the prefix).
+    # Trigger is intentionally broad: any signal of an alternative fires
+    # the banner. The buyer decides whether the substitution is worth it.
+    try:
+        _all_migs_live = [dict(m) for m in db.all_migrations()]
+    except Exception:
+        _all_migs_live = []
+    # Forward = this SKU is a SUCCESSOR for these predecessors
+    _ip_fwd_alts = []
+    # Reverse = this SKU is a PREDECESSOR retired into these successor(s)
+    _ip_rev_alts = []
+    for _m in _all_migs_live:
+        _ret = str(_m.get("retiring_sku") or "")
+        _suc = str(_m.get("successor_sku") or "")
+        if _suc == str(sku):
+            # Live entry uses different keys than CSV — translate so the
+            # downstream rendering code (which expects the CSV shape) works.
+            _ip_fwd_alts.append({
+                "AlternativeSKU": _ret,
+                "MasterSKU": _suc,
+                "Percent": _m.get("share_pct"),
+                "Source": _m.get("set_by") or "",
+                "Title": "",  # filled in from products_df at render time
+                "Barcode": "",
+                "MasterID": "",
+                "AlternativeID": "",
+            })
+        if _ret == str(sku):
+            _ip_rev_alts.append({
+                "AlternativeSKU": _ret,
+                "MasterSKU": _suc,
+                "Percent": _m.get("share_pct"),
+                "Source": _m.get("set_by") or "",
+                "Title": "",
+                "Barcode": "",
+                "MasterID": "",
+                "AlternativeID": "",
+            })
+    _ip_alts_with_stock = 0
+    for _ent in _ip_fwd_alts + _ip_rev_alts:
+        _alt_sku = _ent.get("AlternativeSKU") if _ent in _ip_fwd_alts else _ent.get("MasterSKU")
+        if not _alt_sku:
+            continue
+        _oh_alt = 0.0
+        if engine_df_full is not None and not engine_df_full.empty:
+            _em = engine_df_full[
+                engine_df_full["SKU"].astype(str) == str(_alt_sku)]
+            if not _em.empty:
+                _val = _em.iloc[0].get("OnHand", 0)
+                _oh_alt = float(_val) if pd.notna(_val) else 0.0
+        elif stock_df is not None and not stock_df.empty:
+            _sm = stock_df[stock_df["SKU"].astype(str) == str(_alt_sku)]
+            if not _sm.empty:
+                _oh_alt = float(pd.to_numeric(
+                    _sm["OnHand"], errors="coerce").sum() or 0)
+        if _oh_alt > 0:
+            _ip_alts_with_stock += 1
+    _ip_alts_total = len(_ip_fwd_alts) + len(_ip_rev_alts)
+
     _sub_candidate_count = 0
     _sku_parts_check = str(sku).split("-")
     if len(_sku_parts_check) >= 3:
@@ -591,19 +1098,108 @@ def render_demand_breakdown(
                         _sm["OnHand"], errors="coerce").sum() or 0)
             if _oh > 0:
                 _sub_candidate_count += 1
-    if _sub_candidate_count > 0:
-        st.error(
-            f":arrows_counterclockwise: **HEY — "
-            f"{_sub_candidate_count} alternative variant"
-            f"{'s' if _sub_candidate_count != 1 else ''} with stock!**  \n"
-            "This SKU has family sibling"
-            f"{'s' if _sub_candidate_count != 1 else ''} with **idle "
-            "inventory on hand** — possible substitution"
-            f"{'s' if _sub_candidate_count != 1 else ''} before "
-            "reordering. "
-            "**Scroll down to the :twisted_rightwards_arrows: Family "
-            "siblings section** to review."
+    # Banner priority: IP-derived migration stock ALWAYS takes priority
+    # over the family-prefix heuristic. If a PREDECESSOR (retiring SKU)
+    # still has residual OnHand, the buyer needs to know — consuming
+    # legacy stock first is exactly the kind of thing that gets missed
+    # when the team is just looking at active SKU stock levels.
+    if _ip_alts_with_stock > 0:
+        _heur_extra = (
+            f"  Plus {_sub_candidate_count} family-prefix sibling"
+            f"{'s' if _sub_candidate_count != 1 else ''} with stock "
+            f"(heuristic match)."
+            if _sub_candidate_count > 0 else ""
         )
+        st.error(
+            f":scroll: **{_ip_alts_with_stock} predecessor / migration-"
+            f"linked SKU{'s' if _ip_alts_with_stock != 1 else ''} still "
+            f"holding stock!**  \n"
+            f"Per IP's migration history, "
+            f"{'these have' if _ip_alts_with_stock != 1 else 'this has'} "
+            f"residual inventory you can consume "
+            f"before reordering this SKU. "
+            f"**Scroll down to the :scroll: Migration history section** "
+            f"to review.{_heur_extra}"
+        )
+    elif _sub_candidate_count > 0:
+        st.warning(
+            f":twisted_rightwards_arrows: **{_sub_candidate_count} "
+            f"family-prefix variant"
+            f"{'s' if _sub_candidate_count != 1 else ''} with idle "
+            "stock** (heuristic match — verify specs).  \n"
+            "Other SKUs sharing this product's prefix have inventory on "
+            "hand. They **may or may not be interchangeable** — "
+            "check voltage, length, colour, etc. before treating as a "
+            "substitute. "
+            "**Scroll down to :twisted_rightwards_arrows: Family variants** "
+            "to review."
+        )
+
+    # === Section 1.5: Team notes (Inventory Planner replenishment_notes) ===
+    # Surfaces the per-warehouse free-text notes your team has been
+    # writing in IP for years. Each note also gets parsed for tokens that
+    # look like SKU model references — when a buyer wrote "E60L24DC
+    # REPLACEMENT" on LED-XRD-60W-24, we surface LED-E60L24DC-KO as a
+    # candidate alternative. The parser is heuristic; matches are shown
+    # as suggestions, not as authoritative substitutes.
+    _sku_notes = IP_NOTES.get(str(sku), [])
+    if _sku_notes:
+        st.markdown("#### :memo: Team notes from Inventory Planner")
+        for _n in _sku_notes:
+            note_text = _n.get("text") or ""
+            if not note_text:
+                continue
+            # Parse for SKU candidates
+            parsed = _parse_note_for_skus(
+                note_text, products_df, self_sku=str(sku))
+            # Render the note. If parsing found candidate SKUs, show them
+            # inline as a small caption below.
+            note_disp = note_text.strip()
+            wh_id = _n.get("warehouse_id") or ""
+            wh_label = (f"  ·  warehouse `{wh_id[-12:]}`" if wh_id else "")
+            st.info(f"📝 **{note_disp}**{wh_label}")
+
+            if parsed:
+                # Build a compact suggestion line. When intent is
+                # "REPLACEMENT/REPLACES" the matched SKU is almost
+                # certainly a PREDECESSOR — flag it as such and hint at
+                # the Migration setup. Other intents stay neutral.
+                bits = []
+                migration_candidates = []
+                for p in parsed:
+                    tok = p["token"]
+                    intent = p.get("intent") or ""
+                    matches = p["matches"]
+                    if not matches:
+                        continue
+                    if len(matches) == 1:
+                        match_disp = f"`{matches[0]}`"
+                    else:
+                        head = ", ".join(f"`{m}`" for m in matches[:3])
+                        more = (f" + {len(matches) - 3} more"
+                                if len(matches) > 3 else "")
+                        match_disp = head + more
+                    intent_disp = f" {intent}" if intent else ""
+                    bits.append(f"`{tok}`{intent_disp} → {match_disp}")
+                    # Flag replacement-intent matches as migration candidates
+                    if intent and ("replac" in intent.lower()
+                                    or "🔁" in intent):
+                        for m in matches[:1]:  # most-likely match only
+                            migration_candidates.append(m)
+                if bits:
+                    st.caption(
+                        "**SKU references found in this note:**  \n"
+                        + "  \n".join(bits))
+                if migration_candidates:
+                    st.warning(
+                        ":scroll: **Likely predecessor"
+                        f"{'s' if len(migration_candidates) != 1 else ''}: "
+                        f"{', '.join(f'`{c}`' for c in migration_candidates)}**  \n"
+                        f"The note implies this SKU has replaced "
+                        f"{'them' if len(migration_candidates) != 1 else 'it'}. "
+                        f"Consider recording this in **Migrations** so "
+                        f"their historical sales feed this SKU's forecast."
+                    )
 
     # === Section 2: Demand sources (children rolling up) ===================
     if children:
@@ -685,17 +1281,59 @@ def render_demand_breakdown(
         c_qty = c.get("Quantity")
         if c_sku and c_qty is not None and pd.notna(c_qty):
             sku_to_master_ratio[str(c_sku)] = float(c_qty)
+
+    # === Include predecessors so the chart + activity feed show the FULL
+    # demand lineage, not just post-migration sales. For each family SKU
+    # (master + children), look up its direct migration predecessors and
+    # add them with a scaled ratio = successor's ratio × share_pct/100.
+    # Without this, the chart shows just SIERRA's own sales (61 units)
+    # while the engine is using ~455 (which includes predecessor history
+    # from CASCADE38-W-MP-2390, SMOKIES38-W-MP-3, etc).
+    try:
+        _all_migs_for_chart = [dict(m) for m in db.all_migrations()]
+    except Exception:
+        _all_migs_for_chart = []
+    _preds_by_succ: dict = {}
+    for _m in _all_migs_for_chart:
+        _s = str(_m.get("successor_sku") or "")
+        if _s:
+            _preds_by_succ.setdefault(_s, []).append(_m)
+    _predecessor_skus: list = []
+    for _fsku in list(family_skus):  # iterate over copy; appending below
+        _fsku_str = str(_fsku)
+        _fsku_ratio = sku_to_master_ratio.get(_fsku_str, 1.0)
+        for _m in _preds_by_succ.get(_fsku_str, []):
+            _pred = str(_m.get("retiring_sku") or "")
+            if not _pred or _pred == _fsku_str:
+                continue
+            _share = float(_m.get("share_pct") or 100) / 100.0
+            # Predecessor inherits successor's BOM ratio × migration share.
+            # If 100% migrated and successor's ratio is 1.0, predecessor's
+            # ratio is also 1.0 (each historical unit equals one master unit).
+            sku_to_master_ratio[_pred] = _fsku_ratio * _share
+            _predecessor_skus.append(_pred)
+    # Deduplicate while preserving the master + children + predecessors
+    family_skus = list(dict.fromkeys(
+        [str(s) for s in family_skus + _predecessor_skus]))
+
     family_sl = sl[sl["SKU"].astype(str).isin(
         [str(s) for s in family_skus])].copy()
     family_sl = family_sl.dropna(subset=["InvoiceDate"])
     if not family_sl.empty:
+        _n_preds_with_data = len(set(_predecessor_skus) & set(
+            family_sl["SKU"].astype(str)))
+        _pred_suffix = (
+            f" — incl. {_n_preds_with_data} predecessor"
+            f"{'s' if _n_preds_with_data != 1 else ''} with sales history"
+            if _n_preds_with_data > 0 else "")
         st.markdown(
-            "#### :chart_with_upwards_trend: Family monthly demand — "
-            "master-roll equivalents (last 12 months)")
+            f"#### :chart_with_upwards_trend: Family monthly demand — "
+            f"master-roll equivalents (last 12 months){_pred_suffix}")
         st.caption(
-            "Each child SKU's units are multiplied by its BOM ratio to "
-            "this master, so the chart is in a single unit (master rolls) "
-            "regardless of how the family sells. "
+            "Each SKU's units are multiplied by its BOM ratio (and "
+            "migration share for predecessors) to this master, so the "
+            "chart is in a single unit (master rolls) regardless of how "
+            "the family sells or what predecessors it replaced. "
             f"Master = `{sku}` = 1 unit per row.")
         cutoff_12mo = today - pd.Timedelta(days=365)
         recent_sl = family_sl[family_sl["InvoiceDate"] >= cutoff_12mo].copy()
@@ -718,10 +1356,18 @@ def render_demand_breakdown(
                 "dormant family.")
 
     # === Section 4: Recent activity feed ===================================
+    # family_sl now includes predecessor sales (added above), so this
+    # naturally shows recent CASCADE/SMOKIES sales alongside SIERRA's,
+    # giving the buyer the full lineage view.
     if not family_sl.empty:
+        _pred_set = set(_predecessor_skus)
+        _has_pred_sales = bool(_pred_set & set(family_sl["SKU"].astype(str)))
+        _recent_label = (
+            "across the family (incl. predecessors)"
+            if _has_pred_sales else "across the family")
         st.markdown(
-            "#### :clipboard: Recent activity — last 10 sales "
-            "across the family")
+            f"#### :clipboard: Recent activity — last 10 sales "
+            f"{_recent_label}")
         recent_10 = (family_sl.sort_values("InvoiceDate", ascending=False)
                      .head(10)).copy()
         cols_to_show = [c for c in
@@ -757,6 +1403,276 @@ def render_demand_breakdown(
                     st.column_config.NumberColumn(format="%.4g"),
             })
 
+    # === Section 5.5: Migration history (IP merged[] — successor lineage) ==
+    # IP's "Combine sales/stock" feature is structurally a migration
+    # mapping: the variant where the merge is configured is the SUCCESSOR
+    # (it inherits sales history from the OLD/RETIRING variants listed).
+    # Same concept as our internal sku_migrations DB — see the dedicated
+    # Migrations page and Section 7 redirect.
+    #
+    # In our pulled CSV:
+    #   MasterSKU       = successor (the new active SKU)
+    #   AlternativeSKU  = predecessor (the retiring SKU whose sales merge in)
+    # In our in-memory dicts:
+    #   IP_ALTS_FORWARD[successor] -> list of predecessor entries
+    #   IP_ALTS_REVERSE[predecessor] -> list of successor entries
+    #
+    # Display reflects the buyer's mental model:
+    #   "📜 Replaces N predecessors" (when this SKU is a successor)
+    #   "🔁 Replaced by N successor(s)" (when this SKU is retiring)
+    if _ip_fwd_alts or _ip_rev_alts:
+        if _ip_fwd_alts:
+            st.markdown(
+                f"#### :scroll: Replaces {len(_ip_fwd_alts)} predecessor"
+                f"{'s' if len(_ip_fwd_alts) != 1 else ''} "
+                "(migration history)")
+            st.caption(
+                "This SKU has effectively replaced the SKUs below. "
+                "Their historical sales roll into this SKU's forecast. "
+                "Source covers both manual entries and IP-imported merges.")
+            pred_rows = []
+            for ent in _ip_fwd_alts:
+                pred_sku = ent.get("AlternativeSKU") or ""
+                pred_title = ent.get("Title") or ""
+                # If title wasn't carried with the entry (DB-sourced
+                # entries don't store titles), look it up in products.
+                if not pred_title and not products_df.empty:
+                    _pm = products_df[
+                        products_df["SKU"].astype(str) == str(pred_sku)]
+                    if not _pm.empty:
+                        pred_title = str(_pm.iloc[0].get("Name") or "")
+                pred_sl = sl[sl["SKU"].astype(str) == str(pred_sku)]
+                p_12 = float(pred_sl[pred_sl["InvoiceDate"]
+                                       >= cutoff_365]["Quantity"].sum())
+                p_90 = float(pred_sl[pred_sl["InvoiceDate"]
+                                       >= cutoff_90]["Quantity"].sum())
+                p_last = (pred_sl["InvoiceDate"].max()
+                          if not pred_sl.empty else None)
+                p_oh = 0.0
+                if engine_df_full is not None and not engine_df_full.empty:
+                    em = engine_df_full[
+                        engine_df_full["SKU"].astype(str) == str(pred_sku)]
+                    if not em.empty:
+                        val = em.iloc[0].get("OnHand", 0)
+                        p_oh = float(val) if pd.notna(val) else 0.0
+                elif stock_df is not None and not stock_df.empty:
+                    sm = stock_df[stock_df["SKU"].astype(str) == str(pred_sku)]
+                    if not sm.empty:
+                        p_oh = float(pd.to_numeric(
+                            sm["OnHand"], errors="coerce").sum() or 0)
+                try:
+                    pct_disp = f"{float(ent.get('Percent', 0)):.0f}%"
+                except (TypeError, ValueError):
+                    pct_disp = "—"
+                pred_rows.append({
+                    "Predecessor SKU": str(pred_sku),
+                    "Title": (pred_title or "")[:60],
+                    "Share %": pct_disp,
+                    "Source": str(ent.get("Source") or "—"),
+                    "Residual OnHand": (f"{p_oh:.2f}"
+                                          if p_oh > 0 else "—"),
+                    "12mo units (legacy)": int(p_12),
+                    "90d units (legacy)": int(p_90),
+                    "Last sale": (p_last.strftime("%Y-%m-%d")
+                                   if p_last is not None
+                                   and pd.notna(p_last)
+                                   else "—"),
+                })
+            if pred_rows:
+                st.dataframe(pd.DataFrame(pred_rows),
+                              hide_index=True, width="stretch")
+
+        # === Indirect predecessors via BOM children =====================
+        # The direct migrations above are at the bare-tube level; the
+        # actual sales volume usually lived on the MP-variant siblings
+        # (e.g. CASCADE38-W-MP-2390 retired into SIERRA38-W-MP-2390,
+        # which then BOM-rolls into this bare tube). Walking that chain
+        # here makes the full lineage visible — buyer can see all the
+        # historical sales contributing to this SKU's forecast.
+        _indirect_rows = []
+        try:
+            _all_db_migs = [dict(m) for m in db.all_migrations()]
+        except Exception:
+            _all_db_migs = []
+        _preds_by_succ_idx: dict = {}
+        for _m in _all_db_migs:
+            _s = str(_m.get("successor_sku") or "")
+            if _s:
+                _preds_by_succ_idx.setdefault(_s, []).append(_m)
+        for child in children:
+            child_sku = str(child.get("AssemblySKU") or "")
+            qty_per = float(child.get("Quantity") or 0)
+            if not child_sku or qty_per <= 0:
+                continue
+            for _m in _preds_by_succ_idx.get(child_sku, []):
+                ind_pred = str(_m.get("retiring_sku") or "")
+                if not ind_pred:
+                    continue
+                share = float(_m.get("share_pct") or 100) / 100
+                ind_sl = sl[sl["SKU"].astype(str) == ind_pred]
+                ind_12mo = float(ind_sl[ind_sl["InvoiceDate"]
+                                          >= cutoff_365]["Quantity"].sum())
+                ind_90d = float(ind_sl[ind_sl["InvoiceDate"]
+                                          >= cutoff_90]["Quantity"].sum())
+                ind_last = (ind_sl["InvoiceDate"].max()
+                            if not ind_sl.empty else None)
+                # Contribution to THIS bare-tube master:
+                # predecessor 12mo × share × qty_per
+                contribution_to_master = ind_12mo * share * qty_per
+                ind_title = ""
+                if not products_df.empty:
+                    _pm = products_df[
+                        products_df["SKU"].astype(str) == ind_pred]
+                    if not _pm.empty:
+                        ind_title = str(_pm.iloc[0].get("Name") or "")
+                # Residual OnHand on the indirect predecessor
+                ind_oh = 0.0
+                if engine_df_full is not None and not engine_df_full.empty:
+                    em = engine_df_full[
+                        engine_df_full["SKU"].astype(str) == ind_pred]
+                    if not em.empty:
+                        val = em.iloc[0].get("OnHand", 0)
+                        ind_oh = float(val) if pd.notna(val) else 0.0
+                elif stock_df is not None and not stock_df.empty:
+                    sm = stock_df[stock_df["SKU"].astype(str) == ind_pred]
+                    if not sm.empty:
+                        ind_oh = float(pd.to_numeric(
+                            sm["OnHand"], errors="coerce").sum() or 0)
+                _indirect_rows.append({
+                    "Indirect predecessor": ind_pred,
+                    "Title": ind_title[:50],
+                    "→ via successor child": child_sku,
+                    "Share %": f"{share * 100:.0f}%",
+                    "BOM ratio": f"{qty_per:.4g}",
+                    "Residual OnHand": (f"{ind_oh:.2f}"
+                                          if ind_oh > 0 else "—"),
+                    "12mo units": int(ind_12mo),
+                    "90d units": int(ind_90d),
+                    "Contributes to this": f"{contribution_to_master:.0f}",
+                    "Last sale": (ind_last.strftime("%Y-%m-%d")
+                                   if ind_last is not None
+                                   and pd.notna(ind_last)
+                                   else "—"),
+                })
+        if _indirect_rows:
+            # Sort by largest contribution first
+            _indirect_rows.sort(
+                key=lambda r: -float(r["Contributes to this"]))
+            _total_contrib = sum(
+                float(r["Contributes to this"]) for r in _indirect_rows)
+            st.markdown(
+                f"#### :link: Indirect predecessors via BOM "
+                f"({len(_indirect_rows)} — contributing "
+                f"{_total_contrib:.0f} units)")
+            st.caption(
+                "These predecessors don't migrate directly to this SKU; "
+                "they migrate to its BOM children (the MP-variant "
+                "successors), and from there their demand rolls UP into "
+                "this bare tube via the BOM ratio. This is where the "
+                "real sales volume usually lives — bare tubes rarely "
+                "sell standalone."
+            )
+            st.dataframe(
+                pd.DataFrame(_indirect_rows),
+                hide_index=True, width="stretch")
+
+        if _ip_rev_alts:
+            st.markdown(
+                f"#### 🔁 Replaced by "
+                f"{len(_ip_rev_alts)} successor"
+                f"{'s' if len(_ip_rev_alts) != 1 else ''} "
+                "(migration history)")
+            st.caption(
+                "This SKU has been retired and its demand now rolls "
+                "into the successor(s) below.")
+            succ_rows = []
+            for ent in _ip_rev_alts:
+                succ_sku = ent.get("MasterSKU") or ""
+                # Look up the successor's title from our products data
+                succ_title = ""
+                if not products_df.empty:
+                    sm_match = products_df[
+                        products_df["SKU"].astype(str) == str(succ_sku)]
+                    if not sm_match.empty:
+                        succ_title = str(sm_match.iloc[0].get("Name") or "")
+                try:
+                    pct_disp = f"{float(ent.get('Percent', 0)):.0f}%"
+                except (TypeError, ValueError):
+                    pct_disp = "—"
+                succ_rows.append({
+                    "Successor SKU": str(succ_sku),
+                    "Title": succ_title[:60],
+                    "Share %": pct_disp,
+                    "Source": str(ent.get("Source") or "—"),
+                })
+            if succ_rows:
+                st.dataframe(pd.DataFrame(succ_rows),
+                              hide_index=True, width="stretch")
+
+    # === Section 5.6: Inline "+ Add predecessor" form ======================
+    # Always shown (even when there are no existing predecessors yet) so
+    # the buyer can record a migration without leaving this drill-down.
+    # Saves via db.set_migration() — same backend as the dedicated
+    # Migrations page and the Section 7 redirect.
+    with st.expander(
+            ":heavy_plus_sign: Add a predecessor (this SKU as successor)",
+            expanded=False):
+        st.caption(
+            "If this SKU has effectively replaced an older SKU not yet "
+            "recorded, add the mapping here. The retiring SKU's 12mo "
+            "sales × Share % will start rolling into this SKU's demand "
+            "after the next data refresh.")
+        sku_pool = (sorted(set(products_df["SKU"].astype(str)))
+                     if not products_df.empty else [])
+        # Filter out self and any already-mapped predecessors to reduce
+        # accidental duplicates.
+        existing_pred_skus = {
+            str(ent.get("AlternativeSKU") or "")
+            for ent in _ip_fwd_alts
+        }
+        # Also exclude any SKU already mapped as retiring in the DB
+        if hasattr(db, "all_migrations"):
+            for _m in db.all_migrations():
+                existing_pred_skus.add(str(dict(_m).get("retiring_sku") or ""))
+        sku_pool_filtered = [
+            s for s in sku_pool
+            if s != str(sku) and s not in existing_pred_skus
+        ]
+        ic1, ic2 = st.columns([3, 1])
+        with ic1:
+            inline_pred = st.selectbox(
+                "Retiring (predecessor) SKU",
+                options=[""] + sku_pool_filtered,
+                key=f"inline_add_pred_{sku}",
+                help="Pick the older SKU that this one has replaced.")
+        with ic2:
+            inline_share = st.number_input(
+                "Share %",
+                min_value=1.0, max_value=100.0, value=100.0, step=5.0,
+                key=f"inline_add_pred_share_{sku}")
+        inline_note = st.text_input(
+            "Note (optional)",
+            key=f"inline_add_pred_note_{sku}",
+            placeholder="Why this migration?")
+        save_disabled_inline = (not inline_pred or inline_pred == str(sku))
+        if st.button(":floppy_disk: Save predecessor",
+                      key=f"inline_add_pred_save_{sku}",
+                      disabled=save_disabled_inline,
+                      type="primary"):
+            actor = st.session_state.get("current_user") or "unknown"
+            db.set_migration(
+                retiring_sku=inline_pred,
+                successor_sku=str(sku),
+                actor=actor,
+                share_pct=float(inline_share),
+                note=inline_note or "added inline from drill-down",
+            )
+            st.success(
+                f"Saved: **{inline_pred}** → **{sku}** "
+                f"@ {inline_share:.0f}%. Refresh the page to see it "
+                "in the predecessors table above.")
+            st.rerun()
+
     # === Section 6: Family siblings (same product, alternative form) =======
     # Heuristic match: SKUs sharing the prefix (everything up to the last
     # hyphen-suffix) but NOT in the BOM children/parents list. Surfaces
@@ -782,15 +1698,68 @@ def render_demand_breakdown(
             & ~products_df["SKU"].astype(str).isin(excluded_set)
         )
         family_sibs = products_df[sibs_mask].copy()
+        # ---------- CIN7-confirmed alternatives (authoritative) -----------
+        # If the team has populated CIN7's AdditionalAttribute6 field
+        # ("Alternative Product") for this SKU, surface those entries
+        # ABOVE the heuristic table — they're explicit decisions vs.
+        # pattern matches.
+        cin7_alts = CIN7_ALTERNATIVES.get(str(sku), [])
+        if cin7_alts:
+            st.markdown(
+                f"#### :white_check_mark: CIN7-confirmed alternatives "
+                f"({len(cin7_alts)})")
+            st.caption(
+                "From CIN7's *Alternative Product* attribute on this SKU "
+                "(or another SKU pointing back at this one). Curated by "
+                "your team — treat as real alternatives. No sales "
+                "rollup occurs (those are migrations, shown above).")
+            cin7_alt_rows = []
+            for alt_sku in cin7_alts:
+                alt_match = products_df[
+                    products_df["SKU"].astype(str) == str(alt_sku)]
+                alt_name = (str(alt_match.iloc[0].get("Name") or "")[:60]
+                             if not alt_match.empty else "")
+                # OnHand
+                oh = 0.0
+                if engine_df_full is not None and not engine_df_full.empty:
+                    em = engine_df_full[
+                        engine_df_full["SKU"].astype(str) == str(alt_sku)]
+                    if not em.empty:
+                        val = em.iloc[0].get("OnHand", 0)
+                        oh = float(val) if pd.notna(val) else 0.0
+                elif stock_df is not None and not stock_df.empty:
+                    sm = stock_df[stock_df["SKU"].astype(str) == str(alt_sku)]
+                    if not sm.empty:
+                        oh = float(pd.to_numeric(
+                            sm["OnHand"], errors="coerce").sum() or 0)
+                cin7_alt_rows.append({
+                    "Alternative SKU": str(alt_sku),
+                    "Name": alt_name,
+                    "OnHand": f"{oh:.2f}" if oh > 0 else "—",
+                    "In product master": ("✓" if not alt_match.empty
+                                            else "⚠ unknown SKU"),
+                })
+            if cin7_alt_rows:
+                st.dataframe(pd.DataFrame(cin7_alt_rows),
+                              hide_index=True, width="stretch")
+
         if not family_sibs.empty:
             st.markdown(
-                f"#### :twisted_rightwards_arrows: Family siblings — "
-                f"alternative variants (not BOM-linked)")
-            st.caption(
-                f"Other SKUs matching `{family_prefix}-*` that aren't "
-                "wired to this one via the BOM. Useful when buyer wants "
-                "to consume idle stock of an alternative form (e.g. 5m "
-                "roll for a 100m master) before reordering this SKU.")
+                f"#### :twisted_rightwards_arrows: Family variants — "
+                f"same SKU prefix (informational)")
+            st.warning(
+                f":warning: **These are heuristic matches by SKU prefix "
+                f"only — `{family_prefix}-*`. They are NOT necessarily "
+                "interchangeable.**  \n"
+                "A 24V driver and a 12V driver will share a prefix but "
+                "are not substitutes. A 100m roll and a 5m roll of the "
+                "same product probably are. **Check specs before treating "
+                "any row here as a real alternative.**  \n"
+                "For curated, authoritative substitution decisions, see "
+                "the :scroll: Migration history section above, the "
+                ":white_check_mark: CIN7-confirmed alternatives section "
+                "above (if populated), or set up entries via the "
+                "Migrations page / CIN7's Alternative Product attribute.")
             sib_rows = []
             for _, sib in family_sibs.iterrows():
                 sib_sku = str(sib.get("SKU"))
@@ -1469,6 +2438,12 @@ if page == "Overview":
     if not sale_lines.empty and "InvoiceDate" in sale_lines.columns:
         st.divider()
         st.subheader(":calendar: Today & Month-to-date vs prior years")
+        st.caption(
+            "**Today's comparison uses the matching weekday 52 weeks ago** "
+            "(Shopify-style), not the same calendar date — keeps "
+            "weekday-driven sales patterns aligned (Tue vs Tue, not Tue "
+            "vs Sat). MTD comparison uses the same calendar date range "
+            "across years.")
 
         df = sale_lines.copy()
         df["InvoiceDate"] = _to_date(df["InvoiceDate"]).dt.tz_localize(None)
@@ -1483,6 +2458,7 @@ if page == "Overview":
 
         today = pd.Timestamp(datetime.now().date())
         today_only = today.date()
+        today_weekday = today.strftime("%a")  # 'Mon', 'Tue', etc.
 
         # Today
         today_mask = df["InvoiceDate"].dt.date == today_only
@@ -1496,26 +2472,28 @@ if page == "Overview":
         yest_mask = df["InvoiceDate"].dt.date == yesterday.date()
         yest_rev = float(df[yest_mask]["Total"].sum())
 
-        # Same date last year
-        try:
-            same_last = today.replace(year=today.year - 1)
-            same_last_mask = df["InvoiceDate"].dt.date == same_last.date()
-            same_last_rev = float(df[same_last_mask]["Total"].sum())
-        except ValueError:
-            same_last_rev = 0.0
+        # Matching weekday 52 weeks ago (Shopify-style). 364 days = 52 × 7,
+        # so subtracting it gives the same day-of-week one year back.
+        # This avoids the Mon-vs-Sun mismatch you'd get from same-date YoY.
+        match_last = today - pd.Timedelta(days=364)
+        match_last_mask = df["InvoiceDate"].dt.date == match_last.date()
+        match_last_rev = float(df[match_last_mask]["Total"].sum())
 
         tc1, tc2, tc3, tc4 = st.columns(4)
-        tc1.metric(f"Today ({today_only.strftime('%b %d')})",
+        tc1.metric(f"Today ({today_weekday} {today_only.strftime('%b %d')})",
                    _fmt_money(today_rev),
                    delta=f"{today_orders} orders, {int(today_units)} units")
         tc2.metric("Yesterday", _fmt_money(yest_rev))
-        tc3.metric(f"Same day last year",
-                   _fmt_money(same_last_rev))
-        if same_last_rev > 0:
-            yoy_pct = (today_rev - same_last_rev) / same_last_rev * 100
-            tc4.metric("YoY (today)", f"{yoy_pct:+.1f}%")
+        tc3.metric(
+            f"Matching weekday last year ({match_last.strftime('%a %b %d, %Y')})",
+            _fmt_money(match_last_rev),
+            help="Same day-of-week, 52 weeks ago. Subtracts 364 days "
+                 "(52×7) so Tue→Tue, Sat→Sat — NOT calendar date.")
+        if match_last_rev > 0:
+            yoy_pct = (today_rev - match_last_rev) / match_last_rev * 100
+            tc4.metric("YoY (matching weekday)", f"{yoy_pct:+.1f}%")
         else:
-            tc4.metric("YoY (today)", "—")
+            tc4.metric("YoY (matching weekday)", "—")
 
         # Month-to-date: from 1st of current month up to today
         mtd_start = today.replace(day=1)
@@ -3361,6 +4339,711 @@ elif page == "LED Tubes":
             )
 
 
+elif page == "Supplier Pricing":
+    # ===========================================================
+    # SUPPLIER PRICING & PACK RULES
+    # ===========================================================
+    # Curated team-input for:
+    #   - Family-color tier pricing (Reeves SIERRA38/65 style)
+    #   - Setup fees (color change, etc.)
+    #   - Aggregation rule (sum_across_colors vs per_color)
+    #   - Per-SKU pack quantities (e.g., MMA-M155-25A-M = 10/pack)
+    # All explicit team decisions, fully auditable. Drives the
+    # tier-optimisation cues that surface in the Ordering page.
+    st.header(":moneybag: Supplier Pricing & Pack Rules")
+    st.caption(
+        "Curated team-input that drives the engine's reorder math. "
+        "Tier prices, setup fees, family aggregation rules, per-SKU "
+        "pack quantities. All edits are logged to the audit trail.")
+
+    pricing_tab, fees_tab, rules_tab, packs_tab, seed_tab = st.tabs([
+        "📊 Tier Pricing",
+        "💵 Setup Fees",
+        "⚙️ Aggregation Rules",
+        "📦 Pack Quantities",
+        "🌱 Quick Seed",
+    ])
+
+    actor = st.session_state.get("current_user") or "unknown"
+
+    # ===== Tab 1: Tier Pricing =====
+    with pricing_tab:
+        st.subheader("Family-color tier prices")
+        st.caption(
+            "One row per (family, color, supplier, tier qty). "
+            "tier_qty is the MINIMUM qty at which this row's "
+            "unit_price applies. The tier the buyer qualifies for "
+            "depends on the family's aggregation rule (see Rules tab).")
+
+        existing_pricing = db.all_family_color_pricing()
+        if existing_pricing:
+            df_pricing = pd.DataFrame([dict(r) for r in existing_pricing])
+            display_cols = ["family", "color", "supplier", "tier_qty",
+                             "unit_price", "unit", "currency", "set_by",
+                             "set_at"]
+            st.dataframe(
+                df_pricing[display_cols],
+                hide_index=True, width="stretch",
+                column_config={
+                    "tier_qty": st.column_config.NumberColumn(format="%.0f"),
+                    "unit_price": st.column_config.NumberColumn(format="$%.2f"),
+                })
+        else:
+            st.info("No tier pricing rows yet. Add some below or use "
+                    "the Quick Seed tab to load the Reeves SIERRA tiers.")
+
+        with st.expander(":heavy_plus_sign: Add / update tier row"):
+            ac1, ac2, ac3 = st.columns(3)
+            with ac1:
+                p_family = st.text_input("Family",
+                                            value="SIERRA38",
+                                            key="p_fam")
+            with ac2:
+                p_color = st.text_input("Color",
+                                          value="White",
+                                          key="p_col")
+            with ac3:
+                p_supplier = st.text_input("Supplier",
+                                             value="Reeves",
+                                             key="p_sup")
+            ac4, ac5, ac6 = st.columns(3)
+            with ac4:
+                p_tier = st.number_input(
+                    "Tier qty (min)",
+                    min_value=1.0, value=500.0, step=100.0,
+                    key="p_tier")
+            with ac5:
+                p_price = st.number_input(
+                    "Unit price",
+                    min_value=0.0, value=8.00, step=0.01, format="%.4f",
+                    key="p_price")
+            with ac6:
+                p_unit = st.selectbox(
+                    "Unit", options=["ft", "m", "unit", "pcs"],
+                    key="p_unit")
+            p_note = st.text_input("Note (optional)", key="p_note")
+            if st.button(":floppy_disk: Save tier row",
+                          key="p_save", type="primary",
+                          disabled=not (p_family and p_color and p_supplier)):
+                db.set_family_color_pricing(
+                    family=p_family.strip(),
+                    color=p_color.strip(),
+                    supplier=p_supplier.strip(),
+                    tier_qty=float(p_tier),
+                    unit_price=float(p_price),
+                    actor=actor,
+                    unit=p_unit,
+                    note=p_note,
+                )
+                st.success(f"Saved {p_family}/{p_color}/{p_supplier} "
+                            f"@ {p_tier:.0f} = ${p_price:.4f}/{p_unit}")
+                st.rerun()
+
+        if existing_pricing:
+            with st.expander(":wastebasket: Delete a tier row"):
+                opts = [f"{r['family']} / {r['color']} / {r['supplier']} @ {r['tier_qty']:.0f}"
+                         for r in existing_pricing]
+                pick = st.selectbox("Pick row", options=[""] + opts,
+                                      key="p_del_pick")
+                if pick and st.button(":wastebasket: Delete",
+                                       key="p_del_go", type="secondary"):
+                    idx = opts.index(pick)
+                    r = existing_pricing[idx]
+                    db.delete_family_color_pricing(
+                        r["family"], r["color"], r["supplier"],
+                        float(r["tier_qty"]), actor)
+                    st.success(f"Deleted {pick}")
+                    st.rerun()
+
+    # ===== Tab 2: Setup Fees =====
+    with fees_tab:
+        st.subheader("Setup / changeover fees")
+        st.caption(
+            "Fees that fire under specific PO conditions — the "
+            "Reeves $750 color-change fee is the canonical example. "
+            "fee_type='color_change' triggers when a single PO "
+            "contains more than one color (and aggregation rule "
+            "is sum_across_colors).")
+
+        existing_fees = db.all_family_setup_fees()
+        if existing_fees:
+            df_fees = pd.DataFrame([dict(r) for r in existing_fees])
+            st.dataframe(
+                df_fees[["family", "supplier", "fee_type",
+                          "fee_amount", "currency", "description",
+                          "set_by", "set_at"]],
+                hide_index=True, width="stretch",
+                column_config={
+                    "fee_amount": st.column_config.NumberColumn(format="$%.2f"),
+                })
+        else:
+            st.info("No setup fees configured.")
+
+        with st.expander(":heavy_plus_sign: Add / update setup fee"):
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                f_family = st.text_input("Family",
+                                          value="SIERRA38",
+                                          key="f_fam")
+            with fc2:
+                f_supplier = st.text_input("Supplier",
+                                             value="Reeves",
+                                             key="f_sup")
+            with fc3:
+                f_type = st.selectbox(
+                    "Fee type",
+                    options=["color_change", "tooling_change",
+                              "minimum_runtime", "other"],
+                    key="f_type")
+            fc4, fc5 = st.columns(2)
+            with fc4:
+                f_amt = st.number_input(
+                    "Fee amount",
+                    min_value=0.0, value=750.0, step=50.0,
+                    key="f_amt")
+            with fc5:
+                f_desc = st.text_input(
+                    "Description",
+                    value="Color change setup fee",
+                    key="f_desc")
+            if st.button(":floppy_disk: Save fee",
+                          key="f_save", type="primary",
+                          disabled=not (f_family and f_supplier)):
+                db.set_family_setup_fee(
+                    family=f_family.strip(),
+                    supplier=f_supplier.strip(),
+                    fee_type=f_type,
+                    fee_amount=float(f_amt),
+                    actor=actor,
+                    description=f_desc,
+                )
+                st.success(f"Saved {f_family}/{f_supplier}/{f_type} = ${f_amt:.2f}")
+                st.rerun()
+
+    # ===== Tab 3: Aggregation Rules =====
+    with rules_tab:
+        st.subheader("Family aggregation rules & nag thresholds")
+        st.caption(
+            "How tier qualification rolls up for each family. "
+            "**sum_across_colors** = total demand across all colors "
+            "qualifies the tier; cross-color POs incur the color "
+            "change fee. **per_color** = each color metered "
+            "separately; no color change fee.")
+
+        existing_rules = db.all_family_pricing_rules()
+        if existing_rules:
+            df_rules = pd.DataFrame([dict(r) for r in existing_rules])
+            st.dataframe(
+                df_rules[["family", "supplier", "rule",
+                           "nag_threshold_savings", "nag_threshold_pct",
+                           "auto_pad_threshold_savings",
+                           "set_by", "set_at"]],
+                hide_index=True, width="stretch",
+                column_config={
+                    "nag_threshold_savings": st.column_config.NumberColumn(format="$%.0f"),
+                    "auto_pad_threshold_savings": st.column_config.NumberColumn(format="$%.0f"),
+                    "nag_threshold_pct": st.column_config.NumberColumn(format="%.0f%%"),
+                })
+        else:
+            st.info("No aggregation rules configured. Defaults to "
+                    "**per_color** if not set explicitly.")
+
+        with st.expander(":heavy_plus_sign: Add / update rule"):
+            rc1, rc2, rc3 = st.columns(3)
+            with rc1:
+                r_family = st.text_input("Family",
+                                          value="SIERRA38",
+                                          key="r_fam")
+            with rc2:
+                r_supplier = st.text_input("Supplier",
+                                             value="Reeves",
+                                             key="r_sup")
+            with rc3:
+                r_rule = st.selectbox(
+                    "Aggregation rule",
+                    options=["sum_across_colors", "per_color"],
+                    key="r_rule")
+            rc4, rc5, rc6 = st.columns(3)
+            with rc4:
+                r_nag_sav = st.number_input(
+                    "Nag if savings >",
+                    min_value=0.0, value=200.0, step=50.0,
+                    help="Buyer gets nudged when next-tier savings "
+                         "exceed this amount.", key="r_nag_sav")
+            with rc5:
+                r_nag_pct = st.number_input(
+                    "Or within % of tier-gap",
+                    min_value=0.0, max_value=100.0, value=25.0, step=5.0,
+                    help="Nudge when current qty is within this % of "
+                         "the gap to next tier.", key="r_nag_pct")
+            with rc6:
+                r_auto_pad = st.number_input(
+                    "Auto-pad if savings > (0 = ask)",
+                    min_value=0.0, value=0.0, step=100.0,
+                    key="r_auto_pad")
+            if st.button(":floppy_disk: Save rule",
+                          key="r_save", type="primary",
+                          disabled=not (r_family and r_supplier)):
+                db.set_family_pricing_rule(
+                    family=r_family.strip(),
+                    supplier=r_supplier.strip(),
+                    rule=r_rule,
+                    actor=actor,
+                    nag_threshold_savings=float(r_nag_sav),
+                    nag_threshold_pct=float(r_nag_pct),
+                    auto_pad_threshold_savings=(float(r_auto_pad)
+                                                 if r_auto_pad > 0
+                                                 else None),
+                )
+                st.success(f"Saved {r_family}/{r_supplier} rule = {r_rule}")
+                st.rerun()
+
+    # ===== Tab 4: Pack Quantities =====
+    with packs_tab:
+        st.subheader("Per-SKU pack quantities")
+        st.caption(
+            "When a SKU comes in fixed pack sizes (e.g., MMA-M155-"
+            "25A-M is sold in packs of 10), the engine rounds reorder "
+            "qty UP to the nearest multiple. MOQ override is optional "
+            "— useful when this SKU's MOQ differs from the supplier "
+            "default in supplier_config.")
+
+        existing_packs = db.all_sku_pack()
+        if existing_packs:
+            df_packs = pd.DataFrame([dict(r) for r in existing_packs])
+            # Decorate with product names if available
+            if not products.empty:
+                names = dict(zip(products["SKU"].astype(str),
+                                  products["Name"].astype(str)))
+                df_packs["Name"] = df_packs["sku"].map(names).fillna("")
+            st.dataframe(df_packs, hide_index=True, width="stretch",
+                          column_config={
+                              "pack_qty": st.column_config.NumberColumn(format="%g"),
+                              "moq": st.column_config.NumberColumn(format="%g"),
+                          })
+        else:
+            st.info("No pack quantities configured.")
+
+        with st.expander(":heavy_plus_sign: Add / update pack qty"):
+            sk_options = (sorted(set(products["SKU"].astype(str)))
+                           if not products.empty else [])
+            pq1, pq2, pq3 = st.columns([3, 1, 1])
+            with pq1:
+                pq_sku = st.selectbox(
+                    "SKU", options=[""] + sk_options,
+                    key="pq_sku")
+            with pq2:
+                pq_pack = st.number_input(
+                    "Pack qty",
+                    min_value=0.0, value=10.0, step=1.0,
+                    key="pq_pack")
+            with pq3:
+                pq_moq = st.number_input(
+                    "MOQ override (0=none)",
+                    min_value=0.0, value=0.0, step=1.0,
+                    key="pq_moq")
+            pq_note = st.text_input("Note", key="pq_note")
+            if st.button(":floppy_disk: Save pack",
+                          key="pq_save", type="primary",
+                          disabled=not pq_sku):
+                db.set_sku_pack(
+                    sku=pq_sku,
+                    pack_qty=float(pq_pack),
+                    actor=actor,
+                    moq=(float(pq_moq) if pq_moq > 0 else None),
+                    note=pq_note,
+                )
+                st.success(f"Saved {pq_sku}: pack of {pq_pack:g}")
+                st.rerun()
+
+        if existing_packs:
+            with st.expander(":wastebasket: Clear pack qty"):
+                pick = st.selectbox(
+                    "Pick SKU",
+                    options=[""] + [r["sku"] for r in existing_packs],
+                    key="pq_del")
+                if pick and st.button(":wastebasket: Clear",
+                                       key="pq_del_go"):
+                    db.clear_sku_pack(pick, actor)
+                    st.success(f"Cleared {pick}")
+                    st.rerun()
+
+    # ===== Tab 5: Quick Seed =====
+    with seed_tab:
+        st.subheader("Seed Reeves SIERRA tiers from supplier quotes")
+        st.caption(
+            "One-click load of the Reeves SIERRA38/SIERRA65 White/Black "
+            "tier prices from the work-instruction quotes "
+            "(WI LED-SIERRA38 030626, WI LED-SIERRA65 042125). "
+            "Will overwrite any existing rows for these family-color-tier "
+            "combinations. Setup fee, aggregation rule, and color "
+            "change setup fee are also configured.")
+
+        seed_data = [
+            # (family, color, tier_qty, unit_price)
+            ("SIERRA38", "White", 500, 8.00),
+            ("SIERRA38", "White", 1000, 5.02),
+            ("SIERRA38", "White", 2500, 3.22),
+            ("SIERRA38", "White", 5000, 2.47),
+            ("SIERRA38", "Black", 500, 9.67),
+            ("SIERRA38", "Black", 1000, 5.83),
+            ("SIERRA38", "Black", 2500, 3.76),
+            ("SIERRA38", "Black", 5000, 2.96),
+            ("SIERRA65", "White", 500, 10.60),
+            ("SIERRA65", "White", 1000, 7.41),
+            ("SIERRA65", "White", 2500, 5.50),
+            ("SIERRA65", "White", 5000, 4.42),
+            ("SIERRA65", "Black", 500, 12.12),
+            ("SIERRA65", "Black", 1000, 8.01),
+            ("SIERRA65", "Black", 2500, 5.72),
+            ("SIERRA65", "Black", 5000, 4.75),
+        ]
+        st.dataframe(
+            pd.DataFrame(
+                seed_data,
+                columns=["Family", "Color", "Tier (ft)", "Unit price ($/ft)"],
+            ),
+            hide_index=True, width="stretch")
+
+        if st.button(":seedling: Seed Reeves SIERRA tiers + rules",
+                      type="primary", key="seed_go"):
+            for family, color, tier, price in seed_data:
+                db.set_family_color_pricing(
+                    family=family, color=color, supplier="Reeves Extruded Products, Inc",
+                    tier_qty=float(tier), unit_price=float(price),
+                    actor=actor, unit="ft",
+                    note="seeded from supplier quote PDFs",
+                )
+            # Setup fee ($750 color change) for each family
+            for family in ("SIERRA38", "SIERRA65"):
+                db.set_family_setup_fee(
+                    family=family, supplier="Reeves Extruded Products, Inc",
+                    fee_type="color_change",
+                    fee_amount=750.0, actor=actor,
+                    description="$750 color change fee per quote sheet",
+                )
+                # Aggregation rule: sum_across_colors per user spec
+                db.set_family_pricing_rule(
+                    family=family, supplier="Reeves Extruded Products, Inc",
+                    rule="sum_across_colors", actor=actor,
+                    nag_threshold_savings=200.0,
+                    nag_threshold_pct=25.0,
+                    note="Reeves: total footage qualifies tier; "
+                         "color change fee for cross-color PO",
+                )
+            st.success(
+                f"Seeded {len(seed_data)} tier rows + 2 setup fees + "
+                f"2 aggregation rules. Switch to Tier Pricing tab "
+                f"to verify.")
+            st.rerun()
+
+
+elif page == "Migrations":
+    # ============================================================
+    # MIGRATIONS REGISTRY — central management for retiring/successor
+    # SKU mappings.
+    # ============================================================
+    # Predecessor (retiring) → successor mappings live in db.sku_migrations.
+    # Sources today:
+    #   - Manual entries (set via Section 7 redirect or this page's form)
+    #   - IP-imported (from `ip_import_migrations.py`, source string starts
+    #     with "ip-import")
+    #   - Auto-tube-rule (set by the LED Tubes page when it auto-proposes
+    #     SMOKIES → SIERRA family successors)
+    # All paths lead through db.set_migration() so audit/log is consistent.
+    st.header(":scroll: Migrations registry")
+    st.caption(
+        "Predecessor → successor mappings. The reorder engine uses these "
+        "to roll a retiring SKU's historical sales into its successor's "
+        "demand forecast — so the new SKU is reordered for the WHOLE "
+        "lineage's demand, not just its own ramp-up.")
+
+    all_migs_rows = db.all_migrations()
+    all_migs = [dict(r) for r in all_migs_rows]
+    if not all_migs:
+        st.info(
+            "No migrations recorded yet. Use the **+ Add migration** form "
+            "below or run `ip_import_migrations.py --apply` to import "
+            "from Inventory Planner.")
+    # ---- Summary stats -----------------------------------------------
+    by_source: dict = {}
+    for m in all_migs:
+        src = (m.get("set_by") or "unknown").split(":")[0]
+        by_source[src] = by_source.get(src, 0) + 1
+
+    # Build SKU-keyed velocity + stock lookups so we can decorate each row
+    sl_dt = sale_lines.copy()
+    sl_dt["InvoiceDate"] = pd.to_datetime(
+        sl_dt["InvoiceDate"], errors="coerce")
+    sl_dt["Quantity"] = pd.to_numeric(
+        sl_dt["Quantity"], errors="coerce").fillna(0)
+    today = pd.Timestamp(datetime.now().date())
+    cutoff_365 = today - pd.Timedelta(days=365)
+
+    units_12mo_by_sku = (
+        sl_dt[sl_dt["InvoiceDate"] >= cutoff_365]
+        .groupby("SKU")["Quantity"].sum().to_dict()
+    )
+    onhand_by_sku = {}
+    if not stock.empty and "SKU" in stock.columns and "OnHand" in stock.columns:
+        onhand_by_sku = (
+            pd.to_numeric(stock["OnHand"], errors="coerce")
+            .groupby(stock["SKU"]).sum().to_dict()
+        )
+    name_by_sku = {}
+    if not products.empty and "SKU" in products.columns:
+        name_by_sku = dict(zip(
+            products["SKU"].astype(str),
+            products["Name"].astype(str) if "Name" in products.columns
+            else [""] * len(products)
+        ))
+
+    # Count predecessors with residual stock
+    n_with_stock = sum(
+        1 for m in all_migs
+        if float(onhand_by_sku.get(str(m.get("retiring_sku")), 0) or 0) > 0
+    )
+    n_with_sales = sum(
+        1 for m in all_migs
+        if float(units_12mo_by_sku.get(str(m.get("retiring_sku")), 0) or 0) > 0
+    )
+
+    cols = st.columns(4)
+    cols[0].metric("Total migrations", len(all_migs))
+    cols[1].metric("Sources",
+                    " · ".join(f"{k}={v}" for k, v in
+                                sorted(by_source.items())) or "—")
+    cols[2].metric("Predecessors w/ residual stock", n_with_stock)
+    cols[3].metric("Predecessors w/ 12mo sales", n_with_sales)
+
+    st.divider()
+
+    # ---- + Add migration form ----------------------------------------
+    with st.expander(":heavy_plus_sign: Add new migration", expanded=False):
+        st.caption(
+            "Map a retiring SKU to its successor. The retiring SKU's "
+            "12mo sales × Share % roll into the successor's demand.")
+        sku_options = sorted(set(products["SKU"].astype(str))) if not products.empty else []
+        c1, c2 = st.columns(2)
+        with c1:
+            new_retiring = st.selectbox(
+                "Retiring (predecessor) SKU",
+                options=[""] + sku_options,
+                key="mig_new_ret",
+                help="The SKU being phased out / replaced.")
+        with c2:
+            new_successor = st.selectbox(
+                "Successor (active) SKU",
+                options=[""] + sku_options,
+                key="mig_new_succ",
+                help="The SKU that absorbs the retiring SKU's demand.")
+        c3, c4 = st.columns([1, 3])
+        with c3:
+            new_share = st.number_input(
+                "Share %", min_value=1.0, max_value=100.0, value=100.0,
+                step=5.0, key="mig_new_share",
+                help="Percentage of retiring SKU's sales that roll into "
+                     "the successor. 100 = full migration.")
+        with c4:
+            new_note = st.text_input(
+                "Note (optional)",
+                key="mig_new_note",
+                placeholder="Why this migration? Any caveats?")
+        save_disabled = (not new_retiring or not new_successor
+                          or new_retiring == new_successor)
+        if st.button(":floppy_disk: Save migration",
+                      key="mig_new_save",
+                      disabled=save_disabled,
+                      type="primary"):
+            actor = st.session_state.get("current_user") or "unknown"
+            db.set_migration(
+                retiring_sku=new_retiring,
+                successor_sku=new_successor,
+                actor=actor,
+                share_pct=float(new_share),
+                note=new_note,
+            )
+            st.success(
+                f"Saved: **{new_retiring}** → **{new_successor}** "
+                f"@ {new_share:.0f}%")
+            st.rerun()
+
+    # ---- Suggested predecessors from IP notes parser -----------------
+    # Surface SKU references found in IP notes that AREN'T yet recorded
+    # as migrations — likely candidates the team wrote down but never
+    # formalised. Two-tier: REPLACEMENT-intent (high confidence), other
+    # references (lower).
+    if IP_NOTES:
+        existing_retiring = {str(m.get("retiring_sku") or "")
+                              for m in all_migs}
+        suggested_high = []  # REPLACEMENT-intent
+        suggested_low = []   # other intents / no intent
+        for sku_with_note, note_entries in IP_NOTES.items():
+            for ne in note_entries:
+                note_text = ne.get("text") or ""
+                parsed = _parse_note_for_skus(
+                    note_text, products, self_sku=str(sku_with_note))
+                for p in parsed:
+                    intent = p.get("intent") or ""
+                    is_replacement = (
+                        "replac" in intent.lower() or "🔁" in intent)
+                    for cand_sku in p["matches"][:1]:  # top match
+                        if cand_sku == sku_with_note:
+                            continue
+                        # If cand_sku already mapped as retiring, skip
+                        if cand_sku in existing_retiring:
+                            continue
+                        record = {
+                            "Suggested predecessor": cand_sku,
+                            "Successor": sku_with_note,
+                            "Note": note_text[:80],
+                            "Intent": intent or "—",
+                            "Token matched": p["token"],
+                        }
+                        if is_replacement:
+                            suggested_high.append(record)
+                        else:
+                            suggested_low.append(record)
+        if suggested_high:
+            st.markdown(
+                f"#### :bulb: Suggested predecessors from IP notes "
+                f"({len(suggested_high)} high-confidence)")
+            st.caption(
+                "These are SKU references found in your team's IP notes "
+                "with REPLACEMENT-style intent words. Review and add "
+                "them as migrations to feed their sales into the "
+                "successor's forecast.")
+            st.dataframe(
+                pd.DataFrame(suggested_high),
+                hide_index=True, width="stretch",
+            )
+        if suggested_low:
+            with st.expander(
+                    f":mag: Other SKU references in notes "
+                    f"({len(suggested_low)} lower confidence)"):
+                st.dataframe(
+                    pd.DataFrame(suggested_low),
+                    hide_index=True, width="stretch",
+                )
+
+    # ---- Master table -----------------------------------------------
+    if all_migs:
+        st.markdown(f"#### :scroll: All {len(all_migs)} migrations")
+        rows = []
+        for m in all_migs:
+            ret = str(m.get("retiring_sku") or "")
+            succ = str(m.get("successor_sku") or "")
+            rows.append({
+                "Predecessor": ret,
+                "Predecessor name": (name_by_sku.get(ret) or "")[:50],
+                "Successor": succ,
+                "Successor name": (name_by_sku.get(succ) or "")[:50],
+                "Share %": f"{float(m.get('share_pct') or 0):.0f}",
+                "Source": m.get("set_by") or "—",
+                "Set on": str(m.get("set_at") or "—")[:19],
+                "Pred 12mo units": int(units_12mo_by_sku.get(ret, 0) or 0),
+                "Pred OnHand": f"{onhand_by_sku.get(ret, 0):.0f}"
+                                if onhand_by_sku.get(ret, 0) else "—",
+                "Note": (m.get("note") or "")[:60],
+            })
+        df_migs = pd.DataFrame(rows)
+        # Filter
+        f1, f2, f3 = st.columns([2, 1, 1])
+        with f1:
+            search = st.text_input(
+                "Filter by SKU / name (substring)",
+                key="mig_search").strip().lower()
+        with f2:
+            source_filter = st.selectbox(
+                "Source",
+                options=["(all)"] + sorted(by_source.keys()),
+                key="mig_source_filter")
+        with f3:
+            stock_filter = st.selectbox(
+                "Has residual stock",
+                options=["(any)", "Yes", "No"],
+                key="mig_stock_filter")
+        # Apply filters
+        df_view = df_migs.copy()
+        if search:
+            mask = (
+                df_view["Predecessor"].str.lower().str.contains(search, na=False)
+                | df_view["Successor"].str.lower().str.contains(search, na=False)
+                | df_view["Predecessor name"].str.lower().str.contains(search, na=False)
+                | df_view["Successor name"].str.lower().str.contains(search, na=False)
+            )
+            df_view = df_view[mask]
+        if source_filter != "(all)":
+            df_view = df_view[df_view["Source"] == source_filter]
+        if stock_filter == "Yes":
+            df_view = df_view[df_view["Pred OnHand"] != "—"]
+        elif stock_filter == "No":
+            df_view = df_view[df_view["Pred OnHand"] == "—"]
+        st.caption(
+            f"Showing {len(df_view)} of {len(df_migs)} migrations.")
+        st.dataframe(df_view, hide_index=True, width="stretch")
+
+        # ---- Edit / clear single migration --------------------------
+        st.divider()
+        st.markdown("##### :pencil2: Edit or clear an existing migration")
+        edit_choice = st.selectbox(
+            "Pick a predecessor SKU to edit / clear",
+            options=[""] + [r["Predecessor"] for r in rows],
+            key="mig_edit_pick")
+        if edit_choice:
+            existing = next(
+                (m for m in all_migs
+                 if str(m.get("retiring_sku")) == edit_choice), None)
+            if existing:
+                e1, e2, e3 = st.columns([2, 1, 1])
+                with e1:
+                    edit_succ = st.selectbox(
+                        "Successor",
+                        options=sku_options,
+                        index=(sku_options.index(
+                            str(existing.get("successor_sku")))
+                               if str(existing.get("successor_sku"))
+                               in sku_options else 0),
+                        key="mig_edit_succ")
+                with e2:
+                    edit_share = st.number_input(
+                        "Share %", min_value=1.0, max_value=100.0,
+                        value=float(existing.get("share_pct") or 100),
+                        step=5.0, key="mig_edit_share")
+                with e3:
+                    st.write("")
+                    st.write("")
+                    if st.button(":wastebasket: Clear",
+                                  key="mig_edit_clear",
+                                  help="Remove this migration."):
+                        actor = (st.session_state.get("current_user")
+                                  or "unknown")
+                        if hasattr(db, "clear_migration"):
+                            db.clear_migration(edit_choice, actor)
+                        st.success(f"Cleared: {edit_choice}")
+                        st.rerun()
+                edit_note = st.text_input(
+                    "Note",
+                    value=str(existing.get("note") or ""),
+                    key="mig_edit_note")
+                if st.button(":floppy_disk: Save changes",
+                              key="mig_edit_save",
+                              type="primary"):
+                    actor = (st.session_state.get("current_user")
+                              or "unknown")
+                    db.set_migration(
+                        retiring_sku=edit_choice,
+                        successor_sku=edit_succ,
+                        actor=actor,
+                        share_pct=float(edit_share),
+                        note=edit_note,
+                    )
+                    st.success(
+                        f"Updated: {edit_choice} → {edit_succ} "
+                        f"@ {edit_share:.0f}%")
+                    st.rerun()
+
+
 elif page == "Stock Explorer":
     st.header(":package: Stock Explorer")
 
@@ -3829,7 +5512,15 @@ engine shows every input and how it got to the suggestion.
         st.stop()
 
     # --- Build the full ABC engine DataFrame ---------------------------
-    @st.cache_data(ttl=300, show_spinner="Computing ABC engine…")
+    # persist="disk" pickles the result into .streamlit/cache/ so it
+    # survives Streamlit restarts. The cache only invalidates when the
+    # function source OR its inputs change — so editing UI code
+    # elsewhere in app.py no longer triggers a recompute. Cuts dev
+    # iteration time by ~80%. ttl extended from 5min to 1h since the
+    # underlying data only refreshes via the daily sync.
+    @st.cache_data(
+        persist="disk",
+        show_spinner="Computing ABC engine…")
     def _abc_engine(products: pd.DataFrame,
                     stock: pd.DataFrame,
                     sale_lines: pd.DataFrame,
@@ -4232,6 +5923,11 @@ engine shows every input and how it got to the suggestion.
         migration_inflow: dict = {s: 0.0 for s in df["SKU"]}
         migration_outflow: dict = {s: 0.0 for s in df["SKU"]}  # retiring SKUs
 
+        # Track which retiring SKUs we've already credited so we don't
+        # double-count if a SKU is both a tube AND has an IP-imported
+        # migration record.
+        handled_retiring: set = set()
+
         if not tube_df.empty:
             # For every retiring tube SKU that has sales, compute share and
             # add to the successor's inflow.
@@ -4261,6 +5957,45 @@ engine shows every input and how it got to the suggestion.
                 # Retiring SKU shrinks by that share
                 if retiring_sku in migration_outflow:
                     migration_outflow[retiring_sku] += migrated_units
+
+                handled_retiring.add(retiring_sku)
+
+        # === Generalised migration application (non-tube) =================
+        # Applies ANY db.set_migration() entry — not just tube-family
+        # ones. This is what makes the 71 IP-imported migrations
+        # (LED-XRD, LED-V3000, LED-AL-SL7, LEDEXTA42, etc.) actually
+        # affect successor reorder math.
+        #
+        # Same math as the tube loop: retiring SKU's 12mo units × share
+        # → added to successor's inflow, subtracted from retiring's
+        # outflow. Skips entries already handled by the tube loop above
+        # to avoid double-counting.
+        for retiring_sku, saved in saved_migrations.items():
+            if retiring_sku in handled_retiring:
+                continue
+            successor = saved.get("successor_sku")
+            if not successor or successor not in migration_inflow:
+                # Successor SKU isn't in the engine's product set —
+                # could be discontinued itself or filtered out. Skip
+                # gracefully.
+                continue
+            share = float(saved.get("share_pct", 100.0)) / 100.0
+            if share <= 0:
+                continue
+            units_match = vel.loc[vel["SKU"] == retiring_sku, "units_12mo"]
+            if units_match.empty:
+                continue
+            units_here = float(units_match.sum())
+            if units_here == 0:
+                continue
+            migrated_units = units_here * share
+
+            migration_inflow[successor] += migrated_units
+            migration_notes.setdefault(successor, []).append(
+                f"{retiring_sku}: +{migrated_units:.0f} units")
+            if retiring_sku in migration_outflow:
+                migration_outflow[retiring_sku] += migrated_units
+            handled_retiring.add(retiring_sku)
 
         df["migrated_in"] = df["SKU"].apply(
             lambda s: float(migration_inflow.get(s, 0))).fillna(0)
@@ -4473,17 +6208,26 @@ engine shows every input and how it got to the suggestion.
             own_units = float(vel.loc[vel["SKU"] == sku, "units_12mo"].sum())
             own_units_90d = float(
                 vel.loc[vel["SKU"] == sku, "units_90d"].sum())
-            # Apply migration share if retiring
-            fam = None
-            if not tube_df.empty:
-                tr = tube_df[tube_df["SKU"] == sku]
-                if not tr.empty:
-                    fam = tr.iloc[0]["Family"]
-            if fam and fam in family_migration_rules:
-                saved = saved_migrations.get(sku, {})
-                share = float(saved.get("share_pct", 100.0)) / 100.0
-                own_units *= share
-                own_units_90d *= share
+            # Migration-aware adjustment to own_units before rolling up:
+            #   migration_in : this SKU is a SUCCESSOR — receives demand
+            #                  from retired predecessors. Critical for
+            #                  successor MP variants (e.g. SIERRA38-W-MP-2
+            #                  inheriting from SMOKIES/CASCADE-W-MP-2),
+            #                  otherwise the inherited demand is added to
+            #                  migration_in then immediately zeroed when
+            #                  the MP variant is treated as non-master in
+            #                  _effective_units, never reaching the bare
+            #                  tube via tube_rollup_in.
+            #   migration_out: this SKU is RETIRING — its demand has been
+            #                  redirected to its successor. Replaces the
+            #                  prior buggy "own_units *= share" branch
+            #                  (which multiplied instead of subtracting).
+            # 90d intentionally skips migration: long-term successor
+            # signals shouldn't distort recent-activity dormancy detection.
+            own_units = max(0.0,
+                             own_units
+                             + float(migration_inflow.get(sku, 0))
+                             - float(migration_outflow.get(sku, 0)))
             if own_units == 0 and own_units_90d == 0:
                 continue
             # Roll up to EACH master independently
@@ -4773,6 +6517,36 @@ engine shows every input and how it got to the suggestion.
                 b24 = 23 - int(months_ago)
                 monthly_24[sku_r][b24] += q
 
+        # --- Migration rollup of monthly buckets ---------------------------
+        # For every migration record (retiring → successor), add the
+        # retiring SKU's 12mo / 24mo monthly buckets × share_pct to the
+        # successor's buckets. Without this, "Last 6 months" and "12mo
+        # trend" columns on a successor (e.g. LED-SIERRA38-W-MP-2390)
+        # show only its OWN sales (post-migration), invisible to the
+        # historical demand from CASCADE/SMOKIES MP variants that the
+        # engine actually counts. After this step, sparklines and
+        # last-6-month numbers reflect the FULL lineage.
+        # Runs BEFORE the BOM rollup below so successor-MP variants
+        # propagate their inflated buckets up to the bare tube via BOM.
+        try:
+            _all_migs_buckets = [dict(m) for m in db.all_migrations()]
+        except Exception:
+            _all_migs_buckets = []
+        for _m in _all_migs_buckets:
+            _ret = str(_m.get("retiring_sku") or "")
+            _succ = str(_m.get("successor_sku") or "")
+            if not _ret or not _succ:
+                continue
+            _share = float(_m.get("share_pct") or 100) / 100.0
+            if _share <= 0:
+                continue
+            if _ret in monthly_12:
+                for i in range(12):
+                    monthly_12[_succ][i] += monthly_12[_ret][i] * _share
+            if _ret in monthly_24:
+                for i in range(24):
+                    monthly_24[_succ][i] += monthly_24[_ret][i] * _share
+
         # --- Roll up children's monthly buckets onto master SKUs -----------
         # Without this, "Last 6 months" and "12mo trend" sparkline columns
         # show ONLY direct master sales — and for cut-source masters
@@ -4782,6 +6556,10 @@ engine shows every input and how it got to the suggestion.
         # monthly bucket, so the master's trend reflects family-wide
         # demand expressed in master-roll equivalents (matches the
         # demand-breakdown chart's normalisation).
+        # NB: combined with the migration rollup above, children that
+        # are successors will already have their predecessor history
+        # baked in — so the BOM rollup carries that all the way to the
+        # bare tube master.
         for master_sku, ch_list in BOM_CHILDREN.items():
             for ch in ch_list:
                 ch_sku = ch.get("AssemblySKU")
@@ -4797,6 +6575,181 @@ engine shows every input and how it got to the suggestion.
                     for i in range(24):
                         monthly_24[master_sku][i] += (
                             monthly_24[ch_sku][i] * ratio)
+
+        # --- Migration + BOM rollup of 45d / prior-45d / 90d units ---------
+        # Same pattern as the monthly buckets above, but for the
+        # short-window aggregates the buyer sees in the Ordering grid:
+        # `45d units`, `momentum` (45d / prior-45d), `customers_45d`,
+        # `90d units`. Without rolling these up, a successor bare tube
+        # shows 0 in those columns even when its MP-variant children
+        # (and their predecessors) sold real volume in the last 45 days.
+        u45_dict = dict(zip(
+            df["SKU"].astype(str),
+            pd.to_numeric(df["units_45d"], errors="coerce").fillna(0)))
+        uprior_dict = dict(zip(
+            df["SKU"].astype(str),
+            pd.to_numeric(df["units_prior_45d"], errors="coerce").fillna(0)))
+        u90_dict = dict(zip(
+            df["SKU"].astype(str),
+            pd.to_numeric(df["units_90d"], errors="coerce").fillna(0)))
+
+        # Migration rollup — same logic as for monthly buckets.
+        # 90d intentionally skips migration to keep dormancy detection
+        # focused on RECENT activity (predecessors are by definition
+        # not active anymore).
+        for _m in _all_migs_buckets:
+            _ret = str(_m.get("retiring_sku") or "")
+            _succ = str(_m.get("successor_sku") or "")
+            if not _ret or not _succ:
+                continue
+            _share = float(_m.get("share_pct") or 100) / 100.0
+            if _share <= 0:
+                continue
+            if _ret in u45_dict:
+                u45_dict[_succ] = u45_dict.get(_succ, 0) + u45_dict[_ret] * _share
+            if _ret in uprior_dict:
+                uprior_dict[_succ] = uprior_dict.get(_succ, 0) + uprior_dict[_ret] * _share
+
+        # BOM rollup — child × ratio added to master.
+        for master_sku, ch_list in BOM_CHILDREN.items():
+            for ch in ch_list:
+                ch_sku = ch.get("AssemblySKU")
+                ratio = float(ch.get("Quantity") or 0)
+                if not ch_sku or ratio <= 0:
+                    continue
+                if ch_sku in u45_dict:
+                    u45_dict[master_sku] = u45_dict.get(master_sku, 0) + u45_dict[ch_sku] * ratio
+                if ch_sku in uprior_dict:
+                    uprior_dict[master_sku] = uprior_dict.get(master_sku, 0) + uprior_dict[ch_sku] * ratio
+                if ch_sku in u90_dict:
+                    u90_dict[master_sku] = u90_dict.get(master_sku, 0) + u90_dict[ch_sku] * ratio
+
+        # Write back. Replace the raw values so the Ordering grid columns
+        # (`units_45d`, `momentum`, `units_90d`) reflect the full lineage
+        # consistent with `effective_units_12mo`.
+        df["units_45d"] = df["SKU"].astype(str).map(u45_dict).fillna(0)
+        df["units_prior_45d"] = df["SKU"].astype(str).map(uprior_dict).fillna(0)
+        df["units_90d"] = df["SKU"].astype(str).map(u90_dict).fillna(0)
+        # Recompute momentum from the rolled-up values.
+        df["momentum"] = df.apply(
+            lambda r: (float(r["units_45d"]) / max(float(r["units_prior_45d"]), 1.0)
+                        if float(r["units_prior_45d"]) > 0
+                        else (1.5 if float(r["units_45d"]) > 0 else 1.0)),
+            axis=1)
+
+        # --- Migration + BOM rollup of customer-level metrics ---------------
+        # customers_45d, top_cust_pct, top_2_cust_pct, non_top_avg_units,
+        # top_cust_name, and top_cust_units_12mo are all derived from per-
+        # customer sale-line aggregations. Until now they used ONLY direct
+        # sales of the SKU — leaving 0 customers_45d on bare-tube masters
+        # whose volume actually flows through MP children + predecessors.
+        # This pass rebuilds them from rolled-up customer-qty maps.
+        _cust_qty_45d: dict = {}    # {sku: {customer_id: qty}}
+        _cust_qty_12mo: dict = {}
+        _cust_names: dict = {}      # {sku: {customer_id: customer_name}}
+        for _, _r in sl.iterrows():
+            _s = str(_r.get("SKU") or "")
+            _cid = str(_r.get("CustomerID") or "")
+            if not _s or not _cid:
+                continue
+            _q = float(_r.get("Quantity") or 0)
+            _d = _r.get("InvoiceDate")
+            if pd.isna(_d):
+                continue
+            if _d >= cutoff_12mo if False else _d >= today_ts - pd.Timedelta(days=window_days):
+                _cust_qty_12mo.setdefault(_s, {})
+                _cust_qty_12mo[_s][_cid] = _cust_qty_12mo[_s].get(_cid, 0) + _q
+            if _d >= cutoff_recent:
+                _cust_qty_45d.setdefault(_s, {})
+                _cust_qty_45d[_s][_cid] = _cust_qty_45d[_s].get(_cid, 0) + _q
+            _cn = str(_r.get("Customer") or "")
+            if _cn:
+                _cust_names.setdefault(_s, {})[_cid] = _cn
+
+        # Migration rollup
+        for _m in _all_migs_buckets:
+            _ret = str(_m.get("retiring_sku") or "")
+            _succ = str(_m.get("successor_sku") or "")
+            if not _ret or not _succ:
+                continue
+            _share = float(_m.get("share_pct") or 100) / 100.0
+            if _share <= 0:
+                continue
+            for _src_map in (_cust_qty_45d, _cust_qty_12mo):
+                if _ret in _src_map:
+                    _dest = _src_map.setdefault(_succ, {})
+                    for _cid, _q in _src_map[_ret].items():
+                        _dest[_cid] = _dest.get(_cid, 0) + _q * _share
+            # Carry customer names from predecessor where successor doesn't
+            # already know the name
+            if _ret in _cust_names:
+                _dest_names = _cust_names.setdefault(_succ, {})
+                for _cid, _nm in _cust_names[_ret].items():
+                    _dest_names.setdefault(_cid, _nm)
+
+        # BOM rollup
+        for _master, _ch_list in BOM_CHILDREN.items():
+            for _ch in _ch_list:
+                _ch_sku = _ch.get("AssemblySKU")
+                _ratio = float(_ch.get("Quantity") or 0)
+                if not _ch_sku or _ratio <= 0:
+                    continue
+                for _src_map in (_cust_qty_45d, _cust_qty_12mo):
+                    if _ch_sku in _src_map:
+                        _dest = _src_map.setdefault(_master, {})
+                        for _cid, _q in _src_map[_ch_sku].items():
+                            _dest[_cid] = _dest.get(_cid, 0) + _q * _ratio
+                if _ch_sku in _cust_names:
+                    _dest_names = _cust_names.setdefault(_master, {})
+                    for _cid, _nm in _cust_names[_ch_sku].items():
+                        _dest_names.setdefault(_cid, _nm)
+
+        # Recompute customer-derived columns from the rolled-up maps
+        _new_cust_count: dict = {}
+        _new_top_pct: dict = {}
+        _new_top_2_pct: dict = {}
+        _new_non_top_avg: dict = {}
+        _new_top_name: dict = {}
+        _new_top_12mo: dict = {}
+        for _s in df["SKU"].astype(str):
+            _45 = _cust_qty_45d.get(_s, {})
+            _12 = _cust_qty_12mo.get(_s, {})
+            _names = _cust_names.get(_s, {})
+            if _45:
+                _new_cust_count[_s] = len(_45)
+                _sorted = sorted(_45.items(), key=lambda x: -x[1])
+                _total = sum(_45.values())
+                if _total > 0:
+                    _top_qty = _sorted[0][1]
+                    _top_cid = _sorted[0][0]
+                    _new_top_pct[_s] = _top_qty / _total
+                    if len(_sorted) >= 2:
+                        _new_top_2_pct[_s] = (
+                            _top_qty + _sorted[1][1]) / _total
+                    else:
+                        _new_top_2_pct[_s] = _new_top_pct[_s]
+                    _non_top_qty = _total - _top_qty
+                    _non_top_n = max(len(_sorted) - 1, 0)
+                    _new_non_top_avg[_s] = (
+                        _non_top_qty / _non_top_n
+                        if _non_top_n > 0 else 0.0)
+                    _new_top_name[_s] = _names.get(_top_cid, "")
+                    # Top customer's 12mo total (from 12mo map for SAME cid)
+                    _new_top_12mo[_s] = float(_12.get(_top_cid, 0))
+
+        # Write back — overwrite the raw values with rolled-up versions
+        df["customers_45d"] = (
+            df["SKU"].astype(str).map(_new_cust_count).fillna(0).astype(int))
+        df["top_cust_pct"] = (
+            df["SKU"].astype(str).map(_new_top_pct).fillna(0))
+        df["top_2_cust_pct"] = (
+            df["SKU"].astype(str).map(_new_top_2_pct).fillna(0))
+        df["non_top_avg_units"] = (
+            df["SKU"].astype(str).map(_new_non_top_avg).fillna(0))
+        df["top_cust_name"] = (
+            df["SKU"].astype(str).map(_new_top_name).fillna(""))
+        df["top_cust_units_12mo"] = (
+            df["SKU"].astype(str).map(_new_top_12mo).fillna(0))
 
         df["trend_12m"] = df["SKU"].apply(
             lambda s: list(monthly_12.get(s, [0.0] * 12)))
@@ -5903,6 +7856,237 @@ engine shows every input and how it got to the suggestion.
             ),
         )
 
+    # ------------------------------------------------------------------
+    # PO DRAFT SELECTOR (multi-draft per supplier with lifecycle)
+    # ------------------------------------------------------------------
+    # The buyer picks a working draft (or creates one). Drafts persist
+    # across browser refresh / app restart / multiple users. Pessimistic
+    # locking prevents two buyers from clobbering each other's edits.
+    # See db.py po_drafts + po_draft_lines + helpers.
+    _actor = (st.session_state.get("current_user", "").strip() or "unknown")
+    _drafts_for_supplier = db.list_po_drafts(
+        supplier=sel_sup, include_archived=False)
+    _archived_drafts = db.list_po_drafts(
+        supplier=sel_sup, include_archived=True)
+    _archived_drafts = [d for d in _archived_drafts
+                         if d["status"] in ("finalized", "cancelled")]
+
+    _draft_state_key = f"po_active_draft_{sel_sup}"
+    _active_draft_id = st.session_state.get(_draft_state_key)
+
+    # Build dropdown options
+    _draft_opts: list = ["— Engine baseline (no draft) —"]
+    _draft_opt_to_id: dict = {_draft_opts[0]: None}
+    for d in _drafts_for_supplier:
+        lock_str = ""
+        if d["locked_by"]:
+            if d["locked_by"] == _actor:
+                lock_str = "  🔓 you"
+            else:
+                lock_str = f"  🔒 {d['locked_by']}"
+        status_emoji = {
+            "editing": "📝",
+            "submitted": "📤",
+        }.get(d["status"], "📄")
+        freight_str = (
+            f" [{d['freight_mode']}]" if d["freight_mode"] else "")
+        po_str = (f" → CIN7 PO #{d['cin7_po_number']}"
+                  if d["cin7_po_number"] else "")
+        label = (f"{status_emoji} {d['name']}{freight_str}"
+                 f" ({d['status']}){po_str}{lock_str}")
+        _draft_opts.append(label)
+        _draft_opt_to_id[label] = d["id"]
+
+    _drafts_row = st.container(border=True)
+    with _drafts_row:
+        st.markdown(
+            f"**📋 PO drafts for {sel_sup}** "
+            f"— {len(_drafts_for_supplier)} active"
+            + (f", {len(_archived_drafts)} archived"
+                if _archived_drafts else ""))
+
+        _ds_c1, _ds_c2 = st.columns([3, 2])
+        with _ds_c1:
+            # Determine default index
+            _default_idx = 0
+            if _active_draft_id:
+                for label, did in _draft_opt_to_id.items():
+                    if did == _active_draft_id:
+                        _default_idx = _draft_opts.index(label)
+                        break
+            _picked = st.selectbox(
+                "Active draft (qtys you edit save here)",
+                options=_draft_opts,
+                index=_default_idx,
+                key=f"po_draft_picker_{sel_sup}",
+                help="Pick a draft to load its saved qtys into the "
+                     "editor below. 'Engine baseline' uses engine "
+                     "suggestions only — edits won't be saved unless "
+                     "you create or pick a draft."
+            )
+            _new_active_draft_id = _draft_opt_to_id.get(_picked)
+            if _new_active_draft_id != _active_draft_id:
+                st.session_state[_draft_state_key] = _new_active_draft_id
+                st.rerun()
+            _active_draft_id = _new_active_draft_id
+
+        with _ds_c2:
+            with st.popover("➕ New draft", use_container_width=True):
+                _new_name = st.text_input(
+                    "Name", key=f"new_draft_name_{sel_sup}",
+                    placeholder="e.g. Sea Freight Apr 29")
+                _new_freight = st.selectbox(
+                    "Freight mode",
+                    ["mixed", "sea", "air"],
+                    key=f"new_draft_freight_{sel_sup}")
+                _new_note = st.text_input(
+                    "Note (optional)", key=f"new_draft_note_{sel_sup}")
+                if st.button("Create",
+                              key=f"new_draft_create_{sel_sup}",
+                              type="primary",
+                              disabled=not _new_name.strip()):
+                    new_id = db.create_po_draft(
+                        supplier=sel_sup,
+                        name=_new_name.strip(),
+                        actor=_actor,
+                        freight_mode=_new_freight,
+                        note=_new_note,
+                    )
+                    st.session_state[_draft_state_key] = new_id
+                    st.success(f"Created draft #{new_id}")
+                    st.rerun()
+
+        # If a draft is active, show actions
+        if _active_draft_id:
+            _active = db.get_po_draft(_active_draft_id)
+            if _active is None:
+                st.warning("Selected draft no longer exists. Resetting.")
+                st.session_state[_draft_state_key] = None
+                st.rerun()
+            else:
+                _is_submitted = _active["status"] != "editing"
+                _lock_holder = _active["locked_by"]
+                _i_hold_lock = (_lock_holder == _actor)
+
+                # Status / lock info row
+                _info_cols = st.columns([3, 1, 1, 1])
+                with _info_cols[0]:
+                    _meta = (
+                        f"**{_active['name']}** · status "
+                        f"`{_active['status']}` · "
+                        f"created {_active['created_at']}"
+                    )
+                    if _active["cin7_po_number"]:
+                        _meta += (
+                            f" · CIN7 PO **#{_active['cin7_po_number']}**")
+                    if _is_submitted:
+                        _meta += " 🔒 (read-only here, edit in CIN7)"
+                    elif _lock_holder and not _i_hold_lock:
+                        _meta += (
+                            f" · 🔒 locked by **{_lock_holder}** since "
+                            f"{_active['locked_at']} (read-only for you)")
+                    elif _i_hold_lock:
+                        _meta += " · 🔓 you have the lock"
+                    else:
+                        _meta += " · ⚠ unlocked — click 'Take lock' to edit"
+                    st.markdown(_meta)
+
+                with _info_cols[1]:
+                    if not _is_submitted and not _i_hold_lock:
+                        if st.button(
+                                "🔑 Take lock",
+                                key=f"take_lock_{_active_draft_id}",
+                                use_container_width=True,
+                                help=("Acquire the editing lock. Fails "
+                                       "if another user is actively "
+                                       "editing (their lock is fresh "
+                                       "<30 min).")):
+                            ok = db.lock_po_draft(_active_draft_id, _actor)
+                            if ok:
+                                st.success("Lock acquired.")
+                                st.rerun()
+                            else:
+                                st.error(
+                                    f"🔒 {_lock_holder} holds the lock "
+                                    f"(active <30 min). Try later or "
+                                    f"force-release.")
+                    elif not _is_submitted and _i_hold_lock:
+                        if st.button(
+                                "🔓 Release lock",
+                                key=f"release_lock_{_active_draft_id}",
+                                use_container_width=True,
+                                help=("Free the lock so other team "
+                                       "members can edit.")):
+                            db.release_po_draft_lock(
+                                _active_draft_id, _actor)
+                            st.success("Lock released.")
+                            st.rerun()
+                with _info_cols[2]:
+                    if not _is_submitted and _i_hold_lock:
+                        with st.popover("📤 Submit",
+                                          use_container_width=True):
+                            st.markdown("**Mark as submitted to CIN7**")
+                            st.caption(
+                                "Records the CIN7 PO number and locks "
+                                "this draft as submitted (no further "
+                                "edits in our app — modify in CIN7 from "
+                                "here). Real CIN7 API push is Phase 2.")
+                            _po_num = st.text_input(
+                                "CIN7 PO number",
+                                key=f"submit_po_num_{_active_draft_id}",
+                                placeholder="e.g. 5023")
+                            _submit_note = st.text_input(
+                                "Note (optional)",
+                                key=f"submit_note_{_active_draft_id}")
+                            if st.button(
+                                    "Confirm submit",
+                                    key=f"confirm_submit_{_active_draft_id}",
+                                    type="primary",
+                                    disabled=not _po_num.strip()):
+                                db.mark_po_draft_submitted(
+                                    _active_draft_id, _actor,
+                                    cin7_po_number=_po_num.strip(),
+                                    note=_submit_note)
+                                st.success(
+                                    f"Marked submitted as PO "
+                                    f"#{_po_num.strip()}")
+                                st.rerun()
+                with _info_cols[3]:
+                    if not _is_submitted and _i_hold_lock:
+                        with st.popover("🗑️ Cancel",
+                                          use_container_width=True):
+                            st.markdown(
+                                "**Cancel this draft?** All saved qty "
+                                "edits will be lost. Cannot be undone.")
+                            _cancel_reason = st.text_input(
+                                "Reason (optional)",
+                                key=f"cancel_reason_{_active_draft_id}")
+                            if st.button(
+                                    "Confirm cancel",
+                                    key=f"confirm_cancel_{_active_draft_id}",
+                                    type="secondary"):
+                                db.cancel_po_draft(
+                                    _active_draft_id, _actor,
+                                    reason=_cancel_reason)
+                                st.session_state[_draft_state_key] = None
+                                st.success("Draft cancelled.")
+                                st.rerun()
+
+    # Convenience flag for downstream code.
+    # NOTE: db.get_po_draft returns a sqlite3.Row, which behaves like a
+    # dict for [] indexing but does NOT support .get(). We fetch once,
+    # convert to dict, and short-circuit if there's no active draft.
+    if _active_draft_id is None:
+        _draft_can_edit = False
+    else:
+        _drow = db.get_po_draft(_active_draft_id)
+        _ddict = dict(_drow) if _drow is not None else {}
+        _draft_can_edit = (
+            _ddict.get("status") not in (
+                "submitted", "finalized", "cancelled")
+            and _ddict.get("locked_by") == _actor
+        )
+
     # Filter & apply ABC filter
     fc1, fc2, fc3 = st.columns(3)
     abc_filter = fc1.multiselect("ABC classes",
@@ -6068,28 +8252,99 @@ engine shows every input and how it got to the suggestion.
     # --- Filtered PO summary strip ---
     st.markdown("---")
     st.markdown(f"**Filtered view** — {len(s_df):,} SKUs after filters:")
-    sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("SKUs shown", len(s_df))
-    sc2.metric("Total reorder units",
-               _fmt_number(int(s_df["reorder_qty"].sum())))
-    est_value = float((s_df["reorder_qty"] * s_df["POCost"]).sum())
-    sc3.metric("Est. PO value", _fmt_money(est_value),
-               help="reorder_qty × FixedCost (CIN7 supplier price). "
-                    "Falls back to AverageCost if no FixedCost is on file.")
-    sc4.metric("Filtered stock value",
-               _fmt_money(float(s_df["OnHandValue"].sum())),
-               help="Stock value of just the SKUs shown after filtering.")
 
-    # MOV warning
+    # Pull MOV from supplier config so we can show it alongside PO value
     cfg = supp_configs.get(sel_sup, {})
     mov_amt = cfg.get("mov_amount") or 0
     mov_ccy = cfg.get("mov_currency") or ""
+    est_value = float((s_df["reorder_qty"] * s_df["POCost"]).sum())
+
+    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+    sc1.metric("SKUs shown", len(s_df))
+    sc2.metric("Total reorder units",
+               _fmt_number(int(s_df["reorder_qty"].sum())))
     if mov_amt and est_value < mov_amt:
+        gap = mov_amt - est_value
+        sc3.metric(
+            "Est. PO value",
+            _fmt_money(est_value),
+            delta=f"-{_fmt_money(gap)} below MOV",
+            delta_color="inverse",
+            help="reorder_qty × FixedCost. Falls back to AverageCost.")
+    elif mov_amt:
+        over = est_value - mov_amt
+        sc3.metric(
+            "Est. PO value",
+            _fmt_money(est_value),
+            delta=f"+{_fmt_money(over)} above MOV",
+            delta_color="normal",
+            help="reorder_qty × FixedCost. Falls back to AverageCost.")
+    else:
+        sc3.metric("Est. PO value", _fmt_money(est_value),
+                   help="reorder_qty × FixedCost. Falls back to AverageCost.")
+
+    if mov_amt:
+        sc4.metric(
+            "MOV target",
+            f"{mov_ccy}{_fmt_money(mov_amt)}",
+            help=f"{sel_sup}'s minimum order value, configured in "
+                 f"Supplier configuration above.")
+    else:
+        sc4.metric(
+            "MOV target", "—",
+            help="No MOV configured for this supplier. Set it in the "
+                 "Supplier configuration expander above.")
+
+    sc5.metric("Filtered stock value",
+               _fmt_money(float(s_df["OnHandValue"].sum())),
+               help="Stock value of just the SKUs shown after filtering.")
+
+    # MOV warning + actionable hint
+    # Suppress the warning if there are pending qty edits in the editor
+    # that already cover the gap — st.session_state holds the live
+    # editor state. Without this check, the buyer sees a "MOV not met"
+    # warning at the top while the live preview below shows MOV +met.
+    _editor_state_key = f"po_editor_ord_{sel_sup}"
+    _live_total_check = est_value
+    _editor_state = st.session_state.get(_editor_state_key)
+    if (mov_amt and _editor_state and "edited_rows" in _editor_state):
+        # Sum live values from the editor's saved edits (rough — assumes
+        # the user only adjusted qty, not POCost). Only used to gate
+        # the top warning.
+        try:
+            _edits = _editor_state.get("edited_rows", {})
+            for _idx, _changes in _edits.items():
+                if "Order qty" in _changes:
+                    _new_q = float(_changes["Order qty"] or 0)
+                    _row_costs = s_df["POCost"].fillna(0).tolist()
+                    if _idx < len(_row_costs):
+                        _orig_q = float(s_df.iloc[_idx].get("reorder_qty", 0) or 0)
+                        _orig_cost = float(_row_costs[_idx])
+                        _live_total_check += (_new_q - _orig_q) * _orig_cost
+        except Exception:
+            pass
+
+    if mov_amt and _live_total_check < mov_amt:
+        gap = mov_amt - _live_total_check
         st.warning(
-            f":warning: **MOV not met** — this PO (${est_value:,.0f}) "
-            f"is below {sel_sup}'s minimum order value of "
-            f"{mov_ccy}${mov_amt:,.0f}. "
-            f"Consider adding more lines or consolidating."
+            f":warning: **{sel_sup} MOV not met** — current PO is "
+            f"{_fmt_money(_live_total_check)} vs minimum "
+            f"{_fmt_money(mov_amt)}. **Need {_fmt_money(gap)} more.** "
+            f"Use the Upcoming reorders expander below to consolidate "
+            f"future-needed SKUs into this PO, or pad qtys on lines "
+            f"approaching their next price tier (see Tier Opportunities)."
+        )
+    elif mov_amt and est_value < mov_amt and _live_total_check >= mov_amt:
+        # Live edits already cover the gap — small confirmation note
+        st.success(
+            f":white_check_mark: **MOV met by your edits** — live PO "
+            f"value is now {_fmt_money(_live_total_check)} vs minimum "
+            f"{_fmt_money(mov_amt)}.")
+    elif not mov_amt:
+        st.caption(
+            f":bulb: No MOV configured for {sel_sup}. To enable "
+            "MOV-gap visibility, expand 'Configure lead times, MOQ/MOV, "
+            "freight per supplier' above and set `mov_amount`."
         )
 
     # Editable PO table
@@ -6584,6 +8839,28 @@ engine shows every input and how it got to the suggestion.
         except (ValueError, TypeError):
             return 0
     _work["Order qty"] = _work.apply(_order_qty_cast, axis=1)
+    # Apply the ACTIVE draft's saved line qtys (v2 multi-draft system).
+    # If no draft is active, the editor uses engine-suggested qtys
+    # only and edits won't persist beyond the session.
+    # Falls back to legacy po_draft_edits for backward compat.
+    _active_draft_lines: dict = {}
+    if _active_draft_id:
+        _active_draft_lines = db.get_po_draft_lines(_active_draft_id)
+    if _active_draft_lines:
+        _work["Order qty"] = _work.apply(
+            lambda r: float(_active_draft_lines.get(
+                str(r.get("SKU") or ""), r["Order qty"])),
+            axis=1)
+    else:
+        # Legacy fallback (v1 po_draft_edits) — only used if no v2
+        # draft is selected. Will be removed once all suppliers
+        # have v2 drafts.
+        _persisted_drafts = db.get_po_draft_edits(sel_sup)
+        if _persisted_drafts and not _active_draft_id:
+            _work["Order qty"] = _work.apply(
+                lambda r: float(_persisted_drafts.get(
+                    str(r.get("SKU") or ""), r["Order qty"])),
+                axis=1)
     _work["Line value"] = (_work["Order qty"] * _work["POCost"]).round(2)
     _work["Include?"] = _work["Order qty"] > 0
     # 🔍 Inspect — tick to open the demand-breakdown expander below the
@@ -7095,6 +9372,75 @@ engine shows every input and how it got to the suggestion.
         column_config=_po_col_cfg,
     )
 
+    # --- LIVE EDIT PREVIEW --------------------------------------------
+    # Streamlit's data_editor doesn't automatically update disabled
+    # cells (like "Line value") when their inputs change. The user edits
+    # "Order qty" but the "Line value" column shows the pre-edit value
+    # until the page rerenders. Compute the live totals here and surface
+    # them in a strip RIGHT below the editor so the buyer sees the
+    # immediate impact of their edits — incl. updated MOV gap.
+    if (not edited.empty
+            and "Order qty" in edited.columns
+            and "POCost" in edited.columns):
+        _ord = pd.to_numeric(
+            edited["Order qty"], errors="coerce").fillna(0)
+        _cost = pd.to_numeric(
+            edited["POCost"], errors="coerce").fillna(0)
+        _live_line_value = _ord * _cost
+        _incl_mask = (
+            edited["Include?"].fillna(False).astype(bool)
+            if "Include?" in edited.columns
+            else pd.Series(True, index=edited.index))
+        _live_units = float(_ord[_incl_mask].sum())
+        _live_total = float(_live_line_value[_incl_mask].sum())
+
+        # Compare to the pre-edit total to surface any change.
+        if "Line value" in editable.columns:
+            _orig_incl = (
+                editable["Include?"].fillna(False).astype(bool)
+                if "Include?" in editable.columns
+                else pd.Series(True, index=editable.index))
+            _orig_total = float(
+                pd.to_numeric(editable.loc[_orig_incl, "Line value"],
+                               errors="coerce").fillna(0).sum())
+        else:
+            _orig_total = 0.0
+        _diff = _live_total - _orig_total
+
+        _live_cols = st.columns(3)
+        _live_cols[0].metric(
+            "Live PO units (after edits)",
+            _fmt_number(int(_live_units)))
+        _live_cols[1].metric(
+            "Live PO value (after edits)",
+            _fmt_money(_live_total),
+            delta=(_fmt_money(_diff)
+                   if abs(_diff) > 0.01 else None),
+            delta_color="normal" if _diff >= 0 else "inverse")
+        if mov_amt:
+            if _live_total < mov_amt:
+                _gap = mov_amt - _live_total
+                _live_cols[2].metric(
+                    "MOV gap (live)",
+                    _fmt_money(-_gap),
+                    delta=f"need {_fmt_money(_gap)} more "
+                          f"to reach {_fmt_money(mov_amt)}",
+                    delta_color="inverse")
+            else:
+                _live_cols[2].metric(
+                    "MOV (live)",
+                    _fmt_money(mov_amt),
+                    delta=f"+{_fmt_money(_live_total - mov_amt)} above",
+                    delta_color="normal")
+        else:
+            _live_cols[2].caption(
+                "💡 Set MOV in supplier config for gap visibility.")
+        st.caption(
+            ":wrench: **Note:** the 'Line value' column inside the "
+            "table doesn't auto-update when you edit 'Order qty' "
+            "(Streamlit limitation for disabled columns). The metrics "
+            "above reflect your edits in real time.")
+
     # --- Drill into demand for any ticked SKU -------------------------
     # The :mag: column in the editor is a one-click toggle. Single-tick
     # behaviour — clicking a new row auto-shows that one's breakdown
@@ -7212,6 +9558,98 @@ engine shows every input and how it got to the suggestion.
             old_note = (latest_notes_map.get(sku_e) or "").strip()
             if new_note and new_note != old_note:
                 _changed_notes.append((sku_e, new_note))
+
+    # --- Persistent qty-edit detection + save/clear UI ---------------
+    # Detect Order qty edits by comparing edited["Order qty"] to the
+    # value we LOADED with (editable["Order qty"], which already has
+    # drafts applied). Edits where qty changed go to po_draft_edits
+    # so they survive across browser refresh / app restart.
+    _qty_edits = []
+    if "Order qty" in edited.columns and "SKU" in edited.columns:
+        # Build {sku: loaded_qty} from editable (the engine baseline +
+        # any previously-saved drafts already applied)
+        _loaded_qtys = {}
+        if "SKU" in editable.columns and "Order qty" in editable.columns:
+            for _, _r in editable.iterrows():
+                _loaded_qtys[str(_r.get("SKU") or "")] = float(
+                    pd.to_numeric(_r.get("Order qty", 0),
+                                    errors="coerce") or 0)
+        for _, _r in edited.iterrows():
+            _sk = str(_r.get("SKU") or "")
+            if not _sk:
+                continue
+            _new_q = float(
+                pd.to_numeric(_r.get("Order qty", 0),
+                                errors="coerce") or 0)
+            _old_q = _loaded_qtys.get(_sk, _new_q)
+            if abs(_new_q - _old_q) > 0.001:
+                _qty_edits.append((_sk, _new_q, _old_q))
+
+    if _qty_edits:
+        _q1, _q2 = st.columns([3, 1])
+        with _q1:
+            if _active_draft_id:
+                if _draft_can_edit:
+                    st.info(
+                        f":memo: **{len(_qty_edits)} pending qty edit"
+                        f"{'s' if len(_qty_edits) != 1 else ''}** in this "
+                        f"session. Click **Save qty drafts** to persist "
+                        f"them to draft #{_active_draft_id}.")
+                else:
+                    # sqlite3.Row → dict so .get() works
+                    _row_now = db.get_po_draft(_active_draft_id)
+                    _active_now = dict(_row_now) if _row_now is not None else {}
+                    if (_active_now.get("locked_by")
+                            and _active_now.get("locked_by") != _actor):
+                        st.warning(
+                            f":lock: Draft is locked by "
+                            f"**{_active_now.get('locked_by')}** — your "
+                            f"qty edits won't be saved. Take the lock "
+                            f"above first, or pick a different draft.")
+                    elif _active_now.get("status") in (
+                            "submitted", "finalized", "cancelled"):
+                        st.warning(
+                            f":lock: Draft is `{_active_now.get('status')}` "
+                            f"— qty edits can't be saved here. Edit in "
+                            f"CIN7, or create a new draft.")
+                    else:
+                        st.warning(
+                            ":warning: No lock held — click **Take lock** "
+                            "above to save qty edits to this draft.")
+            else:
+                st.warning(
+                    ":warning: **No active draft selected.** Your qty "
+                    "edits won't persist. Pick or create a draft above "
+                    "to save them durably.")
+        with _q2:
+            if st.button(
+                    ":floppy_disk: Save qty drafts",
+                    key=f"save_qty_drafts_{sel_sup}",
+                    type="primary",
+                    disabled=(not _qty_edits) or (not _draft_can_edit),
+                    help="Persist Order qty edits to the active draft. "
+                         "Requires the lock on a draft in 'editing' "
+                         "state.",
+                    use_container_width=True):
+                # Re-verify lock right before write to defend against
+                # someone else stealing it between page load and save
+                if not db.lock_po_draft(_active_draft_id, _actor):
+                    st.error(
+                        "Lock was taken by another user since the page "
+                        "loaded. Refresh and try again.")
+                else:
+                    for _sk, _new_q, _old_q in _qty_edits:
+                        db.upsert_po_draft_line(
+                            draft_id=_active_draft_id,
+                            sku=_sk,
+                            edited_qty=_new_q,
+                            actor=_actor,
+                            note=f"baseline was {_old_q:g}")
+                    st.success(
+                        f"Saved {len(_qty_edits)} qty edit"
+                        f"{'s' if len(_qty_edits) != 1 else ''} "
+                        f"to draft #{_active_draft_id}.")
+                    st.rerun()
 
     sec1, sec2 = st.columns([1, 3])
     save_disabled = (not _new_exclusions) and (not _changed_notes) \
@@ -7580,15 +10018,263 @@ engine shows every input and how it got to the suggestion.
     actor_ord = st.session_state.get("current_user", "").strip()
     dpa, dpb, dpc = st.columns([1, 1, 1])
     with dpa:
+        # CIN7 POST requires:
+        #   1. lines to push (po_lines)
+        #   2. an actor (current_user) for audit
+        #   3. an active local draft so we have a po_drafts row to track
+        #      lifecycle and remember the cin7_po_id afterwards
+        #   4. the user must hold the lock on that draft (one writer at a time)
+        # We persist saved-edit qty into po_draft_lines first so the push
+        # uses exactly what's in the DB — not a stale snapshot of the editor.
+        _push_disabled = (
+            len(po_lines) == 0
+            or not actor_ord
+            or _active_draft_id is None
+            or not _draft_can_edit
+        )
+        # Tooltip explains exactly why the button is disabled.
+        if _active_draft_id is None:
+            _push_help = ("Pick or create a draft above first — the push "
+                          "needs a po_drafts row to record CIN7 PO ID into.")
+        elif not _draft_can_edit:
+            _push_help = ("You don't hold the lock on this draft, or it's "
+                          "already submitted. Take the lock to push.")
+        elif len(po_lines) == 0:
+            _push_help = "No lines selected."
+        elif not actor_ord:
+            _push_help = "Enter your name in the sidebar first."
+        else:
+            _push_help = ("POST a Draft Advanced Purchase to CIN7 with "
+                          "the lines saved on this local draft. The CIN7 "
+                          "PO will be created in DRAFT status — review "
+                          "and authorise it inside CIN7 to send to "
+                          "the supplier.")
         if st.button(":rocket: Create draft PO in CIN7",
                       type="primary",
-                      disabled=(len(po_lines) == 0 or not actor_ord),
-                      width="stretch"):
-            st.warning(
-                ":construction: CIN7 POST not yet wired. Use CSV / PDF "
-                "export for now; we'll wire `POST /purchase` once "
-                "Reeves pricing is locked in."
-            )
+                      disabled=_push_disabled,
+                      width="stretch",
+                      help=_push_help,
+                      key=f"push_to_cin7_{sel_sup}"):
+            # Open the confirmation popover via session-state flag — we
+            # don't want a single click to fire a real CIN7 POST.
+            st.session_state[f"_show_push_confirm_{sel_sup}"] = True
+
+        if st.session_state.get(f"_show_push_confirm_{sel_sup}"):
+            with st.expander(
+                    f":rocket: Push draft #{_active_draft_id} to CIN7?",
+                    expanded=True):
+                # Detect the partial-failure state: draft already has
+                # a CIN7 PO ID (master created in CIN7) but our local
+                # status is still 'editing' (lines never made it). Offer
+                # recovery options before showing the normal push UI.
+                _drow_now = db.get_po_draft(_active_draft_id)
+                _ddict_now = (dict(_drow_now)
+                              if _drow_now is not None else {})
+                _stuck_cin7_id = _ddict_now.get("cin7_po_id")
+                _stuck_po_num = _ddict_now.get("cin7_po_number")
+                _is_stuck = (
+                    bool(_stuck_cin7_id)
+                    and _ddict_now.get("status") == "editing")
+
+                if _is_stuck:
+                    st.warning(
+                        f":warning: This draft is linked to CIN7 PO "
+                        f"**#{_stuck_po_num}** ({_stuck_cin7_id}) but "
+                        "local status is still `editing` — meaning a "
+                        "previous push created the master in CIN7 but "
+                        "the lines POST failed. Pick one option below:")
+                    rc1, rc2, rc3 = st.columns(3)
+                    if rc1.button(
+                            "↻ Retry lines (keep PO #" +
+                            str(_stuck_po_num or "?") + ")",
+                            key=f"_retry_lines_{sel_sup}",
+                            help="Skip the master POST, only re-send "
+                                 "the lines to the existing CIN7 PO."):
+                        st.session_state[
+                            f"_push_mode_{sel_sup}"] = "retry"
+                    if rc2.button(
+                            "🧹 Clear CIN7 link & start fresh",
+                            key=f"_clear_cin7_link_{sel_sup}",
+                            help="Forget the CIN7 PO ID locally so a "
+                                 "fresh push creates a new master. "
+                                 "You should void the old PO in CIN7 "
+                                 "manually."):
+                        db.set_po_draft_cin7_ids(
+                            _active_draft_id,
+                            cin7_po_id="",
+                            cin7_po_number="",
+                            cin7_status="",
+                            actor=actor_ord or "ui")
+                        st.success(
+                            f"Cleared CIN7 link from draft "
+                            f"#{_active_draft_id}. **Don't forget to "
+                            f"void PO #{_stuck_po_num} in CIN7.**")
+                        st.rerun()
+                    if rc3.button(
+                            "Cancel",
+                            key=f"_cancel_recovery_{sel_sup}"):
+                        st.session_state[
+                            f"_show_push_confirm_{sel_sup}"] = False
+                        st.rerun()
+                    # Don't render the normal push UI when in
+                    # recovery mode and no choice has been made yet.
+                    if (st.session_state.get(
+                            f"_push_mode_{sel_sup}") != "retry"):
+                        st.stop()
+                _is_retry = (
+                    st.session_state.get(
+                        f"_push_mode_{sel_sup}") == "retry")
+                if _is_retry:
+                    st.info(
+                        f":arrows_counterclockwise: **Retry mode** — "
+                        f"will re-POST lines to existing PO "
+                        f"#{_stuck_po_num} without creating a new "
+                        "master.")
+
+                st.markdown(
+                    f"**Supplier:** {sel_sup}  \n"
+                    f"**Lines (saved in draft):** "
+                    f"{len(db.get_po_draft_lines(_active_draft_id))}  \n"
+                    f"**Lines visible in editor (unsaved if higher):** "
+                    f"{len(po_lines)}  \n"
+                    f"**Estimated value:** {_fmt_money(po_value)}"
+                )
+                _saved_lines = db.get_po_draft_lines(_active_draft_id)
+                if not _saved_lines:
+                    st.warning(
+                        "This draft has **no saved lines** yet. Click "
+                        "'Save Qty edits' above first — only saved "
+                        "lines are pushed to CIN7."
+                    )
+                elif len(_saved_lines) != len(po_lines):
+                    st.info(
+                        "The number of saved lines differs from what's "
+                        "visible in the editor. Pushing will use the "
+                        "**saved** lines — make sure they're up to date."
+                    )
+
+                _ack = st.checkbox(
+                    "I understand this creates a real Draft PO in CIN7. "
+                    "It will need human review/authorisation in CIN7 "
+                    "before the supplier sees it.",
+                    key=f"_push_ack_{sel_sup}")
+                _dry_run = st.checkbox(
+                    "Dry-run (validate only, don't post)",
+                    value=False, key=f"_push_dry_{sel_sup}")
+
+                pcola, pcolb = st.columns([1, 1])
+                if pcola.button(
+                        "Confirm push",
+                        type="primary",
+                        disabled=(not _ack) or (not _saved_lines),
+                        key=f"_push_go_{sel_sup}"):
+                    try:
+                        from cin7_post_po import push_po_draft
+                        with st.spinner(
+                                "Talking to CIN7 — this can take "
+                                "10–60 seconds..."):
+                            _result = push_po_draft(
+                                _active_draft_id,
+                                actor=actor_ord,
+                                apply=not _dry_run,
+                                # MOV: we let the cfg dictate; if buyer
+                                # wants to override they should adjust
+                                # supplier_config.mov_amount.
+                                require_mov=bool(
+                                    cfg and (cfg.get("mov_amount") or 0) > 0),
+                                # Pass the editor's actual PO value so
+                                # the MOV check uses the same number the
+                                # buyer is looking at, not a stale CIN7
+                                # AverageCost-based estimate.
+                                po_value_override=float(po_value),
+                                default_location=os.environ.get(
+                                    "CIN7_DEFAULT_LOCATION",
+                                    "Main Warehouse"),
+                                # Surface freight overrides on lines so the
+                                # buyer can see them in CIN7.
+                                freight_overrides=(
+                                    st.session_state.get(
+                                        "freight_overrides", {}
+                                    ).get(sel_sup, {})),
+                                retry_lines_only=_is_retry,
+                            )
+                        if _result.ok:
+                            if _dry_run:
+                                st.success(
+                                    f"✓ Dry-run passed at stage "
+                                    f"`{_result.stage}`. "
+                                    "Verify the resolved supplier and "
+                                    "lines below before unticking "
+                                    "dry-run.")
+                                # Big visible callout for the resolved
+                                # supplier — this is where wrong-vendor
+                                # bugs are caught.
+                                _resolved_sup = (
+                                    _result.master_response.get(
+                                        "resolved_supplier") or {})
+                                if _resolved_sup:
+                                    st.warning(
+                                        f":bust_in_silhouette: **Resolved "
+                                        f"supplier:** "
+                                        f"`{_resolved_sup.get('Name')}` "
+                                        f"(CIN7 ID `{_resolved_sup.get('ID')}`). "
+                                        "Make sure that's the right "
+                                        "vendor before applying!")
+                                with st.expander(
+                                        "Lines that would be sent"):
+                                    st.json(
+                                        _result.order_response.get(
+                                            "lines", []))
+                                with st.expander(
+                                        "Master body that would be sent"):
+                                    st.json(
+                                        _result.master_response.get(
+                                            "body", {}))
+                            else:
+                                st.success(
+                                    f"✓ CIN7 PO **#{_result.cin7_po_number}** "
+                                    f"created in DRAFT status. "
+                                    f"Review and AUTHORISE in CIN7 to "
+                                    f"send to supplier."
+                                )
+                                st.session_state[
+                                    f"_show_push_confirm_{sel_sup}"] = False
+                                # Clear the ack/dry-run/retry-mode for next time
+                                for _k in (f"_push_ack_{sel_sup}",
+                                           f"_push_dry_{sel_sup}",
+                                           f"_push_mode_{sel_sup}"):
+                                    if _k in st.session_state:
+                                        del st.session_state[_k]
+                                # Refresh so the draft shows new
+                                # cin7_po_number in the header pill
+                                st.rerun()
+                            if _result.warnings:
+                                for _w in _result.warnings:
+                                    st.warning(_w)
+                        else:
+                            st.error(
+                                "✗ Push did not complete. "
+                                f"Stopped at stage `{_result.stage}`.")
+                            for _e in _result.errors:
+                                st.error(f"• {_e}")
+                            if _result.cin7_po_id:
+                                st.info(
+                                    f"⚠ Master PO **#{_result.cin7_po_number}** "
+                                    f"({_result.cin7_po_id}) was created "
+                                    "in CIN7 before the failure. Find "
+                                    "and either complete or cancel it "
+                                    "in CIN7 directly.")
+                            if _result.warnings:
+                                for _w in _result.warnings:
+                                    st.warning(_w)
+                    except Exception as _exc:
+                        st.exception(_exc)
+
+                if pcolb.button("Cancel",
+                                key=f"_push_cancel_{sel_sup}"):
+                    st.session_state[
+                        f"_show_push_confirm_{sel_sup}"] = False
+                    st.rerun()
     with dpb:
         if st.button(":page_facing_up: Export CSV",
                       disabled=(len(po_lines_all) == 0),
@@ -7674,6 +10360,206 @@ engine shows every input and how it got to the suggestion.
     if not actor_ord:
         st.caption(":warning: Enter your name in the sidebar to enable "
                    "the Create Draft PO button.")
+
+    # --- Tier opportunities — supplier price-break rollup -------------
+    # When a supplier uses tiered pricing keyed to total family footage
+    # (Reeves SIERRA38/65 style — see Supplier Pricing page), compute
+    # how close the current draft is to the next price tier and surface
+    # savings opportunities. Sums footage across colors when the family's
+    # aggregation rule is sum_across_colors; per-color otherwise.
+    _tier_supplier = sel_sup
+    _has_pricing = bool(db.all_family_color_pricing(supplier=_tier_supplier))
+    if _has_pricing:
+        _opp_rows = []
+        # Pull all pricing rows for this supplier and group by family
+        _pricing_rows = db.all_family_color_pricing(supplier=_tier_supplier)
+        _families_for_supplier = sorted({r["family"] for r in _pricing_rows})
+
+        # Index pricing for quick lookup: pricing_idx[family][color] = sorted list of (tier_qty, unit_price)
+        _pricing_idx: dict = {}
+        for r in _pricing_rows:
+            fam = r["family"]
+            col = r["color"]
+            _pricing_idx.setdefault(fam, {}).setdefault(col, []).append(
+                (float(r["tier_qty"]), float(r["unit_price"])))
+        for fam in _pricing_idx:
+            for col in _pricing_idx[fam]:
+                _pricing_idx[fam][col].sort()  # ascending by tier_qty
+
+        # For each family, aggregate footage across the current draft's
+        # rows that belong to it.
+        if not all_supplier_df.empty and "SKU" in all_supplier_df.columns:
+            _qty_col = ("reorder_qty" if "reorder_qty" in all_supplier_df.columns
+                         else "Suggest" if "Suggest" in all_supplier_df.columns
+                         else None)
+            for fam in _families_for_supplier:
+                # Collect per-color footage for this family from the draft
+                _color_ft: dict = {}  # color -> ft
+                for _, row in all_supplier_df.iterrows():
+                    sku = str(row.get("SKU") or "")
+                    parsed = _parse_tube_sku(sku, str(row.get("Name") or ""))
+                    if not parsed or parsed.get("Family") != fam:
+                        continue
+                    qty = float(row.get(_qty_col, 0) or 0) if _qty_col else 0
+                    if qty <= 0:
+                        continue
+                    length_mm = parsed.get("LengthMM")
+                    if not length_mm:
+                        continue
+                    length_ft = length_mm * 0.00328084
+                    color_norm = "White" if str(parsed.get("Color")) == "W" \
+                        else "Black" if str(parsed.get("Color")) == "B" \
+                        else str(parsed.get("Color"))
+                    _color_ft[color_norm] = (
+                        _color_ft.get(color_norm, 0) + qty * length_ft)
+                if not _color_ft:
+                    continue
+
+                # Get aggregation rule (default per_color if not configured)
+                _rule_row = db.get_family_pricing_rule(fam, _tier_supplier)
+                _rule = (_rule_row["rule"] if _rule_row else "per_color")
+                _nag_thresh = (
+                    _rule_row["nag_threshold_savings"] if _rule_row else 200.0)
+
+                if _rule == "sum_across_colors":
+                    # Total qty qualifies tier; each color priced at own rate
+                    total_ft = sum(_color_ft.values())
+                    cur_cost = 0.0
+                    next_cost = 0.0
+                    cur_tier_qty = None
+                    next_tier_qty = None
+                    for color, ft in _color_ft.items():
+                        tiers = _pricing_idx[fam].get(color, [])
+                        if not tiers:
+                            # No pricing for this color — skip the family
+                            cur_cost = next_cost = None
+                            break
+                        cur = next((p for q, p in reversed(tiers) if q <= total_ft), None)
+                        nxt_pair = next(((q, p) for q, p in tiers if q > total_ft), None)
+                        if cur is None:
+                            # Below all tiers — quote the lowest
+                            cur = tiers[0][1]
+                            cur_tier_qty = tiers[0][0]
+                        else:
+                            cur_tier_qty = next(q for q, p in reversed(tiers) if q <= total_ft)
+                        cur_cost += ft * cur
+                        if nxt_pair is not None:
+                            next_tier_qty = nxt_pair[0]
+                            next_cost += ft * nxt_pair[1]
+                    if cur_cost is None or next_tier_qty is None:
+                        continue
+                    # Add color change fee if the draft contains > 1 color
+                    color_change_fee = 0.0
+                    if len([c for c, ft in _color_ft.items() if ft > 0]) > 1:
+                        for fee in db.all_family_setup_fees(family=fam):
+                            if fee["fee_type"] == "color_change" and \
+                               fee["supplier"] == _tier_supplier:
+                                color_change_fee = float(fee["fee_amount"])
+                                break
+                    # Padding cost: extra ft × next_tier price for any
+                    # one color (assume buyer pads the dominant color)
+                    dominant_color = max(_color_ft, key=_color_ft.get)
+                    next_tier_for_dom = next(
+                        (p for q, p in _pricing_idx[fam][dominant_color]
+                         if q == next_tier_qty), None)
+                    if next_tier_for_dom is None:
+                        continue
+                    gap_ft = next_tier_qty - total_ft
+                    pad_extra_cost = gap_ft * next_tier_for_dom
+                    next_cost_padded = next_cost + pad_extra_cost
+                    savings = (cur_cost + color_change_fee) - \
+                              (next_cost_padded + color_change_fee)
+                    _opp_rows.append({
+                        "Family": fam,
+                        "Rule": _rule,
+                        "Current ft (all colors)": f"{total_ft:.0f}",
+                        "Current tier": f"{cur_tier_qty:.0f}+ ft",
+                        "Next tier": f"{next_tier_qty:.0f}+ ft",
+                        "Gap (ft to pad)": f"+{gap_ft:.0f}",
+                        "Current cost": f"${cur_cost:.0f}",
+                        "Padded cost": f"${next_cost_padded:.0f}",
+                        "Color change fee": (f"${color_change_fee:.0f}"
+                                              if color_change_fee > 0 else "—"),
+                        "Net savings": f"${savings:.0f}",
+                        "_savings_num": savings,
+                        "_above_nag": savings >= _nag_thresh,
+                    })
+                else:  # per_color
+                    for color, ft in _color_ft.items():
+                        tiers = _pricing_idx[fam].get(color, [])
+                        if not tiers:
+                            continue
+                        cur_pair = next(
+                            ((q, p) for q, p in reversed(tiers) if q <= ft),
+                            None)
+                        nxt_pair = next(
+                            ((q, p) for q, p in tiers if q > ft), None)
+                        if cur_pair is None:
+                            cur_pair = tiers[0]
+                        if nxt_pair is None:
+                            continue  # already at top tier
+                        cur_q, cur_p = cur_pair
+                        nxt_q, nxt_p = nxt_pair
+                        gap = nxt_q - ft
+                        cur_cost = ft * cur_p
+                        next_cost = nxt_q * nxt_p
+                        savings = cur_cost - next_cost  # negative if padding outweighs
+                        _opp_rows.append({
+                            "Family": fam,
+                            "Rule": _rule,
+                            "Color": color,
+                            "Current ft": f"{ft:.0f}",
+                            "Current tier": f"{cur_q:.0f}+ ft",
+                            "Next tier": f"{nxt_q:.0f}+ ft",
+                            "Gap (ft to pad)": f"+{gap:.0f}",
+                            "Current cost": f"${cur_cost:.0f}",
+                            "Padded cost": f"${next_cost:.0f}",
+                            "Net savings": f"${savings:.0f}",
+                            "_savings_num": savings,
+                            "_above_nag": savings >= _nag_thresh,
+                        })
+
+        # Sort by savings (descending) and render
+        if _opp_rows:
+            _opp_rows.sort(key=lambda r: r["_savings_num"], reverse=True)
+            n_above = sum(1 for r in _opp_rows if r["_above_nag"])
+            n_pos = sum(1 for r in _opp_rows if r["_savings_num"] > 0)
+            _icon = "🎯" if n_above > 0 else "💰"
+            _expander_label = (
+                f"{_icon} Tier opportunities — {n_pos} potential savings "
+                f"(of {len(_opp_rows)} family rollups)")
+            _expanded = (n_above > 0)
+            with st.expander(_expander_label, expanded=_expanded):
+                st.caption(
+                    "Family-level footage rollups against supplier price "
+                    "tiers. Padding the current draft to the next tier "
+                    "lowers per-foot cost across the whole family — even "
+                    "after the color change fee where applicable. Edit "
+                    "tier rules in **Supplier Pricing** page.")
+                # Display, dropping internal-only columns
+                _display = [{k: v for k, v in r.items()
+                             if not k.startswith("_")} for r in _opp_rows]
+                st.dataframe(
+                    pd.DataFrame(_display),
+                    hide_index=True, width="stretch")
+                if n_above > 0:
+                    st.warning(
+                        f":dart: **{n_above} opportunit"
+                        f"{'ies' if n_above != 1 else 'y'} above your "
+                        f"nag threshold.** Pad the draft qtys for the "
+                        f"matching family/color rows above to capture "
+                        f"the savings before submitting the PO.")
+        elif _families_for_supplier:
+            with st.expander(
+                    f"💰 Tier opportunities — no current draft for "
+                    f"{len(_families_for_supplier)} tracked famil"
+                    f"{'ies' if len(_families_for_supplier) != 1 else 'y'} "
+                    f"({_tier_supplier})", expanded=False):
+                st.caption(
+                    f"Tracked families for {_tier_supplier}: "
+                    f"{', '.join(_families_for_supplier)}. None of them "
+                    "have items in the current draft — when they do, "
+                    "tier comparisons will surface here.")
 
     # --- Upcoming reorders — lookahead consolidation ------------------
     # Show SKUs from the current supplier that AREN'T in the main
@@ -8941,22 +11827,91 @@ elif page == "Product Detail":
 
         labels, sku_list = _build_sku_options(products)
 
+        # UX: start the field EMPTY so the user can just type a fresh
+        # search without first clearing whatever was previously selected.
+        # If they want to revisit the last SKU, a small caption surfaces
+        # below the selector so they can copy/paste it back in.
         prior_sku = st.session_state.get("selected_sku", "")
-        default_idx = 0
-        if prior_sku in sku_list:
-            default_idx = sku_list.index(prior_sku)
 
         chosen_label = st.selectbox(
             "Find a product (type any part of the SKU or name)",
             options=labels,
-            index=default_idx,
-            placeholder="Start typing…",
+            index=None,
+            placeholder="Start typing a SKU or product name…",
             key="pd_selectbox",
         )
+        if prior_sku and chosen_label is None:
+            st.caption(
+                f"Previously viewed: `{prior_sku}` — paste into the box "
+                "above to revisit, or just start typing to search.")
+
+        if chosen_label is None:
+            st.info(
+                ":mag: Pick a product above to see its details — "
+                "demand breakdown, BOM family, sales history, "
+                "supplier info, and more.")
+            st.stop()
+
         sku = chosen_label.split("  —  ", 1)[0].strip()
         st.session_state["selected_sku"] = sku
 
         prod_row = products[products["SKU"] == sku].iloc[0]
+
+        # --- "This SKU has been replaced" banner --------------------------
+        # If this SKU is recorded as a predecessor in the migration DB,
+        # show a loud red banner at the top of Product Detail telling the
+        # buyer the product is retired and pointing them at the successor.
+        # Includes a "Switch to <successor>" button that sets the page's
+        # selectbox to the successor and reruns — saves a clear-and-retype.
+        try:
+            _migs = [dict(m) for m in db.all_migrations()
+                      if str(dict(m).get("retiring_sku")) == str(sku)]
+        except Exception:
+            _migs = []
+        if _migs:
+            _rec = _migs[0]  # one retiring SKU → at most one successor
+            _succ_sku = str(_rec.get("successor_sku") or "").strip()
+            _share = float(_rec.get("share_pct") or 100)
+            _succ_name = ""
+            if _succ_sku and not products.empty:
+                _sm = products[products["SKU"].astype(str) == _succ_sku]
+                if not _sm.empty:
+                    _succ_name = str(_sm.iloc[0].get("Name") or "")
+            _src = str(_rec.get("set_by") or "—")
+            _set_at = str(_rec.get("set_at") or "—")[:10]
+
+            _bcols = st.columns([5, 1])
+            with _bcols[0]:
+                _share_line = (
+                    f"  \n_{_share:.0f}% of this SKU's historical demand "
+                    f"now rolls into the successor's forecast._"
+                    if _share != 100 else
+                    "  \n_Full demand now rolls into the successor's forecast._"
+                )
+                _name_line = f"  \n_{_succ_name[:80]}_" if _succ_name else ""
+                st.error(
+                    f"📜 **This product has been retired and "
+                    f"replaced by `{_succ_sku}`.**"
+                    f"{_name_line}"
+                    f"{_share_line}"
+                )
+                st.caption(
+                    f"Migration source: `{_src}` · set on {_set_at}")
+            with _bcols[1]:
+                # Find the dropdown label for the successor so we can
+                # populate the selectbox cleanly.
+                _succ_label = next(
+                    (l for l in labels
+                     if l.startswith(f"{_succ_sku}  —")), None)
+                if _succ_label and st.button(
+                        f"→ Switch to {_succ_sku}",
+                        key=f"pd_switch_to_succ_{sku}",
+                        type="primary",
+                        width="stretch",
+                        help="Open the successor SKU in this view."):
+                    st.session_state["pd_selectbox"] = _succ_label
+                    st.session_state["selected_sku"] = _succ_sku
+                    st.rerun()
 
         # --- Product family (parent / siblings / children) -----------------
         parent = parent_sku_for(sku)

@@ -25,3 +25,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Streamlit disk-persisted cache (rebuilds itself; never useful in git)
+.streamlit/cache/
+
+# Render-specific local artifacts
+.render/

@@ -66,8 +66,9 @@ REQUEST_TIMEOUT = 60
 MAX_RETRIES = 5
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = SCRIPT_DIR / "output"
-OUTPUT_DIR.mkdir(exist_ok=True)
+# OUTPUT_DIR follows DATA_DIR env var (set to /data on Render).
+# Defaults to project folder locally. See data_paths.py.
+from data_paths import OUTPUT_DIR  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging

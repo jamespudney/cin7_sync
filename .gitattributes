@@ -1,0 +1,19 @@
+# Force shell scripts to use LF line endings regardless of platform.
+# Critical for Render — bash chokes on \r in shebangs and commands.
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# YAML / config files: LF too (some tools dislike CRLF in YAML).
+*.yaml      text eol=lf
+*.yml       text eol=lf
+
+# Python and Markdown: leave as text (default), Git converts as needed.
+*.py        text
+*.md        text
+
+# Binaries: never normalise.
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+*.xlsx      binary
+*.docx      binary
