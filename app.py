@@ -4771,12 +4771,25 @@ elif page == "Migrations":
         src = (m.get("set_by") or "unknown").split(":")[0]
         by_source[src] = by_source.get(src, 0) + 1
 
-    # Build SKU-keyed velocity + stock lookups so we can decorate each row
+    # Build SKU-keyed velocity + stock lookups so we can decorate each row.
+    # Defensive: on a fresh deploy the salelines sync may still be running
+    # in the background, so sale_lines can be empty or missing columns.
+    # In that case we just skip the velocity decoration — the page still
+    # renders, just without velocity numbers next to each migration.
     sl_dt = sale_lines.copy()
-    sl_dt["InvoiceDate"] = pd.to_datetime(
-        sl_dt["InvoiceDate"], errors="coerce")
-    sl_dt["Quantity"] = pd.to_numeric(
-        sl_dt["Quantity"], errors="coerce").fillna(0)
+    if sl_dt.empty or "InvoiceDate" not in sl_dt.columns:
+        st.warning(
+            ":hourglass: Sale-line history not yet loaded — velocity "
+            "columns will fill in once the background sync completes. "
+            "Check `tail /data/output/salelines_sync.log` on the server "
+            "for progress.")
+        sl_dt = pd.DataFrame(
+            columns=["InvoiceDate", "Quantity", "SKU", "Customer"])
+    else:
+        sl_dt["InvoiceDate"] = pd.to_datetime(
+            sl_dt["InvoiceDate"], errors="coerce")
+        sl_dt["Quantity"] = pd.to_numeric(
+            sl_dt["Quantity"], errors="coerce").fillna(0)
     today = pd.Timestamp(datetime.now().date())
     cutoff_365 = today - pd.Timedelta(days=365)
 
