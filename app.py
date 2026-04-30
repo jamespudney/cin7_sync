@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.48 — Source-of-truth rules baked in: CIN7 is master for stock/sales/costs, Shopify for customer-facing copy. New docs/data-sources.md, system prompt updated, shopify_sync intentionally excludes stock numbers so AI doesn't quote stale figures. (Apr 30)")
+    st.caption("🟢 v2.49 — Shopify sync extended: now pulls policies (returns/refund/shipping/privacy/terms) and storefront menus. AI can now answer 'what's our returns policy?' from the actual customer-facing content. ai_kb.py path-handling fixed for files outside the project root. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's

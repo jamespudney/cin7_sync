@@ -74,6 +74,8 @@ PRODUCTS_DIR = OUTPUT_DIR / "products"
 COLLECTIONS_DIR = OUTPUT_DIR / "collections"
 PAGES_DIR = OUTPUT_DIR / "pages"
 BLOG_ARTICLES_DIR = OUTPUT_DIR / "blog-articles"
+POLICIES_DIR = OUTPUT_DIR / "policies"
+MENUS_DIR = OUTPUT_DIR / "menus"
 
 
 def _setup_log() -> logging.Logger:
@@ -215,7 +217,7 @@ class ShopifyClient:
 # ---------------------------------------------------------------------------
 def _ensure_dirs() -> None:
     for d in (PRODUCTS_DIR, COLLECTIONS_DIR, PAGES_DIR,
-              BLOG_ARTICLES_DIR):
+              BLOG_ARTICLES_DIR, POLICIES_DIR, MENUS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -318,6 +320,60 @@ def write_page_md(page: dict) -> Path:
     return fname
 
 
+def write_policy_md(policy: dict) -> Path:
+    """Policies: refund, privacy, terms-of-service, shipping,
+    subscription. These are CUSTOMER-FACING — what shoppers see when
+    they click 'Returns Policy' in the footer. Different endpoint
+    from /pages so we used to miss them entirely."""
+    handle = policy.get("handle") or "policy"
+    fname = POLICIES_DIR / f"{safe_filename(handle)}.md"
+    title = policy.get("title") or handle.replace("-", " ").title()
+    body = html_to_text(policy.get("body", ""))
+    fname.write_text(
+        f"# Policy: {title}\n\n## Metadata\n\n"
+        f"- **Type:** {handle} (customer-facing storefront policy)\n"
+        f"- **URL:** {policy.get('url', '')}\n"
+        f"- **Last updated:** {policy.get('updated_at', '')}\n\n"
+        f"## Body\n\n{body or '*(empty policy body)*'}\n",
+        encoding="utf-8")
+    return fname
+
+
+def write_menu_md(menu: dict) -> Path:
+    """Storefront navigation menu — what links/categories customers
+    see in the header, footer, mobile nav, etc. The AI can use these
+    to answer 'what categories do we have on the website?' or
+    'where would a customer find driveway lights?'."""
+    handle = menu.get("handle") or str(menu.get("id"))
+    fname = MENUS_DIR / f"{safe_filename(handle)}.md"
+    title = menu.get("title") or handle
+    items = menu.get("items") or []
+    lines = [
+        f"# Menu: {title}",
+        "",
+        "## Metadata",
+        "",
+        f"- **Handle:** {handle}",
+        f"- **Item count:** {len(items)}",
+        "",
+        "## Navigation items",
+        "",
+    ]
+
+    def _render_items(items_list, depth: int = 0) -> None:
+        indent = "  " * depth
+        for it in items_list or []:
+            label = it.get("title") or it.get("name") or "(unnamed)"
+            url = it.get("url") or it.get("subject") or ""
+            lines.append(f"{indent}- {label}{' — `' + url + '`' if url else ''}")
+            children = it.get("items") or []
+            if children:
+                _render_items(children, depth + 1)
+    _render_items(items)
+    fname.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return fname
+
+
 def write_article_md(article: dict, blog_handle: str) -> Path:
     handle = article.get("handle") or str(article.get("id"))
     fname = BLOG_ARTICLES_DIR / (
@@ -355,6 +411,10 @@ def main() -> int:
         "--skip-pages", action="store_true")
     parser.add_argument(
         "--skip-blogs", action="store_true")
+    parser.add_argument(
+        "--skip-policies", action="store_true")
+    parser.add_argument(
+        "--skip-menus", action="store_true")
     args = parser.parse_args()
 
     load_dotenv()
@@ -371,6 +431,7 @@ def main() -> int:
     log.info("Connected to %s", domain)
 
     n_products = n_collections = n_pages = n_articles = 0
+    n_policies = n_menus = 0
 
     # ---- Products
     if not args.skip_products:
@@ -434,9 +495,46 @@ def main() -> int:
                     write_article_md(a, blog_handle)
                     n_articles += 1
 
+    # ---- Policies (returns, refund, shipping, privacy, terms)
+    if not args.skip_policies:
+        log.info("Fetching policies (returns/refund/shipping/etc)...")
+        # Policies endpoint returns the full list directly, not paginated
+        r = client._get(f"{client.base}/policies.json")
+        if r.status_code == 200:
+            policies = (r.json() or {}).get("policies") or []
+            log.info("  policies: %d", len(policies))
+            if not args.dry_run:
+                for p in policies:
+                    write_policy_md(p)
+                    n_policies += 1
+        else:
+            log.warning("  /policies.json -> %d %s",
+                         r.status_code, r.text[:200])
+
+    # ---- Menus / navigation (storefront nav, footer links etc)
+    if not args.skip_menus:
+        log.info("Fetching storefront menus / navigation...")
+        # Menus moved to GraphQL in newer API versions, but the REST
+        # /admin/api/.../menus.json endpoint still works on most stores.
+        r = client._get(f"{client.base}/menus.json")
+        if r.status_code == 200:
+            menus = (r.json() or {}).get("menus") or []
+            log.info("  menus: %d", len(menus))
+            if not args.dry_run:
+                for m in menus:
+                    write_menu_md(m)
+                    n_menus += 1
+        else:
+            log.warning(
+                "  /menus.json -> %d (some stores need GraphQL for "
+                "menus — we'll add that path in Phase 1)",
+                r.status_code)
+
     log.info("=" * 60)
-    log.info("Wrote %d products, %d collections, %d pages, %d articles",
-              n_products, n_collections, n_pages, n_articles)
+    log.info("Wrote %d products, %d collections, %d pages, %d articles, "
+              "%d policies, %d menus",
+              n_products, n_collections, n_pages, n_articles,
+              n_policies, n_menus)
     log.info("Output: %s", OUTPUT_DIR)
     return 0
 
