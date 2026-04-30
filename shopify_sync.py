@@ -250,6 +250,11 @@ def write_product_md(prod: dict) -> Path:
     if variants:
         lines.append("## Variants")
         lines.append("")
+        # Note: we deliberately do NOT include inventory_quantity or
+        # other stock fields here. CIN7 is the source of truth for
+        # stock — Shopify mirrors it with a few-minute lag, so we
+        # don't want the AI quoting potentially-stale numbers from
+        # Shopify content. See docs/data-sources.md.
         for v in variants:
             sku = v.get("sku", "")
             vtitle = v.get("title", "")

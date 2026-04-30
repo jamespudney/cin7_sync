@@ -1,234 +1,192 @@
-# Where things stand — IP integration handoff (Apr 28, end of day)
+# Roadmap — what's planned and what's done
 
-## ⚠ DO THIS FIRST WHEN YOU RETURN
+This is the canonical backlog. Edit it directly any time — it's
+indexed by the AI Assistant's knowledge base and read by future
+Claude sessions to pick up where we left off.
 
-The v2.22 demand-rollup fix is in the file but the engine isn't reflecting it
-(stuck on cached output showing 61 instead of expected 477 for
-LED-SIERRA38-W-3). **Full Streamlit restart required:**
+**Convention:** when something ships, move it from "Active backlog"
+to "Shipped" with a date. When something new comes up, add it to
+"Active backlog" or "Future / wishlist".
 
-```powershell
-# In the running Streamlit terminal: Ctrl+C
-cd C:\Tools\cin7_sync
-.\run_app.bat
-```
+Last updated: 2026-04-30
 
-Then in browser:
-1. **Hard-refresh** (Ctrl+Shift+R) — sidebar should show 🟢 v2.22 (or higher)
-2. Click **🔄 Refresh data now** in sidebar
-3. Open `LED-SIERRA38-W-3` drill-down
-4. **Expected: "Total rollup contribution: ~477 master units / 12mo"**
-   (was showing 61 before the fix — anything 400+ confirms v2.22 is active)
+---
 
-If after a full restart it still shows 61, paste the version label and I'll
-investigate further. There's no other obvious culprit; the code change is
-verified correct and at the right scope.
+## How to use this file
 
-## ⏭ AFTER VERIFYING v2.22 IS LIVE
+1. **At the start of any session**, ask Claude to read `NEXT_STEPS.md`
+   — it'll pick up the latest priorities without you re-explaining.
+2. **As work happens**, the task tool tracks in-flight items. At the
+   end of a session, I'll move completed ones into "Shipped" here.
+3. **Long-form context** (architecture decisions, why we did things
+   a certain way) lives in `docs/` — that's also indexed by the AI.
 
-```powershell
-# 1. Push the new CASCADE-W-3 → SIERRA-W-3 migration to CIN7
-.\.venv\Scripts\python cin7_push_migrations.py --apply
+---
 
-# 2. Rename the supplier in pricing tables (was "Reeves", needs full name)
-.\.venv\Scripts\python rename_supplier_in_pricing.py \
-    --from "Reeves" \
-    --to "Reeves Extruded Products, Inc"
-.\.venv\Scripts\python rename_supplier_in_pricing.py \
-    --from "Reeves" \
-    --to "Reeves Extruded Products, Inc" \
-    --apply
+## Active backlog (priority order)
 
-# 3. Audit ALL bare tubes — confirm full demand chain is intact
-.\.venv\Scripts\python audit_all_bare_tubes.py --family SIERRA
+### Tier 1 — fix soon (next 1-2 sessions)
 
-# 4. Reload Streamlit data (sidebar 🔄 Refresh) and check Reeves PO
-#    The Tier Opportunities expander should now populate with SIERRA38/65
-#    family rollups.
-```
+1. **Auto-finalize submitted POs (Phase 3)** — when CIN7 sync detects
+   a submitted PO has flipped to `ORDERED`, auto-transition our
+   local `po_drafts.status` from `submitted` → `finalized`. The DB
+   function `db.mark_po_draft_finalized()` exists; the sync trigger
+   isn't wired into `cin7_sync.py` yet. ~30 min.
+2. **Master-1-per-draft session safeguard** — belt-and-braces in
+   `cin7_post_po.py`: track in session state whether a master POST
+   has been attempted for a given draft; refuse a second attempt
+   even if local `cin7_po_id` was somehow cleared. Prevents the
+   4-orphan-PO scenario. ~30 min.
+3. **Feedback review page + auto-alias learning** — new "Review AI
+   Q&A" page showing recent chats with feedback filter. For
+   thumbs-down rows, allow buyer to enter a corrected SKU + the
+   phrase that confused the AI. Writes to `product_aliases`. The
+   AI Assistant on its next call checks `db.lookup_aliases()` first
+   and uses the human-approved mapping. ~3 hours.
+4. **Inline charts in AI answers** — extend `get_velocity` (and
+   maybe `get_sales_totals`) with daily/weekly buckets; the
+   Streamlit page detects chartable tool results and renders an
+   inline `st.line_chart`. ~30 min.
 
+### Tier 2 — quality & performance
 
+5. **Refresh Overview to CIN7-style KPI dashboard** — KPI cards
+   across the top (Revenue, Net, Pending, Inflow, Outflow), area
+   chart below, period selector. User flagged this as the look they
+   like in CIN7. ~3 hours.
+6. **Use ModifiedSince for master data syncs** — products /
+   customers / suppliers / stock are full pulls every night
+   (~10 min). CIN7's `ModifiedSince` parameter would cut that to
+   ~2 min by only fetching changed rows. ~2 hours.
+7. **Adaptive CIN7 rate limiting** — replace fixed 2.5s rate with
+   adaptive: speed up to 1.5s after several minutes without a 429,
+   back off on first 429. Optimally uses whatever bandwidth is
+   available regardless of what other integrations are doing.
+   ~2 hours.
+8. **Preemptive empty-data guards** — proactively scan the major
+   pages (Overview, Monthly Metrics, FixedCost Audit, Ordering, LED
+   Tubes) for `df["X"]` patterns where X might not exist on a fresh
+   deploy. Replace with safe `.get()` patterns. ~2 hours.
 
-## v2.17 — engine + dedicated Migrations page + inline predecessor add
+### Tier 3 — bigger features
 
-**Three improvements landed:**
+9. **Shopify integration via Dev Dashboard OAuth (Phase 1)** —
+   refactor `shopify_sync.py` to use modern Dev Dashboard flow:
+   `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`, request access
+   tokens programmatically, cache + refresh, prefer GraphQL Admin
+   API over REST. Don't depend on the legacy `shpat_` token
+   long-term (currently borrowed from Darryl's app). ~1 day.
+10. **CIN7 PO push: pre-submit validation enrichment** — verify
+    Location exists in CIN7; compute CIN7's expected line Total in
+    dry-run BEFORE master POST so mismatches are caught early; warn
+    if a SKU has no per-supplier `Cost` (would fall back to
+    `AverageCost`). ~3 hours.
+11. **Nightly SQLite backup to cloud storage** — `team_actions.db`
+    is the source of truth for migrations / drafts / pricing. We
+    should rsync it to Backblaze B2 (~$1/mo) every night. ~2 hours
+    + B2 account setup.
+12. **Custom domain** — `analytics.w4susa.com` instead of
+    `wired4signs-app.onrender.com`. ~30 min, requires DNS access.
 
-1. **Engine fix (the critical one)** — extended the migration-rollup math in the Ordering engine to apply ALL `db.all_migrations()` records, not just tube-family ones. The 71 IP-imported migrations now actually flow through into reorder calculations: a successor's `Suggest` qty includes its predecessors' historical 12mo sales × share %. Section 5.5 already showed the lineage; now the math behind it is real too.
+### Tier 4 — Commercial Intelligence System (the big vision)
 
-2. **New "Migrations" page** in the sidebar — central management for the registry. Features:
-   - Summary stats (total migrations, source breakdown, predecessors with residual stock, predecessors with 12mo sales)
-   - **+ Add migration** form (pick predecessor + successor + share % + note)
-   - **💡 Suggested predecessors from IP notes** — surfaces SKU references the parser found in IP notes that aren't yet recorded as migrations (high-confidence REPLACEMENT-intent shown prominently, lower-confidence in an expander)
-   - Filterable master table (search, source filter, residual-stock filter)
-   - Edit/clear inline (pick a predecessor → adjust successor + share + note → save, or clear)
+This is the multi-month roadmap. Each is its own project, queued in
+priority order:
 
-3. **Inline "+ Add predecessor" form in Section 5.5** — for buyers already in a successor's drill-down: expand the "+ Add a predecessor" panel, pick a SKU, set share %, save. Same `db.set_migration()` backend.
+13. **Slack demand-signal capture** — bot with /stock, /askstock,
+    /slowstock, /deadstock, /cancel, /return commands; LLM
+    extraction of demand signals from messages; AI clarification
+    loop in threads. Buyer warning column on Ordering page.
+    ~2 weeks.
+14. **Cancellation + return intelligence** — extract from Slack/
+    Gorgias mentions; reduce demand-signal weight for cancelled
+    orders; warn buyer before reordering returned products.
+    ~1 week.
+15. **Gorgias integration** — pull customer support conversations;
+    extract demand signals + product complaints + return requests.
+    ~1 week.
+16. **SEO intelligence layer** — monitor a dedicated Slack channel
+    for SEO updates; map ranking changes to Shopify collections;
+    classify demand as early/emerging/confirmed. ~1 week.
+17. **Weekly buyer summary email** — top demand signals, rising
+    families, repeated out-of-stock inquiries, dead stock with new
+    demand, return-affected reorders. ~3 days.
+18. **Multimodal Slack attachment analysis** — vision API on photos
+    of damaged products, screenshots of CIN7 issues, customer
+    install pics. ~1 week.
+19. **Inventory Planner decommission** — IP is the legacy system
+    we want to drop. Audit what IP still does that we don't, build
+    replacements, set sunset date. ~2 weeks.
 
-## Conceptual correction (mid-build)
+### Tier 5 — SaaS readiness (only if/when we go multi-tenant)
 
-I initially framed IP's "Combine sales/stock" / `merged[]` data as
-**alternatives** (interchangeable substitutes). That was wrong — they
-are **predecessor → successor migrations** (this NEW SKU has replaced
-those OLD ones; their historical sales feed this SKU's forecast).
+See `SAAS_NOTES.md` for the full list. Headline items:
 
-The corrected build (v2.16) reframes the data accordingly and feeds it
-into the existing migration system (`sku_migrations` table,
-`db.set_migration()`, Section 7 redirect, Migration forecast page) —
-no parallel "alternatives" concept needed.
+- Postgres migration (replace SQLite for multi-tenant queries)
+- Per-tenant authentication + isolation
+- Pull "Wired4Signs USA" hardcoded business logic out of core code
+- Per-customer billing / Stripe integration
 
-## What got built
+Don't do these until we have at least 1-2 paying customers asking
+for it. Wasted effort otherwise.
 
-### 1. App integration — **v2.16** of `app.py`
+---
 
-- **Module-level loaders**: `_load_ip_alternates()`, `_load_ip_notes()`
-  populate `IP_ALTS_FORWARD`, `IP_ALTS_REVERSE`, `IP_NOTES` at startup.
-  (Names retain "alts" historically — the data is migration data.)
-- **Note parser** `_parse_note_for_skus()` — heuristically extracts
-  SKU-model tokens from notes, matches against real SKUs by substring
-  (SKU column + product Name column). Detects intent words like
-  REPLACEMENT, ALT, USE, SEE, CHECK.
-- **Drill-down sections (in `render_demand_breakdown`):**
-  - **Section 1.5: Team notes** — right after the banner. Renders each
-    per-warehouse note. When the parser spots a SKU reference with
-    REPLACEMENT-intent, an explicit yellow "📜 Likely predecessor: X"
-    box appears suggesting Migration setup.
-  - **Section 5.5: Migration history** — between Parents and Family
-    siblings. Two sub-tables:
-    - **📜 Replaces N predecessors** (when this SKU is a successor) —
-      table shows predecessor SKU, title, share %, source, residual
-      OnHand, legacy 12mo/90d units, last sale.
-    - **🔁 Replaced by N successor(s)** (when this SKU is retiring) —
-      table shows successor SKU + title.
-- **Banner reframed**: when an IP-linked predecessor still has stock,
-  a red banner fires telling the buyer to consume legacy stock before
-  reordering. (This is the migration-cleanup signal that's easy to
-  miss when looking at active SKU stock alone.)
+## Shipped recently
 
-### 2. Comprehensive IP extraction — `ip_pull_alternates.py`
+### 2026-04-30 (today)
 
-Given the long-term plan to drop IP, the script now does a complete
-extraction in one walk. Produces SEVEN CSVs covering everything the IP
-public API exposes:
+- **AI Assistant Phase 0** — natural-language Q&A page, 6 live tools
+  (search_products, get_sku_details, get_velocity, get_dead_stock,
+  get_migration_chain, get_sales_totals, search_knowledge_base),
+  multi-turn conversation memory, audit log, thumbs up/down feedback.
+- **Knowledge base layer** — `ai_kb.py` indexes `docs/` (8 starter
+  docs: inventory-rules, reorder-engine, sync-cadences, migrations,
+  po-workflow, glossary, data-sources, README) plus root-level
+  RULES.md / DEPLOY.md / SAAS_NOTES.md.
+- **Render deploy live** — single web service, persistent disk,
+  password gate, 15-minute nearsync + nightly daily-sync, both
+  inside the same container.
+- **Today/MTD revenue fix** — switched to order-level
+  `InvoiceAmount` so revenue matches CIN7's dashboard (includes
+  shipping + tax).
+- **Sidebar declutter** — consolidated 4 refresh-related buttons
+  into 1.
+- **Shopify content sync** — `shopify_sync.py` pulls products /
+  collections / pages / blog articles via Admin API; AI knowledge
+  base auto-indexes them. Uses borrowed token from Darryl's app
+  for now (proper OAuth in Tier 3).
+- **Source-of-truth rules** — docs/data-sources.md baked into
+  system prompt: CIN7 for numbers, Shopify for words.
+- **Path refactor for portability** — `data_paths.py` centralises
+  `DATA_DIR` so the same code runs locally and on Render.
+- **CIN7 PO POST integration** — multi-step flow with auto-rollback,
+  strict supplier matching, per-supplier-Cost lookup, retry-lines
+  recovery for partially-failed pushes.
+- **`sync_supplier_names.py`** — drift detector + renamer across
+  9 supplier-referencing tables; CIN7 is source of truth.
 
-| CSV | Contents | Wired into app |
-|---|---|---|
-| `ip_alternates_<stamp>.csv` | `merged[]` alternative-variant links | ✅ drill-down |
-| `ip_notes_<stamp>.csv` | Non-empty `replenishment_notes` per warehouse | ✅ drill-down |
-| `ip_variant_settings_<stamp>.csv` | Per-warehouse: LeadTime, ReviewPeriod, Replenishment, MinimumStock, AboveMOQ, AssemblyTime, AssemblyCycle, Segment (ABC), HasForecastOverride, ForecastMethod, InventoryManagement, RegularPrice, CostPrice, LandingCostPrice, Tags | ⏳ not yet (engine integration target) |
-| `ip_velocities_<stamp>.csv` | IP's computed: CurrentSales, SalesVelocity30/1, OOSlast60days, TotalDaysOOS, ForecastedStockoutsDoS, ForecastStockCover (day/week/mo), Last 7/30/90/180/365 days sales + revenue | ⏳ not yet |
-| `ip_vendors_<stamp>.csv` | Per-variant per-vendor: CostPrice, CostPriceCurrency, LandingCostPrice | ⏳ not yet |
-| `ip_forecasts_<stamp>.csv` | 18-month forward forecast (JSON), forecasting method description (JSON), forecasted lost revenue/sales | ⏳ not yet |
-| `ip_variants_summary_<stamp>.csv` | One-row-per-variant lightweight: MergeCount, NoteCount, TagCount, HasForecastOverride | sanity check |
+### Earlier (April 28-29)
 
-**Captures everything API-accessible. What we CANNOT extract** (logged
-at end of every run as a reminder):
-- "Max stock" column (UI-only, not in API surface)
-- Explicit MOQ quantity (only the `above_moq` boolean is exposed)
-- Forecast-period manual overrides (only the boolean flag is exposed)
-- Saved buyer reports / dashboard configurations
+- v2.22 — migration-aware demand rollup in engine
+- v2.31-v2.33 — 45d/90d/365d customer rollups
+- v2.34-v2.40 — CIN7 PO POST iteration cycle
+- Multi-draft PO system with pessimistic locking
+- IP merged[] migration import
 
-**Before decommissioning IP, do a one-time CSV export from IP's UI** to
-capture those four UI-only items. After that, IP can be turned off and
-the CSVs above plus the export become your portable archive.
+See `git log` for the full history.
 
-## What you need to run when you're back
+---
 
-```powershell
-cd C:\Tools\cin7_sync
+## Conventions for future Claude sessions
 
-# 1. Re-pull from IP — now captures notes + tags + per-warehouse
-#    settings + velocities + vendor data + 18-mo forecasts.
-#    Takes 3-4 minutes for 12,482 variants.
-.\.venv\Scripts\python ip_pull_alternates.py
+When starting a new session, please:
 
-# 2. Bridge IP's merged[] migrations into our DB (DRY-RUN first).
-.\.venv\Scripts\python ip_import_migrations.py
-
-# 3. If the diff looks right, commit:
-.\.venv\Scripts\python ip_import_migrations.py --apply
-
-# 4. Restart Streamlit to pick up v2.16.
-.\run_app.bat
-```
-
-After step 3, the existing migration system (Section 7 redirect,
-Migration forecast page, `migrated_from` tracking) automatically picks
-up the 75 IP-curated migrations. No further wiring needed.
-
-## What to test
-
-In the browser, hard-refresh and look for `🟢 v2.16` in the sidebar.
-Then test these SKUs in the Ordering page drill-down (or Product Detail):
-
-| SKU | What you should see |
-|---|---|
-| `LED-XRD-60W-24` (the **successor**) | 📝 Team note: "E60L24DC REPLACEMENT" + a yellow "📜 Likely predecessor: `LED-E60L24DC-KO`" suggestion. Plus 📜 Migration history section showing it has replaced `LED-SMD60R24DC` (and after the importer runs, `LED-E60L24DC-KO` too via the manually-set migration). |
-| `LED-SMD60R24DC` (a **predecessor**) | 🔁 Replaced by `LED-XRD-60W-24` table. If it still has OnHand, opening `LED-XRD-60W-24`'s drill-down should show a red "📜 predecessor / migration-linked SKU still holding stock!" banner pointing buyer back to consume it first. |
-| `LED-V3000938S-20` | 📜 Migration history: replaces `LED-V3000438S-20` (the screenshot example). |
-| `LED-TSB2835-300-24-3000-100` | 📝 Team note: "Keep max 50 meter SOH - Use 5 meter SK". |
-
-## What I couldn't verify (no shell access from this side)
-
-- That the new puller runs cleanly end-to-end with the new fields list
-  (the previous version of the script was confirmed working; my edits
-  should be safe but I can't re-execute).
-- Streamlit reload behaviour with the new sections — there's a small
-  risk of an indentation slip in the new code that only surfaces on
-  reload. If anything errors, paste the traceback and I'll fix it.
-- That the SKU-reference parser actually finds `LED-E60L24DC-KO` from
-  the token `E60L24DC` — this depends on whether `LED-E60L24DC-KO` is
-  in `products_df` (CIN7's Product master). It SHOULD be, but if the
-  parser shows "no parsed references" we need to check whether
-  `E60L24DC` appears as a substring of the canonical SKU OR in the
-  product Name field.
-
-## What's still on the backlog
-
-### Toward decommissioning IP
-
-If the strategic plan is to drop IP, here's what needs to happen
-before the plug can be pulled:
-
-1. **One-time CSV export from IP's UI** for the four fields the API
-   doesn't expose: Max stock, MOQ qty, forecast-period overrides,
-   saved reports. Save to `output/ip_ui_export_<stamp>.csv` and we'll
-   ingest it the same way as the API CSVs.
-2. **Wire the per-warehouse settings CSV into the reorder engine** —
-   IP's `lead_time` and `minimum_stock` per warehouse are richer than
-   what the engine currently uses. After this, our engine produces
-   reorder suggestions that match (or exceed) what IP shows the buyer.
-3. **Pick a long-term home for buyer notes** — options:
-   (a) CIN7's product Notes field (always API-accessible, already
-       part of your data model)
-   (b) `team_actions.db` (our local SQLite, fully under our control)
-   The current IP-pulled notes CSV is portable; once we pick a home,
-   we one-shot migrate them there and the app reads from the new home.
-4. **Pick a long-term home for alternates** — original plan was CIN7's
-   Alternative Products field. Still pending the API-field-name probe
-   step (you add one entry in CIN7's UI on any SKU; I run a GET; we
-   know the field name). ~5 min on your side, ~30 min coding to wire
-   the bidirectional sync.
-5. **Tag display in the app** — variant tags (`overstock11/01` etc.)
-   are captured in CSVs but not yet shown. Would slot in as chip-style
-   labels under the SKU heading.
-6. **Forecast quality compare** — once `ip_forecasts_*.csv` is loaded,
-   build a small "Engine vs IP forecast" report so the team can verify
-   our engine is producing equivalent or better numbers before they
-   stop trusting IP.
-
-### Pre-existing backlog (not IP-related)
-
-7. **The original 12 BOM SKUs that failed pre-fix on Friday** — still
-   not retried.
-8. **Fractional reorder qty for bulk masters** — the 0.40 × 100m roll
-   feature designed Friday.
-
-## Commit guidance
-
-```powershell
-git add app.py ip_pull_alternates.py NEXT_STEPS.md
-git commit -m "v2.15: IP alternates + team notes integration with SKU-reference parser"
-git push
-```
-
-If anything breaks once you re-run, paste the error and I'll debug
-from there.
+1. Read this file first.
+2. Read `RULES.md` (business rules) and `docs/data-sources.md`
+   (where to trust which data).
+3. Check `git log -10 --oneline` to see what's changed recently.
+4. Use TaskCreate/TaskUpdate liberally — even small tasks are worth
+   tracking so they don't slip.
+5. **At the end of each session**, update this file's "Shipped"
+   section so the next session has accurate context.

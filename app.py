@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.47 — Today/MTD revenue now matches CIN7 (uses order-level InvoiceAmount including shipping + tax). New AI tool `get_sales_totals` for company-wide aggregates: 'total sales this month', 'last 90 days revenue', 'monthly trend' — works with grouping by day/week/month. (Apr 30)")
+    st.caption("🟢 v2.48 — Source-of-truth rules baked in: CIN7 is master for stock/sales/costs, Shopify for customer-facing copy. New docs/data-sources.md, system prompt updated, shopify_sync intentionally excludes stock numbers so AI doesn't quote stale figures. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13441,6 +13441,17 @@ elif page == "AI Assistant":
                 "moving?') need BOTH: search the knowledge base for "
                 "the rule, AND look up the SKU's data, then explain "
                 "how the data triggers the rule.\n\n"
+                "**Source-of-truth rules** (critical):\n"
+                "- CIN7 is the source of truth for STOCK, SALES, "
+                "PURCHASES, COSTS, and SUPPLIERS. The live data tools "
+                "above all read CIN7-derived data.\n"
+                "- Shopify is the source of truth for customer-facing "
+                "DESCRIPTIONS, COLLECTIONS, FAQ/blog CONTENT, and SEO "
+                "tags. Shopify mirrors stock from CIN7 with a few-"
+                "minute lag, so do NOT use Shopify-side stock numbers "
+                "as authoritative.\n"
+                "- When in doubt: prefer CIN7 for numbers, Shopify "
+                "for words. See docs/data-sources.md for full rules.\n\n"
                 "**Hard rules** for every answer:\n"
                 "- Never invent numbers, SKUs, stock levels, or rules.\n"
                 "- If a tool returns no results, say so plainly.\n"
