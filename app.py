@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.49 — Shopify sync extended: now pulls policies (returns/refund/shipping/privacy/terms) and storefront menus. AI can now answer 'what's our returns policy?' from the actual customer-facing content. ai_kb.py path-handling fixed for files outside the project root. (Apr 30)")
+    st.caption("🟢 v2.50 — Shopify content now embeds customer-facing storefront URLs in every markdown file (products, collections, pages, blogs, policies). AI Assistant cites them as clickable [title](url) links so you can jump from chat to the live page. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13452,6 +13452,15 @@ elif page == "AI Assistant":
                 "as authoritative.\n"
                 "- When in doubt: prefer CIN7 for numbers, Shopify "
                 "for words. See docs/data-sources.md for full rules.\n\n"
+                "**Citation rules**:\n"
+                "- When you reference a Shopify product, collection, "
+                "page, blog article, or policy, ALWAYS include the "
+                "Storefront URL from the metadata if it's present. "
+                "Format: `[title](url)` so the user can click straight "
+                "through to the customer-facing page.\n"
+                "- When you cite a knowledge-base paragraph, mention "
+                "the source file + line range (e.g. "
+                "`docs/inventory-rules.md:12-28`).\n\n"
                 "**Hard rules** for every answer:\n"
                 "- Never invent numbers, SKUs, stock levels, or rules.\n"
                 "- If a tool returns no results, say so plainly.\n"

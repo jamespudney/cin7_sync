@@ -168,6 +168,15 @@ class ShopifyClient:
             return r
         return r
 
+    def get_shop_info(self) -> dict:
+        """Fetch /shop.json to learn the primary customer-facing
+        domain (not the myshopify.com one). Used to build storefront
+        URLs in each markdown file so the AI can cite them."""
+        r = self._get(f"{self.base}/shop.json")
+        if r.status_code != 200:
+            return {}
+        return (r.json() or {}).get("shop") or {}
+
     def paginate(self, endpoint: str,
                   resource_key: str,
                   params: Optional[dict] = None) -> list:
@@ -221,7 +230,7 @@ def _ensure_dirs() -> None:
         d.mkdir(parents=True, exist_ok=True)
 
 
-def write_product_md(prod: dict) -> Path:
+def write_product_md(prod: dict, storefront_url: str = "") -> Path:
     handle = prod.get("handle") or str(prod.get("id"))
     fname = PRODUCTS_DIR / f"{safe_filename(handle)}.md"
     title = prod.get("title") or handle
@@ -232,6 +241,8 @@ def write_product_md(prod: dict) -> Path:
     variants = prod.get("variants", []) or []
     skus = sorted({v.get("sku") for v in variants
                     if v.get("sku")})
+    public_url = (f"{storefront_url}/products/{handle}"
+                   if storefront_url and handle else "")
 
     lines = [
         f"# {title}",
@@ -239,6 +250,7 @@ def write_product_md(prod: dict) -> Path:
         "## Metadata",
         "",
         f"- **Handle:** {handle}",
+        f"- **Storefront URL:** {public_url}" if public_url else None,
         f"- **Vendor:** {vendor}" if vendor else None,
         f"- **Product type:** {ptype}" if ptype else None,
         f"- **Tags:** {tags}" if tags else None,
@@ -270,18 +282,22 @@ def write_product_md(prod: dict) -> Path:
     return fname
 
 
-def write_collection_md(coll: dict, products_in_coll: list) -> Path:
+def write_collection_md(coll: dict, products_in_coll: list,
+                          storefront_url: str = "") -> Path:
     handle = coll.get("handle") or str(coll.get("id"))
     fname = COLLECTIONS_DIR / f"{safe_filename(handle)}.md"
     title = coll.get("title") or handle
     body = html_to_text(coll.get("body_html", ""))
     sort_order = coll.get("sort_order", "")
+    public_url = (f"{storefront_url}/collections/{handle}"
+                   if storefront_url and handle else "")
     lines = [
         f"# Collection: {title}",
         "",
         "## Metadata",
         "",
         f"- **Handle:** {handle}",
+        f"- **Storefront URL:** {public_url}" if public_url else None,
         f"- **Sort order:** {sort_order}" if sort_order else None,
         f"- **Type:** {'smart' if 'rules' in coll else 'manual'}",
         "",
@@ -307,33 +323,42 @@ def write_collection_md(coll: dict, products_in_coll: list) -> Path:
     return fname
 
 
-def write_page_md(page: dict) -> Path:
+def write_page_md(page: dict, storefront_url: str = "") -> Path:
     handle = page.get("handle") or str(page.get("id"))
     fname = PAGES_DIR / f"{safe_filename(handle)}.md"
     title = page.get("title") or handle
     body = html_to_text(page.get("body_html", ""))
+    public_url = (f"{storefront_url}/pages/{handle}"
+                   if storefront_url and handle else "")
     fname.write_text(
         f"# Page: {title}\n\n## Metadata\n\n- **Handle:** {handle}\n"
-        f"- **Published:** {page.get('published_at', '')}\n\n"
+        + (f"- **Storefront URL:** {public_url}\n" if public_url else "")
+        + f"- **Published:** {page.get('published_at', '')}\n\n"
         f"## Body\n\n{body or '*(empty page body)*'}\n",
         encoding="utf-8")
     return fname
 
 
-def write_policy_md(policy: dict) -> Path:
+def write_policy_md(policy: dict, storefront_url: str = "") -> Path:
     """Policies: refund, privacy, terms-of-service, shipping,
     subscription. These are CUSTOMER-FACING — what shoppers see when
     they click 'Returns Policy' in the footer. Different endpoint
-    from /pages so we used to miss them entirely."""
+    from /pages so we used to miss them entirely. Shopify provides
+    the policy.url field directly so we use that as the public URL."""
     handle = policy.get("handle") or "policy"
     fname = POLICIES_DIR / f"{safe_filename(handle)}.md"
     title = policy.get("title") or handle.replace("-", " ").title()
     body = html_to_text(policy.get("body", ""))
+    # Shopify gives us policy.url directly — prefer it. Fall back to
+    # building from the storefront URL.
+    public_url = (policy.get("url")
+                   or (f"{storefront_url}/policies/{handle}"
+                       if storefront_url else ""))
     fname.write_text(
         f"# Policy: {title}\n\n## Metadata\n\n"
         f"- **Type:** {handle} (customer-facing storefront policy)\n"
-        f"- **URL:** {policy.get('url', '')}\n"
-        f"- **Last updated:** {policy.get('updated_at', '')}\n\n"
+        + (f"- **Storefront URL:** {public_url}\n" if public_url else "")
+        + f"- **Last updated:** {policy.get('updated_at', '')}\n\n"
         f"## Body\n\n{body or '*(empty policy body)*'}\n",
         encoding="utf-8")
     return fname
@@ -374,18 +399,22 @@ def write_menu_md(menu: dict) -> Path:
     return fname
 
 
-def write_article_md(article: dict, blog_handle: str) -> Path:
+def write_article_md(article: dict, blog_handle: str,
+                       storefront_url: str = "") -> Path:
     handle = article.get("handle") or str(article.get("id"))
     fname = BLOG_ARTICLES_DIR / (
         f"{safe_filename(blog_handle)}--{safe_filename(handle)}.md")
     title = article.get("title") or handle
     body = html_to_text(article.get("body_html", ""))
     summary = html_to_text(article.get("summary_html", ""))
+    public_url = (f"{storefront_url}/blogs/{blog_handle}/{handle}"
+                   if storefront_url and handle and blog_handle else "")
     fname.write_text(
         f"# Blog: {title}\n\n## Metadata\n\n"
         f"- **Blog:** {blog_handle}\n"
         f"- **Handle:** {handle}\n"
-        f"- **Author:** {article.get('author', '')}\n"
+        + (f"- **Storefront URL:** {public_url}\n" if public_url else "")
+        + f"- **Author:** {article.get('author', '')}\n"
         f"- **Tags:** {article.get('tags', '')}\n"
         f"- **Published:** {article.get('published_at', '')}\n\n"
         f"## Summary\n\n{summary or '*(no summary)*'}\n\n"
@@ -430,6 +459,20 @@ def main() -> int:
 
     log.info("Connected to %s", domain)
 
+    # Fetch the customer-facing primary domain so we can build
+    # storefront URLs (different from the .myshopify.com one).
+    shop_info = client.get_shop_info()
+    primary_domain = (shop_info.get("primary_locale", "")
+                       and shop_info.get("primary_domain", {}).get("url"))
+    # Older API responses put it under different shapes; be defensive.
+    if not primary_domain:
+        primary_domain = shop_info.get("domain", "")
+    if primary_domain and not primary_domain.startswith("http"):
+        primary_domain = f"https://{primary_domain}"
+    storefront_url = (primary_domain or "").rstrip("/")
+    log.info("Storefront URL: %s",
+              storefront_url or "(unknown — URLs in markdown will be blank)")
+
     n_products = n_collections = n_pages = n_articles = 0
     n_policies = n_menus = 0
 
@@ -440,7 +483,7 @@ def main() -> int:
         log.info("Total products: %d", len(products))
         if not args.dry_run:
             for p in products:
-                write_product_md(p)
+                write_product_md(p, storefront_url)
                 n_products += 1
 
     # ---- Collections (manual + smart)
@@ -466,7 +509,7 @@ def main() -> int:
                     "products.json", "products",
                     params={"collection_id": cid, "fields":
                              "id,title,handle"})
-                write_collection_md(coll, products_in)
+                write_collection_md(coll, products_in, storefront_url)
                 n_collections += 1
 
     # ---- Pages
@@ -476,7 +519,7 @@ def main() -> int:
         log.info("Total pages: %d", len(pages))
         if not args.dry_run:
             for p in pages:
-                write_page_md(p)
+                write_page_md(p, storefront_url)
                 n_pages += 1
 
     # ---- Blog articles
@@ -492,7 +535,7 @@ def main() -> int:
             log.info("    articles: %d", len(articles))
             if not args.dry_run:
                 for a in articles:
-                    write_article_md(a, blog_handle)
+                    write_article_md(a, blog_handle, storefront_url)
                     n_articles += 1
 
     # ---- Policies (returns, refund, shipping, privacy, terms)
@@ -505,7 +548,7 @@ def main() -> int:
             log.info("  policies: %d", len(policies))
             if not args.dry_run:
                 for p in policies:
-                    write_policy_md(p)
+                    write_policy_md(p, storefront_url)
                     n_policies += 1
         else:
             log.warning("  /policies.json -> %d %s",
