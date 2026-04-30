@@ -1,38 +1,43 @@
 # render.yaml
 # ===========
 # Declarative deploy config for Render. Render reads this file when you
-# connect the GitHub repo and creates the services described below.
+# connect the GitHub repo and creates the service described below.
 #
-# Two services + one disk:
+# Single-service architecture
+# ---------------------------
+# Render disks can't be shared across services — each disk attaches to
+# exactly one service. So we run BOTH the Streamlit app AND the daily
+# sync loop inside one web service:
 #
-# 1. wired4signs-app (web service)  — the Streamlit app, served on HTTPS.
-# 2. wired4signs-sync (cron job)   — runs daily_sync.sh at 02:00 UTC every day.
+#   start.sh:
+#     1. starts sync_loop.sh as a background process (handles the daily
+#        02:00 UTC sync — sleeps until the target hour, runs sync, repeat)
+#     2. starts Streamlit in the foreground
 #
-# Both share a 5GB persistent disk mounted at /data. That disk holds:
-#   - /data/team_actions.db   (SQLite — the source of truth for migrations,
-#                              PO drafts, supplier configs, pricing, etc.)
-#   - /data/output/           (CSVs from each CIN7 sync; the app reads these
-#                              to populate the engine)
+# Streamlit must be the foreground process so Render's health check
+# can reach it on $PORT.
+#
+# What's on the persistent disk at /data:
+#   - /data/team_actions.db   (SQLite — migrations, PO drafts, supplier
+#                              configs, pricing — source of truth)
+#   - /data/output/           (CSVs from CIN7 sync; the app reads these)
 #   - /data/.streamlit/cache/ (disk-persisted ABC engine + CSV caches)
 #
-# Secrets (CIN7 keys, IP token, app password) are NOT in this file. They
-# live in Render's encrypted env-var UI. The keys here have `sync: false`
-# which tells Render "don't sync this from the repo, prompt the operator
-# for it on first deploy."
+# Secrets (CIN7 keys, IP token, app password) are NOT in this file.
+# They live in Render's encrypted env-var UI. Keys with `sync: false`
+# tell Render "don't sync from repo — prompt the operator on apply."
 #
-# Custom domain: leave blank to get a free `<service>.onrender.com`
-# subdomain. To use a custom domain, add it via Render's Settings UI
-# AFTER the first deploy works.
+# Custom domain: free `<service>.onrender.com` subdomain by default;
+# add a custom domain via Settings UI after first deploy works.
 
 services:
-  # ----- Web service: the Streamlit app --------------------------------
   - type: web
     name: wired4signs-app
     runtime: python
-    plan: standard          # 2GB RAM — plenty for ABC engine
+    plan: standard          # 2GB RAM — plenty for ABC engine + sync loop.
     region: ohio            # Closest to Florida; change if you prefer.
     branch: main            # Deploy from main on push.
-    autoDeploy: true        # Auto-deploy on git push (you can toggle off later).
+    autoDeploy: true        # Auto-deploy on git push (toggle off later if you want).
     rootDir: .
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: ./start.sh
@@ -55,6 +60,9 @@ services:
       # Persisted-cache home on the disk so caches survive restarts.
       - key: STREAMLIT_HOME
         value: /data/.streamlit
+      # Sync loop schedule: hour of day (UTC) to run daily_sync.sh.
+      - key: SYNC_HOUR_UTC
+        value: "2"
       # ---- Secrets (set in Render UI, not here) -----------------------
       - key: APP_PASSWORD
         sync: false        # Team's shared login password.
@@ -75,34 +83,3 @@ services:
         sync: false        # Inventory Planner token.
       - key: IP_ACCOUNT
         sync: false        # IP account number.
-
-  # ----- Background worker: daily sync ---------------------------------
-  # NOTE: Render Cron Jobs cannot mount persistent disks. Since our sync
-  # writes CSVs and updates the SQLite DB, it MUST have access to the
-  # persistent disk. So instead of a cron service, we run a background
-  # worker that runs a sleep-loop — wakes up once a day at 02:00 UTC,
-  # runs the sync, sleeps again. Background workers DO support disks.
-  - type: worker
-    name: wired4signs-sync
-    runtime: python
-    plan: starter          # Small instance — sync is single-threaded I/O.
-    region: ohio
-    branch: main
-    rootDir: .
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: ./sync_loop.sh
-    disk:
-      name: w4s-data       # SAME disk name as the web service — they share.
-      mountPath: /data
-      sizeGB: 5
-    envVars:
-      - key: DATA_DIR
-        value: /data
-      - key: CIN7_ACCOUNT_ID
-        sync: false
-      - key: CIN7_APPLICATION_KEY
-        sync: false
-      - key: CIN7_RATE_SECONDS
-        value: "1.5"
-      - key: SYNC_HOUR_UTC
-        value: "2"         # Hour of the day (UTC) to run the daily sync.
