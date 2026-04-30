@@ -83,8 +83,15 @@ services:
         sync: false
       - key: CIN7_APPLICATION_KEY
         sync: false
+      # API throttle. CIN7's 60/min cap is SHARED across all integrations
+      # on the account (IP, Shopify, etc). At 1.5s/call (40/min target)
+      # we tripped 429s frequently because IP+Shopify ate the rest of
+      # the budget — and each 429 costs a 60s sleep, killing throughput.
+      # 2.5s/call (24/min target) avoids the cap entirely. Slower per
+      # call, FASTER end-to-end. Bump back to 1.5s only if you confirm
+      # other integrations are quiet (e.g. weekend overnight syncs).
       - key: CIN7_RATE_SECONDS
-        value: "1.5"       # API throttle; non-secret, fine to commit.
+        value: "2.5"
       - key: CIN7_DEFAULT_LOCATION
         value: "Main Warehouse"   # Override if your CIN7 location is named differently.
       # Branding (env-driven so the app can be re-skinned without code changes).
@@ -96,3 +103,8 @@ services:
         sync: false        # Inventory Planner token.
       - key: IP_ACCOUNT
         sync: false        # IP account number.
+      # Anthropic Claude API key for the AI Assistant page. Without
+      # this set, the AI Assistant page shows a "key not configured"
+      # message but the rest of the app keeps working.
+      - key: ANTHROPIC_API_KEY
+        sync: false

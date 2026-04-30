@@ -359,6 +359,49 @@ CREATE TABLE IF NOT EXISTS po_draft_lines (
 );
 CREATE INDEX IF NOT EXISTS ix_po_draft_lines_draft
     ON po_draft_lines(draft_id);
+
+-- AI Q&A audit log. Every question the AI Assistant page processes
+-- gets a row here: prompt, what tools it called, what it answered,
+-- how confident it was, and any thumbs-up/down feedback the user gave.
+-- This is the foundation for the "feedback loop" — over time we mine
+-- the negatively-rated rows to refine prompts/tools/aliases.
+CREATE TABLE IF NOT EXISTS ai_audit_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT,
+    user_question   TEXT NOT NULL,
+    parsed_intent   TEXT,                  -- short summary of what AI thought
+    tools_called_json TEXT,                -- JSON list of {tool, args, result_summary}
+    answer_returned TEXT,
+    confidence_score REAL,                 -- 0.0-1.0; AI's self-assessed
+    feedback        TEXT,                  -- 'positive' | 'negative' | NULL
+    feedback_note   TEXT,
+    duration_ms     INTEGER,
+    model_used      TEXT,                  -- e.g. 'claude-sonnet-4-6'
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_ai_audit_user
+    ON ai_audit_logs(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_ai_audit_feedback
+    ON ai_audit_logs(feedback);
+
+-- Product alias learning table. When the AI matches a fuzzy phrase
+-- ("warm strip", "black shallow channel") to a SKU or product family,
+-- the resolution gets recorded here. Future questions with the same
+-- phrase can short-circuit the LLM call and use this mapping directly.
+-- approved_by lets us distinguish AI-guessed aliases from human-confirmed.
+CREATE TABLE IF NOT EXISTS product_aliases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    phrase          TEXT NOT NULL,         -- normalized lowercase
+    sku             TEXT,                  -- exact SKU match (NULL if family-level)
+    product_family  TEXT,                  -- e.g. 'SIERRA38'
+    confidence      REAL,                  -- 0.0-1.0
+    approved_by     TEXT,                  -- 'ai' or username
+    times_used      INTEGER DEFAULT 1,
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    last_used_at    TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_product_aliases_phrase
+    ON product_aliases(phrase);
 """
 
 
@@ -2057,3 +2100,115 @@ def rename_po_draft(draft_id: int, new_name: str, actor: str) -> None:
             ("po_draft.rename", actor, str(draft_id),
              f"-> {new_name!r}"),
         )
+
+
+# ---------------------------------------------------------------------------
+# AI Q&A logging + alias learning
+# ---------------------------------------------------------------------------
+
+def log_ai_query(*,
+                  user_id: str,
+                  user_question: str,
+                  parsed_intent: Optional[str] = None,
+                  tools_called_json: Optional[str] = None,
+                  answer_returned: Optional[str] = None,
+                  confidence_score: Optional[float] = None,
+                  duration_ms: Optional[int] = None,
+                  model_used: Optional[str] = None) -> int:
+    """Record one AI Assistant interaction. Returns the row ID so the
+    caller can attach feedback later when the user clicks thumbs-up/down."""
+    with connect() as c:
+        cur = c.execute(
+            """
+            INSERT INTO ai_audit_logs
+                (user_id, user_question, parsed_intent, tools_called_json,
+                 answer_returned, confidence_score, duration_ms, model_used)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, user_question, parsed_intent, tools_called_json,
+             answer_returned, confidence_score, duration_ms, model_used),
+        )
+        return int(cur.lastrowid)
+
+
+def record_ai_feedback(audit_id: int, feedback: str,
+                        note: str = "") -> None:
+    """Attach thumbs-up/down feedback to an existing audit log row.
+    feedback should be 'positive' or 'negative'."""
+    if feedback not in ("positive", "negative"):
+        raise ValueError("feedback must be 'positive' or 'negative'")
+    with connect() as c:
+        c.execute(
+            "UPDATE ai_audit_logs SET feedback = ?, feedback_note = ? "
+            "WHERE id = ?",
+            (feedback, note, audit_id),
+        )
+
+
+def list_ai_queries(user_id: Optional[str] = None,
+                     limit: int = 50) -> List[sqlite3.Row]:
+    """Recent AI queries, optionally filtered by user. Newest first."""
+    sql = "SELECT * FROM ai_audit_logs"
+    params: list = []
+    if user_id:
+        sql += " WHERE user_id = ?"
+        params.append(user_id)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    with connect() as c:
+        return c.execute(sql, params).fetchall()
+
+
+def upsert_product_alias(phrase: str, *,
+                          sku: Optional[str] = None,
+                          product_family: Optional[str] = None,
+                          confidence: float = 0.5,
+                          approved_by: str = "ai") -> None:
+    """Store/update a phrase → SKU/family mapping. Phrase is lowercased.
+    On collision (same phrase already mapped to same target), bump
+    times_used + last_used_at instead of creating duplicate rows."""
+    phrase_n = (phrase or "").strip().lower()
+    if not phrase_n:
+        return
+    with connect() as c:
+        existing = c.execute(
+            "SELECT id, times_used FROM product_aliases "
+            "WHERE phrase = ? AND COALESCE(sku, '') = COALESCE(?, '') "
+            "AND COALESCE(product_family, '') = COALESCE(?, '')",
+            (phrase_n, sku, product_family),
+        ).fetchone()
+        if existing:
+            c.execute(
+                "UPDATE product_aliases SET "
+                "times_used = times_used + 1, "
+                "last_used_at = datetime('now'), "
+                "confidence = MAX(confidence, ?) "
+                "WHERE id = ?",
+                (confidence, existing["id"]),
+            )
+        else:
+            c.execute(
+                """
+                INSERT INTO product_aliases
+                    (phrase, sku, product_family, confidence, approved_by)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (phrase_n, sku, product_family, confidence, approved_by),
+            )
+
+
+def lookup_aliases(phrase: str,
+                    min_confidence: float = 0.0) -> List[sqlite3.Row]:
+    """Return any stored aliases matching the phrase (case-insensitive),
+    ordered by times_used desc. Use this BEFORE calling the LLM to
+    short-circuit common questions."""
+    phrase_n = (phrase or "").strip().lower()
+    if not phrase_n:
+        return []
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM product_aliases "
+            "WHERE phrase = ? AND confidence >= ? "
+            "ORDER BY times_used DESC, confidence DESC",
+            (phrase_n, min_confidence),
+        ).fetchall()

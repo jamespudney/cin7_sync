@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.42 — Intra-day sync: nearsync_loop runs every 15 min (stock + same-day sales/purchases incl. line items) so Ordering page stays accurate while you're placing supplier POs. Daily full-masters sync still at 02:00 UTC nightly. (Apr 30)")
+    st.caption("🟢 v2.43 — AI Assistant (Phase 0): natural-language inventory Q&A page powered by Claude with tool-use against engine_df/sale_lines. db.ai_audit_logs records every interaction; thumbs up/down feedback. Foundation for the broader Commercial Intelligence System. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -330,6 +330,7 @@ with st.sidebar:
         "View",
         [
             "Overview",
+            "AI Assistant",
             "Monthly Metrics",
             "Ordering",
             "FixedCost Audit",
@@ -13198,6 +13199,242 @@ elif page == "Kits & Fixtures":
                     f"signal — customers keep building that exact combo. "
                     f"Pre-building those saves the most fulfillment time."
                 )
+
+# ---------------------------------------------------------------------------
+# Page: AI Assistant
+# ---------------------------------------------------------------------------
+# A natural-language Q&A page powered by Claude. The user types a
+# question; we send it to the Anthropic API along with a small set of
+# tools (defined in ai_tools.py) that Claude can call to fetch data.
+# Every interaction is logged to db.ai_audit_logs with a feedback
+# button, so over time we can refine prompts/tools/aliases.
+#
+# Critical design choices:
+#   - Tool-use, not "stuff everything into context": cheaper + handles
+#     cases where data wouldn't fit in 200k tokens.
+#   - Audit log is the source of truth for what happened. UI shows
+#     answer; DB records prompt + tool calls + answer + feedback.
+#   - APP_PASSWORD-gated already — no extra auth needed.
+elif page == "AI Assistant":
+    st.header(":robot_face: AI Assistant")
+    st.caption(
+        "Ask natural-language questions about inventory, sales, "
+        "dead stock, migrations, or velocity. The AI looks at live "
+        "data via tools — it doesn't make numbers up. Every answer "
+        "is logged for audit."
+    )
+
+    # API key check upfront so we fail loud, not silent.
+    _anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not _anthropic_key:
+        st.error(
+            ":x: ANTHROPIC_API_KEY is not set. The AI Assistant won't "
+            "work until an admin adds the key to the environment "
+            "(Render → Environment → ANTHROPIC_API_KEY).")
+        st.stop()
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        st.error(
+            ":x: The `anthropic` Python package isn't installed. "
+            "An admin needs to add it to requirements.txt and redeploy.")
+        st.stop()
+
+    import ai_tools
+
+    # Lay out the page. Left column: chat input + transcript. Right:
+    # a "what can I ask" cheatsheet so users know where to start.
+    main_col, side_col = st.columns([3, 1])
+
+    with side_col:
+        st.markdown("**Try asking:**")
+        st.markdown(
+            "- *What 2700K LED strips are slow moving?*\n"
+            "- *Show me dead stock SIERRA38 with stock value over $500*\n"
+            "- *Velocity for LED-XRD-60W-24 last 90 days*\n"
+            "- *What did LED-E60L24DC-KO get replaced by?*\n"
+            "- *Black recessed channel, in stock, A-class only*"
+        )
+        st.caption(
+            "Tip: include SKUs verbatim when you have them. The AI is "
+            "best at lookups, comparisons, and rollups — not freeform "
+            "guesses."
+        )
+
+    with main_col:
+        # Persist transcript across reruns so user can scroll back.
+        if "_ai_transcript" not in st.session_state:
+            st.session_state["_ai_transcript"] = []
+
+        # Render existing transcript
+        for entry in st.session_state["_ai_transcript"]:
+            with st.chat_message(entry["role"]):
+                st.markdown(entry["content"])
+                if entry["role"] == "assistant" and entry.get("audit_id"):
+                    fb_cols = st.columns([1, 1, 6])
+                    if fb_cols[0].button(
+                            ":+1:",
+                            key=f"fb_pos_{entry['audit_id']}",
+                            help="This answer was helpful and accurate"):
+                        db.record_ai_feedback(entry["audit_id"], "positive")
+                        st.toast("Thanks — feedback recorded.",
+                                  icon=":+1:")
+                    if fb_cols[1].button(
+                            ":-1:",
+                            key=f"fb_neg_{entry['audit_id']}",
+                            help="This answer was wrong or unhelpful"):
+                        db.record_ai_feedback(entry["audit_id"], "negative")
+                        st.toast(
+                            "Thanks — flagged for review.", icon=":-1:")
+                    if entry.get("tool_calls"):
+                        with fb_cols[2].popover(
+                                ":wrench: Why this answer"):
+                            st.markdown(
+                                "**Tools the AI called to gather data:**")
+                            for tc in entry["tool_calls"]:
+                                st.code(
+                                    f"{tc['tool']}({tc['args']})\n"
+                                    f"→ {tc.get('result_summary', '')}",
+                                    language="text")
+
+        # Input
+        _user_question = st.chat_input(
+            "Ask anything about your inventory…")
+        if _user_question:
+            st.session_state["_ai_transcript"].append({
+                "role": "user", "content": _user_question})
+            with st.chat_message("user"):
+                st.markdown(_user_question)
+
+            # Build the Anthropic conversation. We keep the system
+            # prompt small + tool-driven so Claude doesn't waste
+            # tokens "understanding" the data — it asks via tools.
+            _client = anthropic.Anthropic(api_key=_anthropic_key)
+            _messages = [{"role": "user", "content": _user_question}]
+            _system_prompt = (
+                "You are an inventory analyst assistant for "
+                f"{COMPANY_NAME}, a CIN7-using business that sells "
+                "LED lighting products (strips, channels, drivers, "
+                "tubes). Answer the user's question by calling the "
+                "available tools to fetch real data. Never invent "
+                "numbers, SKUs, or stock levels. Keep answers concise "
+                "(3-6 short bullet points or a small table) unless "
+                "the user asks for more detail. When citing a SKU, "
+                "include the name + on-hand quantity in parentheses. "
+                "If you can't answer confidently, say so and ask "
+                "for clarification (preferred SKU, time window, etc).")
+
+            _tool_calls_log: list = []
+            _start_ts = datetime.now()
+            _final_text_parts: list = []
+
+            with st.chat_message("assistant"):
+                _placeholder = st.empty()
+                _placeholder.markdown(":thought_balloon: thinking…")
+
+                # Tool-use loop: send messages, if response includes
+                # tool_use blocks, call them, append results, ask
+                # again, repeat until we get a pure text response.
+                _MAX_TURNS = 6
+                for _turn in range(_MAX_TURNS):
+                    try:
+                        _resp = _client.messages.create(
+                            model="claude-sonnet-4-5",
+                            max_tokens=2048,
+                            system=_system_prompt,
+                            tools=ai_tools.TOOL_SCHEMAS,
+                            messages=_messages,
+                        )
+                    except Exception as _exc:
+                        _placeholder.error(
+                            f"Anthropic API error: {_exc}")
+                        break
+
+                    # Extract text + tool_use blocks
+                    _text_this_turn = []
+                    _tool_uses = []
+                    for _block in _resp.content:
+                        if _block.type == "text":
+                            _text_this_turn.append(_block.text)
+                        elif _block.type == "tool_use":
+                            _tool_uses.append(_block)
+                    if _text_this_turn:
+                        _final_text_parts.extend(_text_this_turn)
+                        _placeholder.markdown(
+                            "\n\n".join(_final_text_parts))
+
+                    if _resp.stop_reason == "end_turn" and not _tool_uses:
+                        break  # done
+
+                    if not _tool_uses:
+                        # Stop reason wasn't end_turn but no tool — bail
+                        break
+
+                    # Run tools, build results to send back
+                    _messages.append({
+                        "role": "assistant", "content": _resp.content})
+                    _tool_results_block: list = []
+                    for _tu in _tool_uses:
+                        _result_json = ai_tools.call_tool(
+                            _tu.name, engine_df, sale_lines,
+                            dict(_tu.input))
+                        # Truncate for the audit log so we don't store huge blobs
+                        _summary = (_result_json[:200] + "…"
+                                     if len(_result_json) > 200
+                                     else _result_json)
+                        _tool_calls_log.append({
+                            "tool": _tu.name,
+                            "args": dict(_tu.input),
+                            "result_summary": _summary,
+                        })
+                        _tool_results_block.append({
+                            "type": "tool_result",
+                            "tool_use_id": _tu.id,
+                            "content": _result_json,
+                        })
+                    _messages.append({
+                        "role": "user", "content": _tool_results_block})
+
+                _final_answer = "\n\n".join(_final_text_parts) or (
+                    "I couldn't answer that. Try rephrasing or "
+                    "include a specific SKU.")
+                _placeholder.markdown(_final_answer)
+
+            # Audit log
+            _duration_ms = int(
+                (datetime.now() - _start_ts).total_seconds() * 1000)
+            try:
+                _audit_id = db.log_ai_query(
+                    user_id=current_user or "anonymous",
+                    user_question=_user_question,
+                    parsed_intent=None,
+                    tools_called_json=json.dumps(_tool_calls_log)
+                                         if _tool_calls_log else None,
+                    answer_returned=_final_answer,
+                    confidence_score=None,
+                    duration_ms=_duration_ms,
+                    model_used="claude-sonnet-4-5",
+                )
+            except Exception as _exc:  # noqa: BLE001
+                _audit_id = None
+                st.warning(f"(Audit log write failed: {_exc})")
+
+            st.session_state["_ai_transcript"].append({
+                "role": "assistant",
+                "content": _final_answer,
+                "audit_id": _audit_id,
+                "tool_calls": _tool_calls_log,
+            })
+            st.rerun()
+
+        # Clear transcript button
+        if st.session_state["_ai_transcript"]:
+            if st.button(":wastebasket: Clear conversation",
+                          help="Clears the on-screen transcript. "
+                               "Audit log entries are kept."):
+                st.session_state["_ai_transcript"] = []
+                st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # Page: Data Health

@@ -6,3 +6,8 @@ plotly>=5.20.0
 duckdb>=1.0.0
 streamlit-sortables>=0.3.1
 reportlab>=4.0.0
+# Anthropic Claude SDK — powers the AI Assistant page (ai_tools.py +
+# the "AI Assistant" page in app.py). Tool-use loop sends questions
+# to Claude with access to engine_df / sale_lines via local Python
+# tools. Cost: ~$0.50-2/day for typical team usage at this volume.
+anthropic>=0.40.0
