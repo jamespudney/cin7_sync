@@ -972,9 +972,25 @@ def render_demand_breakdown(
 
     # Defensive copy + date coercion (sale_lines may already be parsed but
     # this is cheap insurance against caller variability).
+    # Extra guard: on a fresh deploy the salelines sync may still be
+    # running, so sale_lines_df can be empty AND missing InvoiceDate
+    # entirely. Render the page anyway; just zero out demand numbers.
     sl = sale_lines_df.copy()
-    sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
-    sl["Quantity"] = pd.to_numeric(sl["Quantity"], errors="coerce").fillna(0)
+    if sl.empty or "InvoiceDate" not in sl.columns:
+        st.warning(
+            ":hourglass: Sale-line history not yet loaded — demand "
+            "numbers will all show as zero until the background sync "
+            "completes. Check `tail /data/output/salelines_sync.log` "
+            "in the Render shell.")
+        # Build an empty frame with the columns this function expects
+        # so the rest of it can run without crashing.
+        sl = pd.DataFrame(columns=[
+            "InvoiceDate", "Quantity", "SKU", "Customer"])
+    sl["InvoiceDate"] = pd.to_datetime(
+        sl.get("InvoiceDate", pd.Series(dtype="object")), errors="coerce")
+    sl["Quantity"] = pd.to_numeric(
+        sl.get("Quantity", pd.Series(dtype="float64")),
+        errors="coerce").fillna(0)
 
     # Direct sales of the master itself (independent of rollup)
     sl_master = sl[sl["SKU"].astype(str) == str(sku)]
