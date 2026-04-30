@@ -31,3 +31,9 @@ Thumbs.db
 
 # Render-specific local artifacts
 .render/
+
+# Local backup archives — never commit (use Drive / S3 / B2 instead)
+*.zip
+*.tar
+*.tar.gz
+*.tgz

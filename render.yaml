@@ -59,9 +59,17 @@ services:
       # Persisted-cache home on the disk so caches survive restarts.
       - key: STREAMLIT_HOME
         value: /data/.streamlit
-      # Sync loop schedule: hour of day (UTC) to run daily_sync.sh.
+      # Sync loop schedule.
+      # SYNC_HOUR_UTC      — hour of day (UTC) to run the heavy daily
+      #                      sync. Once per 24h.
+      # NEARSYNC_INTERVAL_MIN — how often to run the lightweight near-
+      #                      real-time sync (stock + last-day sales).
+      #                      Critical for Ordering page accuracy during
+      #                      business hours. Default 15 min.
       - key: SYNC_HOUR_UTC
         value: "2"
+      - key: NEARSYNC_INTERVAL_MIN
+        value: "15"
       # ---- Secrets (set in Render UI, not here) -----------------------
       - key: APP_PASSWORD
         sync: false        # Team's shared login password.

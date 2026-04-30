@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.41 — Render deploy ready: data_paths.py centralises DATA_DIR; render.yaml + start.sh + daily_sync.sh in repo; APP_PASSWORD gate (env-driven); branding via COMPANY_NAME / APP_TITLE env vars (SaaS-friendly). See DEPLOY.md for cutover steps (Apr 30)")
+    st.caption("🟢 v2.42 — Intra-day sync: nearsync_loop runs every 15 min (stock + same-day sales/purchases incl. line items) so Ordering page stays accurate while you're placing supplier POs. Daily full-masters sync still at 02:00 UTC nightly. (Apr 30)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's

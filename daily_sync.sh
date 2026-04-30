@@ -32,6 +32,18 @@ echo "[$(stamp)] cin7_sync quick --days 3" >> "$LOG"
 python cin7_sync.py quick --days 3 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync quick FAILED (continuing)" >> "$LOG"
 
+# Sale lines feed the ABC engine, customer rollups, velocity. The
+# `quick` sync above pulls sale headers but NOT line items. Without
+# this incremental pull, line-level data goes stale by ~1 day per day.
+echo "[$(stamp)] cin7_sync salelines --days 3" >> "$LOG"
+python cin7_sync.py salelines --days 3 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync salelines FAILED (continuing)" >> "$LOG"
+
+# Purchase lines feed FixedCost audit and supplier-pricing audits.
+echo "[$(stamp)] cin7_sync purchaselines --days 7" >> "$LOG"
+python cin7_sync.py purchaselines --days 7 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync purchaselines FAILED (continuing)" >> "$LOG"
+
 echo "[$(stamp)] sync_sku_renames" >> "$LOG"
 python sync_sku_renames.py --apply >> "$LOG" 2>&1 || \
   echo "[$(stamp)] sync_sku_renames FAILED (continuing)" >> "$LOG"
