@@ -50,6 +50,12 @@ services:
       # Where data lives — must match the disk mountPath above.
       - key: DATA_DIR
         value: /data
+      # Display timestamps in this timezone everywhere in the app
+      # (Last-sync indicator, audit log, "Today" / MTD slices etc).
+      # Render servers run UTC by default; set this to your business
+      # timezone so wall-clock times line up.
+      - key: TZ
+        value: America/New_York
       # Streamlit prefs: bind to Render's $PORT in headless mode.
       # CORS + XSRF use the Streamlit defaults (both true) — disabling
       # CORS while keeping XSRF on is incompatible and produces a noisy
