@@ -465,6 +465,23 @@ def _dir_fingerprint(pattern: str) -> tuple:
     return tuple(out)
 
 
+# Empty-frame factories used by loaders when no CSVs exist on disk yet.
+# Why: many call sites do `df["Foo"]` without first checking the column
+# exists. Rather than guarding every site, we make the loaders return a
+# DataFrame with the EXPECTED columns even when there are zero rows.
+# A consumer doing `df["InvoiceDate"]` then gets an empty Series instead
+# of a KeyError. Keeps the deploy bring-up much smoother.
+_EMPTY_SALE_LINES_COLS = [
+    "SaleID", "OrderNumber", "InvoiceDate", "Customer",
+    "SKU", "Name", "Quantity", "Price", "Discount", "Tax", "Total"]
+_EMPTY_SALES_COLS = [
+    "SaleID", "OrderNumber", "InvoiceDate", "OrderDate", "Customer",
+    "Status", "Total", "InvoiceAmount"]
+_EMPTY_PURCHASE_LINES_COLS = [
+    "PurchaseID", "OrderNumber", "OrderDate", "Supplier",
+    "SKU", "Name", "Quantity", "Price", "Total"]
+
+
 # Load the most comprehensive sale_lines picture:
 # 1. Start with the longest-window file (has deepest history)
 # 2. Union any more-recent shorter-window files (they contain today's data
@@ -479,7 +496,9 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
         if m:
             files.append((int(m.group(1)), p.stat().st_mtime, p))
     if not files:
-        return pd.DataFrame()
+        # Return an empty frame WITH expected columns so downstream
+        # df["InvoiceDate"] etc. doesn't KeyError on a fresh deploy.
+        return pd.DataFrame(columns=_EMPTY_SALE_LINES_COLS)
 
     # Largest-window file first, then any more-recent smaller files
     files.sort(key=lambda x: (-x[0], -x[1]))
@@ -488,7 +507,7 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_EMPTY_SALE_LINES_COLS)
 
     # Union any file that was written MORE RECENTLY than the base
     for days, mtime, p in files[1:]:
@@ -530,14 +549,14 @@ def _load_longest_sales_cached(fingerprint: tuple) -> pd.DataFrame:
         if m:
             files.append((int(m.group(1)), p.stat().st_mtime, p))
     if not files:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_EMPTY_SALES_COLS)
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_EMPTY_SALES_COLS)
     for days, mtime, p in files[1:]:
         if mtime <= base_mtime:
             continue
@@ -565,14 +584,14 @@ def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
         if m:
             files.append((int(m.group(1)), p.stat().st_mtime, p))
     if not files:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_EMPTY_PURCHASE_LINES_COLS)
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=_EMPTY_PURCHASE_LINES_COLS)
     for days, mtime, p in files[1:]:
         if mtime <= base_mtime:
             continue
