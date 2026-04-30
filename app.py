@@ -313,15 +313,6 @@ with st.sidebar:
                 f"{'s' if len(_pending) != 1 else ''} detected since last "
                 f"products sync (no DB references — informational only).")
 
-    if st.button(":arrows_counterclockwise: Refresh data now",
-                 use_container_width=True,
-                 help="Re-reads CSV files from disk right now. Use this if "
-                      "you just saw the 15-min sync finish and want the "
-                      "numbers on screen to match immediately (otherwise "
-                      "the app's in-memory cache lags by up to 5 min)."):
-        st.cache_data.clear()
-        st.rerun()
-
     st.divider()
 
     # Who's using the app? Used on notes / flags / audit log.
@@ -334,24 +325,6 @@ with st.sidebar:
     )
     if current_user:
         st.session_state["current_user"] = current_user.strip()
-
-    # Force-rebuild caches button. Useful after a daily sync drops fresh
-    # CSVs, or when engine logic has changed but the persisted cache is
-    # still serving the old result. Persisted caches normally invalidate
-    # automatically when their inputs change, but if you've edited the
-    # engine source itself you may want an immediate refresh.
-    if st.button(":arrows_counterclockwise: Refresh data caches",
-                  help="Clear the persisted ABC-engine + CSV-load caches "
-                       "and force a recompute on the next page render. "
-                       "Use after a fresh sync or after editing engine "
-                       "logic.",
-                  width="stretch"):
-        try:
-            st.cache_data.clear()
-            st.success("Caches cleared. Reloading…")
-            st.rerun()
-        except Exception as _exc:
-            st.error(f"Cache clear failed: {_exc}")
 
     page = st.radio(
         "View",
@@ -384,21 +357,25 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Data actions")
 
-    if st.button(":arrows_counterclockwise: Reload from disk",
-                 width="stretch",
-                 help="Re-read the CSV files already on your PC. "
-                      "Fast — no API calls."):
+    # Single consolidated refresh button. CIN7 data is auto-pulled by
+    # the nightly sync (02:00 UTC). This button just clears in-app
+    # caches if you suspect the screen is showing stale numbers.
+    if st.button(":arrows_counterclockwise: Refresh data",
+                  width="stretch",
+                  help="Clear in-app caches and reload from the CSV files "
+                       "on the server. CIN7 itself is auto-synced nightly "
+                       "at 02:00 UTC — you don't normally need this."):
         st.cache_data.clear()
         st.rerun()
 
-    if st.button(":rocket: Force sync from CIN7",
-                 width="stretch",
-                 type="primary",
-                 help="Pulls stock + last 24h of movements from CIN7 right "
-                      "now. Uses ~10 API calls, takes ~60-90 seconds. "
-                      "Normally runs automatically every 15 minutes."):
+    # The rest of this block is the legacy 'Force sync from CIN7' that
+    # used to subprocess.run cin7_sync.py from inside Streamlit. It's
+    # disabled on the deployed app because the cron-equivalent
+    # background loop already handles incremental syncs every night.
+    # Operators who really need to trigger a manual sync should use
+    # the Render Shell to run `python cin7_sync.py nearsync --days 1`.
+    if False:  # kept for reference only — see comment above
         with st.spinner("Syncing from CIN7… please wait 1-2 minutes…"):
             try:
                 result = subprocess.run(
