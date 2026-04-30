@@ -13224,6 +13224,31 @@ elif page == "AI Assistant":
         "is logged for audit."
     )
 
+    # Build a lightweight inventory view for the AI tools. The full
+    # ABC engine is currently scoped to the Ordering page block, so
+    # we don't have engine_df here. Instead we compose a simpler
+    # SKU-level frame from products + stock — enough for search,
+    # SKU lookup, and migration chain queries. Tools that need the
+    # full engine (ABC class, Classification etc.) will see those
+    # columns missing and gracefully degrade.
+    if not products.empty:
+        engine_df = products.copy()
+        engine_df["SKU"] = engine_df["SKU"].astype(str)
+        if not stock.empty and "SKU" in stock.columns:
+            _stock_view = stock[["SKU"]].copy()
+            _stock_view["SKU"] = _stock_view["SKU"].astype(str)
+            for _col in ("OnHand", "Available"):
+                if _col in stock.columns:
+                    _stock_view[_col] = pd.to_numeric(
+                        stock[_col], errors="coerce")
+            engine_df = engine_df.merge(
+                _stock_view, on="SKU", how="left")
+        # Family lives in AdditionalAttribute1 in CIN7 conventions.
+        if "AdditionalAttribute1" in engine_df.columns:
+            engine_df["Family"] = engine_df["AdditionalAttribute1"]
+    else:
+        engine_df = pd.DataFrame(columns=["SKU", "Name", "OnHand"])
+
     # API key check upfront so we fail loud, not silent.
     _anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not _anthropic_key:
