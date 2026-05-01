@@ -832,12 +832,16 @@ def _run_demand_reconcile_after_salelines(days: int) -> None:
             sales_records, window_days=30,
             actor=f"auto_reconciler ({Path(__file__).name})")
         log.info(
-            "  demand reconcile: converted=%d needs_review=%d "
-            "checked=%d skipped=%d errors=%d",
+            "  demand reconcile: checked=%d → converted=%d "
+            "needs_review=%d no_sku=%d no_customer=%d "
+            "no_match=%d cancelled_voided=%d errors=%d",
+            summary.get("checked", 0),
             summary.get("converted", 0),
             summary.get("needs_review", 0),
-            summary.get("checked", 0),
-            summary.get("skipped", 0),
+            summary.get("skipped_no_sku", 0),
+            summary.get("skipped_no_customer", 0),
+            summary.get("skipped_no_match", 0),
+            summary.get("skipped_cancelled_voided", 0),
             summary.get("errors", 0))
     except Exception as exc:
         log.warning("  demand reconcile failed: %s", exc)

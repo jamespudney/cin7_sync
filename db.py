@@ -2800,20 +2800,30 @@ def reconcile_demand_signals(sales_rows,
     nothing to demand_signals or audit_log (one summary row excepted —
     so the page can show that a dry-run was attempted).
 
-    Returns::
+    Returns (v2.61.1 — full bucket breakdown so checked balances)::
         {
-            "checked": int,        # pending signals considered
-            "converted": int,      # auto-converted (HIGH)
-            "needs_review": int,   # flagged for review (MEDIUM)
-            "skipped": int,        # no qualifying match at any tier
+            "checked": int,                  # pending signals considered
+            "converted": int,                # auto-converted (HIGH)
+            "needs_review": int,             # flagged for review (MEDIUM)
+            "skipped_no_sku": int,           # signal had no SKU
+            "skipped_no_customer": int,      # signal had SKU but no
+                                              # customer_id, AND no
+                                              # MEDIUM fallback fired
+            "skipped_no_match": int,         # signal had SKU + customer_id
+                                              # but no qualifying live sale
+            "skipped_cancelled_voided": int, # the only candidate in window
+                                              # was VOIDED / CANCELLED /
+                                              # CREDITED / LOST
             "errors": int,
             "dry_run": bool,
-            "would_convert": [    # only populated when dry_run=True
-                {"signal_id", "sku", "customer_id", "order_number",
-                 "sale_date", "confidence"}
-            ],
-            "would_review": [...]  # same shape
+            "would_convert": [...],   # only when dry_run=True
+            "would_review": [...]     # only when dry_run=True
         }
+
+    Invariant:
+        checked == converted + needs_review + skipped_no_sku
+                 + skipped_no_customer + skipped_no_match
+                 + skipped_cancelled_voided + errors
     """
     from datetime import datetime as _dt, timedelta as _td
 
@@ -2825,7 +2835,10 @@ def reconcile_demand_signals(sales_rows,
         "checked": 0,
         "converted": 0,
         "needs_review": 0,
-        "skipped": 0,
+        "skipped_no_sku": 0,
+        "skipped_no_customer": 0,
+        "skipped_no_match": 0,
+        "skipped_cancelled_voided": 0,
         "errors": 0,
         "dry_run": bool(dry_run),
         "would_convert": [],
@@ -2861,10 +2874,13 @@ def reconcile_demand_signals(sales_rows,
                 "INSERT INTO audit_log (event, actor, target, detail) "
                 "VALUES (?, ?, ?, ?)",
                 ("demand_signal.reconcile_run", actor, "all",
-                 (f"converted={summary['converted']} "
+                 (f"checked={summary['checked']} "
+                  f"converted={summary['converted']} "
                   f"needs_review={summary['needs_review']} "
-                  f"checked={summary['checked']} "
-                  f"skipped={summary['skipped']} "
+                  f"no_sku={summary['skipped_no_sku']} "
+                  f"no_customer={summary['skipped_no_customer']} "
+                  f"no_match={summary['skipped_no_match']} "
+                  f"cancelled_voided={summary['skipped_cancelled_voided']} "
                   f"errors={summary['errors']} "
                   f"window_days={window_days} "
                   f"{'(dry_run)' if dry_run else ''} {extra}").strip()))
@@ -2882,22 +2898,29 @@ def reconcile_demand_signals(sales_rows,
                    ("pending", "open", ""))]
     summary["checked"] = len(pending)
 
-    # Skip empty-sku rows entirely; they can't match anything.
-    eligible = [s for s in pending
-                if s["sku"] and str(s["sku"]).strip()]
+    # Bucket no-sku rows up front so they appear in the summary instead
+    # of vanishing silently (the v2.61 bug James caught).
+    eligible = []
+    for s in pending:
+        if not s["sku"] or not str(s["sku"]).strip():
+            summary["skipped_no_sku"] += 1
+        else:
+            eligible.append(s)
     eligible.sort(key=lambda r: str(r["created_at"] or ""))
 
-    # Build two indexes from sales_rows (filtered for cancellations):
-    #   exact_index : (sku_upper, customer_id_upper) → [sales sorted asc]
-    #   any_cust    : (sku_upper)                    → [sales sorted asc]
-    # Each sale dict carries a `consumed` flag; HIGH pass sets it on its
-    # matches before MEDIUM gets a look.
-    exact_index: dict = {}
-    any_cust_index: dict = {}
+    # Build FOUR indexes from sales_rows so we can distinguish "no
+    # match at all" from "only candidate was cancelled":
+    #   live_exact   : (sku, cid) → [non-cancelled sales sorted asc]
+    #   live_any     : sku        → [non-cancelled sales sorted asc]
+    #   void_exact   : (sku, cid) → [cancelled-status sales]
+    #   void_any     : sku        → [cancelled-status sales]
+    # Same sale_record is shared between live_exact and live_any so
+    # `consumed=True` set in pass 1 is visible in pass 2.
+    live_exact: dict = {}
+    live_any: dict = {}
+    void_exact: dict = {}
+    void_any: dict = {}
     for row in sales_rows:
-        status = str(row.get("Status", "") or "").strip().upper()
-        if status in cancelled_statuses:
-            continue
         sku = str(row.get("SKU", "") or "").strip().upper()
         if not sku:
             continue
@@ -2905,6 +2928,7 @@ def reconcile_demand_signals(sales_rows,
             row.get("OrderDate") or row.get("InvoiceDate"))
         if order_date_dt is None:
             continue
+        status = str(row.get("Status", "") or "").strip().upper()
         sale_id = str(row.get("SaleID") or "").strip()
         product_id = str(row.get("ProductID") or "").strip()
         sale_record = {
@@ -2920,16 +2944,32 @@ def reconcile_demand_signals(sales_rows,
             "Quantity": row.get("Quantity"),
             "consumed": False,
         }
-        # Same record goes into both indexes so consumption in pass 1
-        # is visible to pass 2.
         cid = str(row.get("CustomerID", "") or "").strip().upper()
-        if cid:
-            exact_index.setdefault((sku, cid), []).append(sale_record)
-        any_cust_index.setdefault(sku, []).append(sale_record)
-    for k in exact_index:
-        exact_index[k].sort(key=lambda x: x["OrderDate"])
-    for k in any_cust_index:
-        any_cust_index[k].sort(key=lambda x: x["OrderDate"])
+        if status in cancelled_statuses:
+            if cid:
+                void_exact.setdefault((sku, cid), []).append(sale_record)
+            void_any.setdefault(sku, []).append(sale_record)
+        else:
+            if cid:
+                live_exact.setdefault((sku, cid), []).append(sale_record)
+            live_any.setdefault(sku, []).append(sale_record)
+
+    for k in live_exact:
+        live_exact[k].sort(key=lambda x: x["OrderDate"])
+    for k in live_any:
+        live_any[k].sort(key=lambda x: x["OrderDate"])
+    for k in void_exact:
+        void_exact[k].sort(key=lambda x: x["OrderDate"])
+    for k in void_any:
+        void_any[k].sort(key=lambda x: x["OrderDate"])
+
+    def _exists_in_window(candidates, sig_dt, window_end):
+        """Was there ANY (consumed or not) candidate in window? Used
+        only to detect cancelled-only situations."""
+        for c_sale in candidates:
+            if sig_dt <= c_sale["OrderDate"] <= window_end:
+                return True
+        return False
 
     def _earliest_unconsumed(candidates, sig_dt, window_end):
         for c_sale in candidates:
@@ -3008,22 +3048,25 @@ def reconcile_demand_signals(sales_rows,
                 "VALUES (?, ?, ?, ?)",
                 (event_name, actor, str(sig_id), evidence))
 
-    # ---- Pass 1: HIGH (exact SKU + exact customer) ----
-    medium_candidates = []  # signals that didn't match HIGH but had no
-                              # customer_id captured — try MEDIUM in pass 2.
+    # ---- Pass 1: HIGH (exact SKU + exact customer_id) ----
+    # Signals that lack customer_id are deferred to MEDIUM (pass 2).
+    medium_candidates = []
     for s in eligible:
         sku_key = str(s["sku"]).strip().upper()
         cid_raw = (s["customer_id"] or "").strip()
         sig_dt = _parse_dt(s["created_at"])
         if sig_dt is None:
-            summary["skipped"] += 1
+            # Treat un-parseable created_at as "no qualifying sale"
+            # rather than inventing a fifth bucket.
+            summary["skipped_no_match"] += 1
             continue
         window_end = sig_dt + _td(days=window_days)
 
         if cid_raw:
             cid_key = cid_raw.upper()
-            candidates = exact_index.get((sku_key, cid_key), [])
-            match = _earliest_unconsumed(candidates, sig_dt, window_end)
+            live_candidates = live_exact.get((sku_key, cid_key), [])
+            match = _earliest_unconsumed(
+                live_candidates, sig_dt, window_end)
             if match:
                 try:
                     _apply(s, match, confidence="high")
@@ -3031,20 +3074,24 @@ def reconcile_demand_signals(sales_rows,
                 except Exception:
                     summary["errors"] += 1
             else:
-                # Signal HAS a customer_id but no exact-customer sale.
-                # Don't attempt MEDIUM here — that would be the wrong
-                # customer, which is suspicious not helpful.
-                summary["skipped"] += 1
+                # Live miss. Was there a CANCELLED candidate in window?
+                # If so, that's a different (more diagnostic) skip
+                # category than "no match at all".
+                void_candidates = void_exact.get((sku_key, cid_key), [])
+                if _exists_in_window(
+                        void_candidates, sig_dt, window_end):
+                    summary["skipped_cancelled_voided"] += 1
+                else:
+                    summary["skipped_no_match"] += 1
         else:
-            # No customer_id captured. Defer to pass 2 in case a
-            # SKU-only sale exists to *some* customer.
-            medium_candidates.append((s, sig_dt, window_end))
+            # No customer_id captured. Defer to MEDIUM pass.
+            medium_candidates.append((s, sig_dt, window_end, sku_key))
 
     # ---- Pass 2: MEDIUM (exact SKU, signal had no customer_id) ----
-    for (s, sig_dt, window_end) in medium_candidates:
-        sku_key = str(s["sku"]).strip().upper()
-        candidates = any_cust_index.get(sku_key, [])
-        match = _earliest_unconsumed(candidates, sig_dt, window_end)
+    for (s, sig_dt, window_end, sku_key) in medium_candidates:
+        live_candidates = live_any.get(sku_key, [])
+        match = _earliest_unconsumed(
+            live_candidates, sig_dt, window_end)
         if match:
             try:
                 _apply(s, match, confidence="medium")
@@ -3052,7 +3099,15 @@ def reconcile_demand_signals(sales_rows,
             except Exception:
                 summary["errors"] += 1
         else:
-            summary["skipped"] += 1
+            # No live MEDIUM match. Distinguish "only candidate was
+            # cancelled" from "the missing customer_id is the bottleneck"
+            # (i.e. there's literally no sale of this SKU in window).
+            void_candidates = void_any.get(sku_key, [])
+            if _exists_in_window(
+                    void_candidates, sig_dt, window_end):
+                summary["skipped_cancelled_voided"] += 1
+            else:
+                summary["skipped_no_customer"] += 1
 
     _record_run()
     return summary

@@ -214,12 +214,17 @@ def _freshness_from_output_dir() -> tuple:
 # here. The disk-persisted @st.cache_data on load() means this is
 # essentially free on subsequent renders.
 products = load("products")
+# v2.61.1: customers loaded eagerly so the demand-capture form's customer
+# typeahead (in the sidebar block below) has something to filter against.
+# Same disk-cache treatment as products — the duplicate load() further
+# down is essentially free.
+customers = load("customers")
 
 
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.61 — Reconciler hardening (accuracy > speed): (1) excludes VOIDED/CANCELLED/CREDITED/LOST sales from matching; (2) two confidence tiers — HIGH (exact SKU + exact customer match) auto-converts, MEDIUM (exact SKU, no customer captured) flags `needs_review=1` only; (3) new schema columns `detected_sku` (immutable original), `matched_order_number`, `matched_sale_date`, `matched_sale_line_id`, `match_confidence` populated by the reconciler; (4) distinct audit events `demand_signal_auto_converted` / `demand_signal_needs_review` with structured per-match evidence; (5) dry-run toggle on the page so you can preview before committing. Migration backfills `detected_sku=sku` for pre-v2.61 rows. Lost-marking stays manual. (May 1)")
+    st.caption("🟢 v2.61.1 — (1) Demand-capture customer typeahead: searches the CIN7 customers CSV by name and stores both `customer_id` (the CIN7 ContactID — what the reconciler needs for HIGH-confidence matches) and `customer_name`; free-text fallback still allowed but flagged as MEDIUM at reconcile. (2) Reconciler stats fully accounted: 7 buckets — `converted`, `needs_review`, `skipped_no_sku`, `skipped_no_customer`, `skipped_no_match`, `skipped_cancelled_voided`, `errors` — and `checked` always equals their sum. The page now shows a one-line breakdown. (3) Review page exposes `customer_id` (read-only). Cancelled/voided sales are now distinguishable from no-match-at-all. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -526,6 +531,85 @@ with st.sidebar:
                             "(useful for new product requests or "
                             "when CIN7 hasn't synced yet).")
 
+            # ---- Customer typeahead (OUTSIDE the form, so each keystroke
+            # triggers a rerun and we can show live suggestions). Same
+            # pattern as the SKU search above. The picked customer's id +
+            # name are stashed in session_state and read by the form's
+            # submit handler below.
+            #
+            # Why this matters: without a real CIN7 customer_id captured
+            # here, the reconciler can't ever auto-convert (HIGH tier).
+            # See db.reconcile_demand_signals — HIGH requires exact
+            # customer_id match against the CIN7 sale row. Free-text
+            # names are MEDIUM at best.
+            _cust_text_key = "_ds_cust_text"
+            if "_ds_cust_pending" in st.session_state:
+                st.session_state[_cust_text_key] = (
+                    st.session_state.pop("_ds_cust_pending"))
+            _cust_q_raw = st.text_input(
+                "Customer (search CIN7 to record customer_id)",
+                placeholder="Type a name — picks the CIN7 customer",
+                key=_cust_text_key,
+                help="Recording the real CIN7 customer_id is what lets "
+                     "the auto-reconciler later mark this signal "
+                     "'converted' when the customer actually buys. "
+                     "Leave blank for walk-in / unknown — the signal "
+                     "still saves but stays MEDIUM-confidence at "
+                     "reconcile time.")
+            _cust_q = (_cust_q_raw or "").strip().lower()
+
+            _picked_cust_id = st.session_state.get("_ds_cust_id")
+            _picked_cust_name = st.session_state.get("_ds_cust_name")
+
+            if _picked_cust_id:
+                _selrow = st.columns([4, 1])
+                _selrow[0].success(
+                    f":busts_in_silhouette: **{_picked_cust_name}** "
+                    f"`(id {_picked_cust_id})`")
+                if _selrow[1].button("Clear", key="_ds_cust_clear"):
+                    st.session_state["_ds_cust_id"] = None
+                    st.session_state["_ds_cust_name"] = None
+                    st.session_state["_ds_cust_pending"] = ""
+                    st.rerun()
+            elif len(_cust_q) >= 2:
+                try:
+                    if (not customers.empty
+                            and "Name" in customers.columns):
+                        _name_col = customers["Name"].fillna("").astype(str)
+                        _mask = _name_col.str.lower().str.contains(
+                            _cust_q, na=False)
+                        _cust_matches = customers[_mask].head(8)
+                        if _cust_matches.empty:
+                            st.caption(
+                                f":warning: No CIN7 customer matches "
+                                f"`{_cust_q_raw}`. Save anyway and the "
+                                f"signal will be MEDIUM-confidence "
+                                f"(reviewer can pick later).")
+                        else:
+                            st.caption(":busts_in_silhouette: Pick the "
+                                        "customer:")
+                            for _, _crow in _cust_matches.iterrows():
+                                _cid = str(_crow.get("ID", "") or "").strip()
+                                _cname = str(
+                                    _crow.get("Name", "") or "").strip()
+                                if not _cid or not _cname:
+                                    continue
+                                if st.button(
+                                        f"{_cname}  —  `{_cid}`",
+                                        key=f"_ds_pick_cust_{_cid}",
+                                        use_container_width=True):
+                                    st.session_state["_ds_cust_id"] = _cid
+                                    st.session_state["_ds_cust_name"] = _cname
+                                    st.session_state["_ds_cust_pending"] = ""
+                                    st.rerun()
+                    else:
+                        st.caption(
+                            ":warning: customers CSV not loaded yet — "
+                            "can't search. Save with free-text name; "
+                            "the reviewer can pick a customer later.")
+                except Exception as _e:
+                    st.caption(f":warning: customer search failed: {_e}")
+
             # ---- The actual form for the rest of the fields
             with st.form("ds_form", clear_on_submit=False):
                 _ds_family = st.text_input(
@@ -545,9 +629,6 @@ with st.sidebar:
                     "Quantity (optional)",
                     min_value=0.0, value=0.0, step=1.0,
                     help="Units mentioned. 0 = unknown / N-A.")
-                _ds_customer = st.text_input(
-                    "Customer (optional)",
-                    placeholder="Free text — name or email")
                 _ds_note = st.text_area(
                     "Note (optional)",
                     placeholder="Quick context: 'asked for warm white "
@@ -563,6 +644,14 @@ with st.sidebar:
                     _ds_sku_resolved
                     or (st.session_state[_sku_text_key] or "").strip()
                     or None)
+                # Customer: prefer the picked CIN7 customer (id + name);
+                # fall back to whatever the user typed in the search box
+                # as free-text customer_name with NULL customer_id.
+                _final_cust_id = st.session_state.get("_ds_cust_id")
+                _final_cust_name = (
+                    st.session_state.get("_ds_cust_name")
+                    or (st.session_state.get(_cust_text_key) or "").strip()
+                    or None)
                 if not _ds_sku_final and not _ds_family.strip():
                     st.error(
                         "Need either a SKU or a product family. "
@@ -577,7 +666,8 @@ with st.sidebar:
                             product_family=(
                                 _ds_family.strip().upper() or None),
                             quantity=float(_ds_qty) if _ds_qty > 0 else None,
-                            customer_name=_ds_customer.strip() or None,
+                            customer_id=_final_cust_id,
+                            customer_name=_final_cust_name,
                             salesperson=_ds_actor,
                             note=_ds_note.strip() or None,
                             confidence=1.0,
@@ -585,12 +675,18 @@ with st.sidebar:
                         )
                         st.success(
                             f":white_check_mark: Signal #{_new_id} "
-                            f"saved for **{_ds_sku_final or _ds_family}**.")
-                        # Queue clearing the SKU search so the next
-                        # capture starts fresh. Direct assignment
-                        # would error because the widget is already
-                        # instantiated this run.
+                            f"saved for **{_ds_sku_final or _ds_family}**"
+                            + (f" → {_final_cust_name}"
+                               if _final_cust_name else "")
+                            + ".")
+                        # Queue clearing both the SKU search AND the
+                        # customer selection so the next capture starts
+                        # fresh. Direct assignment would error because
+                        # the widget is already instantiated this run.
                         st.session_state["_ds_sku_pending"] = ""
+                        st.session_state["_ds_cust_pending"] = ""
+                        st.session_state["_ds_cust_id"] = None
+                        st.session_state["_ds_cust_name"] = None
                         st.rerun()
                     except Exception as _exc:
                         st.error(f"Could not save: {_exc}")
@@ -14100,16 +14196,29 @@ elif page == "Demand Signals":
                 _checked = _summary.get("checked", 0)
                 _conv = _summary.get("converted", 0)
                 _rev = _summary.get("needs_review", 0)
-                _skip = _summary.get("skipped", 0)
+                _no_sku = _summary.get("skipped_no_sku", 0)
+                _no_cust = _summary.get("skipped_no_customer", 0)
+                _no_match = _summary.get("skipped_no_match", 0)
+                _void = _summary.get("skipped_cancelled_voided", 0)
+                _err = _summary.get("errors", 0)
+
+                # Compose a one-line breakdown that proves checked balances.
+                _breakdown = (
+                    f"checked={_checked} → converted={_conv}, "
+                    f"needs_review={_rev}, "
+                    f"skipped_no_sku={_no_sku}, "
+                    f"skipped_no_customer={_no_cust}, "
+                    f"skipped_no_match={_no_match}, "
+                    f"skipped_cancelled_voided={_void}, "
+                    f"errors={_err}")
 
                 if _dry_run:
                     if _conv or _rev:
                         st.success(
                             f":microscope: Dry-run: would auto-convert "
-                            f"**{_conv}** and flag **{_rev}** for review "
-                            f"out of {_checked} pending. ({_skip} have no "
-                            f"qualifying match.) Uncheck dry-run and "
-                            f"re-click to commit.")
+                            f"**{_conv}** and flag **{_rev}** for review. "
+                            f"Uncheck dry-run and re-click to commit.")
+                        st.caption(_breakdown)
                         if _summary.get("would_convert"):
                             st.markdown("**Would auto-convert:**")
                             st.dataframe(
@@ -14123,9 +14232,8 @@ elif page == "Demand Signals":
                                 width="stretch", height=200)
                     else:
                         st.info(
-                            f":microscope: Dry-run: nothing would change. "
-                            f"{_checked} pending considered, {_skip} with "
-                            f"no qualifying match.")
+                            f":microscope: Dry-run: nothing would change.")
+                        st.caption(_breakdown)
                 else:
                     if _conv or _rev:
                         _msg_parts = []
@@ -14136,17 +14244,19 @@ elif page == "Demand Signals":
                             _msg_parts.append(
                                 f"**{_rev}** flagged for review (MEDIUM)")
                         st.success(
-                            f":white_check_mark: " + ", ".join(_msg_parts)
-                            + f". {_checked} pending considered, "
-                            f"{_skip} with no qualifying match.")
+                            f":white_check_mark: " + ", ".join(_msg_parts))
+                        st.caption(_breakdown)
                         st.cache_data.clear()
                         st.rerun()
                     else:
                         st.info(
-                            f"No matches this run. {_checked} pending "
-                            f"considered, {_skip} with no qualifying sale "
-                            f"within 30d (cancelled/voided sales were "
-                            f"excluded).")
+                            f"No matches this run. The breakdown below "
+                            f"shows where each pending row went — "
+                            f"`skipped_no_customer` is usually the "
+                            f"signal that the capture form needs a real "
+                            f"CIN7 customer_id (use the Customer "
+                            f"typeahead, don't free-text).")
+                        st.caption(_breakdown)
             except Exception as _e:
                 st.error(f"Reconcile failed: {_e}")
 
@@ -14263,7 +14373,8 @@ elif page == "Demand Signals":
                 "needs_review", "note",
                 "match_confidence", "matched_order_number",
                 "matched_sale_date",
-                "confidence", "customer_name", "salesperson",
+                "confidence", "customer_id", "customer_name",
+                "salesperson",
             ]
             for _c in edit_cols:
                 if _c not in df_signals.columns:
@@ -14334,6 +14445,11 @@ elif page == "Demand Signals":
                     "confidence": st.column_config.NumberColumn(
                         "conf", disabled=True, format="%.2f",
                         width="small"),
+                    "customer_id": st.column_config.TextColumn(
+                        "customer_id", disabled=True, width="small",
+                        help="CIN7 ContactID. Recorded when the capture "
+                             "form's customer typeahead is used. Without "
+                             "this the reconciler can't HIGH-match."),
                     "customer_name": st.column_config.TextColumn(
                         "customer", disabled=True),
                     "salesperson": st.column_config.TextColumn(
