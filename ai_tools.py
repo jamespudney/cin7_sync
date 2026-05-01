@@ -398,80 +398,8 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["query"],
         },
     },
-    {
-        "name": "get_relevant_slow_stock",
-        "description": (
-            "Slow-moving / dead-stock promotion. Call this AFTER you've "
-            "answered the user's main product question, passing the "
-            "SAME filters you used for the main search. Returns "
-            "relevant slow/dead in-stock items (classification IN "
-            "('slow','dead'), OnHand > 0) so the buyer can see what "
-            "to push or offer alongside the primary answer. NEVER "
-            "use this as the main answer — it's a supplementary "
-            "'Slow-moving stock worth offering' section. If the tool "
-            "returns matched=0, OMIT the section from your reply."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "family": {
-                    "type": "string",
-                    "description": (
-                        "Single product family to scan (e.g. SLIM8). "
-                        "Use this OR family_list."),
-                },
-                "family_list": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Multiple families to scan when the main "
-                        "question spanned several. Combined with "
-                        "OR semantics."),
-                },
-                "any_of_terms": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "OR-match keywords (same shape as "
-                        "search_products_by_text). For 'warm white' "
-                        "promotion pass ['warm white','2200K',"
-                        "'2400K','2700K','2800K','3000K']."),
-                },
-                "exclude_types": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Block list mirroring whatever you passed "
-                        "to the main search. Stops 'led strip' "
-                        "promotion from including dimmers, etc."),
-                },
-                "sku_candidates": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Optional restriction to a specific SKU "
-                        "set (e.g. all SKUs the main answer surfaced "
-                        "or all the family's variants). Tightens "
-                        "relevance."),
-                },
-                "intent": {
-                    "type": "string",
-                    "description": (
-                        "Free-text summary of what the user was "
-                        "actually asking ('warm white led strip', "
-                        "'slim8 accessories', etc.) — recorded in "
-                        "the result for audit."),
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": (
-                        "Max slow-stock items to return (cap 25, "
-                        "default 10). Keep small — this is a "
-                        "supplementary section."),
-                },
-            },
-        },
-    },
+    # v2.66.6: get_relevant_slow_stock schema REMOVED. See
+    # TOOL_HANDLERS comment in this file for context.
     {
         "name": "get_compatible_accessories",
         "description": (
@@ -2219,7 +2147,10 @@ TOOL_HANDLERS = {
     "find_similar_products": find_similar_products,
     "get_incoming_stock": get_incoming_stock,
     "get_compatible_accessories": get_compatible_accessories,
-    "get_relevant_slow_stock": get_relevant_slow_stock,
+    # v2.66.6: get_relevant_slow_stock UNREGISTERED. Slow-stock
+    # promotion was breaking product-list queries. Function stays in
+    # the file for tomorrow's rebuild as a separate post-answer call.
+    # "get_relevant_slow_stock": get_relevant_slow_stock,
     "get_sku_details": get_sku_details,
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,

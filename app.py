@@ -225,18 +225,24 @@ with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
     st.caption(
-        "🟢 v2.66.4 — Three diagnostic fixes for AI Assistant answer flow. "
-        "(1) Conversation-history pollution: when the tool-use loop "
-        "exited with no final text, `_messages` was persisted with a "
-        "dangling tool block, poisoning the next question. Fix: only "
-        "persist on success; show an info banner suggesting retry/clear "
-        "on failure. (2) Generalised no-narration rule: Claude told to "
-        "NEVER write 'let me check…' or 'now I'll look up…' mid-stream. "
-        "Tools called silently, single clean final answer. Mid-stream "
-        "narration was eating turns. (3) MAX_TURNS bumped 10 → 14 to "
-        "give multi-step reasoning (call tool → see wrong-period data "
-        "→ call again → produce final text) enough headroom. "
-        "Behavioural changes in v2.66.x carried forward unchanged."
+        "🟢 v2.66.6 — Slow-stock promotion DISABLED so product-list "
+        "questions reliably land. Trace: the slow-stock promotion "
+        "rule (added v2.66, tightened v2.66.2, surrounding edits "
+        "v2.66.4-v2.66.5) was the persistent breaker on questions "
+        "like 'what warm white LED strips do we have in stock' — "
+        "Claude tried to call get_relevant_slow_stock as part of "
+        "the tool-use loop, exhausted the turn budget, and produced "
+        "the empty fallback. Disabling cleanly: system-prompt rule "
+        "removed, tool unregistered from TOOL_HANDLERS and "
+        "TOOL_SCHEMAS. The tool function itself stays in ai_tools.py "
+        "ready for tomorrow's rebuild as a SEPARATE post-answer "
+        "pass that can't interfere with the main answer. "
+        "Everything else from v2.66.x carries forward: sign-in / "
+        "profile / users / multi-target aliases / accessory "
+        "compatibility / similarity / incoming stock / text search "
+        "+ exclude_types / honesty rule / answer format / "
+        "interpretation rules. Defensive history-persist and "
+        "MAX_TURNS=14 also kept."
     )
     # Old v2.66.2 caption kept here for reference, hidden:
     _ = (
@@ -14448,16 +14454,16 @@ elif page == "AI Assistant":
                 "- If the knowledge base doesn't cover something, "
                 "say 'the documentation doesn't explain this — please "
                 "ask an admin to add it'. Do not guess.\n"
-                "- **NEVER narrate tool calls mid-stream.** Don't "
-                "write 'let me check…', 'let me get…', 'now I'll "
-                "look up…', 'I'll search for…', etc. Call tools "
-                "silently and produce ONE clean final answer at "
-                "the end. Mid-stream commentary wastes turns and "
-                "ends in 'I couldn't answer that' fallbacks when "
-                "the loop runs out of turns before the final "
-                "answer materialises. If a tool returns wrong "
-                "data and you need to call it again, just call "
-                "again — don't announce it.\n"
+                # v2.66.5 (pre-staged): the v2.66.4 no-narration rule
+                # may have over-corrected Claude into producing no
+                # text at all on some questions. If you're seeing
+                # empty fallbacks, this paragraph is the prime
+                # suspect — leave it commented out and only the
+                # defensive history-persist + MAX_TURNS bump from
+                # v2.66.4 remain active. Re-enable carefully.
+                # "- **NEVER narrate tool calls mid-stream.** Call "
+                # "tools silently. Produce one clean final answer "
+                # "at the end.\n"
                 "- Keep answers concise (3-6 short bullet points or a "
                 "small table) unless the user asks for more detail.\n"
                 "- When citing a SKU, include the name + on-hand "
@@ -14526,49 +14532,18 @@ elif page == "AI Assistant":
                 "'controller','power supply','channel','profile',"
                 "'accessory','service','module'], "
                 "classification='slow').\n\n"
-                "**Slow-stock promotion (v2.66.2 — tightened):** "
-                "ONLY call get_relevant_slow_stock when the user's "
-                "question is a **product LIST** query — phrasings "
-                "like 'what X products do we have', 'show me X in "
-                "stock', 'list X strips', 'what warm white strips'. "
-                "Call it silently and AFTER your main answer is "
-                "complete. Only render the resulting section if the "
-                "tool returns matched > 0.\n\n"
-                "  CRITICAL: do NOT narrate the tool call. Never "
-                "write 'let me check for slow-moving stock' or "
-                "similar lead-in text. Either the section appears "
-                "at the end of your answer (with results) or it "
-                "doesn't appear at all (no results, no section, no "
-                "narration). Mid-stream announcements break the "
-                "answer flow and waste turns.\n\n"
-                "  DO NOT call get_relevant_slow_stock for any of "
-                "these question types:\n"
-                "  - Similarity questions ('similar to X', "
-                "'alternative to Y', 'replace Z')\n"
-                "  - Single-SKU lookups (`get_sku_details` /  "
-                "velocity / migration questions)\n"
-                "  - Sales totals / company-wide aggregates\n"
-                "  - Demand signal questions (`get_recent_signals` "
-                "etc.)\n"
-                "  - Incoming-stock / ETA / PO questions\n"
-                "  - Accessory / compatibility questions\n"
-                "  - Dead-stock review (already showing dead stock "
-                "by definition)\n"
-                "  - Any question that didn't yield a list of "
-                "products to promote against.\n\n"
-                "  When you DO call it (product-list query, main "
-                "answer complete, matched>0), render:\n\n"
-                "  ### Slow-moving stock worth offering\n"
-                "  Per row: SKU / product name / stock / "
-                "classification (slow vs dead) / `Why relevant` "
-                "(from reason_matched) / caution flag if non-null.\n\n"
-                "  Append `[+ slow_stock_promotion]` to the "
-                "provenance tag at the end of your answer.\n\n"
-                "  RULES:\n"
-                "  - NEVER replace the main answer with slow stock.\n"
-                "  - If matched=0, OMIT the section silently.\n"
-                "  - Clearly label dead vs slow.\n"
-                "  - Surface caution flags next to the SKU.\n\n"
+                # v2.66.6 — Slow-stock promotion rule REMOVED. Even
+                # with v2.66.2's tightening and v2.66.5's
+                # no-narration rollback, the rule was breaking
+                # product-list queries by exhausting the LLM
+                # tool-use loop. Tomorrow's plan: rebuild as a
+                # second, post-answer LLM call that can't interfere
+                # with the main answer flow. The
+                # get_relevant_slow_stock tool itself stays
+                # registered so the rebuild has it ready; Claude
+                # just isn't told to use it in the system prompt
+                # right now.
+
                 "**Honesty rule (v2.65.1):** when a structured filter "
                 "yields zero matches, say so explicitly and DO NOT "
                 "substitute products from a different category. For "
