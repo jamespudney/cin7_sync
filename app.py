@@ -224,7 +224,25 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.66.2 — Slow-stock promotion was breaking unrelated questions. Three fixes: (1) Slow-stock rule tightened to ONLY trigger on product-LIST queries ('what X products do we have', 'show me X in stock'). Explicitly forbidden for similarity / single-SKU / sales-totals / velocity / demand-signal / incoming-stock / accessory / dead-stock-review questions. (2) Claude is now told to NEVER narrate the tool call mid-stream — no 'let me check for slow-moving stock' lead-in. The section either appears at the end with results or doesn't appear at all. (3) MAX_TURNS bumped from 6 to 10 in the LLM tool-use loop so an extra tool call can't exhaust the turn budget and produce the empty 'I couldn't answer that' fallback. Root cause: v2.66's slow-stock rule was making Claude do extra tool calls on non-product questions, exhausting the 6-turn budget before producing final text. (May 1)") (1) The combined picker-with-typed-fallback is replaced with two distinct flows: a selectbox of REGISTERED users for normal sign-in (no free-text), and a separate 'Add new user' expander that explicitly creates a profile. Prevents an existing user from accidentally creating a duplicate profile by typing a slight variation of their name. (2) `current_user_id` (integer) now stored in session_state alongside `current_user` (display_name) and `current_user_profile`. The user_id is the canonical identifier going forward; display_name is the human-readable label. (3) Sign-in now writes a `user.login` audit_log row so we have a record of who was active when. Sign-out clears all four user keys plus `_default_page_consumed`. The full v2.66 behaviour (default_page jump, My Profile page, slow-stock promotion layer, get_relevant_slow_stock tool) carries forward unchanged. (May 1)") (Part A) New `users` table (user_id / display_name / role / email / active / default_page / created_at / updated_at) with helpers `get_user_by_name`, `list_users`, `upsert_user`, `get_or_create_user`. Sidebar 'Your name' replaced with a typeahead picker — pick an existing profile or type a new one (auto-creates with role=sales). Profile loads into `current_user_profile` session_state; if `default_page` is set, the page selector jumps there on first sign-in. Sign-out button clears the session. New 'My Profile' page lets you edit role / email / default_page; admin role sees a read-only table of all users. Roles: buyer/sales/admin/viewer (advisory, not enforced yet). Shared password gate unchanged. (Part B) New AI tool `get_relevant_slow_stock`: called AFTER the main answer with the same filters (family/any_of_terms/exclude_types/sku_candidates), returns slow + dead in-stock items with reason_matched + caution flag (set when SKU has cancellation/return/complaint feedback events). System prompt rule: render results in a separate 'Slow-moving stock worth offering' section with `[+ slow_stock_promotion]` appended to the provenance tag; omit entirely if matched=0; never replace the main answer; clearly label slow vs dead. (May 1)")
+    st.caption(
+        "🟢 v2.66.2 — Slow-stock rule tightened, MAX_TURNS bumped 6 to 10. "
+        "v2.66's slow-stock promotion was making Claude call "
+        "get_relevant_slow_stock on non-product questions (similarity, "
+        "sales totals, velocity), exhausting the 6-turn LLM loop budget "
+        "and producing the empty 'I couldn't answer that' fallback. "
+        "Three fixes: (1) the rule now triggers ONLY on product-LIST "
+        "queries; explicitly forbidden for similarity / single-SKU / "
+        "sales-totals / velocity / demand-signal / incoming-stock / "
+        "accessory / dead-stock-review questions. (2) Claude is told "
+        "to NEVER narrate the tool call — no 'let me check for "
+        "slow-moving stock' lead-in mid-stream. The section either "
+        "lands at the end with results or doesn't appear at all. "
+        "(3) MAX_TURNS bumped 6 to 10 to give the loop comfortable "
+        "headroom. Carries v2.66 forward unchanged: users / profiles "
+        "schema, sidebar sign-in picker (selectbox + 'Add new user' "
+        "form, no free-text), My Profile page, default_page jump, "
+        "user.login audit, get_relevant_slow_stock tool."
+    )
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
