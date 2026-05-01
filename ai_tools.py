@@ -399,6 +399,54 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_compatible_accessories",
+        "description": (
+            "Look up compatible accessories (lenses, diffusers, end "
+            "caps, clips, brackets, connectors) for a product / "
+            "family using Shopify accessory collections as the "
+            "source of truth. Call this for ANY question about "
+            "compatibility, what-fits, what-works-with, or "
+            "accessories for a product. Authoritative when a "
+            "matching '<Family> Accessories' Shopify collection "
+            "exists; falls back to text search across product "
+            "titles (labelled confidence='lower') when one "
+            "doesn't. NEVER guess compatibility from descriptions "
+            "if a curated collection exists."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": (
+                        "Subject product SKU. Either sku or family "
+                        "is required."),
+                },
+                "family": {
+                    "type": "string",
+                    "description": (
+                        "Subject product family / parent code, e.g. "
+                        "SLIM8, SIERRA38, KP24."),
+                },
+                "accessory_type": {
+                    "type": "string",
+                    "enum": ["lens", "diffuser", "cover", "end_cap",
+                              "clip", "bracket", "connector"],
+                    "description": (
+                        "Optional filter: only return accessories of "
+                        "this type. Title-keyword based — 'lens' "
+                        "matches products whose title contains 'lens' "
+                        "or 'lenses', etc."),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max results (cap 50, default 25)."),
+                },
+            },
+        },
+    },
+    {
         "name": "find_similar_products",
         "description": (
             "Find product alternatives to a given SKU or product "
@@ -485,17 +533,16 @@ TOOL_SCHEMAS: list[dict] = [
         "description": (
             "Substring search across one or more product TEXT fields "
             "(title / description / tags / product_type / collections). "
-            "Use this when an alias rule of type='text_search' fires "
-            "in the system-prompt addendum, OR when the user asks for "
-            "products matching a descriptive phrase that isn't tied "
-            "to a specific SKU or family — e.g. 'warm white', "
-            "'diffused lens', 'IP67 outdoor'. Combinable with "
-            "classification + in_stock_only filters so 'show me warm "
-            "white LED strips that are slow movers' is one tool call. "
-            "If a requested field doesn't exist in the catalog data "
-            "yet (e.g. tags before the Shopify merge ships), the tool "
-            "reports it in `missing_fields` rather than silently "
-            "skipping it."
+            "Use when the user asks for products matching a "
+            "descriptive phrase ('warm white', 'IP67 outdoor', "
+            "'diffused lens') OR when an alias rule of type='text_"
+            "search' fires. v2.65.1 supports tokenized AND-match "
+            "(every word in `query` must hit), OR-match via "
+            "`any_of_terms` (at least one of these must hit — used "
+            "for Kelvin alternatives), and `exclude_types` (block "
+            "list of forbidden keywords in Name/Type). Combine with "
+            "classification + in_stock_only + family for full "
+            "structured filtering."
         ),
         "input_schema": {
             "type": "object",
@@ -503,7 +550,34 @@ TOOL_SCHEMAS: list[dict] = [
                 "query": {
                     "type": "string",
                     "description": (
-                        "The phrase to search for, e.g. 'warm white'."),
+                        "AND-matched search phrase. Tokenized on "
+                        "whitespace; every token must appear in at "
+                        "least one searched field. Use for required "
+                        "concepts (e.g. 'led strip')."),
+                },
+                "any_of_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "OR-matched terms. At least one must appear "
+                        "in the searched fields. Use for Kelvin / "
+                        "color-temp alternatives — e.g. for 'warm "
+                        "white' pass ['warm white', '2200K', "
+                        "'2400K', '2700K', '2800K', '3000K']. "
+                        "Composes with `query`: row needs ALL query "
+                        "tokens AND at least one any_of_terms hit."),
+                },
+                "exclude_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Block list. Drop rows whose Name or Type "
+                        "contains any of these keywords. Use to keep "
+                        "'led strip' searches from returning "
+                        "dimmers/controllers/power supplies/etc. — "
+                        "e.g. ['dimmer', 'controller', 'power "
+                        "supply', 'channel', 'profile', 'accessory', "
+                        "'service', 'module']."),
                 },
                 "fields": {
                     "type": "array",
@@ -1150,12 +1224,26 @@ def search_products_by_text(engine_df: pd.DataFrame,
                              sale_lines_df: pd.DataFrame,
                              args: dict) -> dict:
     """v2.64 — text-search rule executor.
+    v2.65.1 — tokenized AND match, plus exclude_types blocklist.
 
     Driven by an alias rule with rule_type='text_search'. The user
     typed a phrase like 'warm white' that's been mapped to a search
     across product fields (title / description / tags / product_type /
     collections). This tool runs the contains-match across whichever
     of those fields exist in the products DataFrame.
+
+    Tokenization (v2.65.1): the query is split on whitespace and
+    EVERY token must appear (substring) in at least one of the
+    searched fields for the row to match. So 'warm white led strip'
+    becomes 4 tokens, all required, but they can appear in different
+    fields (warm + white in title, led + strip in description). This
+    is far less brittle than the old single-substring match which
+    only hit rows containing the phrase end-to-end.
+
+    Exclusions (v2.65.1): exclude_types is a list of forbidden
+    keywords; any row whose Name or Type column contains any of
+    them (case-insensitive substring) is filtered out. Used to keep
+    'LED strip' queries from returning controllers/dimmers/etc.
 
     Combinable with classification + in_stock_only filters so a
     question like 'show me warm white LED strips that are slow movers'
@@ -1164,6 +1252,8 @@ def search_products_by_text(engine_df: pd.DataFrame,
     query = (args.get("query") or "").strip().lower()
     if not query:
         return {"error": "query is required"}
+    # Tokenize on whitespace — empty tokens dropped.
+    query_tokens = [t for t in query.split() if t]
 
     # Map our canonical field names to whichever columns happen to be
     # in the products / engine DataFrame today. Some live in CIN7
@@ -1194,7 +1284,8 @@ def search_products_by_text(engine_df: pd.DataFrame,
     df = engine_df.copy()
     searched_cols: list = []
     missing_fields: list = []
-    masks = []
+    actual_columns: list = []   # the real DataFrame columns we'll
+                                  # search; stays parallel with searched_cols.
     for f in requested:
         candidate_cols = field_aliases.get(f, [f.capitalize()])
         col_used = None
@@ -1205,12 +1296,10 @@ def search_products_by_text(engine_df: pd.DataFrame,
         if col_used is None:
             missing_fields.append(f)
             continue
-        mask = df[col_used].fillna("").astype(str).str.lower().str.contains(
-            query, na=False, regex=False)
-        masks.append((f, col_used, mask))
+        actual_columns.append(col_used)
         searched_cols.append({"requested": f, "actual_column": col_used})
 
-    if not masks:
+    if not actual_columns:
         return {
             "error": (f"None of the requested fields exist in the "
                        f"product data right now: {requested}. "
@@ -1219,10 +1308,64 @@ def search_products_by_text(engine_df: pd.DataFrame,
             "available_columns": list(df.columns),
         }
 
-    combined = masks[0][2]
-    for _, _, m in masks[1:]:
-        combined = combined | m
-    df = df[combined]
+    # v2.65.1 tokenized AND-match. For each token: OR across fields
+    # (any field can contain it). Then AND across tokens (every token
+    # must hit somewhere). 'warm white led strip' becomes 4 tokens
+    # that together require a row that mentions all four somewhere
+    # in the searched columns.
+    combined = None
+    for tok in query_tokens:
+        tok_mask = None
+        for col in actual_columns:
+            colvals = df[col].fillna("").astype(str).str.lower()
+            m = colvals.str.contains(tok, na=False, regex=False)
+            tok_mask = m if tok_mask is None else (tok_mask | m)
+        if tok_mask is None:
+            continue
+        combined = tok_mask if combined is None else (combined & tok_mask)
+    if combined is not None:
+        df = df[combined]
+
+    # v2.65.1 any_of_terms: OR-match. At least ONE of these substrings
+    # must appear in the searched fields for the row to qualify. This
+    # is how the alias rule for 'warm white' encodes Kelvin
+    # alternatives: any_of_terms=['warm white', '2200K', '2400K',
+    # '2700K', '2800K', '3000K'] — any one hit is enough. Composes
+    # with the AND-match above: a row must satisfy ALL tokens in
+    # `query` AND at least one term in `any_of_terms`.
+    any_of_terms = args.get("any_of_terms") or []
+    if isinstance(any_of_terms, str):
+        any_of_terms = [any_of_terms]
+    any_of_terms = [str(t).strip().lower() for t in any_of_terms if t]
+    if any_of_terms and actual_columns:
+        any_mask = None
+        for term in any_of_terms:
+            for col in actual_columns:
+                colvals = df[col].fillna("").astype(str).str.lower()
+                m = colvals.str.contains(term, na=False, regex=False)
+                any_mask = m if any_mask is None else (any_mask | m)
+        if any_mask is not None:
+            df = df[any_mask]
+
+    # v2.65.1 exclude_types: drop rows whose Name or Type contains any
+    # of these keywords. Used to keep 'LED strip' searches from
+    # surfacing controllers/dimmers/power supplies/etc.
+    exclude_types = args.get("exclude_types") or []
+    if isinstance(exclude_types, str):
+        exclude_types = [exclude_types]
+    exclude_types = [str(e).strip().lower() for e in exclude_types if e]
+    excluded_count = 0
+    if exclude_types:
+        ex_mask = pd.Series(False, index=df.index)
+        for excl_col in ("Type", "Name"):
+            if excl_col in df.columns:
+                col_lower = (df[excl_col].fillna("").astype(str)
+                              .str.lower())
+                for kw in exclude_types:
+                    ex_mask = ex_mask | col_lower.str.contains(
+                        kw, na=False, regex=False)
+        excluded_count = int(ex_mask.sum())
+        df = df[~ex_mask]
 
     # Optional secondary filters Claude can stack on top.
     classification = (args.get("classification") or "any").strip().lower()
@@ -1247,7 +1390,10 @@ def search_products_by_text(engine_df: pd.DataFrame,
         "matched": len(rows),
         "results": rows,
         "searched": searched_cols,
+        "tokens": query_tokens,
         "missing_fields": missing_fields,
+        "excluded_count": excluded_count,
+        "exclude_types_applied": exclude_types,
         "note": (
             f"Showing first {limit} of potentially many. Refine the "
             "query (or add more filters) if you need a narrower set."
@@ -1559,11 +1705,250 @@ def get_incoming_stock(engine_df: pd.DataFrame,
     }
 
 
+def get_compatible_accessories(engine_df: pd.DataFrame,
+                                 sale_lines_df: pd.DataFrame,
+                                 args: dict) -> dict:
+    """v2.65 — compatibility lookup using Shopify accessory collections
+    as the source of truth.
+
+    The expectation: for each parent product family there's a matching
+    Shopify collection titled '<Family> Accessories' (e.g. 'Slim8
+    Accessories') that lists the lenses / diffusers / clips / brackets
+    / connectors / end caps the team has explicitly designated as
+    compatible. That curated list is far more reliable than guessing
+    from product descriptions.
+
+    Resolution:
+      1. Subject = sku → resolve family from engine_df
+                  family → use directly (uppercased).
+      2. Read collections_index.csv (written by shopify_sync.py).
+      3. Filter rows where collection_title contains both the family
+         (case-insensitive) and the word 'accessories'.
+      4. Group by product_handle, dedup SKUs, join with engine_df
+         for stock + classification.
+      5. Optional accessory_type filter classifies each row by
+         keyword match in product_title (lens / diffuser / cover /
+         end cap / clip / bracket / connector) and filters to the
+         requested type.
+      6. If no collection matched → fall back to broad text search
+         across product titles for `<family> + <accessory_type>` and
+         label the result `confidence: lower / source:
+         text_fallback`. Per spec, NEVER guess silently.
+      7. If collections_index.csv is missing entirely → return a
+         clear error pointing the user at shopify_sync.py.
+    """
+    import csv as _csv
+    from data_paths import DATA_DIR  # local import keeps ai_tools.py
+                                       # decoupled from cin7 paths if
+                                       # someone reuses the module.
+
+    sku = (args.get("sku") or args.get("product")
+           or args.get("product_or_family") or "").strip()
+    family = (args.get("family") or "").strip().upper()
+    accessory_type = (args.get("accessory_type") or "").strip().lower()
+    limit = min(int(args.get("limit", 25) or 25), 50)
+
+    # Resolve family
+    if not family and sku:
+        if engine_df is not None and not engine_df.empty:
+            row = engine_df[engine_df["SKU"].astype(str) == sku]
+            if not row.empty and "Family" in row.columns:
+                family = str(row.iloc[0].get("Family") or "").strip().upper()
+            elif row.empty:
+                # Maybe sku is actually a family typed by the user
+                family = sku.upper()
+    if not family:
+        return {
+            "error": (
+                "Need a SKU (we'll resolve to its family) or a "
+                "family code directly. Pass sku= or family=. For "
+                "compatibility on Slim8 try family='SLIM8'."),
+        }
+
+    # Locate the index. If it doesn't exist the whole tool can't
+    # function — that's a data-availability state, not a bug.
+    index_path = DATA_DIR / "shopify" / "collections_index.csv"
+    if not index_path.exists():
+        return {
+            "error": (
+                "Shopify collections_index.csv hasn't been built yet. "
+                f"Expected at {index_path}. Run "
+                "`python shopify_sync.py` (with collections enabled) "
+                "to populate it. Until then, accessory lookup falls "
+                "back to text search — explicitly call "
+                "search_products_by_text if you need that path now."),
+            "fallback": "text_search",
+        }
+
+    # Load + filter index. Matching rule: collection_title must
+    # contain BOTH the family (case-insensitive) and the word
+    # 'accessories'. So 'Slim8 Accessories' matches; 'Slim8
+    # Compatible Parts' does NOT (could expand later if naming
+    # convention drifts).
+    fam_lower = family.lower()
+    matches: list = []
+    matching_collections: set = set()
+    seen_skus: set = set()
+    try:
+        with index_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = _csv.DictReader(fh)
+            for row in reader:
+                col_title = (row.get("collection_title") or "").lower()
+                if (fam_lower in col_title
+                        and "accessor" in col_title):
+                    sku_val = (row.get("product_sku") or "").strip()
+                    if sku_val and sku_val in seen_skus:
+                        continue
+                    if sku_val:
+                        seen_skus.add(sku_val)
+                    matching_collections.add(
+                        row.get("collection_title") or "")
+                    matches.append({
+                        "collection_title":
+                            row.get("collection_title"),
+                        "collection_handle":
+                            row.get("collection_handle"),
+                        "product_title":
+                            row.get("product_title"),
+                        "product_handle":
+                            row.get("product_handle"),
+                        "sku": sku_val,
+                    })
+    except Exception as exc:
+        return {
+            "error": f"Could not read collections_index.csv: {exc}",
+        }
+
+    # Optional accessory_type classifier — keyword match on title.
+    # Returns BOTH the classification (so the AI can group/cite) and
+    # uses it to filter when accessory_type was specified.
+    type_keywords = {
+        "lens":      ("lens", "lenses"),
+        "diffuser":  ("diffuser", "diffusing"),
+        "cover":     ("cover", "click cover"),
+        "end_cap":   ("end cap", "endcap", "end-cap"),
+        "clip":      ("clip", "mounting clip"),
+        "bracket":   ("bracket", "bracketry", "mount"),
+        "connector": ("connector", "connecting", "joiner",
+                      "coupler"),
+    }
+
+    def _classify(title: str) -> str:
+        t = (title or "").lower()
+        for k, kws in type_keywords.items():
+            if any(kw in t for kw in kws):
+                return k
+        return "other"
+
+    for m in matches:
+        m["accessory_type"] = _classify(m["product_title"])
+
+    if accessory_type:
+        # Map common synonyms onto our keys
+        synonym = {
+            "lenses": "lens", "diffusers": "diffuser",
+            "covers": "cover", "end caps": "end_cap",
+            "endcaps": "end_cap", "clips": "clip",
+            "mounting clips": "clip", "brackets": "bracket",
+            "connectors": "connector", "joiners": "connector",
+        }
+        target = synonym.get(accessory_type, accessory_type)
+        matches = [m for m in matches
+                    if m["accessory_type"] == target]
+
+    # Fallback: no curated match found.
+    if not matches:
+        if engine_df is None or engine_df.empty:
+            return {
+                "subject_family": family,
+                "matched": 0,
+                "source": "none",
+                "note": (
+                    f"No '{family}' Accessories collection found in "
+                    "Shopify and no engine_df to fall back on."),
+            }
+        # Conservative text fallback: search product titles for
+        # 'family' AND (accessory_type if specified) — labelled
+        # confidence=lower so the AI doesn't present this as
+        # authoritative.
+        df = engine_df.copy()
+        if "Name" in df.columns:
+            mask = df["Name"].fillna("").astype(str).str.lower(
+                ).str.contains(fam_lower, na=False)
+            if accessory_type:
+                kws = type_keywords.get(
+                    accessory_type, (accessory_type,))
+                kw_mask = df["Name"].fillna("").astype(str).str.lower(
+                    ).apply(lambda s: any(k in s for k in kws))
+                mask = mask & kw_mask
+            df = df[mask]
+        else:
+            df = df.head(0)
+        df = df.head(limit)
+        rows_out = []
+        for _, r in df.iterrows():
+            rec = _serialise_row(dict(r))
+            rec["accessory_type"] = _classify(rec.get("Name"))
+            rec["why_match"] = (
+                f"product title contains '{fam_lower}'"
+                + (f" + '{accessory_type}'" if accessory_type else ""))
+            rows_out.append(rec)
+        return {
+            "subject_family": family,
+            "matched": len(rows_out),
+            "source": "text_fallback",
+            "confidence": "lower",
+            "results": rows_out,
+            "note": (
+                f"No '{family} Accessories' Shopify collection found. "
+                "Falling back to text-search across product titles. "
+                "Treat with caution — these are NOT curated "
+                "compatibility designations. Recommend the buyer "
+                "create a Shopify accessory collection so future "
+                "lookups are authoritative."),
+        }
+
+    # Enrich curated matches with stock + classification from engine_df.
+    matches = matches[:limit]
+    if engine_df is not None and not engine_df.empty and "SKU" in engine_df.columns:
+        eng_by_sku = {
+            str(r["SKU"]): r for _, r in engine_df.iterrows()
+            if pd.notna(r.get("SKU"))
+        }
+        for m in matches:
+            if not m["sku"]:
+                continue
+            r = eng_by_sku.get(m["sku"])
+            if r is not None:
+                m["on_hand"] = (
+                    None if pd.isna(r.get("OnHand"))
+                    else float(r.get("OnHand")))
+                m["classification"] = (
+                    None if pd.isna(r.get("Classification"))
+                    else str(r.get("Classification")))
+                m["family"] = (
+                    None if pd.isna(r.get("Family"))
+                    else str(r.get("Family")))
+
+    return {
+        "subject_family": family,
+        "matched": len(matches),
+        "source": "shopify_collection",
+        "confidence": "high",
+        "matched_collections": sorted(matching_collections),
+        "results": matches,
+        "note": (
+            "These are explicit compatibility designations from a "
+            "Shopify accessory collection — authoritative."),
+    }
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
     "find_similar_products": find_similar_products,
     "get_incoming_stock": get_incoming_stock,
+    "get_compatible_accessories": get_compatible_accessories,
     "get_sku_details": get_sku_details,
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,

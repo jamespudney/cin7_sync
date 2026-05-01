@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.64 — Text-search rules + similarity engine + incoming-stock tool. (1) New alias rule type `text_search` with `search_fields_json` column — phrase like 'warm white' becomes a contains-match across title/description/tags/product_type/collections, no SKU/family needed. AI Feedback form now offers 'Text/title keyword search' with field checkboxes. (2) New AI tool `search_products_by_text` runs the rule at query time, combinable with classification + in_stock_only + family filters; reports any requested fields that don't exist in the catalog yet. (3) Similarity-intent detection: when the question contains 'similar', 'alternative', 'replace', 'substitute', etc., a new system-prompt addendum tells Claude to call `find_similar_products` and present alternatives FIRST. (4) New `find_similar_products` tool with conservative tube logic — parses trailing digits from family code as nominal diameter (SIERRA38→38mm), returns only same-diameter families, falls back to title regex (38mm / 1.5\") only when family code is missing (lower-confidence note). (5) New `get_incoming_stock` tool reads `purchase_lines_last_90d`, filters to OPEN POs (excludes received/closed/cancelled/voided + zero-qty), returns SKU/qty/expected-date/supplier/PO#/status. Says 'not available' when no expected date instead of guessing. (May 1)")
+    st.caption("🟢 v2.65.1 — Tighter query interpretation. (1) `search_products_by_text` now does tokenized AND-match (every whitespace-separated word in `query` must hit somewhere in the searched fields) plus `any_of_terms` (OR-match — used for Kelvin alternatives) plus `exclude_types` (block list — keeps 'LED strip' searches from returning controllers/dimmers/power supplies). (2) System-prompt interpretation rules teach Claude to translate descriptive phrases into STRUCTURED filters: 'LED strip' uses `exclude_types=[dimmer,controller,power supply,channel,profile,accessory,service,module]` to proxy the missing product_type column; 'warm white' uses `any_of_terms=[2200K,2400K,2700K,2800K,3000K]` to proxy the missing kelvin column; 'cool white' / 'natural white' similar; 'slow movers' → `classification=slow`; literal family codes ('iris', 'sierra38') → `family` filter. (3) Honesty rule: when zero matches in the requested category, say 'No X found' rather than substituting unrelated categories. (4) Per-row answer format: SKU / Kelvin / Stock / Classification / Why matched. (5) New 'Family keyword' rule type label in the AI Feedback form. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13937,6 +13937,43 @@ elif page == "AI Assistant":
                     "— fewer accurate matches > many weak ones. End "
                     "your answer with `[via similarity_engine]`.")
 
+            # ---- Accessory / compatibility intent (v2.65) ----
+            # Compatibility questions ('what diffusers fit Slim8?',
+            # 'what end caps work with Sierra38?', 'accessories for
+            # KP24') route to get_compatible_accessories which reads
+            # the curated Shopify accessory collection. Per spec:
+            # NEVER guess compatibility from product descriptions when
+            # a curated collection exists.
+            _accessory_phrases = (
+                "what fits", "what fit ", "fits on", "fits with",
+                "compatible", "accessor", "accessories for",
+                "end cap", "end caps", "clips for", "clip for",
+                "lenses fit", "lens fit", "diffusers fit",
+                "diffuser fit", "what works with", "what work with",
+                "covers fit", "cover fit", "brackets for",
+                "connectors for", "joiners for")
+            _accessory_intent = any(p in _ql for p in _accessory_phrases)
+            _accessory_addendum = ""
+            if _accessory_intent:
+                _accessory_addendum = (
+                    "\n\nCOMPATIBILITY / ACCESSORY INTENT DETECTED "
+                    "('what fits', 'compatible', 'accessories for', "
+                    "etc.). Resolve the subject product (alias rule → "
+                    "SKU → family) and call "
+                    "**get_compatible_accessories** with that "
+                    "family. Pass `accessory_type` if the question "
+                    "names one (lens / diffuser / cover / end_cap / "
+                    "clip / bracket / connector). The tool reads the "
+                    "curated Shopify accessory collection — when a "
+                    "result comes back with source='shopify_collection' "
+                    "those designations are AUTHORITATIVE; cite the "
+                    "collection title and end your answer with "
+                    "`[via accessory_collection]`. If the tool returns "
+                    "source='text_fallback' those are GUESSES from "
+                    "title matching — flag them as such and end with "
+                    "`[via accessory_text_fallback]`. Never present "
+                    "fallback results as compatibility-confirmed.")
+
             if _alias_hits:
                 _hit_lines = []
                 for _h in _alias_hits[:6]:
@@ -14090,6 +14127,13 @@ elif page == "AI Assistant":
                 "'alternative', 'replace', 'substitute', 'instead "
                 "of'. Returns alternatives FIRST. Currently tube-only "
                 "(parses diameter from family code).\n"
+                "- get_compatible_accessories — Shopify-collection-"
+                "backed compatibility lookup. Call for 'what fits "
+                "X?', 'accessories for X', 'what diffusers/lenses "
+                "fit X?', 'what end caps work with X?'. "
+                "Authoritative when a '<Family> Accessories' "
+                "collection exists; falls back to text search "
+                "(labelled 'lower' confidence) when one doesn't.\n"
                 "- get_incoming_stock — list OPEN purchase orders "
                 "for a SKU/family. Use for 'when's the next "
                 "shipment?', 'what's on order?', 'ETA for X?'. "
@@ -14158,6 +14202,59 @@ elif page == "AI Assistant":
                 "quantity in parentheses.\n"
                 "- If you can't answer confidently, say so and ask "
                 "for clarification (preferred SKU, time window, etc.).\n"
+                "\n**Query interpretation rules (v2.65.1):**\n"
+                "When the user uses these descriptive phrases, "
+                "translate to STRUCTURED filters. Don't fall back to "
+                "pure text_search when a structured filter is "
+                "available.\n"
+                "- 'LED strip' or 'strip light' → call "
+                "search_products_by_text with query='strip', "
+                "fields=['title','description','product_type'], "
+                "exclude_types=['dimmer','controller','power supply',"
+                "'channel','profile','accessory','service','module']. "
+                "This proxies the missing product_type column.\n"
+                "- 'warm white' → call search_products_by_text "
+                "with any_of_terms=['warm white','2200K','2400K',"
+                "'2700K','2800K','3000K']. Acts as a Kelvin filter "
+                "until the structured kelvin column ships.\n"
+                "- 'cool white' → any_of_terms=['cool white',"
+                "'5000K','5500K','6000K','6500K'].\n"
+                "- 'natural white' / 'neutral white' → "
+                "any_of_terms=['natural white','neutral white',"
+                "'3500K','4000K','4500K'].\n"
+                "- 'slow movers' / 'slow moving' / 'slow' → "
+                "classification='slow'.\n"
+                "- 'dead stock' / 'dead' → classification='dead'.\n"
+                "- 'in stock' → in_stock_only=true.\n"
+                "- 'iris range' / 'iris family' / just 'iris' as a "
+                "noun → family='IRIS'. (And similarly any product "
+                "family code mentioned literally — e.g. 'sierra38' "
+                "in a question means family='SIERRA38'.)\n"
+                "- Combine these in ONE tool call when possible. "
+                "E.g. 'warm white LED strips that are slow movers' "
+                "→ search_products_by_text(query='strip', "
+                "any_of_terms=['warm white','2200K','2400K','2700K',"
+                "'2800K','3000K'], exclude_types=['dimmer',"
+                "'controller','power supply','channel','profile',"
+                "'accessory','service','module'], "
+                "classification='slow').\n\n"
+                "**Honesty rule (v2.65.1):** when a structured filter "
+                "yields zero matches, say so explicitly and DO NOT "
+                "substitute products from a different category. For "
+                "example: 'No slow-moving warm white LED strips "
+                "found.' Do NOT return controllers/dimmers/etc. as "
+                "substitutes unless the user explicitly asks for "
+                "them. You can offer to broaden the search, but "
+                "make the 'no real match' clear first.\n\n"
+                "**Answer format for product lists (v2.65.1):** "
+                "structure each row as:\n"
+                "  - SKU: ...\n"
+                "  - Kelvin / Color: ... (when known from title)\n"
+                "  - Stock: ...\n"
+                "  - Classification: active/slow/dead/watchlist\n"
+                "  - Why matched: brief explanation citing which "
+                "filters fired\n"
+                "Keep it scannable.\n\n"
                 "- ALWAYS end your final answer with a single "
                 "`[via X]` tag noting how you arrived at it. "
                 "Use one of: `[via exact_sku]` (user gave a specific "
@@ -14165,6 +14262,9 @@ elif page == "AI Assistant":
                 "the answer — see addendum if present), "
                 "`[via text_search]` (used search_products_by_text), "
                 "`[via similarity_engine]` (used find_similar_products), "
+                "`[via accessory_collection]` (curated Shopify "
+                "accessory collection), `[via accessory_text_fallback]` "
+                "(no curated collection — text-matched product titles), "
                 "`[via search_products]` (used the basic search tool), "
                 "`[via incoming_stock]` (used get_incoming_stock for "
                 "ETA / open POs), `[via family_lookup]` (resolved by "
@@ -14177,7 +14277,8 @@ elif page == "AI Assistant":
             # behaviour rules.
             _system_prompt = (_system_prompt
                               + (_alias_addendum or "")
-                              + (_similarity_addendum or ""))
+                              + (_similarity_addendum or "")
+                              + (_accessory_addendum or ""))
 
             _tool_calls_log: list = []
             # Charts collected from tool results during this turn.
@@ -14549,6 +14650,8 @@ elif page == "AI Feedback":
                             "Single SKU",
                             "Multiple SKUs",
                             "Single Family",
+                            "Family keyword (matches inside longer "
+                            "questions, e.g. 'iris' → IRIS family)",
                             "Multiple Families",
                             "Mixed (SKU + Family)",
                             "Text/title keyword search",
@@ -14561,6 +14664,15 @@ elif page == "AI Feedback":
                         "Single SKU": "sku",
                         "Multiple SKUs": "sku_list",
                         "Single Family": "family",
+                        # Family keyword stores the same way as Single
+                        # Family — substring matching in
+                        # find_alias_in_question already catches the
+                        # phrase inside longer questions. The
+                        # different label exists to make the intent
+                        # clear to the reviewer.
+                        ("Family keyword (matches inside longer "
+                         "questions, e.g. 'iris' → IRIS family)"):
+                            "family_keyword",
                         "Multiple Families": "family_list",
                         "Mixed (SKU + Family)": "mixed",
                         "Text/title keyword search": "text_search",
@@ -14660,12 +14772,21 @@ elif page == "AI Feedback":
                                      "against the products CSV before "
                                      "save. Invalid ones are reported "
                                      "and not stored.")
-                        if _rule_type in ("family", "mixed"):
+                        if _rule_type in ("family", "family_keyword",
+                                            "mixed"):
                             _alias_families_picked = st.multiselect(
                                 "Correct family (pick one, uppercase)",
                                 options=_all_families,
                                 max_selections=1,
-                                key=f"_fb_fam1_{_aid}")
+                                key=f"_fb_fam1_{_aid}",
+                                help=(
+                                    "For 'family_keyword' rules, "
+                                    "this single family will be "
+                                    "applied as a filter whenever "
+                                    "the phrase appears inside a "
+                                    "longer user question."
+                                    if _rule_type == "family_keyword"
+                                    else ""))
                         if _rule_type == "family_list":
                             _alias_families_picked = st.multiselect(
                                 "Correct families (pick all that apply)",
@@ -14834,7 +14955,9 @@ elif page == "AI Feedback":
                                         _final_families[0]
                                         if (len(_final_families) == 1
                                             and _rule_type
-                                            in ("family", "mixed"))
+                                            in ("family",
+                                                "family_keyword",
+                                                "mixed"))
                                         else None)
                                     _multi_skus = (
                                         _final_skus
