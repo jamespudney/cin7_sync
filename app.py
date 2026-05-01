@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.61.1 — (1) Demand-capture customer typeahead: searches the CIN7 customers CSV by name and stores both `customer_id` (the CIN7 ContactID — what the reconciler needs for HIGH-confidence matches) and `customer_name`; free-text fallback still allowed but flagged as MEDIUM at reconcile. (2) Reconciler stats fully accounted: 7 buckets — `converted`, `needs_review`, `skipped_no_sku`, `skipped_no_customer`, `skipped_no_match`, `skipped_cancelled_voided`, `errors` — and `checked` always equals their sum. The page now shows a one-line breakdown. (3) Review page exposes `customer_id` (read-only). Cancelled/voided sales are now distinguishable from no-match-at-all. (May 1)")
+    st.caption("🟢 v2.62 — Alias learning loop closed. New **AI Feedback** page lists thumbs-down conversations from `ai_audit_logs`; the reviewer enters a trigger phrase + correct SKU/family + confidence and saves a `product_alias`. The AI Assistant page now consults `db.find_alias_in_question()` BEFORE every LLM call and injects matching past corrections as system-prompt context (substring match, longest-phrase-first, dedupe by target). Each lookup bumps `times_used` so popular aliases float to the top. New helpers: `list_product_aliases`, `delete_product_alias`. Every alias mutation writes to `audit_log`; every saved correction writes a `feedback_events` row linking the alias back to its source `ai_audit_log` row. Goal: improve over time without retraining the model. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -713,6 +713,7 @@ with st.sidebar:
         [
             "Overview",
             "AI Assistant",
+            "AI Feedback",
             "Demand Signals",
             "Monthly Metrics",
             "Ordering",
@@ -13857,6 +13858,53 @@ elif page == "AI Assistant":
             with st.chat_message("user"):
                 st.markdown(_user_question)
 
+            # ---- Alias check (v2.62) ----
+            # Before calling the LLM, see if any stored alias phrases
+            # appear in the user's question. Hits get injected as a
+            # "past corrections to keep in mind" addendum to the system
+            # prompt, so Claude has the resolved SKU/family in mind
+            # rather than having to guess. We don't short-circuit the
+            # LLM call entirely — Claude still does tool dispatch and
+            # formatting; we just stop it from re-guessing what the
+            # user means by "warm strip" every time.
+            try:
+                _alias_hits = db.find_alias_in_question(
+                    _user_question, min_confidence=0.6)
+            except Exception:
+                _alias_hits = []
+            if _alias_hits:
+                _hit_lines = []
+                for _h in _alias_hits[:6]:
+                    _target = (
+                        f"SKU `{_h['sku']}`" if _h.get("sku")
+                        else (f"product family `{_h['product_family']}`"
+                              if _h.get("product_family") else ""))
+                    if not _target:
+                        continue
+                    _hit_lines.append(
+                        f"- The phrase `{_h['phrase']}` has been "
+                        f"corrected by a human reviewer to mean "
+                        f"{_target} (used {_h['times_used']}x, "
+                        f"confidence {_h['confidence']:.0%})")
+                    # Bump times_used + last_used_at on this lookup
+                    try:
+                        db.upsert_product_alias(
+                            _h["phrase"],
+                            sku=_h.get("sku"),
+                            product_family=_h.get("product_family"),
+                            confidence=_h["confidence"],
+                            approved_by="alias_lookup")
+                    except Exception:
+                        pass
+                _alias_addendum = (
+                    "\n\nPast corrections to keep in mind for THIS "
+                    "user's question:\n" + "\n".join(_hit_lines)
+                    + "\n\nUse these mappings unless the question "
+                    "context clearly contradicts them. Cite the "
+                    "resolved SKU/family in your answer.") if _hit_lines else ""
+            else:
+                _alias_addendum = ""
+
             # Build the Anthropic conversation. We keep the system
             # prompt small + tool-driven so Claude doesn't waste
             # tokens "understanding" the data — it asks via tools.
@@ -13947,6 +13995,12 @@ elif page == "AI Assistant":
                 "quantity in parentheses.\n"
                 "- If you can't answer confidently, say so and ask "
                 "for clarification (preferred SKU, time window, etc.).")
+
+            # Append any alias-correction hints captured above. Putting
+            # these AFTER the base prompt means they show up as recent
+            # context Claude can use without overriding the core
+            # behaviour rules.
+            _system_prompt = _system_prompt + (_alias_addendum or "")
 
             _tool_calls_log: list = []
             # Charts collected from tool results during this turn.
@@ -14138,6 +14192,283 @@ elif page == "AI Assistant":
 #
 # Edits go through db.update_demand_signal which writes a 'demand_signal.update'
 # row to audit_log per change, so the trail of who-changed-what stays intact.
+
+# ---------------------------------------------------------------------------
+# Page: AI Feedback — review thumbs-down chats and turn corrections into
+# product_aliases that future AI questions consult before calling the LLM.
+# ---------------------------------------------------------------------------
+#
+# This is the human-input side of the alias-learning loop. The AI
+# Assistant page already records every Q&A into ai_audit_logs and
+# captures 👍/👎 feedback. Here the reviewer browses the negative ones,
+# enters the SKU/family the AI should have used, and saves it as an
+# alias. Next time the user asks the same kind of question, the
+# alias-before-LLM hook (in the AI Assistant page) injects the
+# correction as a system-prompt hint so Claude doesn't repeat the
+# mistake. Goal: improve over time without retraining the model.
+
+elif page == "AI Feedback":
+    st.header(":memo: AI Feedback — Review & Teach")
+    st.caption(
+        "Browse AI conversations the team flagged 👎. For each one, "
+        "record what the AI *should* have said — the phrase + correct "
+        "SKU/family becomes a `product_alias` that's injected as "
+        "context into future LLM calls. Improvements compound."
+    )
+
+    # ---- Filters ----
+    fcol1, fcol2, fcol3 = st.columns([1, 1, 2])
+    feedback_filter = fcol1.selectbox(
+        "Show",
+        options=[
+            "Negative only (default)",
+            "All feedback",
+            "Positive only",
+            "No feedback yet",
+        ],
+        index=0,
+    )
+    days_back_fb = fcol2.selectbox(
+        "Date range",
+        options=[7, 30, 90, 365, 9999],
+        index=2,
+        format_func=lambda d: ("All time" if d == 9999
+                                else f"Last {d} days"),
+    )
+    contains = fcol3.text_input(
+        "Question contains",
+        placeholder="Filter by substring (e.g. 'sierra')",
+        value="",
+    )
+
+    # ---- Load matching ai_audit_logs rows ----
+    try:
+        _all_q = db.list_ai_queries(limit=500)
+    except Exception as _e:
+        st.error(f"Could not load ai_audit_logs: {_e}")
+        _all_q = []
+
+    if not _all_q:
+        st.info(
+            "No AI conversations recorded yet. Ask something on the "
+            "**AI Assistant** page, then thumbs-down an answer if it "
+            "was wrong — that's what populates this page.")
+    else:
+        from datetime import datetime as _dt2, timedelta as _td2
+        _cutoff = (_dt2.utcnow() - _td2(days=int(days_back_fb))
+                    if days_back_fb < 9999 else None)
+
+        def _passes_filter(row):
+            fb = (row["feedback"] or "").strip().lower()
+            if feedback_filter == "Negative only (default)":
+                if fb != "negative":
+                    return False
+            elif feedback_filter == "Positive only":
+                if fb != "positive":
+                    return False
+            elif feedback_filter == "No feedback yet":
+                if fb in ("positive", "negative"):
+                    return False
+            # Date filter
+            if _cutoff is not None:
+                try:
+                    _ca = _dt2.fromisoformat(
+                        str(row["created_at"]).replace(" ", "T"))
+                    if _ca < _cutoff:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+            # Substring filter
+            if contains.strip():
+                if (contains.strip().lower()
+                        not in str(row["user_question"]).lower()):
+                    return False
+            return True
+
+        _filtered = [r for r in _all_q if _passes_filter(r)]
+        st.caption(f"Showing **{len(_filtered)}** conversation(s).")
+
+        if not _filtered:
+            st.info("No rows match these filters.")
+        else:
+            # SKU options for the typeahead inside each row's form.
+            try:
+                _all_skus = (sorted(products["SKU"].dropna()
+                                     .astype(str).unique().tolist())
+                              if not products.empty else [])
+            except Exception:
+                _all_skus = []
+            _sku_options = ["(none — family-only mapping)"] + _all_skus
+
+            for _row in _filtered[:50]:  # cap to 50 per render
+                _aid = int(_row["id"])
+                _q = (_row["user_question"] or "").strip()
+                _ans = (_row["answer_returned"] or "").strip()
+                _fb = (_row["feedback"] or "").strip().lower()
+                _fb_icon = (":thumbsup:" if _fb == "positive"
+                             else (":thumbsdown:" if _fb == "negative"
+                                   else ":grey_question:"))
+                _ts = str(_row["created_at"] or "")[:19]
+
+                # Has this row already been corrected? (i.e. an alias
+                # was inserted with this audit_id as the source).
+                # We store that linkage in feedback_events with
+                # feedback='correction', entity_id=audit_id.
+                try:
+                    with db.connect() as _c:
+                        _corr_count = _c.execute(
+                            "SELECT COUNT(*) AS n FROM feedback_events "
+                            "WHERE entity_type = 'ai_audit_log' "
+                            "AND entity_id = ? "
+                            "AND feedback = 'correction'",
+                            (str(_aid),)).fetchone()["n"]
+                except Exception:
+                    _corr_count = 0
+                _corrected_marker = (
+                    f" :white_check_mark: {_corr_count} correction(s)"
+                    if _corr_count else "")
+
+                with st.expander(
+                        f"{_fb_icon} #{_aid} · {_ts} · "
+                        f"{_q[:80]}{'…' if len(_q) > 80 else ''}"
+                        f"{_corrected_marker}",
+                        expanded=False):
+                    st.markdown(f"**Question**\n\n> {_q}")
+                    if _ans:
+                        st.markdown(f"**Answer the AI gave**\n\n{_ans}")
+                    if _row["feedback_note"]:
+                        st.markdown(
+                            f"*Reviewer's note:* "
+                            f"{_row['feedback_note']}")
+
+                    st.markdown("---")
+                    st.markdown(
+                        "**Teach the AI**: enter the phrase it should "
+                        "recognise next time + the correct target.")
+
+                    with st.form(f"_fb_form_{_aid}",
+                                  clear_on_submit=False):
+                        _alias_phrase = st.text_input(
+                            "Alias phrase (will be matched in future "
+                            "questions)",
+                            value=_q.lower()[:80],
+                            key=f"_fb_phr_{_aid}",
+                            help="A short trigger phrase, lowercased. "
+                                 "When the AI sees this substring in a "
+                                 "future question it will know which "
+                                 "SKU/family you mean. Shorter is "
+                                 "usually better — e.g. 'warm strip', "
+                                 "not the full sentence.")
+                        _alias_sku = st.selectbox(
+                            "Correct SKU",
+                            options=_sku_options,
+                            index=0,
+                            key=f"_fb_sku_{_aid}",
+                            help="The SKU the AI should have answered "
+                                 "with. Pick (none) for a family-level "
+                                 "mapping.")
+                        _alias_family = st.text_input(
+                            "OR product family (uppercase, e.g. "
+                            "SIERRA38)",
+                            value="",
+                            key=f"_fb_fam_{_aid}",
+                            help="Use this for family-level mappings. "
+                                 "If both SKU and family are set, both "
+                                 "will be stored.")
+                        _alias_conf = st.slider(
+                            "Confidence",
+                            min_value=0.5, max_value=1.0,
+                            value=0.9, step=0.05,
+                            key=f"_fb_conf_{_aid}")
+                        _save_alias = st.form_submit_button(
+                            ":floppy_disk: Save alias",
+                            type="primary",
+                            use_container_width=True)
+
+                    if _save_alias:
+                        _phr = (_alias_phrase or "").strip().lower()
+                        _sku_val = (None
+                                     if _alias_sku == _sku_options[0]
+                                     else _alias_sku)
+                        _fam_val = (
+                            _alias_family.strip().upper() or None)
+                        if not _phr:
+                            st.error("Alias phrase can't be empty.")
+                        elif not _sku_val and not _fam_val:
+                            st.error(
+                                "Need a SKU or a product family — "
+                                "otherwise the alias has nothing to "
+                                "map to.")
+                        else:
+                            _actor_fb = (st.session_state
+                                          .get("current_user", "")
+                                          .strip()
+                                          or "unknown")
+                            try:
+                                _new_alias_id = db.upsert_product_alias(
+                                    _phr,
+                                    sku=_sku_val,
+                                    product_family=_fam_val,
+                                    confidence=float(_alias_conf),
+                                    approved_by=_actor_fb)
+                                # Record the linkage so this audit row
+                                # shows the green check next time.
+                                db.record_feedback_event(
+                                    source="ai_chat",
+                                    entity_type="ai_audit_log",
+                                    entity_id=str(_aid),
+                                    feedback="correction",
+                                    note=(f"alias_id={_new_alias_id} "
+                                          f"phrase='{_phr}' "
+                                          f"sku={_sku_val or ''} "
+                                          f"family={_fam_val or ''}"),
+                                    user_id=_actor_fb)
+                                st.success(
+                                    f":white_check_mark: Alias #"
+                                    f"{_new_alias_id} saved. The AI "
+                                    "will use this on the next "
+                                    "matching question.")
+                                st.rerun()
+                            except Exception as _e:
+                                st.error(f"Could not save alias: {_e}")
+
+    # ---- Existing aliases panel ----
+    st.divider()
+    with st.expander(
+            ":bookmark: Existing aliases (click to manage)",
+            expanded=False):
+        try:
+            _aliases = db.list_product_aliases(limit=500)
+        except Exception as _e:
+            _aliases = []
+            st.error(f"Could not load product_aliases: {_e}")
+        if not _aliases:
+            st.info(
+                "No aliases stored yet. Save one from any conversation "
+                "above and it'll appear here.")
+        else:
+            _alias_df = pd.DataFrame([dict(a) for a in _aliases])
+            st.dataframe(
+                _alias_df[["id", "phrase", "sku", "product_family",
+                            "confidence", "times_used", "approved_by",
+                            "last_used_at"]],
+                width="stretch", height=300)
+            _del_id = st.number_input(
+                "Delete alias by id (carefully — audit logs the delete)",
+                min_value=0, value=0, step=1)
+            if st.button(":wastebasket: Delete this alias",
+                         disabled=(_del_id <= 0)):
+                _actor_del = (st.session_state
+                              .get("current_user", "").strip()
+                              or "unknown")
+                try:
+                    db.delete_product_alias(int(_del_id), actor=_actor_del)
+                    st.success(
+                        f"Deleted alias #{_del_id}. Audit log written.")
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Delete failed: {_e}")
+
 
 elif page == "Demand Signals":
     st.header(":clipboard: Demand Signals — Review & Edit")

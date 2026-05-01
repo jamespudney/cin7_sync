@@ -2355,13 +2355,19 @@ def upsert_product_alias(phrase: str, *,
                           sku: Optional[str] = None,
                           product_family: Optional[str] = None,
                           confidence: float = 0.5,
-                          approved_by: str = "ai") -> None:
+                          approved_by: str = "ai") -> int:
     """Store/update a phrase → SKU/family mapping. Phrase is lowercased.
     On collision (same phrase already mapped to same target), bump
-    times_used + last_used_at instead of creating duplicate rows."""
+    times_used + last_used_at instead of creating duplicate rows.
+
+    Writes an audit_log row on every insert/update so the alias-learning
+    trail is queryable.
+
+    Returns the id of the row (existing or newly inserted).
+    """
     phrase_n = (phrase or "").strip().lower()
     if not phrase_n:
-        return
+        return 0
     with connect() as c:
         existing = c.execute(
             "SELECT id, times_used FROM product_aliases "
@@ -2378,8 +2384,17 @@ def upsert_product_alias(phrase: str, *,
                 "WHERE id = ?",
                 (confidence, existing["id"]),
             )
-        else:
+            row_id = int(existing["id"])
             c.execute(
+                "INSERT INTO audit_log (event, actor, target, detail) "
+                "VALUES (?, ?, ?, ?)",
+                ("product_alias.bump", approved_by, str(row_id),
+                 f"phrase='{phrase_n}' sku={sku or ''} "
+                 f"family={product_family or ''} "
+                 f"confidence={confidence}"))
+            return row_id
+        else:
+            cur = c.execute(
                 """
                 INSERT INTO product_aliases
                     (phrase, sku, product_family, confidence, approved_by)
@@ -2387,6 +2402,95 @@ def upsert_product_alias(phrase: str, *,
                 """,
                 (phrase_n, sku, product_family, confidence, approved_by),
             )
+            row_id = int(cur.lastrowid)
+            c.execute(
+                "INSERT INTO audit_log (event, actor, target, detail) "
+                "VALUES (?, ?, ?, ?)",
+                ("product_alias.insert", approved_by, str(row_id),
+                 f"phrase='{phrase_n}' sku={sku or ''} "
+                 f"family={product_family or ''} "
+                 f"confidence={confidence}"))
+            return row_id
+
+
+def list_product_aliases(*,
+                          sku: Optional[str] = None,
+                          product_family: Optional[str] = None,
+                          phrase_contains: Optional[str] = None,
+                          min_confidence: float = 0.0,
+                          limit: int = 500) -> List[sqlite3.Row]:
+    """Browse the alias table — used by the AI Feedback page to show
+    what's already been learned. All filters optional."""
+    sql = "SELECT * FROM product_aliases WHERE confidence >= ?"
+    params: list = [min_confidence]
+    if sku:
+        sql += " AND sku = ?"
+        params.append(sku)
+    if product_family:
+        sql += " AND product_family = ?"
+        params.append(product_family)
+    if phrase_contains:
+        sql += " AND phrase LIKE ?"
+        params.append(f"%{phrase_contains.strip().lower()}%")
+    sql += " ORDER BY times_used DESC, last_used_at DESC LIMIT ?"
+    params.append(int(limit))
+    with connect() as c:
+        return c.execute(sql, params).fetchall()
+
+
+def delete_product_alias(alias_id: int, actor: str = "system") -> None:
+    """Remove an alias mapping. Used by the AI Feedback page when a
+    correction was wrong / no longer applies."""
+    with connect() as c:
+        c.execute("DELETE FROM product_aliases WHERE id = ?", (alias_id,))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("product_alias.delete", actor, str(alias_id), ""))
+
+
+def find_alias_in_question(question: str,
+                            min_confidence: float = 0.6) -> List[dict]:
+    """Best-effort match of stored alias phrases against the user's
+    question. Returns a list of {phrase, sku, product_family, confidence,
+    times_used} for any alias whose phrase appears as a substring in
+    the lowercased question, longest-phrase-first.
+
+    Used by the AI Assistant page to inject 'past corrections' hints
+    into the system prompt before sending to the LLM. Substring match
+    catches the realistic case (alias 'warm strip' in a question like
+    'do we have any warm strip in stock?') without requiring exact
+    full-question matches.
+    """
+    q = (question or "").strip().lower()
+    if not q:
+        return []
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM product_aliases WHERE confidence >= ? "
+            "ORDER BY length(phrase) DESC, times_used DESC LIMIT 2000",
+            (min_confidence,),
+        ).fetchall()
+    hits: list[dict] = []
+    seen_targets: set = set()  # de-dup overlapping phrases that point
+                                  # to the same target
+    for r in rows:
+        phrase = (r["phrase"] or "").strip().lower()
+        if not phrase or phrase not in q:
+            continue
+        key = (r["sku"] or "", r["product_family"] or "")
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
+        hits.append({
+            "phrase": phrase,
+            "sku": r["sku"],
+            "product_family": r["product_family"],
+            "confidence": float(r["confidence"] or 0),
+            "times_used": int(r["times_used"] or 0),
+            "id": int(r["id"]),
+        })
+    return hits
 
 
 def lookup_aliases(phrase: str,
