@@ -540,6 +540,64 @@ def _migrate_supplier_stockout_recovery(conn: sqlite3.Connection) -> None:
     except sqlite3.Error:
         pass
 
+
+def _migrate_demand_signal_match_columns(conn: sqlite3.Connection) -> None:
+    """v2.61: split SKU lineage and persist auto-reconciler match metadata.
+
+    Adds five nullable columns to demand_signals and backfills detected_sku
+    from the existing sku for any pre-v2.61 row that doesn't have it yet.
+
+    - detected_sku        TEXT  — what was originally captured (immutable
+                                  source-of-truth for what the signal-capturer
+                                  thought the SKU was)
+    - matched_order_number TEXT — populated by reconcile_demand_signals when
+                                  a HIGH-confidence sale match is found
+    - matched_sale_date    TEXT — sale's OrderDate at the moment we matched
+    - matched_sale_line_id TEXT — synthetic id (SaleID:ProductID) so we can
+                                  later trace each conversion back to a sale
+    - match_confidence     TEXT — 'high' / 'medium' / 'low' / NULL.
+                                  HIGH = exact SKU + exact customer match
+                                  MEDIUM = exact SKU + signal had no
+                                           customer_id, sale exists to *some*
+                                           customer (flagged needs_review,
+                                           NOT auto-converted)
+                                  LOW = future (family-only match)
+
+    `sku` remains the canonical column the matcher reads — it equals the
+    approved value if the buyer corrected it via the review page, otherwise
+    a copy of detected_sku from insert time.
+    """
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('demand_signals')").fetchall()}
+
+        if "detected_sku" not in cols:
+            conn.execute(
+                "ALTER TABLE demand_signals ADD COLUMN detected_sku TEXT")
+            # Backfill: original captured value == current sku for any row
+            # that pre-dates this migration. (For rows captured post-v2.61
+            # the insert helper sets both at the same time.)
+            conn.execute(
+                "UPDATE demand_signals SET detected_sku = sku "
+                "WHERE detected_sku IS NULL AND sku IS NOT NULL")
+
+        if "matched_order_number" not in cols:
+            conn.execute(
+                "ALTER TABLE demand_signals ADD COLUMN "
+                "matched_order_number TEXT")
+        if "matched_sale_date" not in cols:
+            conn.execute(
+                "ALTER TABLE demand_signals ADD COLUMN matched_sale_date TEXT")
+        if "matched_sale_line_id" not in cols:
+            conn.execute(
+                "ALTER TABLE demand_signals ADD COLUMN "
+                "matched_sale_line_id TEXT")
+        if "match_confidence" not in cols:
+            conn.execute(
+                "ALTER TABLE demand_signals ADD COLUMN match_confidence TEXT")
+    except sqlite3.Error:
+        pass
+
 FLAG_TYPES = [
     "For review",
     "Reorder approved",
@@ -750,6 +808,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_ui_prefs_widths(conn)
         _migrate_supplier_dropship(conn)
         _migrate_supplier_stockout_recovery(conn)
+        _migrate_demand_signal_match_columns(conn)
         yield conn
     finally:
         conn.close()
@@ -2408,19 +2467,23 @@ def insert_demand_signal(*,
         raise ValueError("source is required")
     if not signal_type:
         raise ValueError("signal_type is required")
+    # detected_sku locks in the originally-captured SKU at insert time so
+    # later edits to `sku` (via the review page) don't destroy the lineage.
+    # Both columns hold the same value at capture; only `sku` mutates after.
     with connect() as c:
         cur = c.execute(
             """
             INSERT INTO demand_signals
-                (source, source_ref, sku, product_family, raw_text,
-                 signal_type, quantity, customer_id, customer_name,
-                 salesperson, confidence, needs_review, outcome, note,
-                 created_by, updated_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (source, source_ref, sku, detected_sku, product_family,
+                 raw_text, signal_type, quantity, customer_id,
+                 customer_name, salesperson, confidence, needs_review,
+                 outcome, note, created_by, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (source, source_ref, sku, product_family, raw_text,
-             signal_type, quantity, customer_id, customer_name,
-             salesperson, confidence, 1 if needs_review else 0,
+            (source, source_ref, sku, sku, product_family,
+             raw_text, signal_type, quantity, customer_id,
+             customer_name, salesperson, confidence,
+             1 if needs_review else 0,
              outcome, note, created_by, created_by),
         )
         c.execute(
@@ -2440,10 +2503,19 @@ def update_demand_signal(signal_id: int, *,
                           sku: Optional[str] = None,
                           product_family: Optional[str] = None,
                           needs_review: Optional[bool] = None,
+                          matched_order_number: Optional[str] = None,
+                          matched_sale_date: Optional[str] = None,
+                          matched_sale_line_id: Optional[str] = None,
+                          match_confidence: Optional[str] = None,
                           updated_by: str = "system") -> None:
     """Update a signal's mutable fields. Only non-None args are
     written, so it's safe to call with just the fields you mean to
-    change."""
+    change.
+
+    The matched_* and match_confidence columns are populated by the
+    auto-reconciler — manual edits via the review page typically only
+    touch outcome / note / approved_sku / product_family / needs_review.
+    """
     sets = []
     params: list = []
     if outcome is not None:
@@ -2467,6 +2539,18 @@ def update_demand_signal(signal_id: int, *,
     if needs_review is not None:
         sets.append("needs_review = ?")
         params.append(1 if needs_review else 0)
+    if matched_order_number is not None:
+        sets.append("matched_order_number = ?")
+        params.append(matched_order_number)
+    if matched_sale_date is not None:
+        sets.append("matched_sale_date = ?")
+        params.append(matched_sale_date)
+    if matched_sale_line_id is not None:
+        sets.append("matched_sale_line_id = ?")
+        params.append(matched_sale_line_id)
+    if match_confidence is not None:
+        sets.append("match_confidence = ?")
+        params.append(match_confidence)
     if not sets:
         return
     sets.append("updated_at = datetime('now')")
@@ -2685,30 +2769,67 @@ def compute_demand_scores_batch(*,
 def reconcile_demand_signals(sales_rows,
                               *,
                               window_days: int = 30,
-                              actor: str = "auto-reconciler") -> dict:
+                              actor: str = "auto_reconciler",
+                              dry_run: bool = False,
+                              cancelled_statuses=None) -> dict:
     """Auto-mark pending demand signals as converted when a matching CIN7
-    sale exists. See module-level comment for the match rule.
+    sale exists, OR flag them for human review when the evidence is only
+    partial.
 
-    Returns a summary dict::
+    Confidence model (v2.61):
+      HIGH    — exact SKU + exact customer_id, sale within window.
+                AUTO-CONVERTS. Stores match metadata and writes a
+                'demand_signal_auto_converted' audit row.
+      MEDIUM  — exact SKU, signal had NO customer_id captured, sale
+                exists to *some* customer in the window.
+                FLAGS needs_review=1 and stores match metadata, but does
+                NOT change outcome. Writes a 'demand_signal_needs_review'
+                audit row. Reviewer decides via the page.
+      LOW     — reserved for future family-only matches.
 
+    Two-pass: HIGH consumes its sales first, then MEDIUM looks at
+    whatever's left. So a HIGH and a MEDIUM never compete for the same
+    sale row.
+
+    Sales filter: rows whose Status is in `cancelled_statuses` are
+    EXCLUDED from matching. Default excludes VOIDED / CANCELLED /
+    CREDITED / LOST. Per the project rule "accuracy > speed" — better
+    to miss a match than convert off a void.
+
+    `dry_run=True` computes everything and returns the plan but writes
+    nothing to demand_signals or audit_log (one summary row excepted —
+    so the page can show that a dry-run was attempted).
+
+    Returns::
         {
-            "matched": int,            # signals flipped to converted
-            "attempted": int,          # pending signals considered
-            "skipped_no_sku": int,     # pending but no sku captured
-            "skipped_no_customer": int,# pending but no customer_id captured
-            "skipped_no_match": int,   # eligible but no qualifying sale
-            "errors": int,             # update_demand_signal raised
+            "checked": int,        # pending signals considered
+            "converted": int,      # auto-converted (HIGH)
+            "needs_review": int,   # flagged for review (MEDIUM)
+            "skipped": int,        # no qualifying match at any tier
+            "errors": int,
+            "dry_run": bool,
+            "would_convert": [    # only populated when dry_run=True
+                {"signal_id", "sku", "customer_id", "order_number",
+                 "sale_date", "confidence"}
+            ],
+            "would_review": [...]  # same shape
         }
     """
     from datetime import datetime as _dt, timedelta as _td
 
+    if cancelled_statuses is None:
+        cancelled_statuses = {"VOIDED", "CANCELLED", "CREDITED", "LOST"}
+    cancelled_statuses = {str(s).upper() for s in cancelled_statuses}
+
     summary = {
-        "matched": 0,
-        "attempted": 0,
-        "skipped_no_sku": 0,
-        "skipped_no_customer": 0,
-        "skipped_no_match": 0,
+        "checked": 0,
+        "converted": 0,
+        "needs_review": 0,
+        "skipped": 0,
         "errors": 0,
+        "dry_run": bool(dry_run),
+        "would_convert": [],
+        "would_review": [],
     }
 
     def _parse_dt(value):
@@ -2733,109 +2854,205 @@ def reconcile_demand_signals(sales_rows,
             return None
 
     def _record_run(extra=""):
+        # Always write a run-marker row — even on dry-run — so the page
+        # can show "Last reconciled at" honestly. Detail says (dry_run).
         with connect() as c:
             c.execute(
                 "INSERT INTO audit_log (event, actor, target, detail) "
                 "VALUES (?, ?, ?, ?)",
                 ("demand_signal.reconcile_run", actor, "all",
-                 (f"matched={summary['matched']} "
-                  f"attempted={summary['attempted']} "
-                  f"no_sku={summary['skipped_no_sku']} "
-                  f"no_cust={summary['skipped_no_customer']} "
-                  f"no_match={summary['skipped_no_match']} "
+                 (f"converted={summary['converted']} "
+                  f"needs_review={summary['needs_review']} "
+                  f"checked={summary['checked']} "
+                  f"skipped={summary['skipped']} "
                   f"errors={summary['errors']} "
-                  f"window_days={window_days} {extra}").strip()))
+                  f"window_days={window_days} "
+                  f"{'(dry_run)' if dry_run else ''} {extra}").strip()))
 
     sales_rows = list(sales_rows or [])
     if not sales_rows:
         _record_run("(no sales data)")
         return summary
 
-    # Pull pending-equivalent signals (newest list_demand_signals returns
-    # newest-first; we'll re-sort ascending below for FIFO).
+    # Pull pending-equivalent signals (oldest first for FIFO).
     all_pending = list_demand_signals(limit=10000)
     pending = [r for r in all_pending
                if (r["outcome"] is None
                    or str(r["outcome"]).strip().lower() in
                    ("pending", "open", ""))]
-    summary["attempted"] = len(pending)
+    summary["checked"] = len(pending)
 
-    eligible = []
-    for s in pending:
-        if not s["sku"] or not str(s["sku"]).strip():
-            summary["skipped_no_sku"] += 1
-            continue
-        if not s["customer_id"] or not str(s["customer_id"]).strip():
-            summary["skipped_no_customer"] += 1
-            continue
-        eligible.append(s)
+    # Skip empty-sku rows entirely; they can't match anything.
+    eligible = [s for s in pending
+                if s["sku"] and str(s["sku"]).strip()]
     eligible.sort(key=lambda r: str(r["created_at"] or ""))
 
-    # Build (sku_upper, customer_id_upper) → [sales sorted by date] index.
-    sales_index: dict = {}
+    # Build two indexes from sales_rows (filtered for cancellations):
+    #   exact_index : (sku_upper, customer_id_upper) → [sales sorted asc]
+    #   any_cust    : (sku_upper)                    → [sales sorted asc]
+    # Each sale dict carries a `consumed` flag; HIGH pass sets it on its
+    # matches before MEDIUM gets a look.
+    exact_index: dict = {}
+    any_cust_index: dict = {}
     for row in sales_rows:
+        status = str(row.get("Status", "") or "").strip().upper()
+        if status in cancelled_statuses:
+            continue
         sku = str(row.get("SKU", "") or "").strip().upper()
-        cid = str(row.get("CustomerID", "") or "").strip().upper()
-        if not sku or not cid:
+        if not sku:
             continue
         order_date_dt = _parse_dt(
             row.get("OrderDate") or row.get("InvoiceDate"))
         if order_date_dt is None:
             continue
-        sales_index.setdefault((sku, cid), []).append({
+        sale_id = str(row.get("SaleID") or "").strip()
+        product_id = str(row.get("ProductID") or "").strip()
+        sale_record = {
             "OrderDate": order_date_dt,
             "OrderNumber": (row.get("OrderNumber")
                             or row.get("InvoiceNumber") or "?"),
+            "SaleID": sale_id or None,
+            "ProductID": product_id or None,
+            "MatchedSaleLineID": (
+                f"{sale_id}:{product_id}" if (sale_id and product_id)
+                else (sale_id or product_id or "?")),
+            "Status": status or None,
+            "Quantity": row.get("Quantity"),
             "consumed": False,
-        })
-    for k in sales_index:
-        sales_index[k].sort(key=lambda x: x["OrderDate"])
+        }
+        # Same record goes into both indexes so consumption in pass 1
+        # is visible to pass 2.
+        cid = str(row.get("CustomerID", "") or "").strip().upper()
+        if cid:
+            exact_index.setdefault((sku, cid), []).append(sale_record)
+        any_cust_index.setdefault(sku, []).append(sale_record)
+    for k in exact_index:
+        exact_index[k].sort(key=lambda x: x["OrderDate"])
+    for k in any_cust_index:
+        any_cust_index[k].sort(key=lambda x: x["OrderDate"])
 
-    # Match each eligible signal to earliest unconsumed sale within window.
-    for s in eligible:
-        sku_key = str(s["sku"]).strip().upper()
-        cid_key = str(s["customer_id"]).strip().upper()
-        candidates = sales_index.get((sku_key, cid_key), [])
-        if not candidates:
-            summary["skipped_no_match"] += 1
-            continue
-
-        sig_dt = _parse_dt(s["created_at"])
-        if sig_dt is None:
-            summary["skipped_no_match"] += 1
-            continue
-        window_end = sig_dt + _td(days=window_days)
-
-        best = None
+    def _earliest_unconsumed(candidates, sig_dt, window_end):
         for c_sale in candidates:
             if c_sale["consumed"]:
                 continue
             if sig_dt <= c_sale["OrderDate"] <= window_end:
-                best = c_sale
-                break
+                return c_sale
+        return None
 
-        if not best:
-            summary["skipped_no_match"] += 1
+    def _apply(signal, match, *, confidence):
+        """Persist the match. For confidence='high' we flip outcome and
+        write the auto_converted audit row. For 'medium' we set
+        needs_review=1, store the suspected match metadata, but DO NOT
+        change outcome. dry_run short-circuits all writes."""
+        sig_id = int(signal["id"])
+        order_num = match["OrderNumber"] or "?"
+        sale_date_str = match["OrderDate"].strftime("%Y-%m-%d")
+        sale_line_id = match["MatchedSaleLineID"]
+        existing_note = (signal["note"] or "").strip()
+        if confidence == "high":
+            new_note = ((existing_note + " | ") if existing_note else "") + (
+                f"Auto-converted from CIN7 sale Order {order_num} on "
+                f"{sale_date_str}.")
+        else:  # medium
+            new_note = ((existing_note + " | ") if existing_note else "") + (
+                f"SUSPECTED match: CIN7 sale Order {order_num} on "
+                f"{sale_date_str} (no customer_id on signal — please "
+                f"verify).")
+
+        if dry_run:
+            bucket = (summary["would_convert"] if confidence == "high"
+                      else summary["would_review"])
+            bucket.append({
+                "signal_id": sig_id,
+                "sku": signal["sku"],
+                "customer_id": signal["customer_id"],
+                "order_number": order_num,
+                "sale_date": sale_date_str,
+                "confidence": confidence,
+            })
+            match["consumed"] = True
+            return
+
+        kwargs = {
+            "note": new_note,
+            "matched_order_number": str(order_num),
+            "matched_sale_date": sale_date_str,
+            "matched_sale_line_id": str(sale_line_id),
+            "match_confidence": confidence,
+            "updated_by": actor,
+        }
+        if confidence == "high":
+            kwargs["outcome"] = "converted"
+        else:  # medium
+            kwargs["needs_review"] = True
+
+        update_demand_signal(sig_id, **kwargs)
+        match["consumed"] = True
+
+        # Distinct, queryable audit event per match (in addition to the
+        # generic demand_signal.update row written by update_demand_signal).
+        evidence = (
+            f"signal_id={sig_id} "
+            f"sku={signal['sku']} "
+            f"customer_id={signal['customer_id'] or ''} "
+            f"order_number={order_num} "
+            f"sale_date={sale_date_str} "
+            f"sale_line_id={sale_line_id} "
+            f"qty={match.get('Quantity')} "
+            f"confidence={confidence}")
+        event_name = ("demand_signal_auto_converted" if confidence == "high"
+                      else "demand_signal_needs_review")
+        with connect() as c:
+            c.execute(
+                "INSERT INTO audit_log (event, actor, target, detail) "
+                "VALUES (?, ?, ?, ?)",
+                (event_name, actor, str(sig_id), evidence))
+
+    # ---- Pass 1: HIGH (exact SKU + exact customer) ----
+    medium_candidates = []  # signals that didn't match HIGH but had no
+                              # customer_id captured — try MEDIUM in pass 2.
+    for s in eligible:
+        sku_key = str(s["sku"]).strip().upper()
+        cid_raw = (s["customer_id"] or "").strip()
+        sig_dt = _parse_dt(s["created_at"])
+        if sig_dt is None:
+            summary["skipped"] += 1
             continue
+        window_end = sig_dt + _td(days=window_days)
 
-        # Convert: append to existing note rather than overwriting it so
-        # any human context the buyer typed earlier survives.
-        try:
-            existing_note = (s["note"] or "").strip()
-            order_num = best["OrderNumber"] or "?"
-            sale_date_str = best["OrderDate"].strftime("%Y-%m-%d")
-            new_note = ((existing_note + " | ") if existing_note else "") + \
-                       (f"auto-matched to CIN7 Order #{order_num} on "
-                        f"{sale_date_str}")
-            update_demand_signal(
-                int(s["id"]),
-                outcome="converted",
-                note=new_note,
-                updated_by=actor)
-            best["consumed"] = True
-            summary["matched"] += 1
-        except Exception:
-            summary["errors"] += 1
+        if cid_raw:
+            cid_key = cid_raw.upper()
+            candidates = exact_index.get((sku_key, cid_key), [])
+            match = _earliest_unconsumed(candidates, sig_dt, window_end)
+            if match:
+                try:
+                    _apply(s, match, confidence="high")
+                    summary["converted"] += 1
+                except Exception:
+                    summary["errors"] += 1
+            else:
+                # Signal HAS a customer_id but no exact-customer sale.
+                # Don't attempt MEDIUM here — that would be the wrong
+                # customer, which is suspicious not helpful.
+                summary["skipped"] += 1
+        else:
+            # No customer_id captured. Defer to pass 2 in case a
+            # SKU-only sale exists to *some* customer.
+            medium_candidates.append((s, sig_dt, window_end))
+
+    # ---- Pass 2: MEDIUM (exact SKU, signal had no customer_id) ----
+    for (s, sig_dt, window_end) in medium_candidates:
+        sku_key = str(s["sku"]).strip().upper()
+        candidates = any_cust_index.get(sku_key, [])
+        match = _earliest_unconsumed(candidates, sig_dt, window_end)
+        if match:
+            try:
+                _apply(s, match, confidence="medium")
+                summary["needs_review"] += 1
+            except Exception:
+                summary["errors"] += 1
+        else:
+            summary["skipped"] += 1
 
     _record_run()
     return summary

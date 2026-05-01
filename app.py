@@ -219,7 +219,7 @@ products = load("products")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.60 — Demand-signal auto-reconciler: matches pending signals (with sku + customer_id) to CIN7 sales for the same SKU + customer within 30 days, marks them `converted` automatically, appends `auto-matched to CIN7 Order #X on YYYY-MM-DD` to the note. New `🔄 Reconcile against CIN7 sales` button on the Demand Signals page; same routine runs unattended at the end of every `sync_salelines` (nightly + on-demand). Audit log gets a `demand_signal.reconcile_run` row each pass + a `demand_signal.update` row per match (actor=auto-reconciler). FIFO per (sku, customer) so one sale never converts two pendings. Lost-marking stays manual per spec. (May 1)")
+    st.caption("🟢 v2.61 — Reconciler hardening (accuracy > speed): (1) excludes VOIDED/CANCELLED/CREDITED/LOST sales from matching; (2) two confidence tiers — HIGH (exact SKU + exact customer match) auto-converts, MEDIUM (exact SKU, no customer captured) flags `needs_review=1` only; (3) new schema columns `detected_sku` (immutable original), `matched_order_number`, `matched_sale_date`, `matched_sale_line_id`, `match_confidence` populated by the reconciler; (4) distinct audit events `demand_signal_auto_converted` / `demand_signal_needs_review` with structured per-match evidence; (5) dry-run toggle on the page so you can preview before committing. Migration backfills `detected_sku=sku` for pre-v2.61 rows. Lost-marking stays manual. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -14053,46 +14053,100 @@ elif page == "Demand Signals":
     )
 
     # ---- Auto-reconciler controls ----
-    rec_col1, rec_col2 = st.columns([1, 3])
+    #
+    # Two confidence tiers (v2.61):
+    #   HIGH   = exact SKU + exact customer match → AUTO-CONVERT
+    #   MEDIUM = exact SKU, no customer captured + sale exists → flag for
+    #            review only (sets needs_review=1, doesn't change outcome)
+    # Cancelled / voided / credited sales are excluded from matching per
+    # the project rule "accuracy > speed".
+    rec_col1, rec_col2, rec_col3 = st.columns([1, 1, 2])
+    _dry_run = rec_col2.checkbox(
+        ":microscope: Dry-run preview only",
+        value=False,
+        help="Compute what WOULD convert / get flagged without writing to "
+             "the DB. Use this to sanity-check before letting the "
+             "reconciler change anything.",
+        key="ds_dry_run_toggle",
+    )
+    _rec_btn_label = (":arrows_counterclockwise: Preview reconcile"
+                       if _dry_run
+                       else ":arrows_counterclockwise: Reconcile against "
+                            "CIN7 sales")
     if rec_col1.button(
-            ":arrows_counterclockwise: Reconcile against CIN7 sales",
+            _rec_btn_label,
             type="primary",
             width="stretch",
-            help="Match each pending signal to the matching CIN7 sale "
-                 "(same SKU + same customer, sale within 30 days "
-                 "after capture). Marks matched ones as 'converted' "
-                 "and records the matched order # in the note."):
+            help="HIGH-confidence matches (exact SKU + exact customer + "
+                 "sale within 30 days, excluding voided/cancelled) "
+                 "auto-convert. MEDIUM-confidence (exact SKU but no "
+                 "customer captured, sale exists) get flagged for "
+                 "review — they DO NOT auto-convert."):
         try:
             _sales_records = (sale_lines_30d.to_dict(orient="records")
                               if not sale_lines_30d.empty else [])
         except Exception as _e:
             st.error(f"Could not load sale_lines for reconcile: {_e}")
             _sales_records = []
-        with st.spinner("Matching pending signals to CIN7 sales…"):
+        with st.spinner(
+                ("Previewing matches…" if _dry_run
+                 else "Matching pending signals to CIN7 sales…")):
             try:
                 _summary = db.reconcile_demand_signals(
                     _sales_records,
                     window_days=30,
-                    actor="auto-reconciler")
-                if _summary["matched"]:
-                    st.success(
-                        f":white_check_mark: Auto-matched "
-                        f"{_summary['matched']} signal(s) to CIN7 sales. "
-                        f"({_summary['attempted']} pending considered, "
-                        f"{_summary['skipped_no_customer']} skipped for "
-                        f"no customer, "
-                        f"{_summary['skipped_no_match']} no matching "
-                        f"sale yet.)")
-                    st.cache_data.clear()
-                    st.rerun()
+                    actor="auto_reconciler",
+                    dry_run=_dry_run)
+                _checked = _summary.get("checked", 0)
+                _conv = _summary.get("converted", 0)
+                _rev = _summary.get("needs_review", 0)
+                _skip = _summary.get("skipped", 0)
+
+                if _dry_run:
+                    if _conv or _rev:
+                        st.success(
+                            f":microscope: Dry-run: would auto-convert "
+                            f"**{_conv}** and flag **{_rev}** for review "
+                            f"out of {_checked} pending. ({_skip} have no "
+                            f"qualifying match.) Uncheck dry-run and "
+                            f"re-click to commit.")
+                        if _summary.get("would_convert"):
+                            st.markdown("**Would auto-convert:**")
+                            st.dataframe(
+                                pd.DataFrame(_summary["would_convert"]),
+                                width="stretch", height=200)
+                        if _summary.get("would_review"):
+                            st.markdown(
+                                "**Would flag for review (MEDIUM):**")
+                            st.dataframe(
+                                pd.DataFrame(_summary["would_review"]),
+                                width="stretch", height=200)
+                    else:
+                        st.info(
+                            f":microscope: Dry-run: nothing would change. "
+                            f"{_checked} pending considered, {_skip} with "
+                            f"no qualifying match.")
                 else:
-                    st.info(
-                        f"No matches this run. "
-                        f"{_summary['attempted']} pending considered "
-                        f"(skipped: {_summary['skipped_no_sku']} no SKU, "
-                        f"{_summary['skipped_no_customer']} no customer, "
-                        f"{_summary['skipped_no_match']} no qualifying "
-                        f"sale within 30d).")
+                    if _conv or _rev:
+                        _msg_parts = []
+                        if _conv:
+                            _msg_parts.append(
+                                f"**{_conv}** auto-converted (HIGH)")
+                        if _rev:
+                            _msg_parts.append(
+                                f"**{_rev}** flagged for review (MEDIUM)")
+                        st.success(
+                            f":white_check_mark: " + ", ".join(_msg_parts)
+                            + f". {_checked} pending considered, "
+                            f"{_skip} with no qualifying match.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.info(
+                            f"No matches this run. {_checked} pending "
+                            f"considered, {_skip} with no qualifying sale "
+                            f"within 30d (cancelled/voided sales were "
+                            f"excluded).")
             except Exception as _e:
                 st.error(f"Reconcile failed: {_e}")
 
@@ -14101,13 +14155,13 @@ elif page == "Demand Signals":
     except Exception:
         _last_rec = None
     if _last_rec:
-        rec_col2.caption(
+        rec_col3.caption(
             f":clock3: Last reconciled at **{_last_rec}** UTC. "
-            "Also runs automatically as part of the nightly CIN7 sync.")
+            "Runs automatically at the end of every `sync_salelines`.")
     else:
-        rec_col2.caption(
-            ":clock3: Reconciler has never run. Click the button to "
-            "do a first pass, or wait for the nightly sync.")
+        rec_col3.caption(
+            ":clock3: Reconciler has never run. Tick dry-run first to "
+            "preview, then click to commit.")
 
     st.divider()
 
@@ -14200,10 +14254,15 @@ elif page == "Demand Signals":
         else:
             # Order columns for the editor. id/created_at/source/type/customer
             # are read-only so the edit can't accidentally rewrite identity.
+            # The matched_* and match_confidence columns are populated by the
+            # auto-reconciler — read-only here so a manual edit can't fake
+            # a CIN7 match.
             edit_cols = [
                 "id", "created_at", "source", "signal_type",
-                "sku", "product_family", "outcome",
+                "sku", "detected_sku", "product_family", "outcome",
                 "needs_review", "note",
+                "match_confidence", "matched_order_number",
+                "matched_sale_date",
                 "confidence", "customer_name", "salesperson",
             ]
             for _c in edit_cols:
@@ -14242,9 +14301,26 @@ elif page == "Demand Signals":
                         "approved_sku",
                         help="Edit if the captured SKU was wrong. "
                              "Saves overwrite the row's `sku` column "
-                             "and feed the score under the new SKU."),
+                             "and feed the score under the new SKU. "
+                             "The original captured value is preserved "
+                             "in `detected_sku`."),
+                    "detected_sku": st.column_config.TextColumn(
+                        "detected_sku", disabled=True, width="small",
+                        help="What was originally captured at signal "
+                             "insert time. Read-only — never mutated "
+                             "after capture."),
                     "product_family": st.column_config.TextColumn(
                         "product_family"),
+                    "match_confidence": st.column_config.TextColumn(
+                        "match", disabled=True, width="small",
+                        help="Set by the auto-reconciler. high = exact "
+                             "SKU + customer match (auto-converted). "
+                             "medium = exact SKU, no customer captured "
+                             "(flagged for review)."),
+                    "matched_order_number": st.column_config.TextColumn(
+                        "matched order #", disabled=True, width="small"),
+                    "matched_sale_date": st.column_config.TextColumn(
+                        "matched on", disabled=True, width="small"),
                     "outcome": st.column_config.SelectboxColumn(
                         "outcome",
                         options=db.OUTCOME_VALUES,

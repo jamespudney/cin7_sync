@@ -830,13 +830,15 @@ def _run_demand_reconcile_after_salelines(days: int) -> None:
             sales_records = list(csv.DictReader(fh))
         summary = _db.reconcile_demand_signals(
             sales_records, window_days=30,
-            actor=f"auto-reconciler ({Path(__file__).name})")
+            actor=f"auto_reconciler ({Path(__file__).name})")
         log.info(
-            "  demand reconcile: matched=%d attempted=%d "
-            "no_sku=%d no_cust=%d no_match=%d errors=%d",
-            summary["matched"], summary["attempted"],
-            summary["skipped_no_sku"], summary["skipped_no_customer"],
-            summary["skipped_no_match"], summary["errors"])
+            "  demand reconcile: converted=%d needs_review=%d "
+            "checked=%d skipped=%d errors=%d",
+            summary.get("converted", 0),
+            summary.get("needs_review", 0),
+            summary.get("checked", 0),
+            summary.get("skipped", 0),
+            summary.get("errors", 0))
     except Exception as exc:
         log.warning("  demand reconcile failed: %s", exc)
 
