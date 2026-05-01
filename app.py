@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.65.1 — Tighter query interpretation. (1) `search_products_by_text` now does tokenized AND-match (every whitespace-separated word in `query` must hit somewhere in the searched fields) plus `any_of_terms` (OR-match — used for Kelvin alternatives) plus `exclude_types` (block list — keeps 'LED strip' searches from returning controllers/dimmers/power supplies). (2) System-prompt interpretation rules teach Claude to translate descriptive phrases into STRUCTURED filters: 'LED strip' uses `exclude_types=[dimmer,controller,power supply,channel,profile,accessory,service,module]` to proxy the missing product_type column; 'warm white' uses `any_of_terms=[2200K,2400K,2700K,2800K,3000K]` to proxy the missing kelvin column; 'cool white' / 'natural white' similar; 'slow movers' → `classification=slow`; literal family codes ('iris', 'sierra38') → `family` filter. (3) Honesty rule: when zero matches in the requested category, say 'No X found' rather than substituting unrelated categories. (4) Per-row answer format: SKU / Kelvin / Stock / Classification / Why matched. (5) New 'Family keyword' rule type label in the AI Feedback form. (May 1)")
+    st.caption("🟢 v2.65.2 — Inventory-triage tightening. (1) For 'slow movers' / 'dead stock' / similar inventory questions, the AI now defaults to in_stock_only=true (zero-stock rows are noise for triage) AND limit=50 with NO abbreviation — list every result, no 'highlights' summarising. The buyer needs the complete picture. (2) 'warm white' now strictly limited to 2200/2400/2700/2800/3000K. The AI is explicitly told NOT to widen to 4000K / Natural White / Neutral White; rows whose title indicates 4000K+ are excluded from the answer even if they leak through the substring search. (3) Behind the scenes: system-prompt-only update — no code changes, just stricter instructions. v2.65.1 base unchanged. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -14215,16 +14215,31 @@ elif page == "AI Assistant":
                 "This proxies the missing product_type column.\n"
                 "- 'warm white' → call search_products_by_text "
                 "with any_of_terms=['warm white','2200K','2400K',"
-                "'2700K','2800K','3000K']. Acts as a Kelvin filter "
-                "until the structured kelvin column ships.\n"
+                "'2700K','2800K','3000K']. STRICTLY these values. "
+                "DO NOT widen to include 'natural white', 'neutral "
+                "white', '3500K', '4000K', '4500K' or above — those "
+                "are different color temperatures and the user did "
+                "NOT ask for them. If a returned row's title clearly "
+                "indicates 4000K+ (e.g. 'Natural White 4000K'), "
+                "exclude it from your answer. Acts as a Kelvin "
+                "filter until the structured kelvin column ships.\n"
                 "- 'cool white' → any_of_terms=['cool white',"
                 "'5000K','5500K','6000K','6500K'].\n"
                 "- 'natural white' / 'neutral white' → "
                 "any_of_terms=['natural white','neutral white',"
                 "'3500K','4000K','4500K'].\n"
                 "- 'slow movers' / 'slow moving' / 'slow' → "
-                "classification='slow'.\n"
-                "- 'dead stock' / 'dead' → classification='dead'.\n"
+                "classification='slow' AND in_stock_only=true. "
+                "Reason: an inventory-triage question is about what "
+                "we ACTUALLY have sitting on the shelf; zero-stock "
+                "rows are noise. Set limit=50 (the cap) and list "
+                "ALL returned rows in the answer — do NOT abbreviate "
+                "to 'highlights'. The buyer needs the full picture "
+                "to make decisions.\n"
+                "- 'dead stock' / 'dead' → classification='dead' "
+                "AND in_stock_only=true (same reasoning — dead "
+                "inventory is meaningless if there's nothing to "
+                "liquidate). limit=50, list all.\n"
                 "- 'in stock' → in_stock_only=true.\n"
                 "- 'iris range' / 'iris family' / just 'iris' as a "
                 "noun → family='IRIS'. (And similarly any product "
