@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.55 — Smarter SKU search in demand-capture: prefix + substring (both directions) + fuzzy/typo-tolerant + product-name match. Catches base SKUs when you paste a variant suffix, finds typos, lets you search by product name. Shows product name next to each suggestion. (May 1)")
+    st.caption("🟢 v2.56 — Demand-capture search now treats product NAME as first-class (was a fallback). Type 'slim8 black 2m' and it finds the right SKU even if you don't know it. Every word must appear in the name (so multi-word queries narrow down properly). Shows match category (SKU + name + fuzzy) so you know why each suggestion came up. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -359,29 +359,32 @@ with st.sidebar:
                 st.session_state[_sku_text_key] = ""
 
             _ds_sku_typed = st.text_input(
-                "SKU (preferred — paste or type)",
+                "Search by SKU OR product name",
                 key=_sku_text_key,
-                placeholder="e.g. LED-XRD-60W-24 — paste or start typing…",
-                help="Free text — paste a SKU, type the start of one, "
-                     "or click a suggestion below. Leave empty if you "
-                     "only know the product family.")
+                placeholder="Paste a SKU, or type any part of the "
+                            "product name (e.g. 'slim8 black 2m')…",
+                help="Searches both SKU and product name. Type as "
+                     "much or as little as you need; click a "
+                     "suggestion to fill, or just submit with what "
+                     "you typed.")
 
             # Live status / suggestions based on what they typed.
-            # Multi-strategy match:
-            #   1. EXACT (case-insensitive)
-            #   2. PREFIX — SKUs starting with what you typed
-            #   3. SUBSTRING (forward) — your input inside a real SKU
-            #   4. SUBSTRING (reverse) — real SKU inside your input
-            #      (catches LED-89030021 when you typed LED-89030021-2)
-            #   5. FUZZY — typo-tolerant via difflib
-            #   6. NAME match — search product names too
+            # The search now treats SKU and Name equally — type any
+            # word from the product name OR any part of the SKU and
+            # we surface matches. Multi-strategy:
+            #   1. EXACT SKU (case-insensitive)
+            #   2. SKU prefix
+            #   3. SKU substring (forward + reverse for variant pastes)
+            #   4. NAME — every word the user typed must appear in the
+            #      product name (so 'slim8 black 2m' narrows down)
+            #   5. FUZZY SKU (typo-tolerant via difflib)
             _ds_sku_resolved = ""
             _q = (_ds_sku_typed or "").strip()
             if _q:
                 import difflib as _difflib
                 _q_upper = _q.upper()
                 if _q_upper in _sku_upper:
-                    # Exact match — show product name as confirmation
+                    # Exact SKU match — confirmation banner
                     _ds_sku_resolved = _sku_upper[_q_upper]
                     try:
                         _name = (products[products["SKU"] ==
@@ -395,63 +398,89 @@ with st.sidebar:
                             f":white_check_mark: {_ds_sku_resolved}")
                 else:
                     _all_skus_upper = list(_sku_upper.keys())
-                    # 2. Prefix match
+                    # 2. SKU prefix
                     _prefix = [s for s in _sku_options
                                 if s.upper().startswith(_q_upper)]
-                    # 3. Substring forward (input is in SKU)
+                    # 3a. SKU substring forward
                     _sub_fwd = [s for s in _sku_options
                                  if _q_upper in s.upper()
                                  and s not in _prefix]
-                    # 4. Substring reverse (SKU is in input) — catches
-                    # paste of "LED-XYZ-VARIANT" when catalog has the
-                    # base "LED-XYZ"
+                    # 3b. SKU substring reverse (catches variant
+                    # pastes like LED-XYZ-2 when catalog has LED-XYZ)
                     _sub_rev = [s for s in _sku_options
                                  if len(s) >= 6
                                  and s.upper() in _q_upper
                                  and s not in _prefix
                                  and s not in _sub_fwd]
-                    # 5. Fuzzy close-matches (typo-tolerant)
+                    # 4. NAME match — every space-separated word the
+                    # user typed must appear in the product name
+                    # (case-insensitive, word-soup friendly).
+                    # Example: typing "slim8 black 2m" finds
+                    # 'Slim LED Channel ~ Model Slim8 (Black, 2m)'
+                    _name_hits: list = []
+                    try:
+                        if (not products.empty
+                                and "Name" in products.columns
+                                and "SKU" in products.columns):
+                            _words = [w for w in _q.split()
+                                       if len(w) >= 2]
+                            if _words:
+                                _name_series = (
+                                    products["Name"].astype(str)
+                                    .str.lower())
+                                _mask = pd.Series(
+                                    [True] * len(products),
+                                    index=products.index)
+                                for _w in _words:
+                                    _mask &= _name_series.str.contains(
+                                        _w.lower(), na=False, regex=False)
+                                _name_hits = (
+                                    products[_mask]["SKU"]
+                                    .dropna().astype(str).head(20).tolist())
+                                # Drop ones already in earlier buckets
+                                _seen = set(_prefix + _sub_fwd + _sub_rev)
+                                _name_hits = [
+                                    s for s in _name_hits
+                                    if s and s not in _seen]
+                    except Exception:
+                        pass
+                    # 5. Fuzzy SKU (typo-tolerant)
                     _close = _difflib.get_close_matches(
-                        _q_upper, _all_skus_upper, n=6, cutoff=0.65)
+                        _q_upper, _all_skus_upper, n=4, cutoff=0.7)
                     _fuzzy = [_sku_upper[c] for c in _close
                                if c in _sku_upper
                                and _sku_upper[c] not in
-                                   (_prefix + _sub_fwd + _sub_rev)]
-                    # 6. Name match — search product NAME column
-                    _name_hits = []
-                    try:
-                        if not products.empty and "Name" in products.columns:
-                            _name_mask = products["Name"].astype(
-                                str).str.contains(
-                                    _q, case=False, na=False, regex=False)
-                            _name_hits = (
-                                products[_name_mask]["SKU"]
-                                .astype(str).head(4).tolist())
-                            _name_hits = [
-                                s for s in _name_hits
-                                if s and s not in
-                                (_prefix + _sub_fwd + _sub_rev + _fuzzy)
-                            ]
-                    except Exception:
-                        pass
+                                   (_prefix + _sub_fwd + _sub_rev
+                                    + _name_hits)]
 
+                    # Build final list. Order: SKU exact-ish first
+                    # (prefix + sub_fwd + sub_rev), then name matches
+                    # (the user knows the product, just not the SKU),
+                    # then fuzzy as last resort. Cap at 12 — name
+                    # searches can hit dozens.
                     _matches = (
-                        _prefix + _sub_fwd + _sub_rev + _fuzzy
-                        + _name_hits)[:8]
+                        _prefix + _sub_fwd + _sub_rev
+                        + _name_hits + _fuzzy)[:12]
                     if _matches:
+                        # Tell them WHY each match showed up so it's
+                        # not magic.
+                        _categories = []
+                        if _prefix or _sub_fwd or _sub_rev:
+                            _categories.append("SKU")
+                        if _name_hits:
+                            _categories.append("name")
+                        if _fuzzy:
+                            _categories.append("fuzzy")
                         st.caption(
-                            f"_{len(_matches)} possible match"
-                            f"{'es' if len(_matches) != 1 else ''}_ — "
-                            "click to use:")
-                        # Clickable suggestion buttons (must be outside
-                        # the form to be reactive). Show product name
-                        # next to the SKU so the user can disambiguate.
+                            f"_{len(_matches)} match"
+                            f"{'es' if len(_matches) != 1 else ''} "
+                            f"({' + '.join(_categories)})_ — click to use:")
                         for _i, _m in enumerate(_matches):
                             try:
                                 _mname = (
                                     products[products["SKU"] == _m]
                                     ["Name"].iloc[0])
-                                _mname = str(_mname)[:55]
+                                _mname = str(_mname)[:65]
                             except (IndexError, KeyError):
                                 _mname = ""
                             _label = (f"{_m}  —  {_mname}"
@@ -461,12 +490,12 @@ with st.sidebar:
                                     use_container_width=True):
                                 st.session_state[_sku_text_key] = _m
                                 st.rerun()
-                    elif len(_q) >= 3:
+                    elif len(_q) >= 2:
                         st.caption(
-                            f":warning: `{_q}` not in catalog (no "
-                            "fuzzy match either). You can still save "
-                            "the signal — we'll store it as free-text "
-                            "SKU (useful for new product requests or "
+                            f":warning: No SKU or product-name match "
+                            f"for `{_q}`. You can still save the "
+                            "signal — we'll store it as free-text "
+                            "(useful for new product requests or "
                             "when CIN7 hasn't synced yet).")
 
             # ---- The actual form for the rest of the fields
