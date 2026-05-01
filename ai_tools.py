@@ -112,9 +112,10 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "get_velocity",
         "description": (
             "Sales velocity / units sold / revenue for a SKU over the "
-            "last N days. Returns daily breakdown if requested, "
-            "otherwise totals. Use when user asks 'how fast does X "
-            "sell' or 'how many of Y did we sell last month'."
+            "last N days. Returns totals AND optionally a daily/weekly/"
+            "monthly breakdown that the UI will render as an inline "
+            "chart. Use when user asks 'how fast does X sell', 'sales "
+            "history for X', or 'show me the last 90 days of Y'."
         ),
         "input_schema": {
             "type": "object",
@@ -130,6 +131,17 @@ TOOL_SCHEMAS: list[dict] = [
                                    "predecessor SKUs that migrated INTO "
                                    "this SKU (the engine's effective "
                                    "demand view).",
+                },
+                "granularity": {
+                    "type": "string",
+                    "enum": ["none", "day", "week", "month"],
+                    "description": "If set to day/week/month, return a "
+                                   "time-bucketed breakdown alongside "
+                                   "the totals. The UI auto-renders "
+                                   "this as a small line chart. Use "
+                                   "when the user wants to SEE the "
+                                   "trend, not just hear a single "
+                                   "number.",
                 },
             },
             "required": ["sku", "days"],
@@ -355,6 +367,7 @@ def get_velocity(engine_df: pd.DataFrame,
                   args: dict) -> dict:
     sku = (args.get("sku") or "").strip()
     days = min(int(args.get("days", 90) or 90), 1825)
+    granularity = (args.get("granularity") or "none").strip().lower()
     if not sku:
         return {"error": "sku is required"}
     if sale_lines_df is None or sale_lines_df.empty:
@@ -366,7 +379,7 @@ def get_velocity(engine_df: pd.DataFrame,
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
     in_window = sl[(sl["SKU"].astype(str) == sku)
                     & (sl["InvoiceDate"] >= cutoff)]
-    return {
+    result = {
         "sku": sku,
         "window_days": days,
         "units_sold": float(pd.to_numeric(
@@ -382,6 +395,41 @@ def get_velocity(engine_df: pd.DataFrame,
         "last_sale": (in_window["InvoiceDate"].max().strftime("%Y-%m-%d")
                       if not in_window.empty else None),
     }
+
+    # Time-bucketed breakdown — the UI looks for `chart_data` and
+    # renders an inline st.line_chart when present.
+    if granularity != "none" and not in_window.empty:
+        df = in_window.copy()
+        df["__qty"] = pd.to_numeric(
+            df.get("Quantity", 0), errors="coerce").fillna(0)
+        if granularity == "day":
+            df["__bkt"] = df["InvoiceDate"].dt.strftime("%Y-%m-%d")
+            label = "Daily units sold"
+        elif granularity == "week":
+            df["__bkt"] = (df["InvoiceDate"].dt.to_period("W")
+                            .apply(lambda p: f"{p.start_time:%Y-%m-%d}"))
+            label = "Weekly units sold"
+        else:  # month
+            df["__bkt"] = df["InvoiceDate"].dt.strftime("%Y-%m")
+            label = "Monthly units sold"
+        bucketed = df.groupby("__bkt")["__qty"].sum().sort_index()
+        # Fill in missing buckets so the chart line is continuous,
+        # not a series of dots with gaps.
+        if granularity == "day":
+            full_idx = pd.date_range(cutoff.normalize(),
+                                       pd.Timestamp.now().normalize(),
+                                       freq="D").strftime("%Y-%m-%d")
+            bucketed = bucketed.reindex(full_idx, fill_value=0)
+        result["chart_data"] = {
+            "label": label,
+            "x_label": granularity,
+            "y_label": "Units",
+            "series": [{
+                "x": str(k),
+                "y": float(v),
+            } for k, v in bucketed.items()],
+        }
+    return result
 
 
 def get_dead_stock(engine_df: pd.DataFrame,

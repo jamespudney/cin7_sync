@@ -52,6 +52,13 @@ echo "[$(stamp)] sync_supplier_names" >> "$LOG"
 python sync_supplier_names.py --apply >> "$LOG" 2>&1 || \
   echo "[$(stamp)] sync_supplier_names FAILED (continuing)" >> "$LOG"
 
+# Phase 3: auto-finalize submitted POs whose CIN7 status has flipped
+# DRAFT → ORDERED / RECEIVING / etc. Reads the just-pulled purchase
+# headers, transitions local po_drafts.status accordingly. Audited.
+echo "[$(stamp)] auto_finalize_pos" >> "$LOG"
+python auto_finalize_pos.py --apply >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] auto_finalize_pos FAILED (continuing)" >> "$LOG"
+
 # Shopify content sync — feeds the AI Assistant's knowledge base
 # with product descriptions, collections, pages, blog posts. Skipped
 # automatically if SHOPIFY_DOMAIN / SHOPIFY_ACCESS_TOKEN aren't set.

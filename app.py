@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.50 — Shopify content now embeds customer-facing storefront URLs in every markdown file (products, collections, pages, blogs, policies). AI Assistant cites them as clickable [title](url) links so you can jump from chat to the live page. (Apr 30)")
+    st.caption("🟢 v2.51 — Block 1 carry-overs: AI Assistant now renders inline line charts when you ask for sales trends; auto_finalize_pos.py runs nightly to flip submitted POs to finalized when CIN7 authorises them; master-1-per-draft session safeguard prevents duplicate POs even on rapid double-clicks. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13356,6 +13356,28 @@ elif page == "AI Assistant":
         for entry in st.session_state["_ai_transcript"]:
             with st.chat_message(entry["role"]):
                 st.markdown(entry["content"])
+                if entry["role"] == "assistant" and entry.get("charts"):
+                    # Replay any charts that were rendered when this
+                    # answer was first produced. Without this, charts
+                    # disappear when the page reruns (e.g. user types
+                    # a new question).
+                    for _chart in entry["charts"]:
+                        _data = _chart.get("data") or {}
+                        _series = _data.get("series") or []
+                        if not _series:
+                            continue
+                        _df = pd.DataFrame(_series)
+                        if "x" in _df.columns and "y" in _df.columns:
+                            try:
+                                _df["x"] = pd.to_datetime(_df["x"])
+                            except (ValueError, TypeError):
+                                pass
+                            _df = _df.set_index("x")
+                            st.markdown(
+                                f"**:bar_chart: "
+                                f"{_data.get('label') or 'Trend'}**")
+                            st.line_chart(
+                                _df, height=200, use_container_width=True)
                 if entry["role"] == "assistant" and entry.get("audit_id"):
                     fb_cols = st.columns([1, 1, 6])
                     if fb_cols[0].button(
@@ -13475,6 +13497,9 @@ elif page == "AI Assistant":
                 "for clarification (preferred SKU, time window, etc.).")
 
             _tool_calls_log: list = []
+            # Charts collected from tool results during this turn.
+            # Rendered below the answer once the tool-use loop ends.
+            _charts_to_render: list = []
             _start_ts = datetime.now()
             _final_text_parts: list = []
 
@@ -13544,6 +13569,21 @@ elif page == "AI Assistant":
                         _summary = (_result_json[:200] + "…"
                                      if len(_result_json) > 200
                                      else _result_json)
+                        # Detect chartable tool results — get_velocity
+                        # (and other tools later) include a chart_data
+                        # block when the user asked for a trend. We
+                        # collect them here, render below the answer.
+                        try:
+                            _parsed = json.loads(_result_json)
+                            if isinstance(_parsed, dict) and \
+                                    "chart_data" in _parsed:
+                                _charts_to_render.append({
+                                    "tool": _tu.name,
+                                    "args": dict(_tu.input),
+                                    "data": _parsed["chart_data"],
+                                })
+                        except (ValueError, TypeError):
+                            pass
                         _tool_calls_log.append({
                             "tool": _tu.name,
                             "args": dict(_tu.input),
@@ -13561,6 +13601,33 @@ elif page == "AI Assistant":
                     "I couldn't answer that. Try rephrasing or "
                     "include a specific SKU.")
                 _placeholder.markdown(_final_answer)
+
+                # Render any charts the tools produced. The chart_data
+                # block is small and deterministic, so we can render it
+                # directly without re-asking the LLM.
+                for _chart in _charts_to_render:
+                    _data = _chart.get("data") or {}
+                    _series = _data.get("series") or []
+                    if not _series:
+                        continue
+                    _chart_df = pd.DataFrame(_series)
+                    if "x" in _chart_df.columns and \
+                            "y" in _chart_df.columns:
+                        # Try to parse x as date for nicer axis labels;
+                        # fall back to string if it's already a label
+                        # like '2025-01' (month).
+                        try:
+                            _chart_df["x"] = pd.to_datetime(
+                                _chart_df["x"])
+                        except (ValueError, TypeError):
+                            pass
+                        _chart_df = _chart_df.set_index("x")
+                        _label = _data.get("label") or "Trend"
+                        st.markdown(
+                            f"**:bar_chart: {_label}** — "
+                            f"`{_chart['tool']}({_chart['args']})`")
+                        st.line_chart(
+                            _chart_df, height=200, use_container_width=True)
 
             # Audit log
             _duration_ms = int(
@@ -13586,6 +13653,7 @@ elif page == "AI Assistant":
                 "content": _final_answer,
                 "audit_id": _audit_id,
                 "tool_calls": _tool_calls_log,
+                "charts": _charts_to_render,
             })
             # Persist the conversation history (including all tool-use
             # rounds) so the next user turn has full context. Without

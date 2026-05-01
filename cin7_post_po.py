@@ -115,6 +115,20 @@ ALLOWED_LINE_KEYS = {
 
 
 # ---------------------------------------------------------------------------
+# Process-level master-POST tracker — belt-and-braces against
+# accidentally creating duplicate CIN7 master POs for the same local
+# draft within the same process. The local DB's cin7_po_id field is
+# our PRIMARY guard, but if someone clears that field manually (or via
+# the "Clear CIN7 link" button) AND clicks Confirm push twice in quick
+# succession, the second call would see an empty cin7_po_id and POST
+# again. This in-memory set catches that case — it remembers every
+# draft_id we've already POST'd a master for during this Python
+# process's lifetime. Reset on container restart, which is fine because
+# by then the cin7_po_id should be persisted in the DB anyway.
+_MASTER_POSTED_DRAFTS: set = set()
+
+
+# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 @dataclass
@@ -704,6 +718,20 @@ def push_po_draft(draft_id: int, *,
         log.info("  ↻ Re-using master ID=%s OrderNumber=%s",
                   cin7_po_id, cin7_po_number)
     else:
+        # Belt-and-braces: refuse a second master POST for the same
+        # draft within this process even if local cin7_po_id is empty.
+        # Caused the PO-7073/74/75/76 orphan-PO scenario before. The
+        # in-memory set is the second line of defence; the DB-level
+        # idempotency check in validate_draft is the first.
+        if draft_id in _MASTER_POSTED_DRAFTS:
+            result.errors.append(
+                f"Refusing master POST: draft #{draft_id} already had "
+                "a master POSTed in this server process. If the prior "
+                "POST succeeded, its cin7_po_id should already be on "
+                "the draft (check db.po_drafts). If you really need to "
+                "retry, restart the service or use retry_lines_only.")
+            return result
+
         # ---- Step 1: POST master /advanced-purchase
         log.info("POST /advanced-purchase ...")
         resp, last_call = _http(
@@ -732,6 +760,9 @@ def push_po_draft(draft_id: int, *,
         result.cin7_po_number = cin7_po_number
         result.cin7_status = cin7_status
         result.stage = "master_posted"
+        # Belt-and-braces: record this draft has had a master POST in
+        # this process so a second call refuses regardless of DB state.
+        _MASTER_POSTED_DRAFTS.add(draft_id)
         log.info("  ✓ Master created — ID=%s OrderNumber=%s Status=%s",
                   cin7_po_id, cin7_po_number, cin7_status)
 
