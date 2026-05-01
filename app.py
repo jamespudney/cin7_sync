@@ -225,6 +225,21 @@ with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
     st.caption(
+        "🟢 v2.66.4 — Three diagnostic fixes for AI Assistant answer flow. "
+        "(1) Conversation-history pollution: when the tool-use loop "
+        "exited with no final text, `_messages` was persisted with a "
+        "dangling tool block, poisoning the next question. Fix: only "
+        "persist on success; show an info banner suggesting retry/clear "
+        "on failure. (2) Generalised no-narration rule: Claude told to "
+        "NEVER write 'let me check…' or 'now I'll look up…' mid-stream. "
+        "Tools called silently, single clean final answer. Mid-stream "
+        "narration was eating turns. (3) MAX_TURNS bumped 10 → 14 to "
+        "give multi-step reasoning (call tool → see wrong-period data "
+        "→ call again → produce final text) enough headroom. "
+        "Behavioural changes in v2.66.x carried forward unchanged."
+    )
+    # Old v2.66.2 caption kept here for reference, hidden:
+    _ = (
         "🟢 v2.66.2 — Slow-stock rule tightened, MAX_TURNS bumped 6 to 10. "
         "v2.66's slow-stock promotion was making Claude call "
         "get_relevant_slow_stock on non-product questions (similarity, "
@@ -14433,6 +14448,16 @@ elif page == "AI Assistant":
                 "- If the knowledge base doesn't cover something, "
                 "say 'the documentation doesn't explain this — please "
                 "ask an admin to add it'. Do not guess.\n"
+                "- **NEVER narrate tool calls mid-stream.** Don't "
+                "write 'let me check…', 'let me get…', 'now I'll "
+                "look up…', 'I'll search for…', etc. Call tools "
+                "silently and produce ONE clean final answer at "
+                "the end. Mid-stream commentary wastes turns and "
+                "ends in 'I couldn't answer that' fallbacks when "
+                "the loop runs out of turns before the final "
+                "answer materialises. If a tool returns wrong "
+                "data and you need to call it again, just call "
+                "again — don't announce it.\n"
                 "- Keep answers concise (3-6 short bullet points or a "
                 "small table) unless the user asks for more detail.\n"
                 "- When citing a SKU, include the name + on-hand "
@@ -14602,10 +14627,12 @@ elif page == "AI Assistant":
                 # again, repeat until we get a pure text response.
                 # v2.66.2: bumped from 6 → 10 to give the loop more
                 # room when slow-stock promotion adds an extra tool
-                # call beyond the main answer. Empty-fallback was
-                # firing for some questions because the loop ran out
-                # of turns mid-stream.
-                _MAX_TURNS = 10
+                # call beyond the main answer.
+                # v2.66.4: bumped 10 → 14 because Claude sometimes
+                # needs to call a tool, see wrong-period results,
+                # call again with corrected args, then produce final
+                # text. 10 was too tight for that pattern.
+                _MAX_TURNS = 14
                 for _turn in range(_MAX_TURNS):
                     try:
                         _resp = _client.messages.create(
@@ -14750,11 +14777,33 @@ elif page == "AI Assistant":
                 "tool_calls": _tool_calls_log,
                 "charts": _charts_to_render,
             })
-            # Persist the conversation history (including all tool-use
-            # rounds) so the next user turn has full context. Without
-            # this, the next message starts a fresh conversation and
-            # Claude has no memory of which SKU we were discussing.
-            st.session_state["_ai_messages"] = _messages
+            # v2.66.4 — Defensive conversation-history cleanup.
+            # If the tool-use loop exited WITHOUT producing final
+            # assistant text (e.g. Claude got stuck in tool calls,
+            # MAX_TURNS exhausted, API hiccup), `_messages` is left
+            # with a dangling tool_use or tool_result block at the
+            # end. Persisting that into session_state poisons the
+            # next user question — Claude inherits a broken history
+            # and tends to return empty content, hitting the "I
+            # couldn't answer that" fallback.
+            #
+            # Fix: only persist the conversation history when we got
+            # a real text reply this turn. On failure, KEEP the
+            # previous (working) history so the next question starts
+            # from a known-good state. The user-visible fallback
+            # tells them to use the Clear conversation button if it
+            # keeps happening.
+            if _final_text_parts:
+                st.session_state["_ai_messages"] = _messages
+            else:
+                # Don't persist the broken turn. Show a richer
+                # message so the user knows to retry / clear.
+                st.info(
+                    ":information_source: The AI ended its response "
+                    "without producing text — usually means the "
+                    "previous tool-use loop ran out of turns or "
+                    "hit a transient issue. Try asking again, or "
+                    "use **🗑️ Clear conversation** below to reset.")
             st.rerun()
 
         # Clear transcript button — also clears Claude's memory of
