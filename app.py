@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.65.2 — Inventory-triage tightening. (1) For 'slow movers' / 'dead stock' / similar inventory questions, the AI now defaults to in_stock_only=true (zero-stock rows are noise for triage) AND limit=50 with NO abbreviation — list every result, no 'highlights' summarising. The buyer needs the complete picture. (2) 'warm white' now strictly limited to 2200/2400/2700/2800/3000K. The AI is explicitly told NOT to widen to 4000K / Natural White / Neutral White; rows whose title indicates 4000K+ are excluded from the answer even if they leak through the substring search. (3) Behind the scenes: system-prompt-only update — no code changes, just stricter instructions. v2.65.1 base unchanged. (May 1)")
+    st.caption("🟢 v2.65.3 — Color-temperature boundary fix + fixture exclusion. (1) Title-word respect rule: when a row's title literally says 'Natural White' / 'Neutral White' / 'Cool White' / 'Warm White' / 'Daylight', the AI is told to honour the catalog's explicit colour label OVER the Kelvin number. So 'Natural White (5000K)' rows are excluded from a 'cool white' query even though 5000K previously matched. (2) Kelvin ranges aligned to W4S catalog convention: 5000K moved from cool white to natural white (catalog calls it Natural). Cool white now strictly 5500/6000/6500K; natural white is 3500/4000/4500/5000K. (3) LED strip exclude_types now also blocks fixture/kit/complete fixture so SMOKIES38-style complete fixtures don't show up in strip queries. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -14211,23 +14211,34 @@ elif page == "AI Assistant":
                 "search_products_by_text with query='strip', "
                 "fields=['title','description','product_type'], "
                 "exclude_types=['dimmer','controller','power supply',"
-                "'channel','profile','accessory','service','module']. "
+                "'channel','profile','accessory','service','module',"
+                "'fixture','kit','complete fixture']. "
                 "This proxies the missing product_type column.\n"
                 "- 'warm white' → call search_products_by_text "
                 "with any_of_terms=['warm white','2200K','2400K',"
                 "'2700K','2800K','3000K']. STRICTLY these values. "
-                "DO NOT widen to include 'natural white', 'neutral "
-                "white', '3500K', '4000K', '4500K' or above — those "
-                "are different color temperatures and the user did "
-                "NOT ask for them. If a returned row's title clearly "
-                "indicates 4000K+ (e.g. 'Natural White 4000K'), "
-                "exclude it from your answer. Acts as a Kelvin "
-                "filter until the structured kelvin column ships.\n"
+                "DO NOT widen to 3500K, 4000K, 4500K, 5000K or above. "
+                "If a returned row's title literally says 'Natural "
+                "White', 'Neutral White', 'Cool White' or 'Daylight', "
+                "EXCLUDE it from your answer regardless of the Kelvin "
+                "number — the explicit title labelling beats the "
+                "Kelvin range. (Title-word respect rule: when the "
+                "catalog explicitly labels a color, trust that label "
+                "over the Kelvin number.)\n"
                 "- 'cool white' → any_of_terms=['cool white',"
-                "'5000K','5500K','6000K','6500K'].\n"
+                "'5500K','6000K','6500K']. STRICTLY these. DO NOT "
+                "include 5000K — the W4S catalog labels 5000K as "
+                "Natural White, NOT cool white. Also: if a returned "
+                "row's title literally says 'Natural White' or "
+                "'Neutral White', EXCLUDE it from your answer "
+                "regardless of the Kelvin number — the explicit "
+                "title labelling beats the Kelvin range.\n"
                 "- 'natural white' / 'neutral white' → "
                 "any_of_terms=['natural white','neutral white',"
-                "'3500K','4000K','4500K'].\n"
+                "'3500K','4000K','4500K','5000K']. (5000K belongs "
+                "here in the W4S catalog.) If a returned row's "
+                "title literally says 'Cool White' or 'Warm White', "
+                "exclude it.\n"
                 "- 'slow movers' / 'slow moving' / 'slow' → "
                 "classification='slow' AND in_stock_only=true. "
                 "Reason: an inventory-triage question is about what "
