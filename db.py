@@ -51,6 +51,30 @@ CREATE TABLE IF NOT EXISTS flags (
 CREATE INDEX IF NOT EXISTS ix_flags_sku ON flags(sku);
 CREATE INDEX IF NOT EXISTS ix_flags_active ON flags(cleared_at);
 
+-- Users / profiles. v2.66.
+-- Lightweight profile system — NOT per-user authentication. The shared
+-- APP_PASSWORD gate stays. Once past the gate, the user picks (or types)
+-- their name, and we load their profile so actions are tied to a real
+-- team member and forms can read their defaults.
+--
+-- display_name is the human-friendly name shown everywhere ('James',
+-- 'Sarah', 'Aiden'). UNIQUE COLLATE NOCASE so 'james' and 'James' don't
+-- create duplicate rows.
+--
+-- role gates feature visibility (buyer / sales / admin / viewer). admin
+-- can edit anyone's profile; everyone else only their own.
+CREATE TABLE IF NOT EXISTS users (
+    user_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    display_name    TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    role            TEXT    NOT NULL DEFAULT 'sales',
+    email           TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,
+    default_page    TEXT,
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_at      TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_users_active ON users(active, role);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     event       TEXT    NOT NULL,
@@ -2788,6 +2812,131 @@ def lookup_aliases(phrase: str,
             "ORDER BY times_used DESC, confidence DESC",
             (phrase_n, min_confidence),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Users / profiles (v2.66)
+# ---------------------------------------------------------------------------
+#
+# Lightweight profile lookup. After the shared password gate, the user
+# picks (or types) their name; we load a row from `users` so audit logs
+# and forms can show / use their display_name + role + defaults.
+# Per-user authentication is deliberately NOT in scope — see schema
+# comment on the users table.
+
+USER_ROLES = ("buyer", "sales", "admin", "viewer")
+DEFAULT_NEW_USER_ROLE = "sales"
+
+
+def get_user_by_name(display_name: str) -> Optional[sqlite3.Row]:
+    """Look up a user profile by display_name (case-insensitive). Returns
+    None if no row matches. The unique UPPER-COLLATE-NOCASE index on
+    display_name guarantees at most one match."""
+    name = (display_name or "").strip()
+    if not name:
+        return None
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM users WHERE display_name = ? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+
+
+def list_users(active_only: bool = True) -> List[sqlite3.Row]:
+    """All users in the system, ordered by display_name. Set
+    active_only=False to include soft-deactivated rows (rare — used by
+    the admin profile page)."""
+    sql = "SELECT * FROM users"
+    if active_only:
+        sql += " WHERE active = 1"
+    sql += " ORDER BY display_name COLLATE NOCASE"
+    with connect() as c:
+        return c.execute(sql).fetchall()
+
+
+def upsert_user(*,
+                  display_name: str,
+                  role: str = DEFAULT_NEW_USER_ROLE,
+                  email: Optional[str] = None,
+                  active: bool = True,
+                  default_page: Optional[str] = None,
+                  actor: Optional[str] = None) -> int:
+    """Create-or-update a user profile. Match is on display_name
+    (case-insensitive). Returns user_id.
+
+    The role argument is validated against USER_ROLES; unknown values
+    fall back to DEFAULT_NEW_USER_ROLE rather than raising — the app
+    should never crash because someone typed 'Buyer' instead of
+    'buyer'.
+
+    Audit-logged on every mutation. `actor` defaults to the
+    display_name being upserted (self-edit) when not provided.
+    """
+    name = (display_name or "").strip()
+    if not name:
+        raise ValueError("display_name is required")
+    role_norm = (role or DEFAULT_NEW_USER_ROLE).strip().lower()
+    if role_norm not in USER_ROLES:
+        role_norm = DEFAULT_NEW_USER_ROLE
+    actor_eff = (actor or name).strip()
+
+    with connect() as c:
+        existing = c.execute(
+            "SELECT user_id FROM users "
+            "WHERE display_name = ? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+        if existing:
+            uid = int(existing["user_id"])
+            c.execute(
+                "UPDATE users SET "
+                "role = ?, email = ?, active = ?, default_page = ?, "
+                "updated_at = datetime('now') "
+                "WHERE user_id = ?",
+                (role_norm, email, 1 if active else 0, default_page, uid),
+            )
+            c.execute(
+                "INSERT INTO audit_log (event, actor, target, detail) "
+                "VALUES (?, ?, ?, ?)",
+                ("user.update", actor_eff, str(uid),
+                 f"display_name='{name}' role={role_norm} "
+                 f"active={int(bool(active))} "
+                 f"default_page={default_page or ''}"))
+            return uid
+        cur = c.execute(
+            """
+            INSERT INTO users
+                (display_name, role, email, active, default_page)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (name, role_norm, email, 1 if active else 0, default_page),
+        )
+        uid = int(cur.lastrowid)
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("user.insert", actor_eff, str(uid),
+             f"display_name='{name}' role={role_norm}"))
+        return uid
+
+
+def get_or_create_user(display_name: str) -> sqlite3.Row:
+    """Convenience for the sign-in flow: if the user exists, return
+    them; if not, create a basic profile with the default role and
+    return it. Used when the user types a name not yet in the system.
+    """
+    name = (display_name or "").strip()
+    if not name:
+        raise ValueError("display_name is required")
+    existing = get_user_by_name(name)
+    if existing is not None:
+        return existing
+    upsert_user(
+        display_name=name, role=DEFAULT_NEW_USER_ROLE, active=True,
+        actor="self-signin")
+    new_row = get_user_by_name(name)
+    assert new_row is not None  # just inserted
+    return new_row
 
 
 # ---------------------------------------------------------------------------

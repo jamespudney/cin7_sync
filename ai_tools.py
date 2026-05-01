@@ -399,6 +399,80 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_relevant_slow_stock",
+        "description": (
+            "Slow-moving / dead-stock promotion. Call this AFTER you've "
+            "answered the user's main product question, passing the "
+            "SAME filters you used for the main search. Returns "
+            "relevant slow/dead in-stock items (classification IN "
+            "('slow','dead'), OnHand > 0) so the buyer can see what "
+            "to push or offer alongside the primary answer. NEVER "
+            "use this as the main answer — it's a supplementary "
+            "'Slow-moving stock worth offering' section. If the tool "
+            "returns matched=0, OMIT the section from your reply."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "family": {
+                    "type": "string",
+                    "description": (
+                        "Single product family to scan (e.g. SLIM8). "
+                        "Use this OR family_list."),
+                },
+                "family_list": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Multiple families to scan when the main "
+                        "question spanned several. Combined with "
+                        "OR semantics."),
+                },
+                "any_of_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "OR-match keywords (same shape as "
+                        "search_products_by_text). For 'warm white' "
+                        "promotion pass ['warm white','2200K',"
+                        "'2400K','2700K','2800K','3000K']."),
+                },
+                "exclude_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Block list mirroring whatever you passed "
+                        "to the main search. Stops 'led strip' "
+                        "promotion from including dimmers, etc."),
+                },
+                "sku_candidates": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional restriction to a specific SKU "
+                        "set (e.g. all SKUs the main answer surfaced "
+                        "or all the family's variants). Tightens "
+                        "relevance."),
+                },
+                "intent": {
+                    "type": "string",
+                    "description": (
+                        "Free-text summary of what the user was "
+                        "actually asking ('warm white led strip', "
+                        "'slim8 accessories', etc.) — recorded in "
+                        "the result for audit."),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max slow-stock items to return (cap 25, "
+                        "default 10). Keep small — this is a "
+                        "supplementary section."),
+                },
+            },
+        },
+    },
+    {
         "name": "get_compatible_accessories",
         "description": (
             "Look up compatible accessories (lenses, diffusers, end "
@@ -1943,12 +2017,209 @@ def get_compatible_accessories(engine_df: pd.DataFrame,
     }
 
 
+def get_relevant_slow_stock(engine_df: pd.DataFrame,
+                              sale_lines_df: pd.DataFrame,
+                              args: dict) -> dict:
+    """v2.66 — slow-moving / dead-stock promotion layer.
+
+    Designed to be called AFTER the main answer of a product question.
+    The system prompt tells Claude to pass the same filters used for
+    the primary search (family, exclude_types, any_of_terms,
+    sku_candidates) so the slow stock surfaced is genuinely related.
+
+    Rules:
+      - Only return classification IN ('slow', 'dead').
+      - Only return rows with OnHand > 0 (in stock).
+      - Apply the same exclude_types blocks the primary search did so
+        we don't promote off-category items.
+      - sku_candidates (optional) limits the slow-stock pool to a
+        family-related set when the caller wants tight relevance.
+      - Each returned row carries `reason_matched` + `classification`
+        so the AI can render a 'Why relevant' line.
+      - Caution flag set when the SKU has feedback_events of type
+        'cancellation' / 'return' / 'complaint' / 'negative' (best-
+        effort — non-blocking if those tables are empty).
+
+    Returns up to limit rows. If none match, returns matched=0 — the
+    caller should OMIT the slow-stock section entirely rather than
+    forcing it.
+    """
+    family = (args.get("family") or "").strip().upper()
+    family_list = args.get("family_list") or []
+    if isinstance(family_list, str):
+        family_list = [family_list]
+    family_list = [f.strip().upper() for f in family_list if f]
+    if family and family not in family_list:
+        family_list = [family] + family_list
+
+    exclude_types = args.get("exclude_types") or []
+    if isinstance(exclude_types, str):
+        exclude_types = [exclude_types]
+    exclude_types = [str(e).strip().lower() for e in exclude_types if e]
+
+    any_of_terms = args.get("any_of_terms") or []
+    if isinstance(any_of_terms, str):
+        any_of_terms = [any_of_terms]
+    any_of_terms = [str(t).strip().lower() for t in any_of_terms if t]
+
+    sku_candidates = args.get("sku_candidates") or []
+    if isinstance(sku_candidates, str):
+        sku_candidates = [sku_candidates]
+    sku_candidates = [str(s).strip() for s in sku_candidates if s]
+
+    intent = (args.get("intent") or "").strip()
+    limit = min(int(args.get("limit", 10) or 10), 25)
+
+    if engine_df is None or engine_df.empty:
+        return {
+            "matched": 0,
+            "results": [],
+            "note": "engine_df not loaded; cannot scan for slow stock.",
+        }
+
+    df = engine_df.copy()
+
+    # Hard filters: classification + stock.
+    if "Classification" not in df.columns:
+        return {
+            "matched": 0,
+            "results": [],
+            "note": ("Classification column not present in engine_df. "
+                      "Slow-stock promotion requires the ABC engine "
+                      "to have run on this dataset."),
+        }
+    cls_lower = df["Classification"].fillna("").astype(str).str.lower()
+    df = df[cls_lower.isin(("slow", "dead"))]
+    if "OnHand" in df.columns:
+        df = df[df["OnHand"].fillna(0) > 0]
+    if df.empty:
+        return {
+            "matched": 0,
+            "results": [],
+            "note": "No slow/dead in-stock rows in the catalog at all.",
+        }
+
+    # Family filter — accept any family in the list.
+    if family_list and "Family" in df.columns:
+        df = df[df["Family"].fillna("").astype(str).str.upper()
+                  .isin(family_list)]
+
+    # SKU candidate filter — most restrictive when supplied.
+    if sku_candidates and "SKU" in df.columns:
+        df = df[df["SKU"].astype(str).isin(sku_candidates)]
+
+    # any_of_terms — at least one must hit Name (or Description if
+    # present). Composes AND with the family / candidate filters.
+    if any_of_terms:
+        cols_to_search = [c for c in ("Name", "Description")
+                            if c in df.columns]
+        if cols_to_search:
+            ok = pd.Series(False, index=df.index)
+            for col in cols_to_search:
+                vals = df[col].fillna("").astype(str).str.lower()
+                for term in any_of_terms:
+                    ok = ok | vals.str.contains(
+                        term, na=False, regex=False)
+            df = df[ok]
+
+    # exclude_types — drop rows whose Name or Type matches any blocker.
+    if exclude_types:
+        ex_mask = pd.Series(False, index=df.index)
+        for excl_col in ("Type", "Name"):
+            if excl_col in df.columns:
+                col_lower = (df[excl_col].fillna("").astype(str)
+                              .str.lower())
+                for kw in exclude_types:
+                    ex_mask = ex_mask | col_lower.str.contains(
+                        kw, na=False, regex=False)
+        df = df[~ex_mask]
+
+    if df.empty:
+        return {
+            "matched": 0,
+            "results": [],
+            "note": ("No relevant slow/dead in-stock items match "
+                      "the supplied filters. Per the slow-stock-"
+                      "promotion rule, OMIT the section from the "
+                      "answer."),
+        }
+
+    # Caution check: any feedback_events flagged as cancellation /
+    # return / complaint for the SKU. Best-effort — if the table is
+    # empty or query fails, we skip rather than block.
+    flagged_skus: set = set()
+    try:
+        sku_list = df["SKU"].astype(str).tolist() if "SKU" in df.columns else []
+        if sku_list:
+            with db.connect() as c:
+                placeholders = ",".join(["?"] * len(sku_list))
+                rows = c.execute(
+                    f"SELECT entity_id FROM feedback_events "
+                    f"WHERE entity_type = 'sku' "
+                    f"AND feedback IN ('cancellation','return',"
+                    f"'complaint','negative','quality_issue') "
+                    f"AND entity_id IN ({placeholders})",
+                    sku_list).fetchall()
+                flagged_skus = {r["entity_id"] for r in rows}
+    except Exception:
+        pass
+
+    df = df.head(limit)
+    out_rows = []
+    for _, r in df.iterrows():
+        rec = _serialise_row(dict(r))
+        sku = str(rec.get("SKU") or "")
+        rec["caution"] = (
+            ("Past return/cancellation/complaint feedback "
+             "logged — handle with care")
+            if sku in flagged_skus else None)
+        # reason_matched is a brief human-readable note for the AI to
+        # cite in 'Why relevant'.
+        why_parts = []
+        if rec.get("Classification"):
+            why_parts.append(
+                f"classified {rec['Classification']}")
+        if rec.get("Family"):
+            if family_list:
+                why_parts.append(f"same family ({rec['Family']})")
+            else:
+                why_parts.append(f"family {rec['Family']}")
+        if any_of_terms and rec.get("Name"):
+            name_l = str(rec["Name"]).lower()
+            for t in any_of_terms:
+                if t in name_l:
+                    why_parts.append(f"name contains '{t}'")
+                    break
+        rec["reason_matched"] = "; ".join(why_parts) or "filter match"
+        out_rows.append(rec)
+
+    return {
+        "matched": len(out_rows),
+        "results": out_rows,
+        "intent": intent or None,
+        "filters": {
+            "family_list": family_list,
+            "any_of_terms": any_of_terms,
+            "exclude_types": exclude_types,
+            "sku_candidates": sku_candidates,
+        },
+        "note": (
+            "Slow-stock promotion candidates. Caller should render "
+            "these in a SEPARATE 'Slow-moving stock worth offering' "
+            "section AFTER the main answer, never replacing it. Each "
+            "row's `reason_matched` gives the relevance rationale; "
+            "`caution` (if non-null) should be surfaced to the user "
+            "alongside the SKU."),
+    }
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
     "find_similar_products": find_similar_products,
     "get_incoming_stock": get_incoming_stock,
     "get_compatible_accessories": get_compatible_accessories,
+    "get_relevant_slow_stock": get_relevant_slow_stock,
     "get_sku_details": get_sku_details,
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,

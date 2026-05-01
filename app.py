@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.65.3 — Color-temperature boundary fix + fixture exclusion. (1) Title-word respect rule: when a row's title literally says 'Natural White' / 'Neutral White' / 'Cool White' / 'Warm White' / 'Daylight', the AI is told to honour the catalog's explicit colour label OVER the Kelvin number. So 'Natural White (5000K)' rows are excluded from a 'cool white' query even though 5000K previously matched. (2) Kelvin ranges aligned to W4S catalog convention: 5000K moved from cool white to natural white (catalog calls it Natural). Cool white now strictly 5500/6000/6500K; natural white is 3500/4000/4500/5000K. (3) LED strip exclude_types now also blocks fixture/kit/complete fixture so SMOKIES38-style complete fixtures don't show up in strip queries. (May 1)")
+    st.caption("🟢 v2.66 — Profile sign-in + slow-stock promotion layer. (Part A) New `users` table (user_id / display_name / role / email / active / default_page / created_at / updated_at) with helpers `get_user_by_name`, `list_users`, `upsert_user`, `get_or_create_user`. Sidebar 'Your name' replaced with a typeahead picker — pick an existing profile or type a new one (auto-creates with role=sales). Profile loads into `current_user_profile` session_state; if `default_page` is set, the page selector jumps there on first sign-in. Sign-out button clears the session. New 'My Profile' page lets you edit role / email / default_page; admin role sees a read-only table of all users. Roles: buyer/sales/admin/viewer (advisory, not enforced yet). Shared password gate unchanged. (Part B) New AI tool `get_relevant_slow_stock`: called AFTER the main answer with the same filters (family/any_of_terms/exclude_types/sku_candidates), returns slow + dead in-stock items with reason_matched + caution flag (set when SKU has cancellation/return/complaint feedback events). System prompt rule: render results in a separate 'Slow-moving stock worth offering' section with `[+ slow_stock_promotion]` appended to the provenance tag; omit entirely if matched=0; never replace the main answer; clearly label slow vs dead. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -330,16 +330,97 @@ with st.sidebar:
 
     st.divider()
 
-    # Who's using the app? Used on notes / flags / audit log.
-    current_user = st.text_input(
-        "Your name",
-        value=st.session_state.get("current_user", ""),
-        placeholder="e.g. James",
-        help="Identifies you when adding notes, flags, or approvals. "
-             "Remembered for this browser session.",
-    )
-    if current_user:
-        st.session_state["current_user"] = current_user.strip()
+    # ---- Sign-in: name + profile (v2.66) ----
+    # The shared APP_PASSWORD gate above unlocks the app; this is who
+    # the user IS within the team. Typeahead against the users table
+    # so existing profiles are picked rather than re-typed; new names
+    # auto-create a basic profile (role=sales) on first sign-in. The
+    # picked profile is stashed in session_state so forms can read
+    # display_name + role + default_page.
+    try:
+        _user_rows = db.list_users(active_only=True)
+    except Exception:
+        _user_rows = []
+    _existing_names = [r["display_name"] for r in _user_rows]
+
+    _signed_in_name = st.session_state.get("current_user") or ""
+    if _signed_in_name and _signed_in_name in _existing_names:
+        # Already signed in this session — show selected profile + a
+        # "Sign out" button rather than the picker.
+        _profile = (st.session_state.get("current_user_profile")
+                    or {})
+        _role = _profile.get("role", "sales")
+        st.success(
+            f":bust_in_silhouette: **{_signed_in_name}** "
+            f"(`{_role}`)")
+        if st.button("Sign out", key="_signout_btn",
+                      width="stretch"):
+            for _k in ("current_user",
+                        "current_user_profile",
+                        "_signin_pending_name"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+    else:
+        # Sign-in picker. selectbox of existing names + a free-text
+        # 'Or type a new name' fallback. Pressing Sign in loads the
+        # profile (or creates one).
+        _picker_options = ["(pick or type new)"] + _existing_names
+        _picked = st.selectbox(
+            "Sign in as",
+            options=_picker_options,
+            index=0,
+            key="_signin_picker",
+            help="Pick your name from the list of registered users, "
+                 "or type a new one below to create your profile.")
+        _typed = st.text_input(
+            "Or type a new name",
+            value=st.session_state.get("_signin_pending_name", ""),
+            placeholder="e.g. James",
+            key="_signin_typed",
+            help="Used only if you're not in the list. Creates a "
+                 "basic profile (role: sales) you can edit on the "
+                 "My Profile page.")
+        if st.button(":unlock: Sign in",
+                      type="primary", width="stretch",
+                      key="_signin_btn"):
+            _final_name = (_typed.strip()
+                            if _typed and _typed.strip()
+                            else (_picked
+                                  if _picked != _picker_options[0]
+                                  else ""))
+            if not _final_name:
+                st.error("Pick a name or type a new one.")
+            else:
+                try:
+                    _user = db.get_or_create_user(_final_name)
+                    _profile_dict = {
+                        "user_id": int(_user["user_id"]),
+                        "display_name": _user["display_name"],
+                        "role": _user["role"],
+                        "email": _user["email"],
+                        "default_page": _user["default_page"],
+                        "active": bool(_user["active"]),
+                    }
+                    st.session_state["current_user"] = (
+                        _user["display_name"])
+                    st.session_state["current_user_profile"] = (
+                        _profile_dict)
+                    st.success(
+                        f":white_check_mark: Welcome, "
+                        f"**{_user['display_name']}** "
+                        f"(`{_user['role']}`)")
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f"Sign-in failed: {_e}")
+        # Stop the rest of the sidebar from rendering until they sign
+        # in — the demand-capture form, page nav, etc. all rely on
+        # current_user being set so the audit trail is honest.
+        st.stop()
+
+    # Past this point: someone is signed in. Convenience refs.
+    current_user = st.session_state.get("current_user", "")
+    current_user_profile = (
+        st.session_state.get("current_user_profile") or {})
 
     # ---- Quick-capture demand signal ----------------------------------
     # Available from every page so sales/buyers can log a customer
@@ -708,13 +789,12 @@ with st.sidebar:
         except Exception:
             pass
 
-    page = st.radio(
-        "View",
-        [
+    _page_options = [
             "Overview",
             "AI Assistant",
             "AI Feedback",
             "Demand Signals",
+            "My Profile",
             "Monthly Metrics",
             "Ordering",
             "FixedCost Audit",
@@ -728,7 +808,22 @@ with st.sidebar:
             "Purchase Analysis",
             "Sales Recent",
             "Data Health",
-        ],
+    ]
+    # v2.66: if the user has a default_page in their profile, jump
+    # straight to it on first sign-in. We only honour it once per
+    # session so the user can navigate freely afterwards.
+    _default_page = (current_user_profile or {}).get("default_page")
+    if (_default_page
+            and _default_page in _page_options
+            and not st.session_state.get("_default_page_consumed")):
+        _start_idx = _page_options.index(_default_page)
+        st.session_state["_default_page_consumed"] = True
+    else:
+        _start_idx = 0
+    page = st.radio(
+        "View",
+        _page_options,
+        index=_start_idx,
         label_visibility="collapsed",
     )
 
@@ -13944,24 +14039,48 @@ elif page == "AI Assistant":
             # the curated Shopify accessory collection. Per spec:
             # NEVER guess compatibility from product descriptions when
             # a curated collection exists.
+            # v2.65.4: broadened — any mention of an accessory-type
+            # noun fires the addendum. False-positive risk is low
+            # because Claude is told to use get_compatible_accessories
+            # only when the context is actually a compatibility ask;
+            # missing the trigger is worse than triggering for an
+            # unrelated mention.
             _accessory_phrases = (
+                # explicit phrases (kept)
                 "what fits", "what fit ", "fits on", "fits with",
                 "compatible", "accessor", "accessories for",
-                "end cap", "end caps", "clips for", "clip for",
                 "lenses fit", "lens fit", "diffusers fit",
                 "diffuser fit", "what works with", "what work with",
                 "covers fit", "cover fit", "brackets for",
-                "connectors for", "joiners for")
+                "connectors for", "joiners for", "clips for",
+                "clip for",
+                # accessory nouns (new — catches phrasings like
+                # 'what diffuser does the slim8 use' or 'lens for
+                # sierra38' that miss the explicit phrases)
+                "diffuser", "diffusers",
+                "lens", "lenses",
+                "end cap", "end caps", "endcap", "endcaps",
+                "mounting clip", "clip ", " clip", "clips",
+                "bracket", "brackets",
+                "connector", "connectors",
+                "joiner", "joiners",
+                "cover ", " cover", "covers")
             _accessory_intent = any(p in _ql for p in _accessory_phrases)
             _accessory_addendum = ""
             if _accessory_intent:
                 _accessory_addendum = (
                     "\n\nCOMPATIBILITY / ACCESSORY INTENT DETECTED "
-                    "('what fits', 'compatible', 'accessories for', "
-                    "etc.). Resolve the subject product (alias rule → "
-                    "SKU → family) and call "
+                    "(question mentions an accessory-type noun like "
+                    "diffuser/lens/cover/end cap/clip/bracket/"
+                    "connector, or uses phrasing like 'what fits', "
+                    "'compatible with', 'works with', 'use with'). "
+                    "Treat ALL such questions as compatibility "
+                    "lookups — including phrasings like 'what "
+                    "diffuser does X use', 'lens for Y', 'end caps "
+                    "for Z'. Resolve the subject product (alias rule "
+                    "→ SKU → family) and call "
                     "**get_compatible_accessories** with that "
-                    "family. Pass `accessory_type` if the question "
+                    "family. Pass `accessory_type` when the question "
                     "names one (lens / diffuser / cover / end_cap / "
                     "clip / bracket / connector). The tool reads the "
                     "curated Shopify accessory collection — when a "
@@ -13971,8 +14090,14 @@ elif page == "AI Assistant":
                     "`[via accessory_collection]`. If the tool returns "
                     "source='text_fallback' those are GUESSES from "
                     "title matching — flag them as such and end with "
-                    "`[via accessory_text_fallback]`. Never present "
-                    "fallback results as compatibility-confirmed.")
+                    "`[via accessory_text_fallback]`. If the tool "
+                    "errors with 'collections_index.csv not built', "
+                    "tell the user the Shopify accessory data hasn't "
+                    "been synced yet and suggest running "
+                    "shopify_sync.py — DON'T silently fall back to "
+                    "search_products and pretend you found a match. "
+                    "Never present fallback results as "
+                    "compatibility-confirmed.")
 
             if _alias_hits:
                 _hit_lines = []
@@ -14138,6 +14263,11 @@ elif page == "AI Assistant":
                 "for a SKU/family. Use for 'when's the next "
                 "shipment?', 'what's on order?', 'ETA for X?'. "
                 "Excludes received/closed/cancelled.\n"
+                "- get_relevant_slow_stock — slow/dead in-stock "
+                "promotion. Call AFTER answering a product question "
+                "with the same filters. Render results in a separate "
+                "'Slow-moving stock worth offering' section. Never "
+                "replaces the main answer; omitted if matched=0.\n"
                 "- get_sales_totals — for COMPANY-WIDE totals across "
                 "any period ('total sales this month', 'last 90 days "
                 "revenue', 'monthly trend for the last 6 months'). "
@@ -14264,6 +14394,37 @@ elif page == "AI Assistant":
                 "'controller','power supply','channel','profile',"
                 "'accessory','service','module'], "
                 "classification='slow').\n\n"
+                "**Slow-stock promotion (v2.66):** AFTER you've "
+                "answered the user's main product question, AND only "
+                "when the question is about products (not pure data "
+                "questions like sales totals or velocity), call "
+                "**get_relevant_slow_stock** ONCE with the SAME "
+                "filters you used for the main search "
+                "(family/family_list, any_of_terms, exclude_types, "
+                "sku_candidates from the answer set, plus the "
+                "user's `intent` as a free-text summary). If the "
+                "tool returns matched > 0, append a clearly-"
+                "labelled section to your reply:\n\n"
+                "  ### Slow-moving stock worth offering\n"
+                "  Then for each row: SKU / product name / stock / "
+                "classification (slow vs dead) / `Why relevant` "
+                "(from the row's reason_matched) / caution flag if "
+                "non-null.\n\n"
+                "  Append `[+ slow_stock_promotion]` to the "
+                "provenance tag at the end of your answer (e.g. "
+                "`[via text_search] [+ slow_stock_promotion]`).\n\n"
+                "  RULES — read carefully:\n"
+                "  - NEVER replace the main answer with slow stock. "
+                "It's always a supplementary section.\n"
+                "  - If matched=0, OMIT the section entirely. Don't "
+                "force unrelated dead stock into the answer.\n"
+                "  - Clearly label dead stock vs slow-moving stock "
+                "so the buyer can prioritise.\n"
+                "  - If a row has a caution flag, surface it next "
+                "to the SKU.\n"
+                "  - For non-product questions (sales totals, "
+                "velocity, demand signals, etc.) don't call this "
+                "tool — there's no candidate set to promote against.\n\n"
                 "**Honesty rule (v2.65.1):** when a structured filter "
                 "yields zero matches, say so explicitly and DO NOT "
                 "substitute products from a different category. For "
@@ -14496,6 +14657,115 @@ elif page == "AI Assistant":
 #
 # Edits go through db.update_demand_signal which writes a 'demand_signal.update'
 # row to audit_log per change, so the trail of who-changed-what stays intact.
+
+# ---------------------------------------------------------------------------
+# Page: My Profile — edit your own profile, admins can manage all (v2.66)
+# ---------------------------------------------------------------------------
+
+elif page == "My Profile":
+    st.header(":bust_in_silhouette: My Profile")
+    st.caption(
+        "Your profile is loaded automatically when you sign in. "
+        "Edit your role, default landing page, or email below. "
+        "Admins can manage other users via the panel at the bottom.")
+
+    _me = current_user_profile or {}
+    _is_admin = (_me.get("role") == "admin")
+
+    if not _me:
+        st.warning(
+            "No profile loaded. Sign out and sign back in via the "
+            "sidebar.")
+    else:
+        with st.form("_my_profile_form", clear_on_submit=False):
+            st.markdown(f"**Display name:** `{_me.get('display_name')}` "
+                         f"(set at sign-in; cannot be edited here — "
+                         f"sign out and back in with a different name "
+                         f"to switch identity)")
+            _new_role = st.selectbox(
+                "Role",
+                options=list(db.USER_ROLES),
+                index=list(db.USER_ROLES).index(_me.get("role"))
+                       if _me.get("role") in db.USER_ROLES
+                       else list(db.USER_ROLES).index("sales"),
+                help="buyer/sales/admin/viewer. Currently advisory; "
+                     "permissions enforcement comes later.")
+            _new_email = st.text_input(
+                "Email (optional)",
+                value=_me.get("email") or "",
+                placeholder="you@w4susa.com")
+            _new_default_page = st.selectbox(
+                "Default landing page",
+                options=["(none)"] + _page_options,
+                index=(_page_options.index(_me.get("default_page")) + 1
+                       if _me.get("default_page") in _page_options
+                       else 0),
+                help="When you sign in, jump straight to this page "
+                     "instead of Overview.")
+            _save_profile = st.form_submit_button(
+                ":floppy_disk: Save profile",
+                type="primary", width="stretch")
+
+        if _save_profile:
+            try:
+                _final_default = (None
+                                   if _new_default_page == "(none)"
+                                   else _new_default_page)
+                db.upsert_user(
+                    display_name=_me.get("display_name"),
+                    role=_new_role,
+                    email=_new_email.strip() or None,
+                    active=True,
+                    default_page=_final_default,
+                    actor=_me.get("display_name"))
+                # Refresh the session profile so the change reflects
+                # immediately without a re-sign-in.
+                _refreshed = db.get_user_by_name(
+                    _me.get("display_name"))
+                if _refreshed is not None:
+                    st.session_state["current_user_profile"] = {
+                        "user_id": int(_refreshed["user_id"]),
+                        "display_name": _refreshed["display_name"],
+                        "role": _refreshed["role"],
+                        "email": _refreshed["email"],
+                        "default_page": _refreshed["default_page"],
+                        "active": bool(_refreshed["active"]),
+                    }
+                st.success(":white_check_mark: Profile saved.")
+                st.rerun()
+            except Exception as _e:
+                st.error(f"Save failed: {_e}")
+
+    # ---- Admin: manage other users ----
+    if _is_admin:
+        st.divider()
+        st.subheader(":shield: Admin — all users")
+        try:
+            _all_users = db.list_users(active_only=False)
+        except Exception as _e:
+            _all_users = []
+            st.error(f"Could not load users: {_e}")
+        if _all_users:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "user_id": u["user_id"],
+                        "display_name": u["display_name"],
+                        "role": u["role"],
+                        "email": u["email"] or "",
+                        "active": bool(u["active"]),
+                        "default_page": u["default_page"] or "",
+                        "created_at": str(u["created_at"]),
+                        "updated_at": str(u["updated_at"]),
+                    } for u in _all_users
+                ]),
+                width="stretch", height=300)
+            st.caption(
+                "To edit another user, ask them to sign in and "
+                "update their own profile, OR add a per-user "
+                "edit form here in a follow-up version. "
+                "Deactivating users is also future work.")
+
 
 # ---------------------------------------------------------------------------
 # Page: AI Feedback — review thumbs-down chats and turn corrections into
