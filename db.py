@@ -425,6 +425,76 @@ CREATE INDEX IF NOT EXISTS ix_feedback_entity
     ON feedback_events(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS ix_feedback_source
     ON feedback_events(source, created_at DESC);
+
+-- Demand signals — the heart of the proactive intelligence layer.
+-- Captures every "someone is interested in this product" moment from
+-- whatever source. Phase 1 (manual entry) only uses source='manual'.
+-- Slack / Gorgias / SEO / Shopify integrations later add more values
+-- to the source + signal_type columns without schema changes.
+--
+-- Why this matters: without a signal table, Slack messages and
+-- customer chats are noise. With this table, every conversation
+-- becomes a row the buyer can act on.
+--
+-- Reference: docs/demand-scoring.md (designed at end of build day).
+CREATE TABLE IF NOT EXISTS demand_signals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- WHERE the signal came from. Open-ended string so future sources
+    -- (slack, gorgias, seo, shopify_search etc) plug in without a
+    -- schema migration.
+    source          TEXT    NOT NULL,        -- 'manual' | 'slack' | 'gorgias' | 'seo' | 'shopify_search' | 'shopify_abandoned' | 'web_form' | 'phone'
+    source_ref      TEXT,                    -- e.g. Slack message URL, Gorgias ticket #, page URL
+
+    -- WHAT the signal is about. SKU preferred; product_family is the
+    -- fallback when we know the product line but not the variant.
+    sku             TEXT,
+    product_family  TEXT,
+    raw_text        TEXT,                    -- original phrasing — preserved
+                                              -- so future AI re-parsing can
+                                              -- improve on initial extraction
+
+    -- TYPE of signal — open-ended for the same reason as source.
+    signal_type     TEXT    NOT NULL,        -- 'inquiry' | 'quote' | 'sold' | 'lost' | 'substitute_offered' | 'cancelled' | 'returned' | 'complaint' | 'seo_rank' | 'search_query' | 'abandoned_cart' | 'notify_me'
+
+    quantity        REAL,                    -- units mentioned (NULL if unknown)
+
+    -- WHO
+    customer_id     TEXT,                    -- CIN7 customer ID if known
+    customer_name   TEXT,                    -- free-text customer reference
+    salesperson     TEXT,                    -- who logged or owns the signal
+
+    -- HOW CONFIDENT we are about the parsed values. Manual entries
+    -- default to 1.0 (the human said it). AI extractions later might
+    -- start at 0.6 and need_review until corrected.
+    confidence      REAL    DEFAULT 1.0,
+    needs_review    INTEGER DEFAULT 0,       -- 1/0 boolean
+
+    -- LIFECYCLE — set by buyer/sales after the fact when known
+    outcome         TEXT,                    -- 'open' | 'converted' | 'lost' | 'duplicate' | 'invalid'
+    note            TEXT,                    -- buyer/sales notes on this signal
+
+    -- AUDIT
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    created_by      TEXT,
+    updated_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_by      TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_sku
+    ON demand_signals(sku, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_family
+    ON demand_signals(product_family, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_created_at
+    ON demand_signals(created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_signal_type
+    ON demand_signals(signal_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_source
+    ON demand_signals(source, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_outcome
+    ON demand_signals(outcome);
+CREATE INDEX IF NOT EXISTS ix_demand_signals_review
+    ON demand_signals(needs_review)
+    WHERE needs_review = 1;
 """
 
 
@@ -2271,3 +2341,187 @@ def lookup_aliases(phrase: str,
             "ORDER BY times_used DESC, confidence DESC",
             (phrase_n, min_confidence),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Demand signals — proactive intelligence layer
+# ---------------------------------------------------------------------------
+
+def insert_demand_signal(*,
+                          source: str,
+                          signal_type: str,
+                          sku: Optional[str] = None,
+                          product_family: Optional[str] = None,
+                          quantity: Optional[float] = None,
+                          customer_id: Optional[str] = None,
+                          customer_name: Optional[str] = None,
+                          salesperson: Optional[str] = None,
+                          raw_text: Optional[str] = None,
+                          source_ref: Optional[str] = None,
+                          confidence: float = 1.0,
+                          needs_review: bool = False,
+                          outcome: Optional[str] = None,
+                          note: Optional[str] = None,
+                          created_by: str = "system") -> int:
+    """Record one demand signal. Returns the row id.
+
+    Either `sku` or `product_family` should be provided — the buyer
+    warning logic will skip rows that have neither (they're useless).
+    """
+    if not source:
+        raise ValueError("source is required")
+    if not signal_type:
+        raise ValueError("signal_type is required")
+    with connect() as c:
+        cur = c.execute(
+            """
+            INSERT INTO demand_signals
+                (source, source_ref, sku, product_family, raw_text,
+                 signal_type, quantity, customer_id, customer_name,
+                 salesperson, confidence, needs_review, outcome, note,
+                 created_by, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (source, source_ref, sku, product_family, raw_text,
+             signal_type, quantity, customer_id, customer_name,
+             salesperson, confidence, 1 if needs_review else 0,
+             outcome, note, created_by, created_by),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("demand_signal.insert", created_by,
+             sku or product_family or "?",
+             f"source={source} type={signal_type} qty={quantity}"))
+        return int(cur.lastrowid)
+
+
+def update_demand_signal(signal_id: int, *,
+                          outcome: Optional[str] = None,
+                          note: Optional[str] = None,
+                          quantity: Optional[float] = None,
+                          customer_id: Optional[str] = None,
+                          sku: Optional[str] = None,
+                          product_family: Optional[str] = None,
+                          needs_review: Optional[bool] = None,
+                          updated_by: str = "system") -> None:
+    """Update a signal's mutable fields. Only non-None args are
+    written, so it's safe to call with just the fields you mean to
+    change."""
+    sets = []
+    params: list = []
+    if outcome is not None:
+        sets.append("outcome = ?")
+        params.append(outcome)
+    if note is not None:
+        sets.append("note = ?")
+        params.append(note)
+    if quantity is not None:
+        sets.append("quantity = ?")
+        params.append(quantity)
+    if customer_id is not None:
+        sets.append("customer_id = ?")
+        params.append(customer_id)
+    if sku is not None:
+        sets.append("sku = ?")
+        params.append(sku)
+    if product_family is not None:
+        sets.append("product_family = ?")
+        params.append(product_family)
+    if needs_review is not None:
+        sets.append("needs_review = ?")
+        params.append(1 if needs_review else 0)
+    if not sets:
+        return
+    sets.append("updated_at = datetime('now')")
+    sets.append("updated_by = ?")
+    params.append(updated_by)
+    params.append(signal_id)
+    with connect() as c:
+        c.execute(
+            f"UPDATE demand_signals SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("demand_signal.update", updated_by, str(signal_id),
+             ",".join(sets[:-2])))   # exclude updated_at/updated_by
+
+
+def list_demand_signals(*,
+                         sku: Optional[str] = None,
+                         product_family: Optional[str] = None,
+                         signal_type: Optional[str] = None,
+                         source: Optional[str] = None,
+                         since: Optional[str] = None,   # ISO date
+                         outcome: Optional[str] = None,
+                         needs_review: Optional[bool] = None,
+                         limit: int = 200) -> List[sqlite3.Row]:
+    """Filtered list of signals, newest first. All filters are optional.
+    Used by the buyer dashboard, the AI tools, and the warning column.
+    """
+    sql = "SELECT * FROM demand_signals"
+    where = []
+    params: list = []
+    if sku:
+        where.append("sku = ?")
+        params.append(sku)
+    if product_family:
+        where.append("product_family = ?")
+        params.append(product_family)
+    if signal_type:
+        where.append("signal_type = ?")
+        params.append(signal_type)
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    if since:
+        where.append("created_at >= ?")
+        params.append(since)
+    if outcome:
+        where.append("outcome = ?")
+        params.append(outcome)
+    if needs_review is not None:
+        where.append("needs_review = ?")
+        params.append(1 if needs_review else 0)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(int(limit))
+    with connect() as c:
+        return c.execute(sql, params).fetchall()
+
+
+def count_demand_signals_by_sku(*,
+                                  since: Optional[str] = None,
+                                  signal_type: Optional[str] = None,
+                                  ) -> dict:
+    """Aggregate count of signals per SKU. Used by the reorder warning
+    column to flag SKUs with rising/concentrated inquiries.
+    Returns {sku: count}."""
+    sql = ("SELECT sku, COUNT(*) AS n FROM demand_signals "
+           "WHERE sku IS NOT NULL AND sku != ''")
+    params: list = []
+    if since:
+        sql += " AND created_at >= ?"
+        params.append(since)
+    if signal_type:
+        sql += " AND signal_type = ?"
+        params.append(signal_type)
+    sql += " GROUP BY sku"
+    with connect() as c:
+        return {r["sku"]: int(r["n"])
+                for r in c.execute(sql, params).fetchall()}
+
+
+def delete_demand_signal(signal_id: int, actor: str = "system") -> None:
+    """Hard-delete a signal. Use sparingly — for genuinely-invalid
+    rows. For wrong-but-real signals prefer update_demand_signal()
+    with outcome='invalid' so the audit trail stays."""
+    with connect() as c:
+        c.execute("DELETE FROM demand_signals WHERE id = ?", (signal_id,))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("demand_signal.delete", actor, str(signal_id), ""))

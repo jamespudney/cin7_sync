@@ -237,6 +237,111 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_recent_signals",
+        "description": (
+            "List recent demand signals (customer inquiries, quotes, "
+            "lost sales, returns, etc.) optionally filtered by SKU, "
+            "product family, signal type, source, or time window. Use "
+            "for questions like 'any inquiries about LED-XYZ "
+            "recently?', 'what's been asked about this week?', "
+            "'show me lost sales for SIERRA38 this month'. Returns up "
+            "to 50 rows, newest first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string"},
+                "product_family": {"type": "string"},
+                "signal_type": {
+                    "type": "string",
+                    "enum": [
+                        "inquiry", "quote", "sold", "lost",
+                        "substitute_offered", "cancelled", "returned",
+                        "complaint", "abandoned_cart", "notify_me",
+                        "any",
+                    ],
+                },
+                "source": {
+                    "type": "string",
+                    "enum": ["manual", "slack", "gorgias",
+                              "shopify_search", "shopify_abandoned",
+                              "seo", "web_form", "phone", "any"],
+                },
+                "days": {
+                    "type": "integer",
+                    "description": "Look back this many days. Default 30.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max rows (cap 50, default 25).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_top_inquired_products",
+        "description": (
+            "Leaderboard of most-signaled SKUs over a period. Use for "
+            "'what products are getting attention?', 'top inquiries "
+            "this week', 'what's hot right now?'. Counts ALL signal "
+            "types by default (inquiries, quotes, lost sales, etc.) "
+            "but can be narrowed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Look back this many days. Default 30.",
+                },
+                "signal_type": {
+                    "type": "string",
+                    "description": "If set, only count signals of this "
+                                   "type (e.g. 'inquiry' to see what "
+                                   "people are asking about; 'lost' "
+                                   "for what's slipping away).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max rows (default 15).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_rising_demand",
+        "description": (
+            "Compare signal counts in a recent window vs a prior "
+            "window of the same length to find rising demand. Use for "
+            "'what's increasing in demand?', 'what got hot this "
+            "week?', 'what wasn't being asked about a month ago but "
+            "is now?'. Returns SKUs ranked by signal-count growth."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "recent_days": {
+                    "type": "integer",
+                    "description": "Length of the 'recent' window. "
+                                   "Default 7.",
+                },
+                "min_recent": {
+                    "type": "integer",
+                    "description": "Ignore SKUs with fewer than N "
+                                   "signals in the recent window. "
+                                   "Default 2.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max rows (default 15).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "search_knowledge_base",
         "description": (
             "Search the company's app documentation, business rules, "
@@ -632,6 +737,178 @@ def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
     _SALES_FULL_HOLDER["df"] = headers_df
 
 
+def _signal_row_to_dict(row) -> dict:
+    """Make a demand_signals row JSON-friendly for tool returns."""
+    d = dict(row)
+    return {
+        "id": d.get("id"),
+        "source": d.get("source"),
+        "sku": d.get("sku"),
+        "product_family": d.get("product_family"),
+        "signal_type": d.get("signal_type"),
+        "quantity": d.get("quantity"),
+        "customer_name": d.get("customer_name"),
+        "salesperson": d.get("salesperson"),
+        "raw_text": d.get("raw_text"),
+        "note": d.get("note"),
+        "outcome": d.get("outcome"),
+        "confidence": d.get("confidence"),
+        "created_at": d.get("created_at"),
+        "created_by": d.get("created_by"),
+    }
+
+
+def get_recent_signals(engine_df: pd.DataFrame,
+                        sale_lines_df: pd.DataFrame,
+                        args: dict) -> dict:
+    days = max(1, min(int(args.get("days", 30) or 30), 365))
+    sku = (args.get("sku") or "").strip() or None
+    family = (args.get("product_family") or "").strip().upper() or None
+    sig_type = (args.get("signal_type") or "").strip().lower()
+    if sig_type in ("any", ""):
+        sig_type = None
+    source = (args.get("source") or "").strip().lower()
+    if source in ("any", ""):
+        source = None
+    limit = max(1, min(int(args.get("limit", 25) or 25), 50))
+
+    since_dt = (pd.Timestamp.now() - pd.Timedelta(days=days)).strftime(
+        "%Y-%m-%d")
+    rows = db.list_demand_signals(
+        sku=sku,
+        product_family=family,
+        signal_type=sig_type,
+        source=source,
+        since=since_dt,
+        limit=limit,
+    )
+    return {
+        "matched": len(rows),
+        "window_days": days,
+        "filters_applied": {
+            "sku": sku,
+            "product_family": family,
+            "signal_type": sig_type,
+            "source": source,
+        },
+        "results": [_signal_row_to_dict(r) for r in rows],
+    }
+
+
+def get_top_inquired_products(engine_df: pd.DataFrame,
+                                sale_lines_df: pd.DataFrame,
+                                args: dict) -> dict:
+    days = max(1, min(int(args.get("days", 30) or 30), 365))
+    sig_type = (args.get("signal_type") or "").strip().lower() or None
+    if sig_type in ("any", ""):
+        sig_type = None
+    limit = max(1, min(int(args.get("limit", 15) or 15), 50))
+
+    since_dt = (pd.Timestamp.now() - pd.Timedelta(days=days)).strftime(
+        "%Y-%m-%d")
+    by_sku = db.count_demand_signals_by_sku(
+        since=since_dt, signal_type=sig_type)
+    if not by_sku:
+        return {
+            "matched": 0,
+            "window_days": days,
+            "results": [],
+            "note": ("No signals in the window. Either nothing has "
+                      "been logged or the period is too narrow."),
+        }
+    # Decorate with name + on-hand from engine for readability
+    name_lookup: dict = {}
+    onhand_lookup: dict = {}
+    if not engine_df.empty and "SKU" in engine_df.columns:
+        for r in engine_df.to_dict(orient="records"):
+            sku_v = str(r.get("SKU"))
+            if "Name" in r:
+                name_lookup[sku_v] = str(r.get("Name") or "")[:100]
+            if "OnHand" in r:
+                onhand_lookup[sku_v] = r.get("OnHand")
+    ranked = sorted(by_sku.items(), key=lambda x: -x[1])[:limit]
+    return {
+        "matched": len(ranked),
+        "window_days": days,
+        "signal_type_filter": sig_type,
+        "results": [{
+            "sku": s,
+            "name": name_lookup.get(s, ""),
+            "signal_count": n,
+            "on_hand": onhand_lookup.get(s),
+        } for s, n in ranked],
+    }
+
+
+def get_rising_demand(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    recent_days = max(1, min(int(args.get("recent_days", 7) or 7), 90))
+    min_recent = max(1, int(args.get("min_recent", 2) or 2))
+    limit = max(1, min(int(args.get("limit", 15) or 15), 30))
+
+    now = pd.Timestamp.now()
+    recent_since = (now - pd.Timedelta(days=recent_days)).strftime(
+        "%Y-%m-%d")
+    prior_since = (now - pd.Timedelta(days=2 * recent_days)).strftime(
+        "%Y-%m-%d")
+    prior_until = recent_since   # exclusive of recent window
+
+    # Recent counts via the helper
+    recent = db.count_demand_signals_by_sku(since=recent_since)
+    # Prior window — fetch all signals in [prior_since, recent_since)
+    # via list_demand_signals, group manually
+    rows = db.list_demand_signals(since=prior_since, limit=10000)
+    prior: dict = {}
+    for r in rows:
+        d = dict(r)
+        if d.get("created_at", "") >= recent_since:
+            continue   # in the recent window, not prior
+        sku_v = d.get("sku")
+        if not sku_v:
+            continue
+        prior[sku_v] = prior.get(sku_v, 0) + 1
+
+    # Compute deltas
+    rows_out = []
+    for sku_v, n_recent in recent.items():
+        if n_recent < min_recent:
+            continue
+        n_prior = prior.get(sku_v, 0)
+        delta = n_recent - n_prior
+        ratio = (n_recent / n_prior) if n_prior > 0 else None
+        rows_out.append({
+            "sku": sku_v,
+            "recent_count": n_recent,
+            "prior_count": n_prior,
+            "delta": delta,
+            "ratio": (round(ratio, 2) if ratio is not None else None),
+        })
+    rows_out.sort(key=lambda r: (-r["delta"], -r["recent_count"]))
+    rows_out = rows_out[:limit]
+
+    # Decorate with names
+    name_lookup: dict = {}
+    if not engine_df.empty and "SKU" in engine_df.columns:
+        for r in engine_df.to_dict(orient="records"):
+            name_lookup[str(r.get("SKU"))] = str(r.get("Name") or "")[:100]
+    for r in rows_out:
+        r["name"] = name_lookup.get(r["sku"], "")
+
+    return {
+        "matched": len(rows_out),
+        "recent_window_days": recent_days,
+        "prior_window_days": recent_days,
+        "min_recent_threshold": min_recent,
+        "results": rows_out,
+        "note": (
+            "delta = recent_count - prior_count. ratio = recent/prior. "
+            "ratio is null when prior_count was 0 (totally new "
+            "interest)."
+        ),
+    }
+
+
 def search_knowledge_base(engine_df: pd.DataFrame,
                             sale_lines_df: pd.DataFrame,
                             args: dict) -> dict:
@@ -678,6 +955,9 @@ TOOL_HANDLERS = {
     "get_dead_stock": get_dead_stock,
     "get_migration_chain": get_migration_chain,
     "get_sales_totals": get_sales_totals,
+    "get_recent_signals": get_recent_signals,
+    "get_top_inquired_products": get_top_inquired_products,
+    "get_rising_demand": get_rising_demand,
     "search_knowledge_base": search_knowledge_base,
 }
 
