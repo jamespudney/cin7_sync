@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.66 — Profile sign-in + slow-stock promotion layer. (Part A) New `users` table (user_id / display_name / role / email / active / default_page / created_at / updated_at) with helpers `get_user_by_name`, `list_users`, `upsert_user`, `get_or_create_user`. Sidebar 'Your name' replaced with a typeahead picker — pick an existing profile or type a new one (auto-creates with role=sales). Profile loads into `current_user_profile` session_state; if `default_page` is set, the page selector jumps there on first sign-in. Sign-out button clears the session. New 'My Profile' page lets you edit role / email / default_page; admin role sees a read-only table of all users. Roles: buyer/sales/admin/viewer (advisory, not enforced yet). Shared password gate unchanged. (Part B) New AI tool `get_relevant_slow_stock`: called AFTER the main answer with the same filters (family/any_of_terms/exclude_types/sku_candidates), returns slow + dead in-stock items with reason_matched + caution flag (set when SKU has cancellation/return/complaint feedback events). System prompt rule: render results in a separate 'Slow-moving stock worth offering' section with `[+ slow_stock_promotion]` appended to the provenance tag; omit entirely if matched=0; never replace the main answer; clearly label slow vs dead. (May 1)")
+    st.caption("🟢 v2.66.2 — Slow-stock promotion was breaking unrelated questions. Three fixes: (1) Slow-stock rule tightened to ONLY trigger on product-LIST queries ('what X products do we have', 'show me X in stock'). Explicitly forbidden for similarity / single-SKU / sales-totals / velocity / demand-signal / incoming-stock / accessory / dead-stock-review questions. (2) Claude is now told to NEVER narrate the tool call mid-stream — no 'let me check for slow-moving stock' lead-in. The section either appears at the end with results or doesn't appear at all. (3) MAX_TURNS bumped from 6 to 10 in the LLM tool-use loop so an extra tool call can't exhaust the turn budget and produce the empty 'I couldn't answer that' fallback. Root cause: v2.66's slow-stock rule was making Claude do extra tool calls on non-product questions, exhausting the 6-turn budget before producing final text. (May 1)") (1) The combined picker-with-typed-fallback is replaced with two distinct flows: a selectbox of REGISTERED users for normal sign-in (no free-text), and a separate 'Add new user' expander that explicitly creates a profile. Prevents an existing user from accidentally creating a duplicate profile by typing a slight variation of their name. (2) `current_user_id` (integer) now stored in session_state alongside `current_user` (display_name) and `current_user_profile`. The user_id is the canonical identifier going forward; display_name is the human-readable label. (3) Sign-in now writes a `user.login` audit_log row so we have a record of who was active when. Sign-out clears all four user keys plus `_default_page_consumed`. The full v2.66 behaviour (default_page jump, My Profile page, slow-stock promotion layer, get_relevant_slow_stock tool) carries forward unchanged. (May 1)") (Part A) New `users` table (user_id / display_name / role / email / active / default_page / created_at / updated_at) with helpers `get_user_by_name`, `list_users`, `upsert_user`, `get_or_create_user`. Sidebar 'Your name' replaced with a typeahead picker — pick an existing profile or type a new one (auto-creates with role=sales). Profile loads into `current_user_profile` session_state; if `default_page` is set, the page selector jumps there on first sign-in. Sign-out button clears the session. New 'My Profile' page lets you edit role / email / default_page; admin role sees a read-only table of all users. Roles: buyer/sales/admin/viewer (advisory, not enforced yet). Shared password gate unchanged. (Part B) New AI tool `get_relevant_slow_stock`: called AFTER the main answer with the same filters (family/any_of_terms/exclude_types/sku_candidates), returns slow + dead in-stock items with reason_matched + caution flag (set when SKU has cancellation/return/complaint feedback events). System prompt rule: render results in a separate 'Slow-moving stock worth offering' section with `[+ slow_stock_promotion]` appended to the provenance tag; omit entirely if matched=0; never replace the main answer; clearly label slow vs dead. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -356,62 +356,151 @@ with st.sidebar:
         if st.button("Sign out", key="_signout_btn",
                       width="stretch"):
             for _k in ("current_user",
+                        "current_user_id",
                         "current_user_profile",
-                        "_signin_pending_name"):
+                        "_signin_pending_name",
+                        "_default_page_consumed"):
                 st.session_state.pop(_k, None)
             st.rerun()
     else:
-        # Sign-in picker. selectbox of existing names + a free-text
-        # 'Or type a new name' fallback. Pressing Sign in loads the
-        # profile (or creates one).
-        _picker_options = ["(pick or type new)"] + _existing_names
-        _picked = st.selectbox(
-            "Sign in as",
-            options=_picker_options,
-            index=0,
-            key="_signin_picker",
-            help="Pick your name from the list of registered users, "
-                 "or type a new one below to create your profile.")
-        _typed = st.text_input(
-            "Or type a new name",
-            value=st.session_state.get("_signin_pending_name", ""),
-            placeholder="e.g. James",
-            key="_signin_typed",
-            help="Used only if you're not in the list. Creates a "
-                 "basic profile (role: sales) you can edit on the "
-                 "My Profile page.")
-        if st.button(":unlock: Sign in",
-                      type="primary", width="stretch",
-                      key="_signin_btn"):
-            _final_name = (_typed.strip()
-                            if _typed and _typed.strip()
-                            else (_picked
-                                  if _picked != _picker_options[0]
-                                  else ""))
-            if not _final_name:
-                st.error("Pick a name or type a new one.")
-            else:
-                try:
-                    _user = db.get_or_create_user(_final_name)
-                    _profile_dict = {
-                        "user_id": int(_user["user_id"]),
-                        "display_name": _user["display_name"],
-                        "role": _user["role"],
-                        "email": _user["email"],
-                        "default_page": _user["default_page"],
-                        "active": bool(_user["active"]),
-                    }
-                    st.session_state["current_user"] = (
-                        _user["display_name"])
-                    st.session_state["current_user_profile"] = (
-                        _profile_dict)
-                    st.success(
-                        f":white_check_mark: Welcome, "
-                        f"**{_user['display_name']}** "
-                        f"(`{_user['role']}`)")
-                    st.rerun()
-                except Exception as _e:
-                    st.error(f"Sign-in failed: {_e}")
+        # v2.66.1: split sign-in into two distinct flows so an existing
+        # team member can never accidentally create a duplicate
+        # profile by typing a slightly-different version of their
+        # name. Primary path = selectbox of existing users; secondary
+        # path = explicit 'Add new user' expander.
+        if not _existing_names:
+            st.info(
+                ":information_source: No users registered yet. "
+                "Use 'Add new user' below to create the first "
+                "profile.")
+            _picked = ""
+        else:
+            _picked = st.selectbox(
+                "Sign in as",
+                options=["(select your name)"] + _existing_names,
+                index=0,
+                key="_signin_picker",
+                help="Pick your name from the list of registered "
+                     "users. Use 'Add new user' below if you're not "
+                     "yet on the team.")
+            if _picked != "(select your name)":
+                if st.button(":unlock: Sign in",
+                              type="primary", width="stretch",
+                              key="_signin_btn"):
+                    try:
+                        _user = db.get_user_by_name(_picked)
+                        if _user is None:
+                            st.error(
+                                f"Profile for `{_picked}` not found. "
+                                "Try the 'Add new user' flow.")
+                        else:
+                            _profile_dict = {
+                                "user_id": int(_user["user_id"]),
+                                "display_name": _user["display_name"],
+                                "role": _user["role"],
+                                "email": _user["email"],
+                                "default_page": _user["default_page"],
+                                "active": bool(_user["active"]),
+                            }
+                            st.session_state["current_user_id"] = (
+                                int(_user["user_id"]))
+                            st.session_state["current_user"] = (
+                                _user["display_name"])
+                            st.session_state["current_user_profile"] = (
+                                _profile_dict)
+                            # Audit the sign-in itself so we know who
+                            # was active when.
+                            try:
+                                with db.connect() as _c:
+                                    _c.execute(
+                                        "INSERT INTO audit_log "
+                                        "(event, actor, target, "
+                                        "detail) VALUES (?,?,?,?)",
+                                        ("user.login",
+                                         _user["display_name"],
+                                         str(_user["user_id"]),
+                                         f"role={_user['role']}"))
+                            except Exception:
+                                pass
+                            st.success(
+                                f":white_check_mark: Welcome, "
+                                f"**{_user['display_name']}** "
+                                f"(`{_user['role']}`)")
+                            st.rerun()
+                    except Exception as _e:
+                        st.error(f"Sign-in failed: {_e}")
+
+        # Add new user — separate expander to keep first-time signup
+        # off the primary sign-in path (so existing users don't
+        # accidentally create dup profiles by typing a slight
+        # variation of their name).
+        with st.expander(":heavy_plus_sign: Add new user",
+                          expanded=not _existing_names):
+            with st.form("_signup_form", clear_on_submit=False):
+                _new_name = st.text_input(
+                    "Name", placeholder="e.g. James",
+                    key="_signup_name")
+                _new_role = st.selectbox(
+                    "Role", options=list(db.USER_ROLES),
+                    index=list(db.USER_ROLES).index("sales"),
+                    key="_signup_role",
+                    help="buyer/sales/admin/viewer. You can change "
+                         "this later on the My Profile page.")
+                _signup_submit = st.form_submit_button(
+                    ":sparkles: Create profile and sign in",
+                    type="primary", width="stretch")
+            if _signup_submit:
+                _name_clean = (_new_name or "").strip()
+                if not _name_clean:
+                    st.error("Name is required.")
+                elif _name_clean in _existing_names:
+                    st.error(
+                        f"`{_name_clean}` already exists — use the "
+                        "Sign in flow above to log in as them, or "
+                        "pick a different name.")
+                else:
+                    try:
+                        _uid = db.upsert_user(
+                            display_name=_name_clean,
+                            role=_new_role,
+                            active=True,
+                            actor=_name_clean)
+                        _user = db.get_user_by_name(_name_clean)
+                        if _user is not None:
+                            _profile_dict = {
+                                "user_id": int(_user["user_id"]),
+                                "display_name": _user["display_name"],
+                                "role": _user["role"],
+                                "email": _user["email"],
+                                "default_page": _user["default_page"],
+                                "active": bool(_user["active"]),
+                            }
+                            st.session_state["current_user_id"] = (
+                                int(_user["user_id"]))
+                            st.session_state["current_user"] = (
+                                _user["display_name"])
+                            st.session_state["current_user_profile"] = (
+                                _profile_dict)
+                            try:
+                                with db.connect() as _c:
+                                    _c.execute(
+                                        "INSERT INTO audit_log "
+                                        "(event, actor, target, "
+                                        "detail) VALUES (?,?,?,?)",
+                                        ("user.login",
+                                         _user["display_name"],
+                                         str(_user["user_id"]),
+                                         "via signup"))
+                            except Exception:
+                                pass
+                            st.success(
+                                f":white_check_mark: Profile created. "
+                                f"Welcome, **{_user['display_name']}**"
+                                f" (`{_user['role']}`)")
+                            st.rerun()
+                    except Exception as _e:
+                        st.error(f"Signup failed: {_e}")
+
         # Stop the rest of the sidebar from rendering until they sign
         # in — the demand-capture form, page nav, etc. all rely on
         # current_user being set so the audit trail is honest.
@@ -14394,37 +14483,49 @@ elif page == "AI Assistant":
                 "'controller','power supply','channel','profile',"
                 "'accessory','service','module'], "
                 "classification='slow').\n\n"
-                "**Slow-stock promotion (v2.66):** AFTER you've "
-                "answered the user's main product question, AND only "
-                "when the question is about products (not pure data "
-                "questions like sales totals or velocity), call "
-                "**get_relevant_slow_stock** ONCE with the SAME "
-                "filters you used for the main search "
-                "(family/family_list, any_of_terms, exclude_types, "
-                "sku_candidates from the answer set, plus the "
-                "user's `intent` as a free-text summary). If the "
-                "tool returns matched > 0, append a clearly-"
-                "labelled section to your reply:\n\n"
+                "**Slow-stock promotion (v2.66.2 — tightened):** "
+                "ONLY call get_relevant_slow_stock when the user's "
+                "question is a **product LIST** query — phrasings "
+                "like 'what X products do we have', 'show me X in "
+                "stock', 'list X strips', 'what warm white strips'. "
+                "Call it silently and AFTER your main answer is "
+                "complete. Only render the resulting section if the "
+                "tool returns matched > 0.\n\n"
+                "  CRITICAL: do NOT narrate the tool call. Never "
+                "write 'let me check for slow-moving stock' or "
+                "similar lead-in text. Either the section appears "
+                "at the end of your answer (with results) or it "
+                "doesn't appear at all (no results, no section, no "
+                "narration). Mid-stream announcements break the "
+                "answer flow and waste turns.\n\n"
+                "  DO NOT call get_relevant_slow_stock for any of "
+                "these question types:\n"
+                "  - Similarity questions ('similar to X', "
+                "'alternative to Y', 'replace Z')\n"
+                "  - Single-SKU lookups (`get_sku_details` /  "
+                "velocity / migration questions)\n"
+                "  - Sales totals / company-wide aggregates\n"
+                "  - Demand signal questions (`get_recent_signals` "
+                "etc.)\n"
+                "  - Incoming-stock / ETA / PO questions\n"
+                "  - Accessory / compatibility questions\n"
+                "  - Dead-stock review (already showing dead stock "
+                "by definition)\n"
+                "  - Any question that didn't yield a list of "
+                "products to promote against.\n\n"
+                "  When you DO call it (product-list query, main "
+                "answer complete, matched>0), render:\n\n"
                 "  ### Slow-moving stock worth offering\n"
-                "  Then for each row: SKU / product name / stock / "
+                "  Per row: SKU / product name / stock / "
                 "classification (slow vs dead) / `Why relevant` "
-                "(from the row's reason_matched) / caution flag if "
-                "non-null.\n\n"
+                "(from reason_matched) / caution flag if non-null.\n\n"
                 "  Append `[+ slow_stock_promotion]` to the "
-                "provenance tag at the end of your answer (e.g. "
-                "`[via text_search] [+ slow_stock_promotion]`).\n\n"
-                "  RULES — read carefully:\n"
-                "  - NEVER replace the main answer with slow stock. "
-                "It's always a supplementary section.\n"
-                "  - If matched=0, OMIT the section entirely. Don't "
-                "force unrelated dead stock into the answer.\n"
-                "  - Clearly label dead stock vs slow-moving stock "
-                "so the buyer can prioritise.\n"
-                "  - If a row has a caution flag, surface it next "
-                "to the SKU.\n"
-                "  - For non-product questions (sales totals, "
-                "velocity, demand signals, etc.) don't call this "
-                "tool — there's no candidate set to promote against.\n\n"
+                "provenance tag at the end of your answer.\n\n"
+                "  RULES:\n"
+                "  - NEVER replace the main answer with slow stock.\n"
+                "  - If matched=0, OMIT the section silently.\n"
+                "  - Clearly label dead vs slow.\n"
+                "  - Surface caution flags next to the SKU.\n\n"
                 "**Honesty rule (v2.65.1):** when a structured filter "
                 "yields zero matches, say so explicitly and DO NOT "
                 "substitute products from a different category. For "
@@ -14481,7 +14582,12 @@ elif page == "AI Assistant":
                 # Tool-use loop: send messages, if response includes
                 # tool_use blocks, call them, append results, ask
                 # again, repeat until we get a pure text response.
-                _MAX_TURNS = 6
+                # v2.66.2: bumped from 6 → 10 to give the loop more
+                # room when slow-stock promotion adds an extra tool
+                # call beyond the main answer. Empty-fallback was
+                # firing for some questions because the loop ran out
+                # of turns mid-stream.
+                _MAX_TURNS = 10
                 for _turn in range(_MAX_TURNS):
                     try:
                         _resp = _client.messages.create(
