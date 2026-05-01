@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.62 — Alias learning loop closed. New **AI Feedback** page lists thumbs-down conversations from `ai_audit_logs`; the reviewer enters a trigger phrase + correct SKU/family + confidence and saves a `product_alias`. The AI Assistant page now consults `db.find_alias_in_question()` BEFORE every LLM call and injects matching past corrections as system-prompt context (substring match, longest-phrase-first, dedupe by target). Each lookup bumps `times_used` so popular aliases float to the top. New helpers: `list_product_aliases`, `delete_product_alias`. Every alias mutation writes to `audit_log`; every saved correction writes a `feedback_events` row linking the alias back to its source `ai_audit_log` row. Goal: improve over time without retraining the model. (May 1)")
+    st.caption("🟢 v2.63 — Multi-target alias rules + provenance. (1) Schema: `product_aliases` extended with `rule_type` (sku/sku_list/family/family_list/mixed/attributes), `target_skus_json`, `target_families_json`, `attributes_json`, `source` (manual/feedback/system), `created_by`. Idempotent migration backfills existing rows. (2) AI Feedback page now offers Single SKU / Multi SKU / Single Family / Multi Family / Mixed rule types with multiselect + paste-list inputs and pre-save validation against the products CSV; an 'Existing rules for this phrase' panel shows what's already mapped before you save another. (3) Alias-before-LLM hint renders multi-target rules as 'ANY of these SKUs/families' and family-expands the first 8 member SKUs into the prompt so Claude can tool-dispatch over the candidate set. (4) Every AI answer now ends with a `[via X]` provenance tag — exact_sku / alias_rule / search_products / family_lookup / similarity_engine / none — so the buyer sees how the AI decided. Attribute filters captured but NOT YET ENFORCED (waiting on product_attributes / Tier-A1). (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13858,50 +13858,134 @@ elif page == "AI Assistant":
             with st.chat_message("user"):
                 st.markdown(_user_question)
 
-            # ---- Alias check (v2.62) ----
+            # ---- Alias check (v2.62 + v2.63 multi-target) ----
             # Before calling the LLM, see if any stored alias phrases
-            # appear in the user's question. Hits get injected as a
-            # "past corrections to keep in mind" addendum to the system
-            # prompt, so Claude has the resolved SKU/family in mind
-            # rather than having to guess. We don't short-circuit the
-            # LLM call entirely — Claude still does tool dispatch and
-            # formatting; we just stop it from re-guessing what the
-            # user means by "warm strip" every time.
+            # appear in the user's question. Hits become a "past
+            # corrections to keep in mind" addendum at the end of the
+            # system prompt so Claude has the resolved candidate set in
+            # mind rather than re-guessing every time.
+            #
+            # v2.63: multi-target rules render as "any of: SKU1 | SKU2"
+            # or "any in family: F1 | F2". We don't short-circuit the
+            # LLM — Claude still picks among candidates, calls tools,
+            # and formats the answer; the alias just narrows the
+            # candidate set.
             try:
                 _alias_hits = db.find_alias_in_question(
                     _user_question, min_confidence=0.6)
             except Exception:
                 _alias_hits = []
+
+            # Build family → member-SKUs index once if we'll need it
+            # below. Family expansion lets the AI know which actual
+            # products it should consider when an alias points at
+            # families. Cap at 20 SKUs per family to keep the prompt
+            # short; Claude can use search_products for the rest.
+            def _expand_family(_fam):
+                _fam_u = (_fam or "").strip().upper()
+                if not _fam_u or products.empty:
+                    return []
+                _fam_col = None
+                for _candidate in (
+                        "AdditionalAttribute1", "Family", "ProductFamily"):
+                    if _candidate in products.columns:
+                        _fam_col = _candidate
+                        break
+                if _fam_col is None:
+                    return []
+                try:
+                    _mask = (products[_fam_col].fillna("")
+                              .astype(str).str.upper() == _fam_u)
+                    return (products[_mask]["SKU"].dropna()
+                            .astype(str).head(20).tolist())
+                except Exception:
+                    return []
+
             if _alias_hits:
                 _hit_lines = []
                 for _h in _alias_hits[:6]:
-                    _target = (
-                        f"SKU `{_h['sku']}`" if _h.get("sku")
-                        else (f"product family `{_h['product_family']}`"
-                              if _h.get("product_family") else ""))
-                    if not _target:
+                    _skus = _h.get("skus") or []
+                    _families = _h.get("families") or []
+                    _attrs = _h.get("attributes") or {}
+                    _rule = _h.get("rule_type") or ""
+
+                    _target_parts = []
+                    if _skus:
+                        if len(_skus) == 1:
+                            _target_parts.append(f"SKU `{_skus[0]}`")
+                        else:
+                            _target_parts.append(
+                                "ANY of these SKUs: "
+                                + ", ".join(f"`{s}`" for s in _skus))
+                    if _families:
+                        _exp_lines = []
+                        for _fam in _families:
+                            _members = _expand_family(_fam)
+                            if _members:
+                                _members_s = ", ".join(
+                                    f"`{m}`" for m in _members[:8])
+                                _suffix = (
+                                    f" (e.g. {_members_s}"
+                                    + (f", +{len(_members)-8} more"
+                                       if len(_members) > 8 else "")
+                                    + ")")
+                            else:
+                                _suffix = ""
+                            _exp_lines.append(f"`{_fam}`{_suffix}")
+                        if len(_families) == 1:
+                            _target_parts.append(
+                                f"product family {_exp_lines[0]}")
+                        else:
+                            _target_parts.append(
+                                "ANY of these families: "
+                                + " | ".join(_exp_lines))
+                    if _attrs:
+                        _target_parts.append(
+                            f"attribute filter (CAPTURED, NOT YET "
+                            f"ENFORCED — pending product_attributes "
+                            f"layer): `{_attrs}`")
+                    if not _target_parts:
                         continue
+                    _target = "; ".join(_target_parts)
                     _hit_lines.append(
                         f"- The phrase `{_h['phrase']}` has been "
-                        f"corrected by a human reviewer to mean "
-                        f"{_target} (used {_h['times_used']}x, "
-                        f"confidence {_h['confidence']:.0%})")
-                    # Bump times_used + last_used_at on this lookup
+                        f"corrected to mean {_target}. "
+                        f"[rule_type={_rule}, used {_h['times_used']}x, "
+                        f"confidence {_h['confidence']:.0%}]")
+                    # Bump times_used + last_used_at on this lookup,
+                    # preserving the multi-target shape.
                     try:
                         db.upsert_product_alias(
                             _h["phrase"],
-                            sku=_h.get("sku"),
-                            product_family=_h.get("product_family"),
+                            sku=(_skus[0] if len(_skus) == 1 else None),
+                            product_family=(_families[0]
+                                            if len(_families) == 1
+                                            else None),
+                            rule_type=_rule or None,
+                            target_skus=(_skus if len(_skus) > 1
+                                         else None),
+                            target_families=(_families
+                                             if len(_families) > 1
+                                             else None),
+                            attributes=(_attrs if _attrs else None),
                             confidence=_h["confidence"],
+                            source="system",
                             approved_by="alias_lookup")
                     except Exception:
                         pass
-                _alias_addendum = (
-                    "\n\nPast corrections to keep in mind for THIS "
-                    "user's question:\n" + "\n".join(_hit_lines)
-                    + "\n\nUse these mappings unless the question "
-                    "context clearly contradicts them. Cite the "
-                    "resolved SKU/family in your answer.") if _hit_lines else ""
+                if _hit_lines:
+                    _alias_addendum = (
+                        "\n\nPast corrections to keep in mind for THIS "
+                        "user's question:\n" + "\n".join(_hit_lines)
+                        + "\n\nWhen resolving the question, treat the "
+                        "above as the canonical candidate set. If an "
+                        "alias maps to multiple SKUs/families, do NOT "
+                        "pick one arbitrarily — present the full set "
+                        "ranked by relevance (use search_products / "
+                        "get_sku_details to enrich). End your answer "
+                        "with `[via alias_rule]`.")
+                else:
+                    _alias_addendum = ""
             else:
                 _alias_addendum = ""
 
@@ -13994,7 +14078,18 @@ elif page == "AI Assistant":
                 "- When citing a SKU, include the name + on-hand "
                 "quantity in parentheses.\n"
                 "- If you can't answer confidently, say so and ask "
-                "for clarification (preferred SKU, time window, etc.).")
+                "for clarification (preferred SKU, time window, etc.).\n"
+                "- ALWAYS end your final answer with a single "
+                "`[via X]` tag noting how you arrived at it. "
+                "Use one of: `[via exact_sku]` (user gave a specific "
+                "SKU), `[via alias_rule]` (a past correction guided "
+                "the answer — see the addendum below if present), "
+                "`[via search_products]` (used the search tool), "
+                "`[via family_lookup]` (resolved by product family), "
+                "`[via similarity_engine]` (similarity search — "
+                "arrives in v2.64), or `[via none]` (no resolution "
+                "possible). This tag lets the buyer audit how the AI "
+                "decided.")
 
             # Append any alias-correction hints captured above. Putting
             # these AFTER the base prompt means they show up as recent
@@ -14291,7 +14386,9 @@ elif page == "AI Feedback":
         if not _filtered:
             st.info("No rows match these filters.")
         else:
-            # SKU options for the typeahead inside each row's form.
+            # SKU + family options for the typeahead inside each row's
+            # form. Family lives in AdditionalAttribute1 in CIN7
+            # conventions.
             try:
                 _all_skus = (sorted(products["SKU"].dropna()
                                      .astype(str).unique().tolist())
@@ -14299,6 +14396,20 @@ elif page == "AI Feedback":
             except Exception:
                 _all_skus = []
             _sku_options = ["(none — family-only mapping)"] + _all_skus
+            _fam_col_name = None
+            for _candidate in ("AdditionalAttribute1", "Family",
+                                "ProductFamily"):
+                if not products.empty and _candidate in products.columns:
+                    _fam_col_name = _candidate
+                    break
+            try:
+                _all_families = (sorted(set(
+                    s.strip().upper()
+                    for s in products[_fam_col_name].dropna().astype(str)
+                    if s and s.strip()))
+                                  if _fam_col_name else [])
+            except Exception:
+                _all_families = []
 
             for _row in _filtered[:50]:  # cap to 50 per render
                 _aid = int(_row["id"])
@@ -14344,93 +14455,301 @@ elif page == "AI Feedback":
                     st.markdown("---")
                     st.markdown(
                         "**Teach the AI**: enter the phrase it should "
-                        "recognise next time + the correct target.")
+                        "recognise next time + the correct target. "
+                        "Multi-SKU and multi-family rules supported as "
+                        "of v2.63.")
+
+                    # Rule-type selector OUTSIDE the form so the
+                    # conditional inputs can switch on each change.
+                    _rule_type_label = st.selectbox(
+                        "Rule type",
+                        options=[
+                            "Single SKU",
+                            "Multiple SKUs",
+                            "Single Family",
+                            "Multiple Families",
+                            "Mixed (SKU + Family)",
+                            "Attribute filter — coming with "
+                            "product_attributes (disabled)",
+                        ],
+                        index=0,
+                        key=f"_fb_rt_{_aid}")
+                    _rule_type_map = {
+                        "Single SKU": "sku",
+                        "Multiple SKUs": "sku_list",
+                        "Single Family": "family",
+                        "Multiple Families": "family_list",
+                        "Mixed (SKU + Family)": "mixed",
+                    }
+                    _rule_type = _rule_type_map.get(_rule_type_label)
+                    _rt_disabled = _rule_type is None
+
+                    if _rt_disabled:
+                        st.warning(
+                            "Attribute filters need the "
+                            "`product_attributes` layer (Tier-A1 in "
+                            "the roadmap). They're saved as JSON now "
+                            "but won't filter products until that "
+                            "ships. Pick a different rule type for "
+                            "now.")
+
+                    # Default phrase = first 80 chars of the question.
+                    _phr_default = _q.lower()[:80]
 
                     with st.form(f"_fb_form_{_aid}",
                                   clear_on_submit=False):
                         _alias_phrase = st.text_input(
-                            "Alias phrase (will be matched in future "
-                            "questions)",
-                            value=_q.lower()[:80],
+                            "Alias phrase (lowercase, substring "
+                            "matched in future questions)",
+                            value=_phr_default,
                             key=f"_fb_phr_{_aid}",
-                            help="A short trigger phrase, lowercased. "
-                                 "When the AI sees this substring in a "
-                                 "future question it will know which "
-                                 "SKU/family you mean. Shorter is "
-                                 "usually better — e.g. 'warm strip', "
-                                 "not the full sentence.")
-                        _alias_sku = st.selectbox(
-                            "Correct SKU",
-                            options=_sku_options,
-                            index=0,
-                            key=f"_fb_sku_{_aid}",
-                            help="The SKU the AI should have answered "
-                                 "with. Pick (none) for a family-level "
-                                 "mapping.")
-                        _alias_family = st.text_input(
-                            "OR product family (uppercase, e.g. "
-                            "SIERRA38)",
-                            value="",
-                            key=f"_fb_fam_{_aid}",
-                            help="Use this for family-level mappings. "
-                                 "If both SKU and family are set, both "
-                                 "will be stored.")
+                            help="Shorter is usually better — e.g. "
+                                 "'warm strip', not the full sentence.")
+
+                        # Conditional inputs based on rule_type
+                        _alias_skus_picked: list = []
+                        _alias_families_picked: list = []
+                        _alias_paste_skus = ""
+                        _alias_paste_fams = ""
+
+                        if _rule_type in ("sku", "mixed"):
+                            _alias_skus_picked = st.multiselect(
+                                "Correct SKU (pick one)",
+                                options=_all_skus,
+                                max_selections=1,
+                                key=f"_fb_sku1_{_aid}",
+                                help="The SKU the AI should have "
+                                     "answered with.")
+                        if _rule_type == "sku_list":
+                            _alias_skus_picked = st.multiselect(
+                                "Correct SKUs (pick all that apply)",
+                                options=_all_skus,
+                                key=f"_fb_skuN_{_aid}",
+                                help="Multi-target rule: the phrase "
+                                     "maps to ANY of these SKUs.")
+                            _alias_paste_skus = st.text_area(
+                                "OR paste a SKU list (one per line "
+                                "or comma-separated)",
+                                value="", height=80,
+                                key=f"_fb_paste_skuN_{_aid}",
+                                help="Pasted SKUs are validated "
+                                     "against the products CSV before "
+                                     "save. Invalid ones are reported "
+                                     "and not stored.")
+                        if _rule_type in ("family", "mixed"):
+                            _alias_families_picked = st.multiselect(
+                                "Correct family (pick one, uppercase)",
+                                options=_all_families,
+                                max_selections=1,
+                                key=f"_fb_fam1_{_aid}")
+                        if _rule_type == "family_list":
+                            _alias_families_picked = st.multiselect(
+                                "Correct families (pick all that apply)",
+                                options=_all_families,
+                                key=f"_fb_famN_{_aid}",
+                                help="Multi-target rule: the phrase "
+                                     "maps to ANY of these families.")
+                            _alias_paste_fams = st.text_area(
+                                "OR paste a family list (one per line "
+                                "or comma-separated)",
+                                value="", height=80,
+                                key=f"_fb_paste_famN_{_aid}")
+
                         _alias_conf = st.slider(
                             "Confidence",
                             min_value=0.5, max_value=1.0,
                             value=0.9, step=0.05,
                             key=f"_fb_conf_{_aid}")
-                        _save_alias = st.form_submit_button(
-                            ":floppy_disk: Save alias",
-                            type="primary",
-                            use_container_width=True)
 
-                    if _save_alias:
+                        _save_alias = st.form_submit_button(
+                            ":floppy_disk: Save rule",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=_rt_disabled)
+
+                    # Existing-rules panel for THIS phrase — shown
+                    # OUTSIDE the form so it updates on phrase change.
+                    if _alias_phrase and _alias_phrase.strip():
+                        try:
+                            _existing = db.aliases_for_phrase(
+                                _alias_phrase)
+                        except Exception:
+                            _existing = []
+                        if _existing:
+                            with st.expander(
+                                    f":bookmark: This phrase already "
+                                    f"has {len(_existing)} rule(s) — "
+                                    "click to review before saving",
+                                    expanded=False):
+                                _existing_rows = []
+                                for _exr in _existing:
+                                    _existing_rows.append({
+                                        "id": int(_exr["id"]),
+                                        "rule_type":
+                                            _exr["rule_type"] or "",
+                                        "sku": _exr["sku"] or "",
+                                        "family":
+                                            _exr["product_family"] or "",
+                                        "skus_json":
+                                            (_exr["target_skus_json"]
+                                             or ""),
+                                        "families_json":
+                                            (_exr[
+                                                 "target_families_json"]
+                                             or ""),
+                                        "confidence":
+                                            _exr["confidence"],
+                                        "times_used":
+                                            _exr["times_used"],
+                                        "approved_by":
+                                            _exr["approved_by"] or "",
+                                    })
+                                st.dataframe(
+                                    pd.DataFrame(_existing_rows),
+                                    width="stretch", height=160)
+                                st.caption(
+                                    "Saving below adds another rule "
+                                    "for this phrase. Use a different "
+                                    "phrase if you want to preserve "
+                                    "the originals; or delete one of "
+                                    "the above from the bottom panel "
+                                    "if it's wrong.")
+
+                    if _save_alias and not _rt_disabled:
                         _phr = (_alias_phrase or "").strip().lower()
-                        _sku_val = (None
-                                     if _alias_sku == _sku_options[0]
-                                     else _alias_sku)
-                        _fam_val = (
-                            _alias_family.strip().upper() or None)
                         if not _phr:
                             st.error("Alias phrase can't be empty.")
-                        elif not _sku_val and not _fam_val:
-                            st.error(
-                                "Need a SKU or a product family — "
-                                "otherwise the alias has nothing to "
-                                "map to.")
                         else:
-                            _actor_fb = (st.session_state
-                                          .get("current_user", "")
-                                          .strip()
-                                          or "unknown")
-                            try:
-                                _new_alias_id = db.upsert_product_alias(
-                                    _phr,
-                                    sku=_sku_val,
-                                    product_family=_fam_val,
-                                    confidence=float(_alias_conf),
-                                    approved_by=_actor_fb)
-                                # Record the linkage so this audit row
-                                # shows the green check next time.
-                                db.record_feedback_event(
-                                    source="ai_chat",
-                                    entity_type="ai_audit_log",
-                                    entity_id=str(_aid),
-                                    feedback="correction",
-                                    note=(f"alias_id={_new_alias_id} "
-                                          f"phrase='{_phr}' "
-                                          f"sku={_sku_val or ''} "
-                                          f"family={_fam_val or ''}"),
-                                    user_id=_actor_fb)
-                                st.success(
-                                    f":white_check_mark: Alias #"
-                                    f"{_new_alias_id} saved. The AI "
-                                    "will use this on the next "
-                                    "matching question.")
-                                st.rerun()
-                            except Exception as _e:
-                                st.error(f"Could not save alias: {_e}")
+                            # Resolve the multi-target lists from
+                            # whichever inputs the rule_type used.
+                            def _split_paste(s):
+                                if not s:
+                                    return []
+                                _parts = []
+                                for _line in s.replace(",", "\n").splitlines():
+                                    _line = _line.strip()
+                                    if _line:
+                                        _parts.append(_line)
+                                return _parts
+
+                            _final_skus = list(_alias_skus_picked)
+                            _pasted_skus = _split_paste(_alias_paste_skus)
+                            _invalid_skus = []
+                            if _pasted_skus and _all_skus:
+                                _sku_set = set(_all_skus)
+                                for _ps in _pasted_skus:
+                                    if _ps in _sku_set:
+                                        if _ps not in _final_skus:
+                                            _final_skus.append(_ps)
+                                    else:
+                                        _invalid_skus.append(_ps)
+
+                            _final_families = list(
+                                _alias_families_picked)
+                            _pasted_fams = _split_paste(_alias_paste_fams)
+                            _invalid_fams = []
+                            if _pasted_fams:
+                                _fam_set = set(
+                                    _f.upper() for _f in _all_families)
+                                for _pf in _pasted_fams:
+                                    _pf_u = _pf.strip().upper()
+                                    if not _pf_u:
+                                        continue
+                                    if _pf_u in _fam_set:
+                                        if _pf_u not in _final_families:
+                                            _final_families.append(_pf_u)
+                                    else:
+                                        _invalid_fams.append(_pf)
+
+                            if _invalid_skus or _invalid_fams:
+                                _bits = []
+                                if _invalid_skus:
+                                    _bits.append(
+                                        f"Invalid SKUs (not in "
+                                        f"products CSV): "
+                                        + ", ".join(
+                                            f"`{s}`" for s
+                                            in _invalid_skus))
+                                if _invalid_fams:
+                                    _bits.append(
+                                        f"Invalid families: "
+                                        + ", ".join(
+                                            f"`{f}`" for f
+                                            in _invalid_fams))
+                                _bits.append(
+                                    "Fix and re-save, or remove these "
+                                    "from the paste box.")
+                                st.error("\n\n".join(_bits))
+                            elif (not _final_skus
+                                   and not _final_families):
+                                st.error(
+                                    "Need at least one SKU or "
+                                    "family — otherwise the rule has "
+                                    "nothing to map to.")
+                            else:
+                                _actor_fb = (
+                                    st.session_state
+                                    .get("current_user", "")
+                                    .strip() or "unknown")
+                                try:
+                                    _single_sku = (
+                                        _final_skus[0]
+                                        if (len(_final_skus) == 1
+                                            and _rule_type
+                                            in ("sku", "mixed"))
+                                        else None)
+                                    _single_fam = (
+                                        _final_families[0]
+                                        if (len(_final_families) == 1
+                                            and _rule_type
+                                            in ("family", "mixed"))
+                                        else None)
+                                    _multi_skus = (
+                                        _final_skus
+                                        if _rule_type == "sku_list"
+                                        else None)
+                                    _multi_fams = (
+                                        _final_families
+                                        if _rule_type == "family_list"
+                                        else None)
+                                    _new_alias_id = db.upsert_product_alias(
+                                        _phr,
+                                        sku=_single_sku,
+                                        product_family=_single_fam,
+                                        rule_type=_rule_type,
+                                        target_skus=_multi_skus,
+                                        target_families=_multi_fams,
+                                        confidence=float(_alias_conf),
+                                        approved_by=_actor_fb,
+                                        source="feedback",
+                                        created_by=_actor_fb)
+                                    db.record_feedback_event(
+                                        source="ai_chat",
+                                        entity_type="ai_audit_log",
+                                        entity_id=str(_aid),
+                                        feedback="correction",
+                                        note=(f"alias_id="
+                                              f"{_new_alias_id} "
+                                              f"phrase='{_phr}' "
+                                              f"rule_type={_rule_type} "
+                                              f"n_skus="
+                                              f"{len(_final_skus)} "
+                                              f"n_families="
+                                              f"{len(_final_families)}"),
+                                        user_id=_actor_fb)
+                                    st.success(
+                                        f":white_check_mark: Rule #"
+                                        f"{_new_alias_id} saved "
+                                        f"({_rule_type}: "
+                                        f"{len(_final_skus)} SKU(s), "
+                                        f"{len(_final_families)} "
+                                        f"family/families). The AI "
+                                        "will use this on the next "
+                                        "matching question.")
+                                    st.rerun()
+                                except Exception as _e:
+                                    st.error(
+                                        f"Could not save rule: {_e}")
 
     # ---- Existing aliases panel ----
     st.divider()
@@ -14448,10 +14767,19 @@ elif page == "AI Feedback":
                 "above and it'll appear here.")
         else:
             _alias_df = pd.DataFrame([dict(a) for a in _aliases])
+            # New v2.63 columns shown alongside the legacy ones. Some
+            # may be absent on a fresh DB before the migration runs;
+            # guard with .reindex so missing cols render blank rather
+            # than KeyError.
+            _show_cols = [
+                "id", "phrase", "rule_type",
+                "sku", "product_family",
+                "target_skus_json", "target_families_json",
+                "confidence", "times_used", "source",
+                "approved_by", "created_by", "last_used_at",
+            ]
             st.dataframe(
-                _alias_df[["id", "phrase", "sku", "product_family",
-                            "confidence", "times_used", "approved_by",
-                            "last_used_at"]],
+                _alias_df.reindex(columns=_show_cols),
                 width="stretch", height=300)
             _del_id = st.number_input(
                 "Delete alias by id (carefully — audit logs the delete)",

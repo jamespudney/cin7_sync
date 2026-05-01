@@ -541,6 +541,86 @@ def _migrate_supplier_stockout_recovery(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _migrate_product_aliases_multi_target(conn: sqlite3.Connection) -> None:
+    """v2.63: extend product_aliases beyond a single (sku XOR family)
+    target so a phrase can map to multiple SKUs, multiple families, or
+    a captured attribute filter.
+
+    Adds (idempotent ADD COLUMN):
+      - rule_type           TEXT   (values: 'sku' | 'sku_list' | 'family'
+                                    | 'family_list' | 'attributes' |
+                                    'mixed' | NULL for legacy single-target
+                                    rows)
+      - target_skus_json    TEXT   JSON list of SKUs (or NULL)
+      - target_families_json TEXT  JSON list of families (or NULL)
+      - attributes_json     TEXT   JSON object (or NULL) — captured for
+                                    later use when product_attributes
+                                    (A1) ships; alias-before-LLM hint
+                                    surfaces it but the system can't
+                                    enforce attribute filters yet.
+
+    Backfill: any pre-v2.63 row keeps its original sku / product_family
+    columns AND gets rule_type set to 'sku' (if sku is non-null) or
+    'family' (if product_family is non-null). The new JSON columns are
+    left NULL — readers consult sku/product_family first, then
+    target_skus_json / target_families_json. find_alias_in_question
+    handles both shapes transparently.
+    """
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('product_aliases')").fetchall()}
+        if "rule_type" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN rule_type TEXT")
+            # Backfill: classify legacy rows so future readers can
+            # route uniformly on rule_type.
+            conn.execute(
+                "UPDATE product_aliases SET rule_type = 'sku' "
+                "WHERE rule_type IS NULL AND sku IS NOT NULL "
+                "AND TRIM(sku) != ''")
+            conn.execute(
+                "UPDATE product_aliases SET rule_type = 'family' "
+                "WHERE rule_type IS NULL AND product_family IS NOT NULL "
+                "AND TRIM(product_family) != ''")
+        if "target_skus_json" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN "
+                "target_skus_json TEXT")
+        if "target_families_json" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN "
+                "target_families_json TEXT")
+        if "attributes_json" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN "
+                "attributes_json TEXT")
+        # Provenance columns (v2.63 spec): track WHERE the rule came
+        # from (manual / feedback / system) and WHO created it (separate
+        # from approved_by which captures who signed off — usually the
+        # same person but the model leaves room for future split).
+        if "source" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN source TEXT")
+            # Backfill: any legacy row is assumed manual unless an AI
+            # marker is detectable in approved_by.
+            conn.execute(
+                "UPDATE product_aliases "
+                "SET source = CASE "
+                "  WHEN LOWER(COALESCE(approved_by, '')) IN ('ai', "
+                "       'system', 'alias_lookup') THEN 'system' "
+                "  ELSE 'manual' END "
+                "WHERE source IS NULL")
+        if "created_by" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN created_by TEXT")
+            # Default created_by = approved_by for legacy rows.
+            conn.execute(
+                "UPDATE product_aliases SET created_by = approved_by "
+                "WHERE created_by IS NULL")
+    except sqlite3.Error:
+        pass
+
+
 def _migrate_demand_signal_match_columns(conn: sqlite3.Connection) -> None:
     """v2.61: split SKU lineage and persist auto-reconciler match metadata.
 
@@ -809,6 +889,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_supplier_dropship(conn)
         _migrate_supplier_stockout_recovery(conn)
         _migrate_demand_signal_match_columns(conn)
+        _migrate_product_aliases_multi_target(conn)
         yield conn
     finally:
         conn.close()
@@ -2354,63 +2435,154 @@ def list_ai_queries(user_id: Optional[str] = None,
 def upsert_product_alias(phrase: str, *,
                           sku: Optional[str] = None,
                           product_family: Optional[str] = None,
+                          rule_type: Optional[str] = None,
+                          target_skus: Optional[list] = None,
+                          target_families: Optional[list] = None,
+                          attributes: Optional[dict] = None,
                           confidence: float = 0.5,
-                          approved_by: str = "ai") -> int:
-    """Store/update a phrase → SKU/family mapping. Phrase is lowercased.
-    On collision (same phrase already mapped to same target), bump
-    times_used + last_used_at instead of creating duplicate rows.
+                          approved_by: str = "ai",
+                          source: str = "manual",
+                          created_by: Optional[str] = None) -> int:
+    """Store/update a phrase → target mapping. Phrase is lowercased.
+    On collision (same phrase + same target shape), bump times_used.
+    Writes an audit_log row on every insert/update.
 
-    Writes an audit_log row on every insert/update so the alias-learning
-    trail is queryable.
+    Two compatible call shapes:
+
+      Legacy single-target (pre-v2.63):
+        upsert_product_alias(phrase, sku='LED-X', confidence=0.9)
+        upsert_product_alias(phrase, product_family='SIERRA38')
+
+      Multi-target (v2.63+):
+        upsert_product_alias(phrase, rule_type='sku_list',
+                             target_skus=['LED-A','LED-B'])
+        upsert_product_alias(phrase, rule_type='family_list',
+                             target_families=['SIERRA38','SMOKIES38'])
+        upsert_product_alias(phrase, rule_type='attributes',
+                             attributes={'product_type':'LED strip',
+                                         'kelvin':[2200,2700]})
+
+    Both shapes round-trip through the same row. The single-target
+    fields (sku, product_family) stay populated when the rule is a
+    single target so legacy readers keep working.
 
     Returns the id of the row (existing or newly inserted).
     """
+    import json as _json
+
     phrase_n = (phrase or "").strip().lower()
     if not phrase_n:
         return 0
+
+    # Normalise inputs. If caller passed a single sku/family, hoist
+    # them into the corresponding rule_type/list shape so the row is
+    # stored consistently going forward.
+    target_skus = [s for s in (target_skus or []) if s and s.strip()]
+    target_families = [f.strip().upper() for f in (target_families or [])
+                        if f and f.strip()]
+    if rule_type is None:
+        if attributes:
+            rule_type = "attributes"
+        elif len(target_skus) > 1:
+            rule_type = "sku_list"
+        elif len(target_families) > 1:
+            rule_type = "family_list"
+        elif sku and product_family:
+            rule_type = "mixed"
+        elif sku:
+            rule_type = "sku"
+        elif product_family:
+            rule_type = "family"
+        elif target_skus:
+            rule_type = "sku"
+            sku = sku or target_skus[0]
+        elif target_families:
+            rule_type = "family"
+            product_family = product_family or target_families[0]
+
+    target_skus_json = _json.dumps(target_skus) if target_skus else None
+    target_families_json = (_json.dumps(target_families)
+                              if target_families else None)
+    attributes_json = (_json.dumps(attributes, sort_keys=True)
+                        if attributes else None)
+
     with connect() as c:
+        # Collision detection: same phrase + same canonical target
+        # shape. For multi-target rules we compare the JSON blobs so
+        # two distinct lists don't collapse to one row.
         existing = c.execute(
             "SELECT id, times_used FROM product_aliases "
-            "WHERE phrase = ? AND COALESCE(sku, '') = COALESCE(?, '') "
-            "AND COALESCE(product_family, '') = COALESCE(?, '')",
-            (phrase_n, sku, product_family),
+            "WHERE phrase = ? "
+            "AND COALESCE(sku, '') = COALESCE(?, '') "
+            "AND COALESCE(product_family, '') = COALESCE(?, '') "
+            "AND COALESCE(target_skus_json, '') = COALESCE(?, '') "
+            "AND COALESCE(target_families_json, '') = COALESCE(?, '') "
+            "AND COALESCE(attributes_json, '') = COALESCE(?, '')",
+            (phrase_n, sku, product_family,
+             target_skus_json, target_families_json, attributes_json),
         ).fetchone()
         if existing:
             c.execute(
                 "UPDATE product_aliases SET "
                 "times_used = times_used + 1, "
                 "last_used_at = datetime('now'), "
-                "confidence = MAX(confidence, ?) "
+                "confidence = MAX(confidence, ?), "
+                "rule_type = COALESCE(rule_type, ?) "
                 "WHERE id = ?",
-                (confidence, existing["id"]),
+                (confidence, rule_type, existing["id"]),
             )
             row_id = int(existing["id"])
             c.execute(
                 "INSERT INTO audit_log (event, actor, target, detail) "
                 "VALUES (?, ?, ?, ?)",
                 ("product_alias.bump", approved_by, str(row_id),
-                 f"phrase='{phrase_n}' sku={sku or ''} "
-                 f"family={product_family or ''} "
+                 f"phrase='{phrase_n}' rule_type={rule_type or ''} "
                  f"confidence={confidence}"))
             return row_id
         else:
             cur = c.execute(
                 """
                 INSERT INTO product_aliases
-                    (phrase, sku, product_family, confidence, approved_by)
-                VALUES (?, ?, ?, ?, ?)
+                    (phrase, sku, product_family, rule_type,
+                     target_skus_json, target_families_json,
+                     attributes_json, confidence, approved_by,
+                     source, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (phrase_n, sku, product_family, confidence, approved_by),
+                (phrase_n, sku, product_family, rule_type,
+                 target_skus_json, target_families_json,
+                 attributes_json, confidence, approved_by,
+                 source, created_by or approved_by),
             )
             row_id = int(cur.lastrowid)
             c.execute(
                 "INSERT INTO audit_log (event, actor, target, detail) "
                 "VALUES (?, ?, ?, ?)",
                 ("product_alias.insert", approved_by, str(row_id),
-                 f"phrase='{phrase_n}' sku={sku or ''} "
-                 f"family={product_family or ''} "
+                 f"phrase='{phrase_n}' rule_type={rule_type or ''} "
+                 f"sku={sku or ''} family={product_family or ''} "
+                 f"n_skus={len(target_skus)} "
+                 f"n_families={len(target_families)} "
+                 f"has_attributes={bool(attributes)} "
                  f"confidence={confidence}"))
             return row_id
+
+
+def aliases_for_phrase(phrase: str) -> List[sqlite3.Row]:
+    """Return ALL rules whose phrase exactly matches `phrase` (after
+    normalising to lowercase). Used by the AI Feedback page to show
+    'this phrase already has the following rules' BEFORE the user
+    saves a new one — prevents accidental duplicates and lets the
+    reviewer see what's there before adding more."""
+    phrase_n = (phrase or "").strip().lower()
+    if not phrase_n:
+        return []
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM product_aliases WHERE phrase = ? "
+            "ORDER BY confidence DESC, times_used DESC",
+            (phrase_n,),
+        ).fetchall()
 
 
 def list_product_aliases(*,
@@ -2451,17 +2623,37 @@ def delete_product_alias(alias_id: int, actor: str = "system") -> None:
 
 def find_alias_in_question(question: str,
                             min_confidence: float = 0.6) -> List[dict]:
-    """Best-effort match of stored alias phrases against the user's
-    question. Returns a list of {phrase, sku, product_family, confidence,
-    times_used} for any alias whose phrase appears as a substring in
-    the lowercased question, longest-phrase-first.
+    """Best-effort substring match of stored alias phrases against the
+    user's question. Returns hits longest-phrase-first, deduped by
+    target shape so a phrase mapped twice to the same target only
+    surfaces once.
+
+    Each hit dict (v2.63 multi-target shape):
+        {
+          "id": int,
+          "phrase": str,
+          "rule_type": str | None,    # 'sku'/'sku_list'/'family'/
+                                        # 'family_list'/'mixed'/'attributes'
+          "skus":         list[str],   # always populated; single rules
+                                        # surface as a 1-element list,
+                                        # multi-rules surface fully
+          "families":     list[str],
+          "attributes":   dict,
+          "confidence":   float,
+          "times_used":   int,
+        }
+
+    Callers that want the legacy single-target fields can read
+    hit['skus'][0] / hit['families'][0] when len()==1.
 
     Used by the AI Assistant page to inject 'past corrections' hints
-    into the system prompt before sending to the LLM. Substring match
-    catches the realistic case (alias 'warm strip' in a question like
-    'do we have any warm strip in stock?') without requiring exact
-    full-question matches.
+    into the system prompt before the LLM call. Substring match
+    catches realistic phrasing (alias 'warm strip' inside 'do we have
+    any warm strip in stock?') without requiring exact full-question
+    matches.
     """
+    import json as _json
+
     q = (question or "").strip().lower()
     if not q:
         return []
@@ -2471,24 +2663,87 @@ def find_alias_in_question(question: str,
             "ORDER BY length(phrase) DESC, times_used DESC LIMIT 2000",
             (min_confidence,),
         ).fetchall()
+
+    def _decode_list(blob):
+        if not blob:
+            return []
+        try:
+            v = _json.loads(blob)
+            return [str(x) for x in v] if isinstance(v, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def _decode_dict(blob):
+        if not blob:
+            return {}
+        try:
+            v = _json.loads(blob)
+            return dict(v) if isinstance(v, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
     hits: list[dict] = []
-    seen_targets: set = set()  # de-dup overlapping phrases that point
-                                  # to the same target
+    seen_targets: set = set()
     for r in rows:
         phrase = (r["phrase"] or "").strip().lower()
         if not phrase or phrase not in q:
             continue
-        key = (r["sku"] or "", r["product_family"] or "")
+
+        # Compose unified multi-target view of this row. Single-target
+        # legacy rows (sku XOR family populated) get hoisted into the
+        # list shape so callers don't need to special-case.
+        cols = r.keys() if hasattr(r, "keys") else []
+
+        skus = (_decode_list(r["target_skus_json"])
+                if "target_skus_json" in cols else [])
+        families = (_decode_list(r["target_families_json"])
+                    if "target_families_json" in cols else [])
+        attrs = (_decode_dict(r["attributes_json"])
+                  if "attributes_json" in cols else {})
+
+        if not skus and r["sku"]:
+            skus = [str(r["sku"])]
+        if not families and r["product_family"]:
+            families = [str(r["product_family"])]
+
+        # Dedup key uses the FULL target shape so a phrase mapped to
+        # different sets of SKUs surfaces twice (intended).
+        key = (
+            tuple(sorted(s.upper() for s in skus)),
+            tuple(sorted(f.upper() for f in families)),
+            tuple(sorted(attrs.items())),
+        )
         if key in seen_targets:
             continue
         seen_targets.add(key)
+
+        rule_type = (r["rule_type"]
+                      if "rule_type" in cols and r["rule_type"]
+                      else None)
+        if rule_type is None:
+            # Infer for fully legacy rows.
+            if attrs:
+                rule_type = "attributes"
+            elif len(skus) > 1:
+                rule_type = "sku_list"
+            elif len(families) > 1:
+                rule_type = "family_list"
+            elif skus and families:
+                rule_type = "mixed"
+            elif skus:
+                rule_type = "sku"
+            elif families:
+                rule_type = "family"
+
         hits.append({
+            "id": int(r["id"]),
             "phrase": phrase,
-            "sku": r["sku"],
-            "product_family": r["product_family"],
+            "rule_type": rule_type,
+            "skus": skus,
+            "families": families,
+            "attributes": attrs,
             "confidence": float(r["confidence"] or 0),
             "times_used": int(r["times_used"] or 0),
-            "id": int(r["id"]),
         })
     return hits
 
