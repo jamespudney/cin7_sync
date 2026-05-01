@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.52 — Proactive intelligence (Phase 0): demand_signals table + sidebar capture form + 3 AI tools (recent/top-inquired/rising) + rule-based AI Warning column on Ordering page. docs/demand-scoring.md designs the score formula future Slack/Gorgias signals will plug into. (May 1)")
+    st.caption("🟢 v2.53 — Demand-capture SKU field rebuilt as proper smart-search: paste any SKU, type freely, see live suggestions matching what you typed (click to fill), or save with whatever you typed (free-text supported for new product requests). Stops the typing-doesn't-stick UX issue. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -349,15 +349,69 @@ with st.sidebar:
                     else [])
             except Exception:
                 _sku_options = []
-            with st.form("ds_form", clear_on_submit=True):
-                _ds_sku = st.selectbox(
-                    "SKU (preferred)",
-                    options=[""] + _sku_options,
-                    index=0,
-                    help="Pick the exact SKU if you know it. Empty if "
-                         "you only know the product family.",
-                    placeholder="Start typing…",
-                )
+            # ---- Smart SKU search (OUTSIDE the form so it can be
+            # reactive — clicking a suggestion re-runs and updates the
+            # text input). Lets the user paste, type freely, and pick
+            # from live-filtered matches.
+            _sku_upper = {s.upper(): s for s in _sku_options}
+            _sku_text_key = "_ds_sku_text"
+            if _sku_text_key not in st.session_state:
+                st.session_state[_sku_text_key] = ""
+
+            _ds_sku_typed = st.text_input(
+                "SKU (preferred — paste or type)",
+                key=_sku_text_key,
+                placeholder="e.g. LED-XRD-60W-24 — paste or start typing…",
+                help="Free text — paste a SKU, type the start of one, "
+                     "or click a suggestion below. Leave empty if you "
+                     "only know the product family.")
+
+            # Live status / suggestions based on what they typed
+            _ds_sku_resolved = ""
+            _q = (_ds_sku_typed or "").strip()
+            if _q:
+                _q_upper = _q.upper()
+                if _q_upper in _sku_upper:
+                    # Exact match — show product name as confirmation
+                    _ds_sku_resolved = _sku_upper[_q_upper]
+                    try:
+                        _name = (products[products["SKU"] ==
+                                            _ds_sku_resolved]
+                                  ["Name"].iloc[0])
+                        st.caption(
+                            f":white_check_mark: **{_ds_sku_resolved}** — "
+                            f"{str(_name)[:80]}")
+                    except (IndexError, KeyError):
+                        st.caption(
+                            f":white_check_mark: {_ds_sku_resolved}")
+                else:
+                    # Partial / fuzzy match — offer suggestions
+                    _matches = sorted(
+                        s for s in _sku_options
+                        if _q_upper in s.upper()
+                    )[:6]
+                    if _matches:
+                        st.caption(
+                            f"_{len(_matches)} possible match"
+                            f"{'es' if len(_matches) != 1 else ''}_ — "
+                            "click to use:")
+                        # Clickable suggestion buttons (must be outside
+                        # the form to be reactive)
+                        for _i, _m in enumerate(_matches):
+                            if st.button(
+                                    _m, key=f"_ds_pick_{_i}_{_m}",
+                                    use_container_width=True):
+                                st.session_state[_sku_text_key] = _m
+                                st.rerun()
+                    elif len(_q) >= 3:
+                        st.caption(
+                            f":warning: `{_q}` is not in the CIN7 "
+                            "catalog. You can still save the signal — "
+                            "we'll just store it as free-text SKU "
+                            "(useful for new product requests).")
+
+            # ---- The actual form for the rest of the fields
+            with st.form("ds_form", clear_on_submit=False):
                 _ds_family = st.text_input(
                     "Product family (fallback)",
                     placeholder="e.g. SIERRA38 — only if no SKU",
@@ -387,7 +441,13 @@ with st.sidebar:
                     ":floppy_disk: Save signal", type="primary",
                     use_container_width=True)
             if _ds_submit:
-                if not _ds_sku and not _ds_family.strip():
+                # Use whatever's in the SKU text input — exact match
+                # if found, free-text otherwise.
+                _ds_sku_final = (
+                    _ds_sku_resolved
+                    or (st.session_state[_sku_text_key] or "").strip()
+                    or None)
+                if not _ds_sku_final and not _ds_family.strip():
                     st.error(
                         "Need either a SKU or a product family. "
                         "Signals without a target product can't drive "
@@ -397,7 +457,7 @@ with st.sidebar:
                         _new_id = db.insert_demand_signal(
                             source="manual",
                             signal_type=_ds_type,
-                            sku=_ds_sku or None,
+                            sku=_ds_sku_final,
                             product_family=(
                                 _ds_family.strip().upper() or None),
                             quantity=float(_ds_qty) if _ds_qty > 0 else None,
@@ -409,7 +469,11 @@ with st.sidebar:
                         )
                         st.success(
                             f":white_check_mark: Signal #{_new_id} "
-                            "saved.")
+                            f"saved for **{_ds_sku_final or _ds_family}**.")
+                        # Clear the SKU search after save so next
+                        # capture starts fresh
+                        st.session_state[_sku_text_key] = ""
+                        st.rerun()
                     except Exception as _exc:
                         st.error(f"Could not save: {_exc}")
 
