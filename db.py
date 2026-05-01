@@ -470,8 +470,12 @@ CREATE TABLE IF NOT EXISTS demand_signals (
     confidence      REAL    DEFAULT 1.0,
     needs_review    INTEGER DEFAULT 0,       -- 1/0 boolean
 
-    -- LIFECYCLE — set by buyer/sales after the fact when known
-    outcome         TEXT,                    -- 'open' | 'converted' | 'lost' | 'duplicate' | 'invalid'
+    -- LIFECYCLE — set by buyer/sales after the fact when known.
+    -- Canonical values (v2.59+): 'pending' | 'converted' | 'lost' |
+    --                            'ignored' | 'duplicate' | 'wrong_sku'
+    -- Legacy values still in old rows: 'open' (= pending), 'invalid'
+    -- (= ignored). normalize_outcome() in this file maps them on read.
+    outcome         TEXT,
     note            TEXT,                    -- buyer/sales notes on this signal
 
     -- AUDIT
@@ -2346,6 +2350,38 @@ def lookup_aliases(phrase: str,
 # ---------------------------------------------------------------------------
 # Demand signals — proactive intelligence layer
 # ---------------------------------------------------------------------------
+
+# Canonical outcome vocabulary as of v2.59. The DB column is just TEXT
+# (no CHECK constraint), so legacy values can coexist — we map them on
+# read for display, and the next edit on a row rewrites it to the new
+# vocabulary. See `normalize_outcome()` below for the mapping.
+OUTCOME_VALUES = [
+    "pending",     # not yet resolved (was 'open' pre-v2.59)
+    "converted",   # closed as a sale — feeds demand_scoring conversion factor
+    "lost",        # customer didn't buy
+    "ignored",     # not actionable / spam (was 'invalid' pre-v2.59)
+    "duplicate",   # same demand already captured in another row
+    "wrong_sku",   # captured SKU was wrong; corrected via 'approved_sku' edit
+]
+
+# Legacy → canonical map. Applied on display so old rows render under the
+# new labels without a destructive migration.
+_OUTCOME_LEGACY_MAP = {
+    "open":    "pending",
+    "invalid": "ignored",
+}
+
+
+def normalize_outcome(value):
+    """Return the canonical outcome label for display. Maps legacy values
+    ('open' → 'pending', 'invalid' → 'ignored') and treats NULL/empty as
+    'pending'. Anything already canonical (or unrecognised) is returned
+    as-is so we never silently drop information."""
+    if value is None or str(value).strip() == "":
+        return "pending"
+    v = str(value).strip().lower()
+    return _OUTCOME_LEGACY_MAP.get(v, v)
+
 
 def insert_demand_signal(*,
                           source: str,

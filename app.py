@@ -20,7 +20,7 @@ from __future__ import annotations
 import glob
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -219,7 +219,7 @@ products = load("products")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.58 — Fix: demand-capture smart-search returned no suggestions for ANYTHING because the form (inside `with st.sidebar:`) was running BEFORE `products = load(\"products\")` further down the script. The try/except silently swallowed the NameError, leaving `_sku_options = []` permanently. Now products is loaded before the sidebar block, so SKU/name autocomplete actually has data. (May 1)")
+    st.caption("🟢 v2.59 — Demand Signals review/edit page: filter captured signals by SKU/source/outcome/confidence/date, edit outcome (pending/converted/lost/ignored/duplicate/wrong_sku), approved_sku, product_family, notes inline. Edits go through `update_demand_signal` so each change is audited. demand_scoring.py now counts `outcome='converted'` rows in the conversion factor (deduped by id with signal_type='sold'), so marking an inquiry as won feeds back into the score. Outcome legacy values ('open'/'invalid') auto-display as the new vocabulary via `normalize_outcome`. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -617,6 +617,7 @@ with st.sidebar:
         [
             "Overview",
             "AI Assistant",
+            "Demand Signals",
             "Monthly Metrics",
             "Ordering",
             "FixedCost Audit",
@@ -14027,6 +14028,257 @@ elif page == "AI Assistant":
                 st.session_state["_ai_transcript"] = []
                 st.session_state["_ai_messages"] = []
                 st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Page: Demand Signals — review & edit captured signals
+# ---------------------------------------------------------------------------
+#
+# Lets the buyer / sales team triage signals captured via the demand-capture
+# sidebar form (or any future Slack / Gorgias / SEO ingest). Edit `outcome`
+# to mark inquiries as converted/lost/etc. — the conversion rate inside
+# demand_scoring.py reads `outcome='converted'` so these edits feed back
+# into the score the next time it's computed.
+#
+# Edits go through db.update_demand_signal which writes a 'demand_signal.update'
+# row to audit_log per change, so the trail of who-changed-what stays intact.
+
+elif page == "Demand Signals":
+    st.header(":clipboard: Demand Signals — Review & Edit")
+    st.caption(
+        "Triage captured demand signals. Mark each one with its real "
+        "outcome (converted, lost, ignored, duplicate, wrong_sku) — the "
+        "demand score reads `outcome='converted'` so your edits "
+        "compound into a sharper signal next time."
+    )
+
+    # ---- Filters ----
+    fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([1.5, 1, 1, 1, 1])
+    sku_filter = fcol1.text_input(
+        "SKU contains", value="",
+        help="Substring match against the captured SKU. Leave blank for all.",
+    )
+
+    # Source list — pulled from existing rows so we don't have to hard-code
+    # every future ingestion source.
+    try:
+        _all_for_src = db.list_demand_signals(limit=5000)
+        src_set = sorted({(r["source"] or "").lower()
+                          for r in _all_for_src if r["source"]})
+    except Exception:
+        src_set = []
+    source_filter = fcol2.selectbox(
+        "Source", options=["(any)"] + src_set, index=0,
+    )
+
+    outcome_filter = fcol3.selectbox(
+        "Outcome",
+        options=["(any)"] + db.OUTCOME_VALUES,
+        index=0,
+        help="Filters by canonical value. Legacy 'open' rows show up "
+             "under 'pending'; legacy 'invalid' under 'ignored'.",
+    )
+
+    min_conf = fcol4.slider(
+        "Min confidence", min_value=0.0, max_value=1.0,
+        value=0.0, step=0.05,
+        help="Hide low-confidence rows (e.g. AI extractions awaiting "
+             "review). Manual entries default to 1.0.",
+    )
+
+    days_back = fcol5.selectbox(
+        "Date range",
+        options=[7, 30, 90, 365],
+        index=1,
+        format_func=lambda d: f"Last {d} days",
+    )
+
+    # ---- Load rows ----
+    _since_iso = (datetime.utcnow()
+                   - timedelta(days=int(days_back))).isoformat()
+    try:
+        _rows = db.list_demand_signals(
+            source=None if source_filter == "(any)" else source_filter,
+            since=_since_iso,
+            limit=1000,
+        )
+    except Exception as e:
+        st.error(f"Could not load demand_signals: {e}")
+        _rows = []
+
+    if not _rows:
+        st.info(
+            "No signals match these filters. Capture one via the "
+            "**💡 Capture demand signal** form in the sidebar."
+        )
+    else:
+        df_signals = pd.DataFrame([dict(r) for r in _rows])
+
+        # Normalize outcome for display (legacy 'open' → 'pending', etc.)
+        # Keeps untouched rows showing the new vocabulary even though the
+        # underlying DB value hasn't been rewritten.
+        df_signals["outcome"] = df_signals["outcome"].apply(
+            db.normalize_outcome)
+
+        # Apply post-load filters that list_demand_signals doesn't support
+        # natively (sku-substring, min-confidence, normalized outcome).
+        if sku_filter.strip():
+            _q = sku_filter.strip().lower()
+            df_signals = df_signals[
+                df_signals["sku"].fillna("").astype(str)
+                .str.lower().str.contains(_q, na=False)
+            ]
+        df_signals = df_signals[
+            df_signals["confidence"].fillna(0.0).astype(float) >= float(min_conf)
+        ]
+        if outcome_filter != "(any)":
+            df_signals = df_signals[df_signals["outcome"] == outcome_filter]
+
+        st.caption(f"Showing **{len(df_signals)}** signal(s).")
+
+        if df_signals.empty:
+            st.info("No signals match the post-load filters.")
+        else:
+            # Order columns for the editor. id/created_at/source/type/customer
+            # are read-only so the edit can't accidentally rewrite identity.
+            edit_cols = [
+                "id", "created_at", "source", "signal_type",
+                "sku", "product_family", "outcome",
+                "needs_review", "note",
+                "confidence", "customer_name", "salesperson",
+            ]
+            for _c in edit_cols:
+                if _c not in df_signals.columns:
+                    df_signals[_c] = None
+            df_edit_view = df_signals[edit_cols].copy().reset_index(drop=True)
+
+            # Snapshot of original values keyed by id, used after save to
+            # diff against the edited dataframe and only push changes.
+            _orig_by_id = {
+                int(r["id"]): {
+                    k: r[k] for k in
+                    ("sku", "product_family", "outcome",
+                     "needs_review", "note")
+                }
+                for _, r in df_edit_view.iterrows()
+                if pd.notna(r["id"])
+            }
+
+            edited_df = st.data_editor(
+                df_edit_view,
+                num_rows="fixed",
+                width="stretch",
+                height=520,
+                key="ds_review_editor",
+                column_config={
+                    "id": st.column_config.NumberColumn(
+                        "id", disabled=True, width="small"),
+                    "created_at": st.column_config.TextColumn(
+                        "captured at", disabled=True, width="medium"),
+                    "source": st.column_config.TextColumn(
+                        "source", disabled=True, width="small"),
+                    "signal_type": st.column_config.TextColumn(
+                        "type", disabled=True, width="small"),
+                    "sku": st.column_config.TextColumn(
+                        "approved_sku",
+                        help="Edit if the captured SKU was wrong. "
+                             "Saves overwrite the row's `sku` column "
+                             "and feed the score under the new SKU."),
+                    "product_family": st.column_config.TextColumn(
+                        "product_family"),
+                    "outcome": st.column_config.SelectboxColumn(
+                        "outcome",
+                        options=db.OUTCOME_VALUES,
+                        required=True,
+                        help="Marking 'converted' counts this signal "
+                             "in the conversion factor for its SKU."),
+                    "needs_review": st.column_config.CheckboxColumn(
+                        "review?", width="small"),
+                    "note": st.column_config.TextColumn(
+                        "notes", width="large"),
+                    "confidence": st.column_config.NumberColumn(
+                        "conf", disabled=True, format="%.2f",
+                        width="small"),
+                    "customer_name": st.column_config.TextColumn(
+                        "customer", disabled=True),
+                    "salesperson": st.column_config.TextColumn(
+                        "salesperson", disabled=True),
+                },
+            )
+
+            save_col, info_col = st.columns([1, 4])
+            if save_col.button(":floppy_disk: Save changes",
+                                type="primary",
+                                width="stretch"):
+                _actor = (st.session_state.get("current_user", "")
+                           or "").strip() or "unknown"
+                _n_changed = 0
+                _errors = []
+                for _, new_row in edited_df.iterrows():
+                    try:
+                        _rid = int(new_row["id"])
+                    except (TypeError, ValueError):
+                        continue
+                    _orig = _orig_by_id.get(_rid)
+                    if _orig is None:
+                        continue
+                    _changes = {}
+                    for _col in ("sku", "product_family", "outcome", "note"):
+                        _new_v = new_row[_col]
+                        _old_v = _orig[_col]
+                        # Treat NaN/None/'' as equivalent so we don't
+                        # spuriously overwrite null with '' or vice versa.
+                        _new_norm = (None if (pd.isna(_new_v)
+                                              or str(_new_v).strip() == "")
+                                     else str(_new_v).strip())
+                        _old_norm = (None if (_old_v is None
+                                              or str(_old_v).strip() == "")
+                                     else str(_old_v).strip())
+                        if _new_norm != _old_norm:
+                            _changes[_col] = _new_norm
+                    _new_review = bool(new_row["needs_review"])
+                    _old_review = bool(_orig["needs_review"]) if _orig[
+                        "needs_review"] is not None else False
+                    if _new_review != _old_review:
+                        _changes["needs_review"] = _new_review
+                    if _changes:
+                        try:
+                            db.update_demand_signal(
+                                _rid, updated_by=_actor, **_changes)
+                            _n_changed += 1
+                        except Exception as _e:
+                            _errors.append(f"#{_rid}: {_e}")
+                if _errors:
+                    st.error(
+                        f"Saved {_n_changed} change(s); "
+                        f"{len(_errors)} failed:\n- "
+                        + "\n- ".join(_errors))
+                elif _n_changed:
+                    st.success(
+                        f":white_check_mark: Saved {_n_changed} "
+                        "signal update(s). Audit log written. "
+                        "Refreshing…")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    info_col.info("No changes detected.")
+
+            with st.expander(
+                    ":mag: How outcome edits feed the demand score"):
+                st.markdown("""
+- **`converted`** — counted in the numerator of the conversion factor
+  inside `demand_scoring.py`. Marking an old inquiry as converted
+  raises that SKU's score the next time it's computed.
+- **`lost`** — leaves the row in the denominator (it was real interest)
+  but does not count as a sale. Lowers the conversion ratio.
+- **`ignored` / `wrong_sku` / `duplicate`** — informational. The score
+  still sees the row, but you can use `wrong_sku` + the *approved_sku*
+  edit above to redirect the demand to the correct SKU's score.
+- **`pending`** — default for unresolved signals. No effect either way.
+
+Every save writes a `demand_signal.update` row to `audit_log` with the
+list of fields that changed and your `current_user` as actor.
+                """)
 
 
 # ---------------------------------------------------------------------------

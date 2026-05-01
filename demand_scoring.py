@@ -183,17 +183,37 @@ def score_signals(signals: Iterable[dict],
         recency_total += weight
     recency_weight = recency_total / max(n, 1)
 
-    # ---- Conversion factor (sold / inquiry-class) over wider window
+    # ---- Conversion factor over wider window.
+    #
+    # Numerator counts "this demand turned into a sale". Two ways a row
+    # can qualify:
+    #   (a) signal_type == 'sold' (the original closed-sale event), OR
+    #   (b) outcome == 'converted' (an inquiry/quote/etc. that the buyer
+    #       later marked as won via the Demand Signals review page).
+    # Dedup by row id so a single row counted under both still counts
+    # once. Rows without an id (synthetic / test data) fall through to
+    # a positional count which is fine because there's nothing to dedup
+    # against.
+    #
+    # Denominator counts inquiry-class rows regardless of outcome, so a
+    # converted inquiry is correctly scored as 1/1 not 0/1.
     n_conv_total = 0
-    n_conv_sold = 0
+    converted_ids: set = set()
+    n_conv_sold_no_id = 0
     inquiry_class = ("inquiry", "quote", "abandoned_cart",
                       "notify_me", "search_query")
     for s in conversion_signals:
         t = (s.get("signal_type") or "").lower()
+        o = (s.get("outcome") or "").lower()
+        rid = s.get("id")
         if t in inquiry_class:
             n_conv_total += 1
-        elif t == "sold":
-            n_conv_sold += 1
+        if t == "sold" or o == "converted":
+            if rid is not None:
+                converted_ids.add(rid)
+            else:
+                n_conv_sold_no_id += 1
+    n_conv_sold = len(converted_ids) + n_conv_sold_no_id
     if n_conv_total > 0:
         conversion_rate = n_conv_sold / n_conv_total
     else:
