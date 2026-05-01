@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.56 — Demand-capture search now treats product NAME as first-class (was a fallback). Type 'slim8 black 2m' and it finds the right SKU even if you don't know it. Every word must appear in the name (so multi-word queries narrow down properly). Shows match category (SKU + name + fuzzy) so you know why each suggestion came up. (May 1)")
+    st.caption("🟢 v2.57 — Fix: demand-capture form was raising 'cannot modify session_state' on save and on suggestion clicks. Replaced direct widget-state assignment with Streamlit's pending-value pattern (queue → apply before next render). The save itself was working all along — only the post-save clear was failing. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -353,8 +353,24 @@ with st.sidebar:
             # reactive — clicking a suggestion re-runs and updates the
             # text input). Lets the user paste, type freely, and pick
             # from live-filtered matches.
+            #
+            # Streamlit gotcha: you CANNOT do
+            # `st.session_state[widget_key] = value` AFTER the widget
+            # has been rendered in this run — it raises "cannot be
+            # modified after the widget is instantiated". Workaround:
+            # any state change must happen BEFORE the widget renders,
+            # OR use an on_click callback (which runs pre-render on
+            # the next cycle).
             _sku_upper = {s.upper(): s for s in _sku_options}
             _sku_text_key = "_ds_sku_text"
+
+            # Apply any pending value queued by a suggestion button or
+            # by the post-save "clear" flow. This runs BEFORE the
+            # text_input below, so it's allowed.
+            if "_ds_sku_pending" in st.session_state:
+                st.session_state[_sku_text_key] = (
+                    st.session_state.pop("_ds_sku_pending"))
+
             if _sku_text_key not in st.session_state:
                 st.session_state[_sku_text_key] = ""
 
@@ -488,7 +504,9 @@ with st.sidebar:
                             if st.button(
                                     _label, key=f"_ds_pick_{_i}_{_m}",
                                     use_container_width=True):
-                                st.session_state[_sku_text_key] = _m
+                                # Queue the new value; it'll be applied
+                                # to the widget BEFORE the next render.
+                                st.session_state["_ds_sku_pending"] = _m
                                 st.rerun()
                     elif len(_q) >= 2:
                         st.caption(
@@ -558,9 +576,11 @@ with st.sidebar:
                         st.success(
                             f":white_check_mark: Signal #{_new_id} "
                             f"saved for **{_ds_sku_final or _ds_family}**.")
-                        # Clear the SKU search after save so next
-                        # capture starts fresh
-                        st.session_state[_sku_text_key] = ""
+                        # Queue clearing the SKU search so the next
+                        # capture starts fresh. Direct assignment
+                        # would error because the widget is already
+                        # instantiated this run.
+                        st.session_state["_ds_sku_pending"] = ""
                         st.rerun()
                     except Exception as _exc:
                         st.error(f"Could not save: {_exc}")
