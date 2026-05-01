@@ -224,7 +224,7 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.63 — Multi-target alias rules + provenance. (1) Schema: `product_aliases` extended with `rule_type` (sku/sku_list/family/family_list/mixed/attributes), `target_skus_json`, `target_families_json`, `attributes_json`, `source` (manual/feedback/system), `created_by`. Idempotent migration backfills existing rows. (2) AI Feedback page now offers Single SKU / Multi SKU / Single Family / Multi Family / Mixed rule types with multiselect + paste-list inputs and pre-save validation against the products CSV; an 'Existing rules for this phrase' panel shows what's already mapped before you save another. (3) Alias-before-LLM hint renders multi-target rules as 'ANY of these SKUs/families' and family-expands the first 8 member SKUs into the prompt so Claude can tool-dispatch over the candidate set. (4) Every AI answer now ends with a `[via X]` provenance tag — exact_sku / alias_rule / search_products / family_lookup / similarity_engine / none — so the buyer sees how the AI decided. Attribute filters captured but NOT YET ENFORCED (waiting on product_attributes / Tier-A1). (May 1)")
+    st.caption("🟢 v2.64 — Text-search rules + similarity engine + incoming-stock tool. (1) New alias rule type `text_search` with `search_fields_json` column — phrase like 'warm white' becomes a contains-match across title/description/tags/product_type/collections, no SKU/family needed. AI Feedback form now offers 'Text/title keyword search' with field checkboxes. (2) New AI tool `search_products_by_text` runs the rule at query time, combinable with classification + in_stock_only + family filters; reports any requested fields that don't exist in the catalog yet. (3) Similarity-intent detection: when the question contains 'similar', 'alternative', 'replace', 'substitute', etc., a new system-prompt addendum tells Claude to call `find_similar_products` and present alternatives FIRST. (4) New `find_similar_products` tool with conservative tube logic — parses trailing digits from family code as nominal diameter (SIERRA38→38mm), returns only same-diameter families, falls back to title regex (38mm / 1.5\") only when family code is missing (lower-confidence note). (5) New `get_incoming_stock` tool reads `purchase_lines_last_90d`, filters to OPEN POs (excludes received/closed/cancelled/voided + zero-qty), returns SKU/qty/expected-date/supplier/PO#/status. Says 'not available' when no expected date instead of guessing. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -13763,6 +13763,15 @@ elif page == "AI Assistant":
     # get_sales_totals tool can read order-level revenue (which
     # includes shipping + tax — matches CIN7's dashboard).
     ai_tools.set_sales_full_headers(sales_full)
+    # v2.64: hand the purchase_lines DataFrame to ai_tools so the new
+    # get_incoming_stock tool can scan open POs without re-reading
+    # the CSV per call.
+    try:
+        ai_tools.set_purchase_lines(purchase_lines)
+    except Exception:
+        # Non-fatal — get_incoming_stock will report "not loaded"
+        # if the DF never made it through.
+        pass
 
     # Lay out the page. Left column: chat input + transcript. Right:
     # a "what can I ask" cheatsheet so users know where to start.
@@ -13901,13 +13910,68 @@ elif page == "AI Assistant":
                 except Exception:
                     return []
 
+            # ---- Similarity intent (v2.64) ----
+            # If the question contains words like 'similar', 'alternative',
+            # 'like', 'equivalent', 'replace', 'substitute', 'instead of',
+            # tell Claude to call find_similar_products instead of plain
+            # search_products. We also flag the intent so the alias-hint
+            # rendering stays consistent.
+            _ql = (_user_question or "").lower()
+            _similarity_words = (
+                "similar", "alternative", "alternatives", "like",
+                "equivalent", "replace", "replacement", "substitute",
+                "substitutes", "instead of", "swap", "comparable")
+            _similarity_intent = any(w in _ql for w in _similarity_words)
+            _similarity_addendum = ""
+            if _similarity_intent:
+                _similarity_addendum = (
+                    "\n\nSIMILARITY INTENT DETECTED ('similar', "
+                    "'alternative', 'replace', etc.). Resolve the "
+                    "subject product first (alias rule → exact SKU → "
+                    "family search) and then call "
+                    "**find_similar_products** with that SKU or family. "
+                    "Return alternatives FIRST, optionally include the "
+                    "original family as a reference at the end. Show "
+                    "why each is similar AND what is different "
+                    "(diameter, material, mounting). Be conservative "
+                    "— fewer accurate matches > many weak ones. End "
+                    "your answer with `[via similarity_engine]`.")
+
             if _alias_hits:
                 _hit_lines = []
                 for _h in _alias_hits[:6]:
                     _skus = _h.get("skus") or []
                     _families = _h.get("families") or []
                     _attrs = _h.get("attributes") or {}
+                    _search_fields = _h.get("search_fields") or []
                     _rule = _h.get("rule_type") or ""
+
+                    # text_search rules render differently — they're
+                    # not a target, they're a search instruction.
+                    if _rule == "text_search" and _search_fields:
+                        _hit_lines.append(
+                            f"- The phrase `{_h['phrase']}` is a "
+                            f"TEXT SEARCH rule across these product "
+                            f"fields: {_search_fields}. Call "
+                            f"`search_products_by_text` with "
+                            f"query=`{_h['phrase']}`, fields="
+                            f"{_search_fields}. Combine with any "
+                            f"other filters from the question (in "
+                            f"stock, slow movers, family, etc.). "
+                            f"[used {_h['times_used']}x, "
+                            f"confidence {_h['confidence']:.0%}]")
+                        # Bump times_used preserving the rule shape.
+                        try:
+                            db.upsert_product_alias(
+                                _h["phrase"],
+                                rule_type="text_search",
+                                search_fields=_search_fields,
+                                confidence=_h["confidence"],
+                                source="system",
+                                approved_by="alias_lookup")
+                        except Exception:
+                            pass
+                        continue
 
                     _target_parts = []
                     if _skus:
@@ -14015,6 +14079,21 @@ elif page == "AI Assistant":
                 "- search_products / get_sku_details / get_velocity / "
                 "get_dead_stock / get_migration_chain — for "
                 "single-SKU and product-level questions.\n"
+                "- search_products_by_text — substring search across "
+                "title/description/tags/product_type/collections. Use "
+                "when an alias rule of type='text_search' fires (see "
+                "addendum) OR when the user describes products by "
+                "phrase ('warm white', 'IP67 outdoor'). Combinable "
+                "with classification + in_stock_only.\n"
+                "- find_similar_products — conservative similarity "
+                "search. Call when the question contains 'similar', "
+                "'alternative', 'replace', 'substitute', 'instead "
+                "of'. Returns alternatives FIRST. Currently tube-only "
+                "(parses diameter from family code).\n"
+                "- get_incoming_stock — list OPEN purchase orders "
+                "for a SKU/family. Use for 'when's the next "
+                "shipment?', 'what's on order?', 'ETA for X?'. "
+                "Excludes received/closed/cancelled.\n"
                 "- get_sales_totals — for COMPANY-WIDE totals across "
                 "any period ('total sales this month', 'last 90 days "
                 "revenue', 'monthly trend for the last 6 months'). "
@@ -14083,19 +14162,22 @@ elif page == "AI Assistant":
                 "`[via X]` tag noting how you arrived at it. "
                 "Use one of: `[via exact_sku]` (user gave a specific "
                 "SKU), `[via alias_rule]` (a past correction guided "
-                "the answer — see the addendum below if present), "
-                "`[via search_products]` (used the search tool), "
-                "`[via family_lookup]` (resolved by product family), "
-                "`[via similarity_engine]` (similarity search — "
-                "arrives in v2.64), or `[via none]` (no resolution "
-                "possible). This tag lets the buyer audit how the AI "
-                "decided.")
+                "the answer — see addendum if present), "
+                "`[via text_search]` (used search_products_by_text), "
+                "`[via similarity_engine]` (used find_similar_products), "
+                "`[via search_products]` (used the basic search tool), "
+                "`[via incoming_stock]` (used get_incoming_stock for "
+                "ETA / open POs), `[via family_lookup]` (resolved by "
+                "product family), or `[via none]` (no resolution "
+                "possible). Lets the buyer audit how the AI decided.")
 
             # Append any alias-correction hints captured above. Putting
             # these AFTER the base prompt means they show up as recent
             # context Claude can use without overriding the core
             # behaviour rules.
-            _system_prompt = _system_prompt + (_alias_addendum or "")
+            _system_prompt = (_system_prompt
+                              + (_alias_addendum or "")
+                              + (_similarity_addendum or ""))
 
             _tool_calls_log: list = []
             # Charts collected from tool results during this turn.
@@ -14469,6 +14551,7 @@ elif page == "AI Feedback":
                             "Single Family",
                             "Multiple Families",
                             "Mixed (SKU + Family)",
+                            "Text/title keyword search",
                             "Attribute filter — coming with "
                             "product_attributes (disabled)",
                         ],
@@ -14480,6 +14563,7 @@ elif page == "AI Feedback":
                         "Single Family": "family",
                         "Multiple Families": "family_list",
                         "Mixed (SKU + Family)": "mixed",
+                        "Text/title keyword search": "text_search",
                     }
                     _rule_type = _rule_type_map.get(_rule_type_label)
                     _rt_disabled = _rule_type is None
@@ -14511,6 +14595,46 @@ elif page == "AI Feedback":
                         _alias_families_picked: list = []
                         _alias_paste_skus = ""
                         _alias_paste_fams = ""
+                        _alias_search_fields: list = []
+
+                        if _rule_type == "text_search":
+                            st.caption(
+                                "**Text search rule**: this phrase will "
+                                "match products whose chosen text fields "
+                                "CONTAIN it. No SKU/family needed — "
+                                "the AI runs a substring search across "
+                                "the catalog at query time, combinable "
+                                "with other filters.")
+                            _ts_title = st.checkbox(
+                                "Search in **title** (Name)",
+                                value=True,
+                                key=f"_fb_ts_title_{_aid}")
+                            _ts_desc = st.checkbox(
+                                "Search in **description** (if "
+                                "Shopify-merged)",
+                                value=True,
+                                key=f"_fb_ts_desc_{_aid}")
+                            _ts_tags = st.checkbox(
+                                "Search in **tags** (if Shopify-merged)",
+                                value=True,
+                                key=f"_fb_ts_tags_{_aid}")
+                            _ts_type = st.checkbox(
+                                "Search in **product_type** / Type",
+                                value=False,
+                                key=f"_fb_ts_type_{_aid}")
+                            _ts_coll = st.checkbox(
+                                "Search in **collections** / Categories",
+                                value=False,
+                                key=f"_fb_ts_coll_{_aid}")
+                            for _flag, _name in (
+                                    (_ts_title, "title"),
+                                    (_ts_desc, "description"),
+                                    (_ts_tags, "tags"),
+                                    (_ts_type, "product_type"),
+                                    (_ts_coll, "collections"),
+                            ):
+                                if _flag:
+                                    _alias_search_fields.append(_name)
 
                         if _rule_type in ("sku", "mixed"):
                             _alias_skus_picked = st.multiselect(
@@ -14680,7 +14804,15 @@ elif page == "AI Feedback":
                                     "Fix and re-save, or remove these "
                                     "from the paste box.")
                                 st.error("\n\n".join(_bits))
-                            elif (not _final_skus
+                            elif (_rule_type == "text_search"
+                                   and not _alias_search_fields):
+                                st.error(
+                                    "Pick at least one field to "
+                                    "search (title, description, "
+                                    "tags, product_type, or "
+                                    "collections).")
+                            elif (_rule_type != "text_search"
+                                   and not _final_skus
                                    and not _final_families):
                                 st.error(
                                     "Need at least one SKU or "
@@ -14712,6 +14844,10 @@ elif page == "AI Feedback":
                                         _final_families
                                         if _rule_type == "family_list"
                                         else None)
+                                    _ts_fields = (
+                                        _alias_search_fields
+                                        if _rule_type == "text_search"
+                                        else None)
                                     _new_alias_id = db.upsert_product_alias(
                                         _phr,
                                         sku=_single_sku,
@@ -14719,6 +14855,7 @@ elif page == "AI Feedback":
                                         rule_type=_rule_type,
                                         target_skus=_multi_skus,
                                         target_families=_multi_fams,
+                                        search_fields=_ts_fields,
                                         confidence=float(_alias_conf),
                                         approved_by=_actor_fb,
                                         source="feedback",
@@ -14735,15 +14872,25 @@ elif page == "AI Feedback":
                                               f"n_skus="
                                               f"{len(_final_skus)} "
                                               f"n_families="
-                                              f"{len(_final_families)}"),
+                                              f"{len(_final_families)} "
+                                              f"search_fields="
+                                              f"{_alias_search_fields}"),
                                         user_id=_actor_fb)
+                                    if _rule_type == "text_search":
+                                        _summary_msg = (
+                                            f"text_search across "
+                                            f"{_alias_search_fields}")
+                                    else:
+                                        _summary_msg = (
+                                            f"{_rule_type}: "
+                                            f"{len(_final_skus)} "
+                                            f"SKU(s), "
+                                            f"{len(_final_families)} "
+                                            f"family/families")
                                     st.success(
                                         f":white_check_mark: Rule #"
                                         f"{_new_alias_id} saved "
-                                        f"({_rule_type}: "
-                                        f"{len(_final_skus)} SKU(s), "
-                                        f"{len(_final_families)} "
-                                        f"family/families). The AI "
+                                        f"({_summary_msg}). The AI "
                                         "will use this on the next "
                                         "matching question.")
                                     st.rerun()

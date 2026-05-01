@@ -617,6 +617,13 @@ def _migrate_product_aliases_multi_target(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE product_aliases SET created_by = approved_by "
                 "WHERE created_by IS NULL")
+        # v2.64: text_search rule type — phrase becomes a text filter
+        # across product title / description / tags / product_type /
+        # collections. Stored as JSON list of field names.
+        if "search_fields_json" not in cols:
+            conn.execute(
+                "ALTER TABLE product_aliases ADD COLUMN "
+                "search_fields_json TEXT")
     except sqlite3.Error:
         pass
 
@@ -2439,6 +2446,7 @@ def upsert_product_alias(phrase: str, *,
                           target_skus: Optional[list] = None,
                           target_families: Optional[list] = None,
                           attributes: Optional[dict] = None,
+                          search_fields: Optional[list] = None,
                           confidence: float = 0.5,
                           approved_by: str = "ai",
                           source: str = "manual",
@@ -2480,8 +2488,13 @@ def upsert_product_alias(phrase: str, *,
     target_skus = [s for s in (target_skus or []) if s and s.strip()]
     target_families = [f.strip().upper() for f in (target_families or [])
                         if f and f.strip()]
+    search_fields = [str(f).strip().lower()
+                      for f in (search_fields or [])
+                      if f and str(f).strip()]
     if rule_type is None:
-        if attributes:
+        if search_fields:
+            rule_type = "text_search"
+        elif attributes:
             rule_type = "attributes"
         elif len(target_skus) > 1:
             rule_type = "sku_list"
@@ -2505,6 +2518,8 @@ def upsert_product_alias(phrase: str, *,
                               if target_families else None)
     attributes_json = (_json.dumps(attributes, sort_keys=True)
                         if attributes else None)
+    search_fields_json = (_json.dumps(search_fields)
+                           if search_fields else None)
 
     with connect() as c:
         # Collision detection: same phrase + same canonical target
@@ -2517,9 +2532,11 @@ def upsert_product_alias(phrase: str, *,
             "AND COALESCE(product_family, '') = COALESCE(?, '') "
             "AND COALESCE(target_skus_json, '') = COALESCE(?, '') "
             "AND COALESCE(target_families_json, '') = COALESCE(?, '') "
-            "AND COALESCE(attributes_json, '') = COALESCE(?, '')",
+            "AND COALESCE(attributes_json, '') = COALESCE(?, '') "
+            "AND COALESCE(search_fields_json, '') = COALESCE(?, '')",
             (phrase_n, sku, product_family,
-             target_skus_json, target_families_json, attributes_json),
+             target_skus_json, target_families_json, attributes_json,
+             search_fields_json),
         ).fetchone()
         if existing:
             c.execute(
@@ -2545,13 +2562,14 @@ def upsert_product_alias(phrase: str, *,
                 INSERT INTO product_aliases
                     (phrase, sku, product_family, rule_type,
                      target_skus_json, target_families_json,
-                     attributes_json, confidence, approved_by,
-                     source, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     attributes_json, search_fields_json,
+                     confidence, approved_by, source, created_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (phrase_n, sku, product_family, rule_type,
                  target_skus_json, target_families_json,
-                 attributes_json, confidence, approved_by,
+                 attributes_json, search_fields_json,
+                 confidence, approved_by,
                  source, created_by or approved_by),
             )
             row_id = int(cur.lastrowid)
@@ -2564,6 +2582,7 @@ def upsert_product_alias(phrase: str, *,
                  f"n_skus={len(target_skus)} "
                  f"n_families={len(target_families)} "
                  f"has_attributes={bool(attributes)} "
+                 f"search_fields={search_fields or ''} "
                  f"confidence={confidence}"))
             return row_id
 
@@ -2700,6 +2719,8 @@ def find_alias_in_question(question: str,
                     if "target_families_json" in cols else [])
         attrs = (_decode_dict(r["attributes_json"])
                   if "attributes_json" in cols else {})
+        search_fields = (_decode_list(r["search_fields_json"])
+                          if "search_fields_json" in cols else [])
 
         if not skus and r["sku"]:
             skus = [str(r["sku"])]
@@ -2712,6 +2733,7 @@ def find_alias_in_question(question: str,
             tuple(sorted(s.upper() for s in skus)),
             tuple(sorted(f.upper() for f in families)),
             tuple(sorted(attrs.items())),
+            tuple(sorted(search_fields)),
         )
         if key in seen_targets:
             continue
@@ -2722,7 +2744,9 @@ def find_alias_in_question(question: str,
                       else None)
         if rule_type is None:
             # Infer for fully legacy rows.
-            if attrs:
+            if search_fields:
+                rule_type = "text_search"
+            elif attrs:
                 rule_type = "attributes"
             elif len(skus) > 1:
                 rule_type = "sku_list"
@@ -2742,6 +2766,7 @@ def find_alias_in_question(question: str,
             "skus": skus,
             "families": families,
             "attributes": attrs,
+            "search_fields": search_fields,
             "confidence": float(r["confidence"] or 0),
             "times_used": int(r["times_used"] or 0),
         })

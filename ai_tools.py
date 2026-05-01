@@ -398,6 +398,152 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "find_similar_products",
+        "description": (
+            "Find product alternatives to a given SKU or product "
+            "family. Conservative: returns only families with the "
+            "SAME nominal diameter (parsed from trailing digits in "
+            "the family code, e.g. SIERRA38 → 38mm). Same-diameter "
+            "families that don't exist are not invented — the tool "
+            "returns no alternatives rather than guess. Call this "
+            "when the user asks for 'similar', 'alternative', "
+            "'equivalent', 'replace', 'substitute', or 'instead of' "
+            "phrasing. Show alternatives FIRST in your answer, "
+            "include the original family only as a reference."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": (
+                        "Subject SKU. Either sku or family is "
+                        "required.")
+                },
+                "family": {
+                    "type": "string",
+                    "description": (
+                        "Subject product family code, e.g. "
+                        "SIERRA38. Required if sku not given.")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max alternatives to return (cap 20, "
+                        "default 8).")
+                },
+                "include_original_family": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, the response also names the "
+                        "subject family for reference (NOT counted "
+                        "as an alternative).")
+                },
+            },
+        },
+    },
+    {
+        "name": "get_incoming_stock",
+        "description": (
+            "List OPEN / incomplete CIN7 purchase orders for a SKU "
+            "or family. Use this for questions about upcoming "
+            "shipments — 'when's the next delivery of X?', 'how "
+            "many SIERRA38 do we have on order?', 'what's the ETA "
+            "on Y?'. Excludes received / closed / cancelled / "
+            "voided POs and zero-quantity lines. If a line has no "
+            "expected delivery date in CIN7, the tool returns "
+            "'not available' rather than guessing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": (
+                        "Exact SKU to look up. Either sku or "
+                        "family is required.")
+                },
+                "family": {
+                    "type": "string",
+                    "description": (
+                        "Product family / SKU prefix when looking "
+                        "across variants — e.g. SIERRA38 will match "
+                        "SIERRA38-* SKUs.")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max PO lines to return (cap 50, "
+                        "default 25).")
+                },
+            },
+        },
+    },
+    {
+        "name": "search_products_by_text",
+        "description": (
+            "Substring search across one or more product TEXT fields "
+            "(title / description / tags / product_type / collections). "
+            "Use this when an alias rule of type='text_search' fires "
+            "in the system-prompt addendum, OR when the user asks for "
+            "products matching a descriptive phrase that isn't tied "
+            "to a specific SKU or family — e.g. 'warm white', "
+            "'diffused lens', 'IP67 outdoor'. Combinable with "
+            "classification + in_stock_only filters so 'show me warm "
+            "white LED strips that are slow movers' is one tool call. "
+            "If a requested field doesn't exist in the catalog data "
+            "yet (e.g. tags before the Shopify merge ships), the tool "
+            "reports it in `missing_fields` rather than silently "
+            "skipping it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The phrase to search for, e.g. 'warm white'."),
+                },
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "string",
+                              "enum": ["title", "name", "description",
+                                       "tags", "product_type", "type",
+                                       "collections", "category",
+                                       "family"]},
+                    "description": (
+                        "Which product fields to search across. "
+                        "Defaults to ['title']. Pass the list from "
+                        "the alias rule's search_fields."),
+                },
+                "classification": {
+                    "type": "string",
+                    "enum": ["active", "slow", "dead", "watchlist", "any"],
+                    "description": (
+                        "Optional secondary filter to a specific "
+                        "stock classification."),
+                },
+                "in_stock_only": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, only return SKUs with on-hand > 0."),
+                },
+                "family": {
+                    "type": "string",
+                    "description": (
+                        "Optional product-family code to narrow "
+                        "further (e.g. SIERRA38)."),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max rows to return (cap 50, default 25)."),
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -754,6 +900,7 @@ def get_sales_totals(engine_df: pd.DataFrame,
 # populates this once per session via set_sales_full_headers() so
 # every tool call sees the same headers without repeatedly loading.
 _SALES_FULL_HOLDER: dict = {"df": None}
+_PURCHASE_LINES_HOLDER: dict = {"df": None}
 
 
 def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
@@ -761,6 +908,13 @@ def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
     the merged sales-headers DataFrame so get_sales_totals can read
     it without recomputing per-tool-call."""
     _SALES_FULL_HOLDER["df"] = headers_df
+
+
+def set_purchase_lines(purchase_lines_df: pd.DataFrame) -> None:
+    """Called by the Streamlit AI Assistant page on load. Stashes the
+    purchase_lines_last_90d DataFrame so get_incoming_stock can scan
+    open POs without re-loading the CSV per tool call."""
+    _PURCHASE_LINES_HOLDER["df"] = purchase_lines_df
 
 
 def _signal_row_to_dict(row) -> dict:
@@ -992,8 +1146,424 @@ def search_knowledge_base(engine_df: pd.DataFrame,
 # ---------------------------------------------------------------------------
 # Dispatch table — maps tool name (from Claude) to implementation.
 # ---------------------------------------------------------------------------
+def search_products_by_text(engine_df: pd.DataFrame,
+                             sale_lines_df: pd.DataFrame,
+                             args: dict) -> dict:
+    """v2.64 — text-search rule executor.
+
+    Driven by an alias rule with rule_type='text_search'. The user
+    typed a phrase like 'warm white' that's been mapped to a search
+    across product fields (title / description / tags / product_type /
+    collections). This tool runs the contains-match across whichever
+    of those fields exist in the products DataFrame.
+
+    Combinable with classification + in_stock_only filters so a
+    question like 'show me warm white LED strips that are slow movers'
+    resolves to a single tool call.
+    """
+    query = (args.get("query") or "").strip().lower()
+    if not query:
+        return {"error": "query is required"}
+
+    # Map our canonical field names to whichever columns happen to be
+    # in the products / engine DataFrame today. Some live in CIN7
+    # masters (Name, Type), some only after shopify_sync has merged
+    # (Description, Tags, Collections, ProductType). Fields the user
+    # asks for that aren't present in the DF get reported as missing
+    # — we don't pretend to have searched them.
+    field_aliases = {
+        "title":         ["Name"],
+        "name":          ["Name"],
+        "description":   ["Description", "Body", "Body_html"],
+        "tags":          ["Tags", "Tags_csv"],
+        "product_type":  ["ProductType", "Type"],
+        "type":          ["ProductType", "Type"],
+        "collections":   ["Collections", "Categories", "Category"],
+        "category":      ["Collections", "Categories", "Category"],
+        "family":        ["Family", "AdditionalAttribute1",
+                          "ProductFamily"],
+    }
+
+    requested = args.get("fields") or ["title"]
+    if isinstance(requested, str):
+        requested = [requested]
+    requested = [str(f).strip().lower() for f in requested if f]
+    if not requested:
+        requested = ["title"]
+
+    df = engine_df.copy()
+    searched_cols: list = []
+    missing_fields: list = []
+    masks = []
+    for f in requested:
+        candidate_cols = field_aliases.get(f, [f.capitalize()])
+        col_used = None
+        for c in candidate_cols:
+            if c in df.columns:
+                col_used = c
+                break
+        if col_used is None:
+            missing_fields.append(f)
+            continue
+        mask = df[col_used].fillna("").astype(str).str.lower().str.contains(
+            query, na=False, regex=False)
+        masks.append((f, col_used, mask))
+        searched_cols.append({"requested": f, "actual_column": col_used})
+
+    if not masks:
+        return {
+            "error": (f"None of the requested fields exist in the "
+                       f"product data right now: {requested}. "
+                       f"Available columns: {list(df.columns)[:20]}"),
+            "missing_fields": missing_fields,
+            "available_columns": list(df.columns),
+        }
+
+    combined = masks[0][2]
+    for _, _, m in masks[1:]:
+        combined = combined | m
+    df = df[combined]
+
+    # Optional secondary filters Claude can stack on top.
+    classification = (args.get("classification") or "any").strip().lower()
+    if classification != "any" and "Classification" in df.columns:
+        df = df[df["Classification"].astype(str).str.lower()
+                  == classification]
+    in_stock_only = bool(args.get("in_stock_only", False))
+    if in_stock_only and "OnHand" in df.columns:
+        df = df[df["OnHand"].fillna(0) > 0]
+    family = (args.get("family") or "").strip().upper()
+    if family and "Family" in df.columns:
+        df = df[df["Family"].astype(str).str.upper() == family]
+
+    limit = min(int(args.get("limit", 25) or 25), 50)
+    cols_we_want = [c for c in [
+        "SKU", "Name", "Family", "ABC", "Classification",
+        "OnHand", "TargetStock", "ReorderSuggested",
+    ] if c in df.columns]
+    df = df.head(limit)[cols_we_want] if cols_we_want else df.head(limit)
+    rows = [_serialise_row(r) for r in df.to_dict(orient="records")]
+    return {
+        "matched": len(rows),
+        "results": rows,
+        "searched": searched_cols,
+        "missing_fields": missing_fields,
+        "note": (
+            f"Showing first {limit} of potentially many. Refine the "
+            "query (or add more filters) if you need a narrower set."
+            if len(rows) == limit else None),
+    }
+
+
+def find_similar_products(engine_df: pd.DataFrame,
+                           sale_lines_df: pd.DataFrame,
+                           args: dict) -> dict:
+    """v2.64 — conservative similarity search.
+
+    Tube-only ranking for now (the only category with a reliable
+    naming convention right now: family code with trailing digits =
+    nominal diameter in mm, e.g. SIERRA38 → 38mm).
+
+    Resolution order:
+      1. If sku given → look up its family from engine_df.
+      2. If family given → use that.
+      3. Parse trailing digits from family code as nominal diameter.
+
+    Ranking (per spec — accuracy > speed, so weak matches are
+    deliberately suppressed):
+      - Same diameter (parsed from family code)         + strong match
+      - Same product_type / Type if column exists       + bonus
+      - Stock availability (OnHand > 0)                 + bonus
+      - Material similarity (best-effort — only if
+        the products DF has a Material column)          + bonus
+    Other-diameter families are NOT returned by default — they're
+    'maybe similar' at best and the spec says fewer accurate >
+    many weak.
+
+    If no trailing digits in the family code, returns
+    {"diameter": "unknown"} and an empty list rather than guessing.
+    Fallback to title/description regex (1.50&quot;, 38mm) is captured
+    in the result with confidence='lower' when used.
+    """
+    import re
+    sku = (args.get("sku") or "").strip()
+    family = (args.get("family") or "").strip().upper()
+    limit = min(int(args.get("limit", 8) or 8), 20)
+    include_original_family = bool(
+        args.get("include_original_family", False))
+
+    if engine_df is None or engine_df.empty:
+        return {"error": "engine_df is empty — products not loaded"}
+
+    # Resolve family
+    if not family and sku:
+        _row = engine_df[engine_df["SKU"].astype(str) == sku]
+        if not _row.empty and "Family" in _row.columns:
+            family = str(_row.iloc[0].get("Family") or "").strip().upper()
+
+    if not family:
+        return {
+            "error": ("Could not resolve a product family. Pass "
+                      "either sku= or family=. For tubes the family "
+                      "is the part code without the variant suffix "
+                      "(e.g. SIERRA38, SMOKIES38).")
+        }
+
+    # Diameter from trailing digits — primary signal.
+    _m = re.search(r"(\d{2,3})$", family)
+    nominal_diameter = int(_m.group(1)) if _m else None
+    diameter_source = "family_code" if nominal_diameter else "unknown"
+
+    # Fallback: try to parse a diameter from the family-name title.
+    # Lower confidence — used only when family code didn't yield one.
+    fallback_used = False
+    if nominal_diameter is None and "Name" in engine_df.columns:
+        sample_row = engine_df[engine_df["Family"].astype(str).str.upper()
+                                 == family]
+        if not sample_row.empty:
+            _name = str(sample_row.iloc[0].get("Name") or "")
+            # 38mm / 38 mm
+            m_mm = re.search(r"(\d{2,3})\s*mm", _name, re.IGNORECASE)
+            if m_mm:
+                nominal_diameter = int(m_mm.group(1))
+                diameter_source = "title_mm"
+                fallback_used = True
+            else:
+                # 1.5" / 1-1/2" — convert inches to mm (rough)
+                m_inch = re.search(
+                    r"(\d+(?:\.\d+)?)\s*[\"”]", _name)
+                if m_inch:
+                    inches = float(m_inch.group(1))
+                    nominal_diameter = int(round(inches * 25.4))
+                    diameter_source = "title_inch"
+                    fallback_used = True
+
+    if nominal_diameter is None:
+        return {
+            "subject_family": family,
+            "diameter": "unknown",
+            "alternatives": [],
+            "note": ("Could not determine a diameter for this family "
+                     "(no trailing digits in the family code, no "
+                     "explicit mm/inch in the product name). Returning "
+                     "no alternatives rather than guessing — per the "
+                     "'accuracy > speed' rule."),
+        }
+
+    # Find candidate families with the same trailing diameter.
+    if "Family" not in engine_df.columns:
+        return {"error": "engine_df has no 'Family' column to compare"}
+
+    fam_series = engine_df["Family"].fillna("").astype(str).str.upper()
+    diameter_re = re.compile(rf"(\d{{2,3}})$")
+    same_diameter_families: list = []
+    for f in fam_series.unique():
+        if not f or f == family:
+            continue
+        m = diameter_re.search(f)
+        if m and int(m.group(1)) == nominal_diameter:
+            same_diameter_families.append(f)
+
+    # Build ranked alternatives. For each family, pick a representative
+    # SKU (prefer one with stock; otherwise just the first).
+    alternatives = []
+    for f in same_diameter_families:
+        rows = engine_df[fam_series == f]
+        if rows.empty:
+            continue
+        rep = None
+        if "OnHand" in rows.columns:
+            in_stock = rows[rows["OnHand"].fillna(0) > 0]
+            if not in_stock.empty:
+                rep = in_stock.iloc[0]
+        if rep is None:
+            rep = rows.iloc[0]
+        rep_dict = _serialise_row(dict(rep))
+        why_parts = [f"same nominal diameter ({nominal_diameter}mm)"]
+        differences = []
+        # Material similarity — only if a material column exists.
+        material_col = next(
+            (c for c in ("Material", "Substrate") if c in rows.columns),
+            None)
+        if material_col:
+            subject_rows = engine_df[fam_series == family]
+            if not subject_rows.empty:
+                _subj_mat = str(subject_rows.iloc[0]
+                                  .get(material_col) or "").strip()
+                _alt_mat = str(rep.get(material_col) or "").strip()
+                if _subj_mat and _alt_mat and _subj_mat != _alt_mat:
+                    differences.append(
+                        f"different material ({_subj_mat} vs "
+                        f"{_alt_mat})")
+                elif _subj_mat and _alt_mat:
+                    why_parts.append(f"same material ({_alt_mat})")
+        # Stock note
+        on_hand = rep_dict.get("OnHand")
+        stock_note = (f"in stock ({on_hand})"
+                      if on_hand and float(on_hand) > 0
+                      else "out of stock")
+        alternatives.append({
+            "family": f,
+            "representative_sku": rep_dict.get("SKU"),
+            "name": rep_dict.get("Name"),
+            "on_hand": on_hand,
+            "classification": rep_dict.get("Classification"),
+            "why_similar": "; ".join(why_parts),
+            "differences": "; ".join(differences) or None,
+            "stock_note": stock_note,
+        })
+
+    # Conservative ranking: in-stock first, then by family code.
+    alternatives.sort(
+        key=lambda a: (
+            0 if (a["on_hand"] and float(a["on_hand"]) > 0) else 1,
+            a["family"],
+        ))
+    alternatives = alternatives[:limit]
+
+    result = {
+        "subject_family": family,
+        "diameter": nominal_diameter,
+        "diameter_source": diameter_source,
+        "diameter_confidence": (
+            "lower (parsed from product name, not family code)"
+            if fallback_used else "high (parsed from family code)"),
+        "alternatives": alternatives,
+        "note": (
+            "Conservative result — only families with the SAME "
+            "trailing-digit nominal diameter are listed. Other "
+            "diameters are NOT returned automatically; ask "
+            "specifically if you want them."
+            + (" Diameter inferred from product name; treat with "
+               "caution." if fallback_used else "")),
+    }
+    if include_original_family:
+        result["subject_family_reference"] = {
+            "family": family,
+            "note": "Listed as reference; not an alternative.",
+        }
+    return result
+
+
+def get_incoming_stock(engine_df: pd.DataFrame,
+                        sale_lines_df: pd.DataFrame,
+                        args: dict) -> dict:
+    """v2.64 — list open / incomplete CIN7 purchase order lines for a
+    SKU or family. Powers questions like 'when's the next shipment of
+    LED-XYZ?' and 'do we have any SIERRA38 incoming?'.
+
+    Per spec, we only return OPEN POs:
+      - Status NOT IN (DRAFT, RECEIVED, CLOSED, COMPLETED, CANCELLED,
+        VOIDED, ORDERED-Received and the like)
+      - Quantity > 0 (zero-qty lines suppressed)
+
+    Expected delivery date — we use whichever of the standard CIN7
+    fields exists in the schema today (`RequiredBy` is the canonical
+    one in cin7_sync._extract_purchase_lines as of v2.64). Field name
+    is reported in the output so the caller can audit.
+
+    If no open lines match, returns matched=0 with a reason. If no
+    expected date is recorded for an open line, the line is included
+    with expected_date='not available'."""
+    sku = (args.get("sku") or "").strip()
+    family = (args.get("family") or "").strip().upper()
+    limit = min(int(args.get("limit", 25) or 25), 50)
+
+    purchase_lines = _PURCHASE_LINES_HOLDER.get("df")
+    if purchase_lines is None or purchase_lines.empty:
+        return {
+            "error": ("Purchase lines not loaded for this session. "
+                      "An admin needs to call "
+                      "ai_tools.set_purchase_lines() once at AI "
+                      "Assistant page boot."),
+        }
+
+    df = purchase_lines.copy()
+
+    # Pick a date column from whichever of the candidates is present.
+    date_col_candidates = (
+        "RequiredBy", "ExpectedDate", "DeliveryDate",
+        "RequiredDate", "DateRequired", "ETA")
+    date_col = next(
+        (c for c in date_col_candidates if c in df.columns), None)
+
+    # Filter to OPEN POs. CIN7 statuses include AUTHORISED / ORDERED /
+    # PARTIAL / RECEIVED / CLOSED / VOIDED. We exclude the closed /
+    # cancelled / fully-received tail. Status containing 'Received'
+    # (e.g. 'ORDERED-Received') is the synthetic stock-received row
+    # written by _extract_purchase_lines — exclude that too.
+    closed_keywords = ("RECEIVED", "CLOSED", "COMPLETED",
+                        "CANCELLED", "VOIDED", "DRAFT")
+    if "Status" in df.columns:
+        status_u = df["Status"].fillna("").astype(str).str.upper()
+        keep_mask = ~status_u.apply(
+            lambda s: any(k in s for k in closed_keywords))
+        df = df[keep_mask]
+
+    # Suppress zero-qty lines.
+    if "Quantity" in df.columns:
+        df = df[pd.to_numeric(
+            df["Quantity"], errors="coerce").fillna(0) > 0]
+
+    # Match by SKU or family.
+    if sku and "SKU" in df.columns:
+        df = df[df["SKU"].astype(str).str.upper() == sku.upper()]
+    elif family:
+        # No Family column on purchase_lines (CIN7 doesn't set it on
+        # the line). Fall back to substring against SKU prefix or Name.
+        sku_match = (df["SKU"].astype(str).str.upper().str.startswith(
+            family) if "SKU" in df.columns else False)
+        name_match = (df["Name"].astype(str).str.upper().str.contains(
+            family, na=False) if "Name" in df.columns else False)
+        df = df[sku_match | name_match]
+
+    if df.empty:
+        return {
+            "matched": 0,
+            "subject": sku or family,
+            "date_field_used": date_col,
+            "note": ("No open / incomplete purchase orders match. "
+                      "Either the SKU has nothing on order, or all "
+                      "matching POs are already received / closed / "
+                      "cancelled. Per spec we don't return those."),
+        }
+
+    out_rows = []
+    for _, r in df.head(limit).iterrows():
+        rec = {
+            "sku": r.get("SKU"),
+            "name": r.get("Name"),
+            "quantity_on_order": r.get("Quantity"),
+            "quantity_remaining": (
+                r.get("QuantityRemaining")
+                if "QuantityRemaining" in df.columns
+                else None),
+            "expected_date": (
+                str(r.get(date_col)) if (date_col
+                                         and pd.notna(r.get(date_col)))
+                else "not available"),
+            "supplier": r.get("Supplier"),
+            "po_number": r.get("OrderNumber"),
+            "status": r.get("Status"),
+        }
+        out_rows.append(_serialise_row(rec))
+
+    return {
+        "matched": len(out_rows),
+        "subject": sku or family,
+        "date_field_used": date_col,
+        "lines": out_rows,
+        "note": (
+            f"Showing first {limit} of potentially many open POs."
+            if len(out_rows) == limit else None),
+    }
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
+    "search_products_by_text": search_products_by_text,
+    "find_similar_products": find_similar_products,
+    "get_incoming_stock": get_incoming_stock,
     "get_sku_details": get_sku_details,
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,
