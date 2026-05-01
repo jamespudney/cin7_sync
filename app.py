@@ -209,7 +209,7 @@ def _freshness_from_output_dir() -> tuple:
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.53 — Demand-capture SKU field rebuilt as proper smart-search: paste any SKU, type freely, see live suggestions matching what you typed (click to fill), or save with whatever you typed (free-text supported for new product requests). Stops the typing-doesn't-stick UX issue. (May 1)")
+    st.caption("🟢 v2.55 — Smarter SKU search in demand-capture: prefix + substring (both directions) + fuzzy/typo-tolerant + product-name match. Catches base SKUs when you paste a variant suffix, finds typos, lets you search by product name. Shows product name next to each suggestion. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -366,10 +366,19 @@ with st.sidebar:
                      "or click a suggestion below. Leave empty if you "
                      "only know the product family.")
 
-            # Live status / suggestions based on what they typed
+            # Live status / suggestions based on what they typed.
+            # Multi-strategy match:
+            #   1. EXACT (case-insensitive)
+            #   2. PREFIX — SKUs starting with what you typed
+            #   3. SUBSTRING (forward) — your input inside a real SKU
+            #   4. SUBSTRING (reverse) — real SKU inside your input
+            #      (catches LED-89030021 when you typed LED-89030021-2)
+            #   5. FUZZY — typo-tolerant via difflib
+            #   6. NAME match — search product names too
             _ds_sku_resolved = ""
             _q = (_ds_sku_typed or "").strip()
             if _q:
+                import difflib as _difflib
                 _q_upper = _q.upper()
                 if _q_upper in _sku_upper:
                     # Exact match — show product name as confirmation
@@ -385,30 +394,80 @@ with st.sidebar:
                         st.caption(
                             f":white_check_mark: {_ds_sku_resolved}")
                 else:
-                    # Partial / fuzzy match — offer suggestions
-                    _matches = sorted(
-                        s for s in _sku_options
-                        if _q_upper in s.upper()
-                    )[:6]
+                    _all_skus_upper = list(_sku_upper.keys())
+                    # 2. Prefix match
+                    _prefix = [s for s in _sku_options
+                                if s.upper().startswith(_q_upper)]
+                    # 3. Substring forward (input is in SKU)
+                    _sub_fwd = [s for s in _sku_options
+                                 if _q_upper in s.upper()
+                                 and s not in _prefix]
+                    # 4. Substring reverse (SKU is in input) — catches
+                    # paste of "LED-XYZ-VARIANT" when catalog has the
+                    # base "LED-XYZ"
+                    _sub_rev = [s for s in _sku_options
+                                 if len(s) >= 6
+                                 and s.upper() in _q_upper
+                                 and s not in _prefix
+                                 and s not in _sub_fwd]
+                    # 5. Fuzzy close-matches (typo-tolerant)
+                    _close = _difflib.get_close_matches(
+                        _q_upper, _all_skus_upper, n=6, cutoff=0.65)
+                    _fuzzy = [_sku_upper[c] for c in _close
+                               if c in _sku_upper
+                               and _sku_upper[c] not in
+                                   (_prefix + _sub_fwd + _sub_rev)]
+                    # 6. Name match — search product NAME column
+                    _name_hits = []
+                    try:
+                        if not products.empty and "Name" in products.columns:
+                            _name_mask = products["Name"].astype(
+                                str).str.contains(
+                                    _q, case=False, na=False, regex=False)
+                            _name_hits = (
+                                products[_name_mask]["SKU"]
+                                .astype(str).head(4).tolist())
+                            _name_hits = [
+                                s for s in _name_hits
+                                if s and s not in
+                                (_prefix + _sub_fwd + _sub_rev + _fuzzy)
+                            ]
+                    except Exception:
+                        pass
+
+                    _matches = (
+                        _prefix + _sub_fwd + _sub_rev + _fuzzy
+                        + _name_hits)[:8]
                     if _matches:
                         st.caption(
                             f"_{len(_matches)} possible match"
                             f"{'es' if len(_matches) != 1 else ''}_ — "
                             "click to use:")
                         # Clickable suggestion buttons (must be outside
-                        # the form to be reactive)
+                        # the form to be reactive). Show product name
+                        # next to the SKU so the user can disambiguate.
                         for _i, _m in enumerate(_matches):
+                            try:
+                                _mname = (
+                                    products[products["SKU"] == _m]
+                                    ["Name"].iloc[0])
+                                _mname = str(_mname)[:55]
+                            except (IndexError, KeyError):
+                                _mname = ""
+                            _label = (f"{_m}  —  {_mname}"
+                                      if _mname else _m)
                             if st.button(
-                                    _m, key=f"_ds_pick_{_i}_{_m}",
+                                    _label, key=f"_ds_pick_{_i}_{_m}",
                                     use_container_width=True):
                                 st.session_state[_sku_text_key] = _m
                                 st.rerun()
                     elif len(_q) >= 3:
                         st.caption(
-                            f":warning: `{_q}` is not in the CIN7 "
-                            "catalog. You can still save the signal — "
-                            "we'll just store it as free-text SKU "
-                            "(useful for new product requests).")
+                            f":warning: `{_q}` not in catalog (no "
+                            "fuzzy match either). You can still save "
+                            "the signal — we'll store it as free-text "
+                            "SKU (useful for new product requests or "
+                            "when CIN7 hasn't synced yet).")
 
             # ---- The actual form for the rest of the fields
             with st.form("ds_form", clear_on_submit=False):
@@ -9132,110 +9191,40 @@ engine shows every input and how it got to the suggestion.
     # decide when to promote them to stocked). Tick or untick to toggle.
     _work["Dropship?"] = _work["SKU"].astype(str).isin(dropship_skus)
 
-    # ----- AI Warning column (rule-based, no LLM call per row) ---------
-    # Every row gets a warning level + short text + evidence summary
-    # based on recent demand signals, classification history, and
-    # cancellation/return events. The warning is purely informational —
-    # it doesn't block ordering — but flags anything the buyer should
-    # think twice about before committing inventory dollars.
+    # ----- AI Warning column (score-based, no LLM call per row) --------
+    # Each SKU gets a 0-100 demand score computed from its
+    # demand_signals (volume × quality × source × recency × conversion
+    # − quality_penalty). The score → warning level mapping is in
+    # demand_scoring.score_warning_level(). See docs/demand-scoring.md
+    # for the formula.
     #
-    # Rule priority (highest first):
-    #   1. HIGH    — long dormancy (6+ months no movement) + reorder
-    #                being suggested
-    #   2. MEDIUM  — recent cancellation/return signals
-    #   3. MEDIUM  — was previously dead/slow, now seeing inquiries
-    #   4. WATCH   — many inquiries, zero conversions (pricing/avail?)
-    #   5. WATCH   — rising demand (signal count jump vs prior week)
-    #
-    # If multiple rules fire, we show the highest-priority one and
-    # mention the others in the evidence text.
+    # Performance: we batch-compute scores for ALL SKUs with at least
+    # one signal in one DB scan (db.compute_demand_scores_batch). SKUs
+    # without signals get no warning. For 11k products this is fast
+    # because most rows are silent.
     try:
-        _today_ts = pd.Timestamp.now()
-        _signals_30d_rows = db.list_demand_signals(
-            since=(_today_ts - pd.Timedelta(days=30)).strftime(
-                "%Y-%m-%d"),
-            limit=10000,
-        )
+        _scores_by_sku = db.compute_demand_scores_batch(
+            window_days=30, conversion_window_days=90)
     except Exception:
-        _signals_30d_rows = []
+        _scores_by_sku = {}
 
-    # Group signals by SKU + type for fast lookup
-    _signals_by_sku: dict = {}
-    for _r in _signals_30d_rows:
-        _d = dict(_r)
-        _s = _d.get("sku")
-        if not _s:
-            continue
-        _bucket = _signals_by_sku.setdefault(_s, {
-            "all": 0, "inquiry": 0, "quote": 0, "sold": 0,
-            "lost": 0, "cancelled": 0, "returned": 0,
-            "complaint": 0, "recent_7d": 0, "prior_7d": 0,
-        })
-        _bucket["all"] += 1
-        _t = (_d.get("signal_type") or "").lower()
-        if _t in _bucket:
-            _bucket[_t] += 1
-        # Recent vs prior 7-day for trending logic
-        _ca = _d.get("created_at") or ""
-        if _ca >= (_today_ts - pd.Timedelta(days=7)).strftime(
-                "%Y-%m-%d"):
-            _bucket["recent_7d"] += 1
-        elif _ca >= (_today_ts - pd.Timedelta(days=14)).strftime(
-                "%Y-%m-%d"):
-            _bucket["prior_7d"] += 1
+    import demand_scoring as _ds_mod
 
     def _warning_for_row(row: dict) -> tuple:
         """Returns (level, short_text). level in {'high', 'medium',
-        'watch', None}."""
+        'watch', None}. Pure score-based now — no manual rule
+        priority tree."""
         sku = str(row.get("SKU") or "")
         if not sku:
             return (None, "")
-        bucket = _signals_by_sku.get(sku, {})
-        cls = str(row.get("Classification") or "").lower()
-        suggested = float(row.get("ReorderSuggested") or 0)
-        last_move = row.get("LastMovementDate") or row.get(
-            "LastSaleDate")
-
-        # Rule 1: long dormancy + reorder being suggested
-        if suggested > 0 and cls in ("dead", "slow"):
-            return ("high",
-                    f"⛔ Caution: classified {cls.upper()} but engine "
-                    f"is suggesting reorder — verify demand before "
-                    "committing.")
-
-        # Rule 2: recent cancellation/return signals
-        n_cancel = bucket.get("cancelled", 0) + bucket.get("returned", 0)
-        if n_cancel >= 1 and suggested > 0:
-            return ("medium",
-                    f"⚠️ Recent cancellations/returns: {n_cancel} in "
-                    "last 30 days. Reorder cautiously — demand may "
-                    "be temporary.")
-
-        # Rule 3: dead/slow but recent inquiries
-        if cls in ("dead", "slow") and bucket.get("inquiry", 0) >= 2:
-            return ("medium",
-                    f"⚠️ Was {cls.upper()}; "
-                    f"{bucket['inquiry']} inquiries in last 30d. "
-                    "Promotion or one-off interest? Confirm before "
-                    "reordering.")
-
-        # Rule 4: inquiries without conversion
-        n_inq = bucket.get("inquiry", 0)
-        n_sold = bucket.get("sold", 0)
-        if n_inq >= 3 and n_sold == 0:
-            return ("watch",
-                    f"👀 {n_inq} inquiries, 0 sold — pricing or "
-                    "availability issue?")
-
-        # Rule 5: rising demand
-        n_recent = bucket.get("recent_7d", 0)
-        n_prior = bucket.get("prior_7d", 0)
-        if n_recent >= 3 and n_recent > 2 * max(n_prior, 1):
-            return ("watch",
-                    f"📈 Rising: {n_recent} signals this week "
-                    f"(was {n_prior}).")
-
-        return (None, "")
+        score_dict = _scores_by_sku.get(sku)
+        if not score_dict:
+            return (None, "")  # no signals → no warning
+        return _ds_mod.score_warning_level(
+            score_dict,
+            classification=str(row.get("Classification") or ""),
+            reorder_suggested=float(row.get("ReorderSuggested") or 0),
+        )
 
     _work["AI Warning"] = _work.apply(
         lambda r: _warning_for_row(dict(r))[1], axis=1)
@@ -13744,14 +13733,18 @@ elif page == "AI Assistant":
                 "Uses order-level data so the revenue figure matches "
                 "CIN7's dashboard (includes shipping + tax).\n"
                 "- get_recent_signals / get_top_inquired_products / "
-                "get_rising_demand — DEMAND SIGNAL tools. Use these "
-                "for proactive questions: 'what are customers asking "
-                "about?', 'what's getting attention this week?', "
-                "'what's increasing in demand?', 'any inquiries about "
-                "X recently?'. Signals are LEADING indicators — they "
-                "show interest BEFORE it shows up in sales. A SKU "
-                "with rising signal count + flat/zero sales is a key "
-                "buyer warning case.\n\n"
+                "get_rising_demand / get_demand_score — DEMAND "
+                "SIGNAL tools. Use these for proactive questions: "
+                "'what are customers asking about?', 'what's getting "
+                "attention this week?', 'what's the demand score for "
+                "X?', 'is this real or a one-off?'. Signals are "
+                "LEADING indicators — they show interest BEFORE it "
+                "appears in sales. The demand score (0-100) combines "
+                "volume + signal type + source credibility + recency "
+                "+ conversion rate. Cite the score AND the confidence "
+                "(0-1) — confidence < 0.5 means the score is "
+                "preliminary. See docs/demand-scoring.md for "
+                "the formula.\n\n"
                 "**Knowledge base tool** (search_knowledge_base) — "
                 "use for HOW or WHY questions. Examples: 'why is X "
                 "slow-moving?', 'how does the reorder engine "
