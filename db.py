@@ -2653,3 +2653,202 @@ def compute_demand_scores_batch(*,
             now=now,
         )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Demand-signal auto-reconciler — match pending signals to CIN7 sales.
+# ---------------------------------------------------------------------------
+#
+# Reduces manual work on the Demand Signals review page: when a captured
+# inquiry is followed by a real CIN7 sale to the same customer for the
+# same SKU, we mark the signal `outcome='converted'` automatically.
+#
+# Caller passes in the sale_lines records (list of dicts with at minimum
+# SKU, CustomerID, OrderDate, OrderNumber). Keeping db.py free of pandas
+# imports — the page-side and the nightly cin7_sync hook each load the
+# CSV in their own context and pass dicts down.
+#
+# Match rule:
+#   - signal.outcome ∈ {pending, open, NULL}
+#   - signal.sku and signal.customer_id both present
+#   - sale's CustomerID matches signal.customer_id (case-insensitive)
+#   - sale's SKU matches signal.sku (case-insensitive)
+#   - sale's OrderDate >= signal.created_at AND <= created_at + window_days
+#
+# FIFO per (sku, customer_id) — the OLDEST pending signal claims the
+# earliest unconsumed matching sale, so a single sale never converts two
+# pendings.
+#
+# Per spec (v2.60): we do NOT auto-mark `lost`. That stays a manual
+# decision until we trust the conversion side first.
+
+def reconcile_demand_signals(sales_rows,
+                              *,
+                              window_days: int = 30,
+                              actor: str = "auto-reconciler") -> dict:
+    """Auto-mark pending demand signals as converted when a matching CIN7
+    sale exists. See module-level comment for the match rule.
+
+    Returns a summary dict::
+
+        {
+            "matched": int,            # signals flipped to converted
+            "attempted": int,          # pending signals considered
+            "skipped_no_sku": int,     # pending but no sku captured
+            "skipped_no_customer": int,# pending but no customer_id captured
+            "skipped_no_match": int,   # eligible but no qualifying sale
+            "errors": int,             # update_demand_signal raised
+        }
+    """
+    from datetime import datetime as _dt, timedelta as _td
+
+    summary = {
+        "matched": 0,
+        "attempted": 0,
+        "skipped_no_sku": 0,
+        "skipped_no_customer": 0,
+        "skipped_no_match": 0,
+        "errors": 0,
+    }
+
+    def _parse_dt(value):
+        if value is None:
+            return None
+        if isinstance(value, _dt):
+            return value.replace(tzinfo=None) if value.tzinfo else value
+        s = str(value).strip()
+        if not s or s.lower() in ("nan", "none", "nat"):
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%f",
+                    "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d"):
+            try:
+                return _dt.strptime(s.split("+")[0].rstrip("Z"), fmt)
+            except ValueError:
+                continue
+        try:
+            return _dt.fromisoformat(
+                s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except (ValueError, AttributeError):
+            return None
+
+    def _record_run(extra=""):
+        with connect() as c:
+            c.execute(
+                "INSERT INTO audit_log (event, actor, target, detail) "
+                "VALUES (?, ?, ?, ?)",
+                ("demand_signal.reconcile_run", actor, "all",
+                 (f"matched={summary['matched']} "
+                  f"attempted={summary['attempted']} "
+                  f"no_sku={summary['skipped_no_sku']} "
+                  f"no_cust={summary['skipped_no_customer']} "
+                  f"no_match={summary['skipped_no_match']} "
+                  f"errors={summary['errors']} "
+                  f"window_days={window_days} {extra}").strip()))
+
+    sales_rows = list(sales_rows or [])
+    if not sales_rows:
+        _record_run("(no sales data)")
+        return summary
+
+    # Pull pending-equivalent signals (newest list_demand_signals returns
+    # newest-first; we'll re-sort ascending below for FIFO).
+    all_pending = list_demand_signals(limit=10000)
+    pending = [r for r in all_pending
+               if (r["outcome"] is None
+                   or str(r["outcome"]).strip().lower() in
+                   ("pending", "open", ""))]
+    summary["attempted"] = len(pending)
+
+    eligible = []
+    for s in pending:
+        if not s["sku"] or not str(s["sku"]).strip():
+            summary["skipped_no_sku"] += 1
+            continue
+        if not s["customer_id"] or not str(s["customer_id"]).strip():
+            summary["skipped_no_customer"] += 1
+            continue
+        eligible.append(s)
+    eligible.sort(key=lambda r: str(r["created_at"] or ""))
+
+    # Build (sku_upper, customer_id_upper) → [sales sorted by date] index.
+    sales_index: dict = {}
+    for row in sales_rows:
+        sku = str(row.get("SKU", "") or "").strip().upper()
+        cid = str(row.get("CustomerID", "") or "").strip().upper()
+        if not sku or not cid:
+            continue
+        order_date_dt = _parse_dt(
+            row.get("OrderDate") or row.get("InvoiceDate"))
+        if order_date_dt is None:
+            continue
+        sales_index.setdefault((sku, cid), []).append({
+            "OrderDate": order_date_dt,
+            "OrderNumber": (row.get("OrderNumber")
+                            or row.get("InvoiceNumber") or "?"),
+            "consumed": False,
+        })
+    for k in sales_index:
+        sales_index[k].sort(key=lambda x: x["OrderDate"])
+
+    # Match each eligible signal to earliest unconsumed sale within window.
+    for s in eligible:
+        sku_key = str(s["sku"]).strip().upper()
+        cid_key = str(s["customer_id"]).strip().upper()
+        candidates = sales_index.get((sku_key, cid_key), [])
+        if not candidates:
+            summary["skipped_no_match"] += 1
+            continue
+
+        sig_dt = _parse_dt(s["created_at"])
+        if sig_dt is None:
+            summary["skipped_no_match"] += 1
+            continue
+        window_end = sig_dt + _td(days=window_days)
+
+        best = None
+        for c_sale in candidates:
+            if c_sale["consumed"]:
+                continue
+            if sig_dt <= c_sale["OrderDate"] <= window_end:
+                best = c_sale
+                break
+
+        if not best:
+            summary["skipped_no_match"] += 1
+            continue
+
+        # Convert: append to existing note rather than overwriting it so
+        # any human context the buyer typed earlier survives.
+        try:
+            existing_note = (s["note"] or "").strip()
+            order_num = best["OrderNumber"] or "?"
+            sale_date_str = best["OrderDate"].strftime("%Y-%m-%d")
+            new_note = ((existing_note + " | ") if existing_note else "") + \
+                       (f"auto-matched to CIN7 Order #{order_num} on "
+                        f"{sale_date_str}")
+            update_demand_signal(
+                int(s["id"]),
+                outcome="converted",
+                note=new_note,
+                updated_by=actor)
+            best["consumed"] = True
+            summary["matched"] += 1
+        except Exception:
+            summary["errors"] += 1
+
+    _record_run()
+    return summary
+
+
+def last_demand_signal_reconcile_at() -> Optional[str]:
+    """ISO timestamp of the most recent reconcile_demand_signals run, or
+    None if it's never been run. Used by the Demand Signals page to show
+    a 'Last reconciled at:' caption."""
+    with connect() as c:
+        row = c.execute(
+            "SELECT at FROM audit_log "
+            "WHERE event = 'demand_signal.reconcile_run' "
+            "ORDER BY at DESC LIMIT 1"
+        ).fetchone()
+    return row["at"] if row else None

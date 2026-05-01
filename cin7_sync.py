@@ -801,6 +801,45 @@ def sync_salelines(client: Cin7Client, days: int) -> None:
         output_name=f"sale_lines_last_{days}d",
     )
 
+    # Auto-reconcile pending demand signals against the freshly-written
+    # sale lines. Best-effort; failure here must not crash the sync.
+    _run_demand_reconcile_after_salelines(days)
+
+
+def _run_demand_reconcile_after_salelines(days: int) -> None:
+    """Load the just-written sale_lines_last_{days}d CSV and ask db.py to
+    auto-mark matching pending demand signals as 'converted'. Logged but
+    never raised — the demand-signal layer is a non-critical add-on; if
+    it breaks we don't want it to take the nightly CIN7 sync down."""
+    try:
+        import db as _db   # local import keeps the cin7_sync top-level
+                            # imports clean and avoids a hard dependency.
+    except Exception as exc:
+        log.info("  demand reconcile skipped: db import failed (%s)", exc)
+        return
+    try:
+        latest = sorted(
+            OUTPUT_DIR.glob(f"sale_lines_last_{days}d_*.csv")
+        )
+        if not latest:
+            log.info("  demand reconcile: no sale_lines_last_%dd file found",
+                     days)
+            return
+        import csv
+        with open(latest[-1], encoding="utf-8", newline="") as fh:
+            sales_records = list(csv.DictReader(fh))
+        summary = _db.reconcile_demand_signals(
+            sales_records, window_days=30,
+            actor=f"auto-reconciler ({Path(__file__).name})")
+        log.info(
+            "  demand reconcile: matched=%d attempted=%d "
+            "no_sku=%d no_cust=%d no_match=%d errors=%d",
+            summary["matched"], summary["attempted"],
+            summary["skipped_no_sku"], summary["skipped_no_customer"],
+            summary["skipped_no_match"], summary["errors"])
+    except Exception as exc:
+        log.warning("  demand reconcile failed: %s", exc)
+
 
 def _purchase_detail_path(header: Dict[str, Any]) -> str:
     """Route based on PO Type. Simple -> /purchase,

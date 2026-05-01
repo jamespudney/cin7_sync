@@ -219,7 +219,7 @@ products = load("products")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.59 — Demand Signals review/edit page: filter captured signals by SKU/source/outcome/confidence/date, edit outcome (pending/converted/lost/ignored/duplicate/wrong_sku), approved_sku, product_family, notes inline. Edits go through `update_demand_signal` so each change is audited. demand_scoring.py now counts `outcome='converted'` rows in the conversion factor (deduped by id with signal_type='sold'), so marking an inquiry as won feeds back into the score. Outcome legacy values ('open'/'invalid') auto-display as the new vocabulary via `normalize_outcome`. (May 1)")
+    st.caption("🟢 v2.60 — Demand-signal auto-reconciler: matches pending signals (with sku + customer_id) to CIN7 sales for the same SKU + customer within 30 days, marks them `converted` automatically, appends `auto-matched to CIN7 Order #X on YYYY-MM-DD` to the note. New `🔄 Reconcile against CIN7 sales` button on the Demand Signals page; same routine runs unattended at the end of every `sync_salelines` (nightly + on-demand). Audit log gets a `demand_signal.reconcile_run` row each pass + a `demand_signal.update` row per match (actor=auto-reconciler). FIFO per (sku, customer) so one sale never converts two pendings. Lost-marking stays manual per spec. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
@@ -14046,11 +14046,70 @@ elif page == "AI Assistant":
 elif page == "Demand Signals":
     st.header(":clipboard: Demand Signals — Review & Edit")
     st.caption(
-        "Triage captured demand signals. Mark each one with its real "
-        "outcome (converted, lost, ignored, duplicate, wrong_sku) — the "
-        "demand score reads `outcome='converted'` so your edits "
-        "compound into a sharper signal next time."
+        "Triage captured demand signals. The auto-reconciler matches "
+        "pending signals to CIN7 sales for you — only the leftovers "
+        "(no customer captured, no matching sale yet, or genuinely "
+        "lost) need a human touch."
     )
+
+    # ---- Auto-reconciler controls ----
+    rec_col1, rec_col2 = st.columns([1, 3])
+    if rec_col1.button(
+            ":arrows_counterclockwise: Reconcile against CIN7 sales",
+            type="primary",
+            width="stretch",
+            help="Match each pending signal to the matching CIN7 sale "
+                 "(same SKU + same customer, sale within 30 days "
+                 "after capture). Marks matched ones as 'converted' "
+                 "and records the matched order # in the note."):
+        try:
+            _sales_records = (sale_lines_30d.to_dict(orient="records")
+                              if not sale_lines_30d.empty else [])
+        except Exception as _e:
+            st.error(f"Could not load sale_lines for reconcile: {_e}")
+            _sales_records = []
+        with st.spinner("Matching pending signals to CIN7 sales…"):
+            try:
+                _summary = db.reconcile_demand_signals(
+                    _sales_records,
+                    window_days=30,
+                    actor="auto-reconciler")
+                if _summary["matched"]:
+                    st.success(
+                        f":white_check_mark: Auto-matched "
+                        f"{_summary['matched']} signal(s) to CIN7 sales. "
+                        f"({_summary['attempted']} pending considered, "
+                        f"{_summary['skipped_no_customer']} skipped for "
+                        f"no customer, "
+                        f"{_summary['skipped_no_match']} no matching "
+                        f"sale yet.)")
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.info(
+                        f"No matches this run. "
+                        f"{_summary['attempted']} pending considered "
+                        f"(skipped: {_summary['skipped_no_sku']} no SKU, "
+                        f"{_summary['skipped_no_customer']} no customer, "
+                        f"{_summary['skipped_no_match']} no qualifying "
+                        f"sale within 30d).")
+            except Exception as _e:
+                st.error(f"Reconcile failed: {_e}")
+
+    try:
+        _last_rec = db.last_demand_signal_reconcile_at()
+    except Exception:
+        _last_rec = None
+    if _last_rec:
+        rec_col2.caption(
+            f":clock3: Last reconciled at **{_last_rec}** UTC. "
+            "Also runs automatically as part of the nightly CIN7 sync.")
+    else:
+        rec_col2.caption(
+            ":clock3: Reconciler has never run. Click the button to "
+            "do a first pass, or wait for the nightly sync.")
+
+    st.divider()
 
     # ---- Filters ----
     fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns([1.5, 1, 1, 1, 1])
