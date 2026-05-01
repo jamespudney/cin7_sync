@@ -311,6 +311,32 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_demand_score",
+        "description": (
+            "Compute a 0-100 demand score for one SKU from its recent "
+            "demand_signals. The score combines signal volume, signal "
+            "type (inquiry vs quote vs cancelled), source credibility, "
+            "recency, and conversion rate. Returns the score, a "
+            "confidence band (0-1), the breakdown of which "
+            "signal types/sources contributed, and a human-readable "
+            "explanation. Use when the user asks 'what's the demand "
+            "score for X?', 'is X really rising or just a one-off?', "
+            "'should I trust the inquiries on X?'. Per "
+            "docs/demand-scoring.md."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string"},
+                "window_days": {
+                    "type": "integer",
+                    "description": "Recent window (default 30).",
+                },
+            },
+            "required": ["sku"],
+        },
+    },
+    {
         "name": "get_rising_demand",
         "description": (
             "Compare signal counts in a recent window vs a prior "
@@ -909,6 +935,24 @@ def get_rising_demand(engine_df: pd.DataFrame,
     }
 
 
+def get_demand_score(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """Compute the 0-100 demand score for a single SKU. Wraps
+    db.compute_demand_score and adds Claude-friendly explanation
+    text via demand_scoring.explain_score()."""
+    import demand_scoring
+    sku = (args.get("sku") or "").strip()
+    if not sku:
+        return {"error": "sku is required"}
+    window = max(1, min(int(args.get("window_days", 30) or 30), 365))
+    score_dict = db.compute_demand_score(sku, window_days=window)
+    score_dict["sku"] = sku
+    score_dict["explanation"] = demand_scoring.explain_score(
+        score_dict)
+    return score_dict
+
+
 def search_knowledge_base(engine_df: pd.DataFrame,
                             sale_lines_df: pd.DataFrame,
                             args: dict) -> dict:
@@ -958,6 +1002,7 @@ TOOL_HANDLERS = {
     "get_recent_signals": get_recent_signals,
     "get_top_inquired_products": get_top_inquired_products,
     "get_rising_demand": get_rising_demand,
+    "get_demand_score": get_demand_score,
     "search_knowledge_base": search_knowledge_base,
 }
 

@@ -2525,3 +2525,95 @@ def delete_demand_signal(signal_id: int, actor: str = "system") -> None:
             "INSERT INTO audit_log (event, actor, target, detail) "
             "VALUES (?, ?, ?, ?)",
             ("demand_signal.delete", actor, str(signal_id), ""))
+
+
+# ---------------------------------------------------------------------------
+# Demand score wrappers - bridge demand_signals rows -> demand_scoring module.
+# Kept here (not in demand_scoring.py) so the scoring module stays pure /
+# DB-free / unit-testable. This is the only place that knows how to fetch
+# rows for a SKU.
+# ---------------------------------------------------------------------------
+
+def compute_demand_score(sku,
+                          *,
+                          window_days=30,
+                          conversion_window_days=90):
+    """Compute the 0-100 demand score + confidence for a single SKU.
+
+    Pulls signals from demand_signals within the window and hands them
+    to demand_scoring.score_signals(). Returns the same dict shape that
+    function returns (score, confidence, components, breakdown, why).
+    Returns the empty/zero dict if no signals.
+    """
+    import demand_scoring as _ds
+    from datetime import datetime, timedelta
+
+    sku = (sku or "").strip()
+    if not sku:
+        return _ds.score_signals([], window_days=window_days)
+
+    now = datetime.utcnow()
+    window_since = (now - timedelta(days=window_days)).isoformat()
+    conv_since = (now - timedelta(days=conversion_window_days)).isoformat()
+
+    window_rows = list_demand_signals(
+        sku=sku, since=window_since, limit=10000)
+    conv_rows = list_demand_signals(
+        sku=sku, since=conv_since, limit=10000)
+
+    window_dicts = [dict(r) for r in window_rows]
+    conv_dicts = [dict(r) for r in conv_rows]
+
+    return _ds.score_signals(
+        window_dicts,
+        window_days=window_days,
+        conversion_signals=conv_dicts,
+        conversion_window_days=conversion_window_days,
+        now=now,
+    )
+
+
+def compute_demand_scores_batch(*,
+                                  window_days=30,
+                                  conversion_window_days=90):
+    """Compute scores for ALL SKUs that have at least one signal in the
+    window, in one DB scan. Returns {sku: score_dict}.
+
+    Used by the Ordering page warning column. The naive
+    "loop compute_demand_score per sku" version was O(N) DB calls; this
+    is O(2) (one for the window range, one for the conversion range).
+    """
+    import demand_scoring as _ds
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow()
+    window_since = (now - timedelta(days=window_days)).isoformat()
+    conv_since = (now - timedelta(days=conversion_window_days)).isoformat()
+
+    with connect() as c:
+        window_rows = c.execute(
+            "SELECT * FROM demand_signals "
+            "WHERE sku IS NOT NULL AND sku != '' AND created_at >= ?",
+            (window_since,)).fetchall()
+        conv_rows = c.execute(
+            "SELECT * FROM demand_signals "
+            "WHERE sku IS NOT NULL AND sku != '' AND created_at >= ?",
+            (conv_since,)).fetchall()
+
+    by_sku_window = {}
+    for r in window_rows:
+        by_sku_window.setdefault(r["sku"], []).append(dict(r))
+    by_sku_conv = {}
+    for r in conv_rows:
+        by_sku_conv.setdefault(r["sku"], []).append(dict(r))
+
+    out = {}
+    for sku, sigs in by_sku_window.items():
+        out[sku] = _ds.score_signals(
+            sigs,
+            window_days=window_days,
+            conversion_signals=by_sku_conv.get(sku, sigs),
+            conversion_window_days=conversion_window_days,
+            now=now,
+        )
+    return out

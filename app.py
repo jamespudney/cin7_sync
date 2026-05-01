@@ -206,10 +206,20 @@ def _freshness_from_output_dir() -> tuple:
         return (None, None, None)
 
 
+# The sidebar's demand-capture form needs `products` loaded so it can
+# build the SKU/name autocomplete. Streamlit runs the script top-to-
+# bottom — if we delay loading products until below the sidebar
+# block, the form sees an undefined name, the try/except silently
+# catches it, and the autocomplete is permanently empty. So load it
+# here. The disk-persisted @st.cache_data on load() means this is
+# essentially free on subsequent renders.
+products = load("products")
+
+
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    st.caption("🟢 v2.57 — Fix: demand-capture form was raising 'cannot modify session_state' on save and on suggestion clicks. Replaced direct widget-state assignment with Streamlit's pending-value pattern (queue → apply before next render). The save itself was working all along — only the post-save clear was failing. (May 1)")
+    st.caption("🟢 v2.58 — Fix: demand-capture smart-search returned no suggestions for ANYTHING because the form (inside `with st.sidebar:`) was running BEFORE `products = load(\"products\")` further down the script. The try/except silently swallowed the NameError, leaving `_sku_options = []` permanently. Now products is loaded before the sidebar block, so SKU/name autocomplete actually has data. (May 1)")
 
     # --- Data freshness indicator ---------------------------------------
     # Shows how stale the on-disk sync data is (independent of the browser's
