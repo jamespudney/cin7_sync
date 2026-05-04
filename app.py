@@ -228,10 +228,22 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.6 — Pass-1 family cap dropped 4 → 1 so "
-                "Iris/Lily aren't starved by higher-scored families.")
+    st.caption("🟢 v2.67.7 — Per-shopify-hit emission + family-aware "
+                "fallback so Iris pure-white and stocked Lily surface.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.7** — Two union-loop bugs from v2.67.6 fixed: "
+            "(a) Lily's older 'lilly' Shopify page was emitting a "
+            "misleading 'stock data not available' note before the "
+            "newer 'lily' page (with real LED-WLWW-* CIN7 stock) "
+            "could emit; precompute `family_has_any_passing` so a "
+            "hit's shopify-only fallback yields when a sibling hit "
+            "in the family has real coverage. (b) Iris RGBW ate "
+            "the family's cap=1 slot before pure-white Iris hits "
+            "could emit; pass-1 now emits one row per shopify_hit "
+            "(not per family), with per-family cap raised 1 → 3 so "
+            "Iris gets RGBW + pure-white IP20 + pure-white IP68 "
+            "in pass 1. Pass 2 still drains deferred for depth.\n\n"
             "**v2.67.6** — _PER_FAMILY_PASS_1 lowered 4 → 1. With "
             "cap=4 the limit=60 budget was filled by the top "
             "9-15 high-scored families before lower-ranked ones "

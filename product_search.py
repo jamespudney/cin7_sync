@@ -148,21 +148,18 @@ def detect_family(text: Optional[str]) -> Optional[str]:
 # memory accounting.
 _BODY_CAP_CHARS = 12288
 
-# v2.67.6 — per-family variant cap on the first emission pass.
-# Lowered 4 → 1 after observing that with cap=4 the pass-1 budget
-# (limit=60) was being filled by the top 9-15 high-scored families
-# alone -- each emitting 4 variants -- so lower-ranked families like
-# White Iris and White Lily were never reached. Iris specifically
-# scores ~6.0 instead of 8+ because its title ("White High CRI IP20
-# LED Strip (24V) ~ White Iris Series") contains NO warm-white token
-# -- the warm-white signal is only in body content, which gives a
-# +1.0 OR-leg boost instead of the +3.0 boost that title-matched
-# families get. With cap=1, pass 1 emits exactly one variant per
-# family for true breadth, then pass 2 drains the deferred queue to
-# fill depth from the higher-scored families. Guarantees every
-# matched family appears in the answer as long as the family count
-# does not exceed the overall limit.
-_PER_FAMILY_PASS_1 = 1
+# v2.67.7 — per-family overall cap on pass-1 emissions, paired with a
+# per-shopify-hit cap of 1 (each Shopify .md page gets at most one
+# pass-1 row). Set to 3 so a multi-page family like White Iris (which
+# has separate Shopify .md pages for RGBW IP20, RGBW IP68, pure-white
+# IP20 24V, pure-white IP68 24V, pure-white 12V, UL...) gets up to
+# three of those .md pages represented in pass 1 -- typically one
+# RGBW + one pure-white IP20 + one pure-white IP68 -- giving the
+# user real variety. v2.67.6 had this set to 1 which meant whichever
+# Iris .md scored highest (RGBW) ate the only slot and pure-white
+# variants were starved. Pass 2 still drains deferred SKUs for
+# additional depth; this cap only governs pass-1 breadth.
+_PER_FAMILY_PASS_1 = 3
 
 
 @dataclass
@@ -651,40 +648,94 @@ def find_products(engine_df: pd.DataFrame,
             "note": None,
         })
 
-    # Pass 1: per-family breadth-capped emission.
+    # v2.67.7 — per-shopify-hit emission with family-aware fallback
+    # decision and a modest per-family cap.
+    #
+    # Why this structure:
+    #
+    # 1. Multi-page-per-family case (Lily): two Shopify pages share
+    #    family WHITE_LILY (the older "continuous-led-lighting-strip-
+    #    white-lilly-series" and the newer "continuous-cob-ip67-…-
+    #    white-lily-series" with real CIN7-matching SKUs). v2.67.6
+    #    processed the older one first, fell into the shopify-only
+    #    branch with the misleading "stock data not available" note,
+    #    and capped the family. The newer page's matching SKUs got
+    #    deferred and lost. Fix: precompute family-level "any hit has
+    #    passing SKUs?" lookahead — when this hit has no passing SKUs
+    #    BUT another hit in the same family does, skip the shopify-
+    #    only fallback for this hit and let the other hit emit.
+    #
+    # 2. Variety-per-family case (Iris): family WHITE_IRIS has 5+
+    #    Shopify pages — RGBW IP20, RGBW IP68, pure-white IP20 24V,
+    #    pure-white IP68 24V, pure-white 12V, UL — and the user
+    #    expects to see BOTH the RGBW variants AND the pure-white
+    #    variants. Cap=1 per family meant whichever Iris hit scored
+    #    highest (RGBW) ate the family's only slot and pure-white was
+    #    starved. Fix: emit one SKU per shopify_hit (not per family),
+    #    then enforce a per-family cap of _PER_FAMILY_PASS_1=3 to
+    #    keep one prolific family from dominating the answer. Iris
+    #    gets up to 3 distinct .md files represented (likely RGBW +
+    #    one pure-white IP20 + one pure-white IP68); pass 2 fills
+    #    depth from deferred.
+
+    # Pre-compute family-level lookahead: does ANY hit in this
+    # family have at least one SKU passing the per-row CIN7 filter?
+    # Used to decide whether a particular hit's "no passing" branch
+    # should fire its shopify-only fallback or yield to a sibling
+    # hit with real coverage.
+    family_has_any_passing: dict[str, bool] = {}
+    family_has_any_in_cin7: dict[str, bool] = {}
+    for score, fields_hit, sp in shopify_hits:
+        family_key = sp.family or f"_handle_{sp.handle}"
+        if family_key not in family_has_any_passing:
+            family_has_any_passing[family_key] = False
+            family_has_any_in_cin7[family_key] = False
+        for s in sp.skus or []:
+            if s in cin7_matched_skus:
+                family_has_any_passing[family_key] = True
+            if s in cin7_sku_set:
+                family_has_any_in_cin7[family_key] = True
+
+    # Pass 1: one emission per shopify_hit (not per family) with a
+    # per-family overall cap.
     for score, fields_hit, sp in shopify_hits:
         if len(out) >= limit:
             break
         sp_skus = sp.skus or []
-        sp_skus_in_cin7 = [s for s in sp_skus if s in cin7_sku_set]
         sp_skus_passing = [s for s in sp_skus if s in cin7_matched_skus]
         family_key = sp.family or f"_handle_{sp.handle}"
 
         if sp_skus_passing:
+            # Emit ONE passing SKU from this hit, then defer the rest
+            # of this hit's passing SKUs. Per-family cap caps how many
+            # hits from the same family contribute pass-1 emissions.
+            emitted_for_this_hit = False
             for sku in sp_skus_passing:
                 if sku in seen_skus:
                     continue
                 if (emitted_per_family.get(family_key, 0)
-                        >= _PER_FAMILY_PASS_1):
+                        >= _PER_FAMILY_PASS_1) or emitted_for_this_hit:
                     deferred.append((score, fields_hit, sp, sku))
                     continue
                 _emit_both_row(sku, score, fields_hit, sp)
                 emitted_per_family[family_key] = (
                     emitted_per_family.get(family_key, 0) + 1)
+                emitted_for_this_hit = True
                 if len(out) >= limit:
                     break
         else:
-            # No variants passed the per-row CIN7 filter — surface a
-            # shopify-only row so the family isn't silently omitted.
-            # Skip if a sibling shopify hit for the same family already
-            # contributed something (avoids duplicate display rows).
+            # No passing SKUs on THIS hit. Skip the shopify-only
+            # fallback if a sibling hit in the same family DOES have
+            # passing SKUs (it'll emit them) — otherwise we'd produce
+            # the misleading "stock data not available" row when real
+            # stock exists on a different .md page.
+            if family_has_any_passing.get(family_key, False):
+                continue
+            # Also skip if the family already has any kind of emission
+            # (avoid duplicate display rows for one family).
             if emitted_per_family.get(family_key, 0) > 0:
                 continue
-            if sp_skus_in_cin7:
-                # Family is represented in CIN7 but the active filter
-                # excluded every variant (e.g. White Lily's only CIN7
-                # rows are discontinued connectors that the strip-
-                # accessory exclude_types filter dropped).
+            if family_has_any_in_cin7.get(family_key, False):
                 note = (
                     "Found in Shopify; CIN7 has variants for this "
                     "family but none passed the active filter (may "
@@ -713,9 +764,9 @@ def find_products(engine_df: pd.DataFrame,
             emitted_per_family[family_key] = (
                 emitted_per_family.get(family_key, 0) + 1)
 
-    # Pass 2: drain deferred variants up to limit. By this point every
-    # family that had hits has at least its top-_PER_FAMILY_PASS_1
-    # variants represented; pass 2 simply backfills depth.
+    # Pass 2: drain deferred variants up to limit. Pass 1 guarantees
+    # every hit (and every family with at least one passing-SKU hit)
+    # got pass-1 representation; pass 2 just backfills depth.
     if len(out) < limit:
         for score, fields_hit, sp, sku in deferred:
             if len(out) >= limit:
