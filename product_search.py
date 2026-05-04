@@ -137,13 +137,16 @@ def detect_family(text: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Shopify .md parsing (matches the format written by shopify_sync.py).
 # ---------------------------------------------------------------------------
-# v2.67.1 — body content is capped at this size to keep the in-process
-# product cache bounded. Most product descriptions are <2KB; capping at
-# 4KB still preserves enough text for tag/keyword matching while
-# preventing a single product page with a giant FAQ block from
-# inflating the cache. Counted in *characters*, not bytes — close
-# enough for memory accounting.
-_BODY_CAP_CHARS = 4096
+# v2.67.3 — body content is capped at this size to keep the in-process
+# product cache bounded. Originally 4KB (v2.67.1) sized for just the
+# customer-facing description, but v2.67.3 folded the ## Variants
+# section into body content (see _parse_shopify_product_md) and a
+# popular family page (e.g. White Iris) has 30+ variant lines averaging
+# 80 chars each → 2.4KB just for variants, plus 1-2KB description.
+# 12KB gives comfortable headroom while keeping per-product memory
+# bounded. Counted in characters, not bytes — close enough for
+# memory accounting.
+_BODY_CAP_CHARS = 12288
 
 # v2.67.2 — per-family variant cap on the first emission pass. With a
 # default limit of 60 and 4 per family, pass 1 represents up to 15
@@ -210,7 +213,17 @@ def _parse_shopify_product_md(path: Path) -> Optional[ShopifyProduct]:
         if s.startswith("## "):
             heading = s[3:].strip().lower()
             in_meta = (heading == "metadata")
-            in_body = (heading == "customer-facing description")
+            # v2.67.3 — any non-metadata ## section flows into body.
+            # Previously only "customer-facing description" was kept;
+            # that lost the ## Variants section, where the kelvin
+            # temperatures and "Ultra Wm" abbreviations actually live
+            # (each variant line written by shopify_sync reads e.g.
+            # "- LEDIRIS2700-120-0305 — Ultra Wm (2700K) 120 LEDs/m
+            # — $1.50"). Without those lines in the haystack the Iris
+            # and Lily pages never scored against warm-white queries.
+            # Folding everything-but-metadata into body restores the
+            # signal and is forward-compatible with new ## sections.
+            in_body = not in_meta
             continue
         if in_meta:
             m = _META_LINE.match(s)
@@ -234,8 +247,9 @@ def _parse_shopify_product_md(path: Path) -> Optional[ShopifyProduct]:
             body_lines.append(line)
     body = " ".join(ln.strip() for ln in body_lines if ln.strip())
     if len(body) > _BODY_CAP_CHARS:
-        # v2.67.1 — bound per-product memory. Truncating here means a
-        # single oversized product page can't bloat the index cache.
+        # v2.67.1/v2.67.3 — bound per-product memory. Truncating here
+        # means a single oversized product page can't bloat the index
+        # cache. v2.67.3 raised the cap to fit the ## Variants block.
         body = body[:_BODY_CAP_CHARS]
     try:
         mt = path.stat().st_mtime

@@ -225,7 +225,17 @@ with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
     st.caption(
-        "🟢 v2.67.2 — Two union-loop fixes for find_products. "
+        "🟢 v2.67.3 — Parser now folds ## Variants into body content. "
+        "Iris and Lily Shopify pages weren't scoring against warm-"
+        "white queries because their kelvin tokens (Ultra Wm, 2700K, "
+        "etc.) live in the ## Variants section of each .md, which "
+        "the parser was dropping. Each variant line written by "
+        "shopify_sync reads e.g. '- LEDIRIS2700-120-0305 — Ultra Wm "
+        "(2700K) 120 LEDs/m — $1.50' — exactly the warm-white signal "
+        "we needed in the haystack. Now any non-metadata ## section "
+        "flows into body. Body cap bumped 4KB → 12KB to fit ~30 "
+        "variant lines per family page. v2.67.2 retained: "
+        "Two union-loop fixes for find_products. "
         "Bug #1 (Lily-explicit returned 0): fork on sp_skus_passing "
         "not sp_skus_in_cin7 so the Shopify-only fallback fires "
         "when no variants pass the per-row filter. White Lily's "
