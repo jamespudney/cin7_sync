@@ -228,10 +228,20 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.16 — Round-robin pass-2 + cap=2 per "
-                "(family, kelvin) so depth fills evenly across families.")
+    st.caption("🟢 v2.67.17 — Density-aware bucket diversification "
+                "so 180-density variants surface alongside 120/60.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.17** — Within each (family, kelvin) bucket, "
+            "reorder SKUs to interleave by first varying segment. "
+            "v2.67.16's pass-1 cap=2 was emitting two same-density "
+            "variants (120-0305 + 120-100M) because alphabetical "
+            "order kept all 120-density SKUs at the front of the "
+            "Iris 2700K bucket. The new _diversify_skus helper "
+            "splits on '-' and groups by first varying part, then "
+            "round-robins across groups: 120-0305, 180-0305, "
+            "60-0305, 120-100M, 180-100M, … Generic — works for "
+            "any SKU pattern with a varying middle segment.\n\n"
             "**v2.67.16** — Two depth-distribution fixes. "
             "(a) Pass-1 per-(family, kelvin) cap raised 1 → 2 so "
             "each kelvin bucket emits 2 SKUs upfront (e.g. both "

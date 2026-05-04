@@ -615,6 +615,55 @@ def _shopify_score(sp: ShopifyProduct,
 # `_unknown` exemption (designed for legitimate warm RGBW pages)
 # from also letting cool/natural RGBW variants slip into warm-white
 # answers. Returns one of: "_warm", "_cool", "_natural", "_unknown".
+def _diversify_skus(skus: list[str]) -> list[str]:
+    """Reorder SKUs within a kelvin bucket to interleave by their
+    first varying segment.
+
+    v2.67.17 — Without diversification, the alphabetically-first
+    SKUs in a bucket (e.g. LEDIRIS2700-*) tend to share their first
+    segment (density `120`), so pass-1 cap=2 emits two same-density
+    variants (120-0305 + 120-100M) and the 180-density variants
+    don't surface until deep in pass-2. By splitting on `-` and
+    finding the first segment position where SKUs differ, we can
+    round-robin across those distinct values: for LEDIRIS2700, that
+    means interleaving `120-...`, `180-...`, `60-...` so the first
+    few emissions span all three densities.
+
+    Generic: works for any SKU naming convention with a varying
+    segment. Falls back to original order when SKUs share all
+    segments (single SKU or otherwise homogeneous).
+    """
+    if len(skus) <= 1:
+        return list(skus)
+    parts_list = [s.split("-") for s in skus]
+    max_len = max(len(p) for p in parts_list)
+    diversify_idx: Optional[int] = None
+    for i in range(max_len):
+        vals: set[str] = set()
+        for parts in parts_list:
+            if i < len(parts):
+                vals.add(parts[i])
+        if len(vals) > 1:
+            diversify_idx = i
+            break
+    if diversify_idx is None:
+        return list(skus)
+    groups: dict[str, list[str]] = {}
+    group_order: list[str] = []
+    for sku, parts in zip(skus, parts_list):
+        key = parts[diversify_idx] if diversify_idx < len(parts) else ""
+        if key not in groups:
+            groups[key] = []
+            group_order.append(key)
+        groups[key].append(sku)
+    result: list[str] = []
+    while any(groups[k] for k in group_order):
+        for key in group_order:
+            if groups[key]:
+                result.append(groups[key].pop(0))
+    return result
+
+
 def _classify_color_from_name(name: str) -> str:
     """Map a name without explicit kelvin to a color-class bucket."""
     nl = (name or "").lower()
@@ -1139,6 +1188,15 @@ def find_products(engine_df: pd.DataFrame,
                 else:
                     kelvin = _classify_color_from_name(name)
                 sku_by_kelvin.setdefault(kelvin, []).append(sku)
+            # v2.67.17 — within each (family, kelvin) bucket,
+            # reorder SKUs to interleave by their first varying
+            # SKU segment (typically density: 60/120/180 LEDs/m
+            # for Iris-style SKUs). Pass-1 cap=2 then picks two
+            # SKUs from different densities/form-factors instead
+            # of two same-density variants, surfacing the variety
+            # users expect to see in a single answer.
+            for k in sku_by_kelvin:
+                sku_by_kelvin[k] = _diversify_skus(sku_by_kelvin[k])
 
             kelvins_already_emitted = (
                 emitted_kelvin_per_family.setdefault(family_key, set()))
