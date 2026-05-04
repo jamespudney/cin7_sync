@@ -803,6 +803,23 @@ def find_products(engine_df: pd.DataFrame,
     shopify_collections = _index_shopify_collections()
     collection_hits: list[tuple[float, ShopifyCollection]] = []
     for c in shopify_collections:
+        # v2.67.15 — apply exclude_types to collection TITLES.
+        # v2.67.14's first run matched 49 collections for a warm-
+        # white-strip query, including "LED Drivers", "Casambi
+        # Bluetooth LED controllers", "LED Modules for Signs",
+        # "LED Strip Soldering Services", "LED Light Bases for
+        # Edge-Lit Acrylic" — none of which are LED strips. Their
+        # descriptions just happened to contain "led strip"
+        # generically. Member products would have been filtered
+        # at expansion time anyway by the same exclude_types, but
+        # filtering at the collection level is cleaner: it keeps
+        # collections_matched honest, prevents accessory-collection
+        # member products from getting a score boost (which they
+        # shouldn't), and saves the scoring work entirely.
+        if exclude_types:
+            ct_lower = c.title.lower()
+            if any(e.lower() in ct_lower for e in exclude_types):
+                continue
         cs = _score_collection(c, query_tokens, any_of_terms)
         if cs > 0:
             collection_hits.append((cs, c))

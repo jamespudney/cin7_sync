@@ -228,10 +228,23 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.14 — Shopify collections now searched + boost "
-                "member products into shopify_hits.")
+    st.caption("🟢 v2.67.15 — Collection titles filtered by "
+                "exclude_types so accessory collections don't pollute.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.15** — Apply exclude_types to collection "
+            "titles before scoring. v2.67.14's first run matched "
+            "49 collections for a warm-white-strip query, "
+            "including 'LED Drivers', 'Casambi Bluetooth LED "
+            "controllers', 'LED Modules for Signs', 'LED Strip "
+            "Soldering Services' — accessory collections whose "
+            "descriptions mention 'led strip' generically but "
+            "aren't actually strips. Their member products were "
+            "filtered at expansion time anyway, but the noise "
+            "in collections_matched / collection_titles_matched "
+            "was misleading. Now we drop these at the collection "
+            "scoring step, keeping the matched-collection list "
+            "tight to actual strip-relevant groupings.\n\n"
             "**v2.67.14** — find_products now walks "
             "/data/shopify/collections/*.md, scores each collection "
             "against the query, and uses matches to (a) boost member "
