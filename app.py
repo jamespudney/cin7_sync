@@ -225,22 +225,7 @@ with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
     st.caption(
-        "🟢 v2.67 — Unified product discovery (CIN7 ⋃ Shopify). "
-        "New find_products tool unions CIN7 inventory with the "
-        "Shopify product KB so 'what warm white strips do we have' "
-        "now surfaces Shopify-only families (White Lily, pure-white "
-        "White Iris, Cardinal Flower, etc.) instead of silently "
-        "omitting them. Each result is tagged source ∈ "
-        "{cin7, shopify, both}; Shopify-only rows come back with "
-        "stock_status='unknown' and a 'Found in Shopify; stock data "
-        "not available' note. AI Assistant page shows a freshness "
-        "banner if /data/shopify/ is missing or older than 48h. "
-        "Family detector (Elite Gold, White Iris, White Lily, "
-        "Decor, Cardinal Flower, Liatris, Baltic Ivy, Honey Suckle, "
-        "Sierra, Smokies, Oslo, Slim8, Slim, PLW80, PLW70, Disa) "
-        "is a placeholder until product_attributes (Tier-A1) ships. "
-        "v2.66.6 baseline retained: "
-        "Slow-stock promotion DISABLED so product-list "
+        "🟢 v2.66.6 — Slow-stock promotion DISABLED so product-list "
         "questions reliably land. Trace: the slow-stock promotion "
         "rule (added v2.66, tightened v2.66.2, surrounding edits "
         "v2.66.4-v2.66.5) was the persistent breaker on questions "
@@ -13954,39 +13939,6 @@ elif page == "AI Assistant":
         "is logged for audit."
     )
 
-    # v2.67 — Shopify product-index freshness banner. find_products
-    # unions Shopify product KB with CIN7; if /data/shopify/ isn't
-    # populated we lose Shopify-only families (White Lily, pure-white
-    # Iris, etc.) and the answer to 'what warm white strips do we
-    # have' silently omits them. Tell the user when we're degraded.
-    try:
-        from product_search import shopify_freshness_status
-        _shopify_freshness = shopify_freshness_status()
-    except Exception as _exc:  # noqa: BLE001
-        _shopify_freshness = {
-            "state": "missing",
-            "n_products": 0,
-            "message": f"product_search import failed: {_exc}",
-        }
-    if _shopify_freshness.get("state") == "missing":
-        st.error(
-            ":warning: **Shopify product discovery data missing or "
-            "stale.** "
-            f"{_shopify_freshness.get('message', '')} The AI "
-            "Assistant will only see CIN7 inventory until the sync "
-            "runs — Shopify-only families (White Lily, pure-white "
-            "White Iris, etc.) will not appear in product-discovery "
-            "answers. Run `python shopify_sync.py` on the host."
-        )
-    elif _shopify_freshness.get("state") == "stale":
-        _hrs = _shopify_freshness.get("oldest_age_hours")
-        st.warning(
-            f":hourglass_flowing_sand: Shopify product docs last "
-            f"synced {_hrs}h ago — may be stale. "
-            f"({_shopify_freshness.get('n_products', 0)} products "
-            f"indexed.) Run `python shopify_sync.py` to refresh."
-        )
-
     # Build a lightweight inventory view for the AI tools. The full
     # ABC engine is currently scoped to the Ordering page block, so
     # we don't have engine_df here. Instead we compose a simpler
@@ -14580,52 +14532,6 @@ elif page == "AI Assistant":
                 "'controller','power supply','channel','profile',"
                 "'accessory','service','module'], "
                 "classification='slow').\n\n"
-                # v2.67 — product-discovery routing. The bare
-                # search_products_by_text tool only sees CIN7 data,
-                # so questions like 'what warm white strips do we
-                # have' silently miss Shopify-only families (White
-                # Lily, pure-white White Iris). For those questions
-                # Claude MUST use find_products, which unions both
-                # data sources.
-                "**Product-discovery routing (v2.67) — IMPORTANT:** "
-                "for BROAD CATEGORY questions about what products "
-                "we have ('what warm white strips do we have', "
-                "'show me our outdoor LED products', 'list our "
-                "high-CRI strips', 'do we have any cardinal flower "
-                "strips'), call `find_products`, NOT bare "
-                "`search_products_by_text`. find_products unions "
-                "CIN7 inventory with the Shopify product knowledge "
-                "base, so Shopify-only families (White Lily, pure-"
-                "white White Iris, etc.) are surfaced — these have "
-                "no CIN7 stock row, and bare text_search would omit "
-                "them. find_products marks each result with a "
-                "`source` field ∈ {cin7, shopify, both}. Rows with "
-                "source='shopify' come back with stock_status="
-                "'unknown' and a `note` saying 'Found in Shopify; "
-                "stock data not available' — INCLUDE these in your "
-                "answer with that note, do not silently skip them. "
-                "When find_products returns Shopify-side warnings "
-                "(e.g. 'Shopify product index is stale'), surface "
-                "the warning to the user briefly so they know the "
-                "answer's coverage may be incomplete. Use bare "
-                "`search_products_by_text` only for narrow SKU/"
-                "string lookups where Shopify content adds nothing "
-                "(e.g. 'find SKUs containing LED-31.164').\n\n"
-                "**Title-abbreviation reality (v2.67):** CIN7 "
-                "product titles abbreviate freely. 'Ultra Wm', "
-                "'Wm', or 'Warm' may appear instead of 'warm white' "
-                "(e.g. White Iris series titles read 'Ultra Wm "
-                "(2700K)', not 'warm white'). When passing "
-                "`any_of_terms` for a warm-white query, ALWAYS "
-                "include both the abbreviation forms AND the "
-                "kelvin tokens — kelvin carries most of the recall "
-                "(every warm-white row has its kelvin in the "
-                "title) but the abbreviations help edge cases. "
-                "Example: 'what warm white LED strips do we have "
-                "in stock?' → find_products(query='led strip', "
-                "any_of_terms=['warm white','Ultra Wm','Wm','Warm',"
-                "'2200K','2400K','2700K','2800K','3000K'], "
-                "in_stock_only=true).\n\n"
                 # v2.66.6 — Slow-stock promotion rule REMOVED. Even
                 # with v2.66.2's tightening and v2.66.5's
                 # no-narration rollback, the rule was breaking
@@ -14661,8 +14567,6 @@ elif page == "AI Assistant":
                 "SKU), `[via alias_rule]` (a past correction guided "
                 "the answer — see addendum if present), "
                 "`[via text_search]` (used search_products_by_text), "
-                "`[via find_products]` (used find_products — the "
-                "v2.67 unified CIN7+Shopify discovery tool), "
                 "`[via similarity_engine]` (used find_similar_products), "
                 "`[via accessory_collection]` (curated Shopify "
                 "accessory collection), `[via accessory_text_fallback]` "
