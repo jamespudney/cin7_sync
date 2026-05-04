@@ -148,15 +148,21 @@ def detect_family(text: Optional[str]) -> Optional[str]:
 # memory accounting.
 _BODY_CAP_CHARS = 12288
 
-# v2.67.2 — per-family variant cap on the first emission pass. With a
-# default limit of 60 and 4 per family, pass 1 represents up to 15
-# families before any deferral; pass 2 then drains the deferred SKUs
-# until the limit is reached. Tuned so a query like "warm white led
-# strips" doesn't let the top-scoring family (Elite Gold) eat the
-# entire budget and starve White Iris / White Lily / etc. Kept low —
-# breadth matters more than depth at first; users can drill into a
-# specific family with a follow-up query that passes ``families=[…]``.
-_PER_FAMILY_PASS_1 = 4
+# v2.67.6 — per-family variant cap on the first emission pass.
+# Lowered 4 → 1 after observing that with cap=4 the pass-1 budget
+# (limit=60) was being filled by the top 9-15 high-scored families
+# alone -- each emitting 4 variants -- so lower-ranked families like
+# White Iris and White Lily were never reached. Iris specifically
+# scores ~6.0 instead of 8+ because its title ("White High CRI IP20
+# LED Strip (24V) ~ White Iris Series") contains NO warm-white token
+# -- the warm-white signal is only in body content, which gives a
+# +1.0 OR-leg boost instead of the +3.0 boost that title-matched
+# families get. With cap=1, pass 1 emits exactly one variant per
+# family for true breadth, then pass 2 drains the deferred queue to
+# fill depth from the higher-scored families. Guarantees every
+# matched family appears in the answer as long as the family count
+# does not exceed the overall limit.
+_PER_FAMILY_PASS_1 = 1
 
 
 @dataclass

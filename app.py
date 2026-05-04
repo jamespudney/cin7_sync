@@ -228,10 +228,19 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.5 — Iris warm-white variants now emit with "
-                "stock data (was silently capped at 50).")
+    st.caption("🟢 v2.67.6 — Pass-1 family cap dropped 4 → 1 so "
+                "Iris/Lily aren't starved by higher-scored families.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.6** — _PER_FAMILY_PASS_1 lowered 4 → 1. With "
+            "cap=4 the limit=60 budget was filled by the top "
+            "9-15 high-scored families before lower-ranked ones "
+            "(Iris, Lily) were reached. Iris title has no warm-"
+            "white token → score 6.0 vs 8+ for families with "
+            "kelvin in their title → ranked too low for pass 1. "
+            "Cap=1 guarantees every matched family gets pass-1 "
+            "representation; pass 2 drains deferred SKUs for "
+            "depth from higher-scored families.\n\n"
             "**v2.67.5** — Bumped search_products_by_text internal "
             "cap 50 → 500. find_products requested 200 internal "
             "rows but the underlying tool capped at 50, dropping "
