@@ -228,10 +228,19 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.13 — Family split (IRIS_RGBW vs WHITE_IRIS) "
-                "+ color-class detection so cool RGBW doesn't pollute.")
+    st.caption("🟢 v2.67.14 — Shopify collections now searched + boost "
+                "member products into shopify_hits.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.14** — find_products now walks "
+            "/data/shopify/collections/*.md, scores each collection "
+            "against the query, and uses matches to (a) boost member "
+            "products' scores in shopify_hits and (b) add member "
+            "products that didn't directly match. Honors spec point "
+            "1's 'Shopify collections' source that v2.67-v2.67.13 "
+            "silently skipped. Result dict now reports "
+            "collections_indexed, collections_matched, and the "
+            "titles of matched collections for transparency.\n\n"
             "**v2.67.13** — Two complementary fixes after v2.67.12 "
             "still missed 2700K Iris. (a) Family detector splits "
             "RGBW Iris into its own family (IRIS_RGBW) so it "

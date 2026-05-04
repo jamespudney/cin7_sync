@@ -81,6 +81,13 @@ if not log.handlers:
 
 SHOPIFY_DIR = DATA_DIR / "shopify"
 SHOPIFY_PRODUCTS_DIR = SHOPIFY_DIR / "products"
+# v2.67.14 — collections directory contains curated groupings (e.g.
+# "White LED Strip", "Outdoor Strips") written by shopify_sync.py.
+# find_products scores each collection against the query and uses
+# matches to (a) boost member products' scores in shopify_hits and
+# (b) add member products that didn't directly match. Honors spec
+# point 1's "Shopify collections" search source.
+SHOPIFY_COLLECTIONS_DIR = SHOPIFY_DIR / "collections"
 
 # Staleness threshold for the freshness banner. We picked 48h because
 # storefront content doesn't change minute-to-minute and the nightly
@@ -305,6 +312,168 @@ def _index_shopify_products() -> list[ShopifyProduct]:
     _PRODUCT_CACHE.clear()
     _PRODUCT_CACHE[fp] = out
     return out
+
+
+# ---------------------------------------------------------------------------
+# v2.67.14 — Shopify collections parsing.
+# Collections are curated groupings written by shopify_sync.py to
+# /data/shopify/collections/<handle>.md. Each .md file has metadata
+# (handle, storefront URL, sort order, type) plus a description and
+# a list of member product handles. find_products scores each
+# collection against the query and uses matches to boost / expand
+# the shopify_hits set.
+# ---------------------------------------------------------------------------
+@dataclass
+class ShopifyCollection:
+    """Parsed view of one Shopify collection .md file."""
+    handle: str
+    title: str
+    body: str = ""
+    storefront_url: str = ""
+    product_handles: list[str] = field(default_factory=list)
+    file_mtime: float = 0.0
+
+
+# Matches a member product line in the .md, written by shopify_sync as:
+#     - [Product Title](products/handle.md)
+_COLLECTION_MEMBER_LINE = re.compile(
+    r"^-\s+\[.*?\]\(products/([^)]+?)\.md\)\s*$")
+
+
+def _parse_shopify_collection_md(path: Path) -> Optional[ShopifyCollection]:
+    """Parse one collection .md. Returns None on read errors."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    title = ""
+    handle = path.stem
+    storefront_url = ""
+    body_lines: list[str] = []
+    product_handles: list[str] = []
+    in_meta = False
+    in_body = False
+    in_products_list = False
+    for line in raw.splitlines():
+        s = line.strip()
+        if s.startswith("# ") and not title:
+            title = s[2:].strip()
+            # shopify_sync writes "Collection: <title>" — strip prefix.
+            if title.lower().startswith("collection:"):
+                title = title.split(":", 1)[1].strip()
+            continue
+        if s.startswith("## "):
+            heading = s[3:].strip().lower()
+            in_meta = (heading == "metadata")
+            in_body = (heading == "description")
+            # The members section heading reads "Products in this
+            # collection (N)" — startswith match handles the count.
+            in_products_list = heading.startswith(
+                "products in this collection")
+            continue
+        if in_meta:
+            m = _META_LINE.match(s)
+            if not m:
+                continue
+            label = m.group(1).strip().lower()
+            val = m.group(2).strip()
+            if label == "handle":
+                handle = val or handle
+            elif label == "storefront url":
+                storefront_url = val
+        elif in_body:
+            body_lines.append(line)
+        elif in_products_list:
+            m = _COLLECTION_MEMBER_LINE.match(s)
+            if m:
+                product_handles.append(m.group(1))
+    body = " ".join(ln.strip() for ln in body_lines if ln.strip())
+    if len(body) > _BODY_CAP_CHARS:
+        body = body[:_BODY_CAP_CHARS]
+    try:
+        mt = path.stat().st_mtime
+    except OSError:
+        mt = 0.0
+    return ShopifyCollection(
+        handle=handle,
+        title=title or handle,
+        body=body,
+        storefront_url=storefront_url,
+        product_handles=product_handles,
+        file_mtime=mt,
+    )
+
+
+_COLLECTIONS_CACHE: dict[tuple, list[ShopifyCollection]] = {}
+
+
+def _index_shopify_collections() -> list[ShopifyCollection]:
+    if not SHOPIFY_COLLECTIONS_DIR.exists():
+        return []
+    paths = list(SHOPIFY_COLLECTIONS_DIR.glob("*.md"))
+    if not paths:
+        return []
+    fp = tuple(sorted(
+        (str(p), p.stat().st_mtime) for p in paths if p.exists()))
+    if fp in _COLLECTIONS_CACHE:
+        return _COLLECTIONS_CACHE[fp]
+    out: list[ShopifyCollection] = []
+    for p in paths:
+        c = _parse_shopify_collection_md(p)
+        if c is not None:
+            out.append(c)
+    _COLLECTIONS_CACHE.clear()
+    _COLLECTIONS_CACHE[fp] = out
+    return out
+
+
+def _score_collection(c: ShopifyCollection,
+                      query_tokens: set[str],
+                      any_of_terms: list[str]) -> float:
+    """Score a Shopify collection against the query.
+
+    Same shape as ``_shopify_score`` but on collection title / body /
+    handle (collections don't have product_type / tags / variants).
+    Returns 0.0 if the collection doesn't satisfy AND-leg + OR-leg.
+    """
+    fields = {
+        "title": _tok(c.title),
+        "body": _tok(c.body),
+        "handle": _tok(c.handle.replace("-", " ")),
+    }
+    score = 0.0
+
+    if query_tokens:
+        for tok in query_tokens:
+            hit_field = None
+            for fname, ftoks in fields.items():
+                if tok in ftoks:
+                    hit_field = fname
+                    break
+            if hit_field is None:
+                return 0.0
+            score += 2.5 if hit_field == "title" else 1.0
+
+    if any_of_terms:
+        haystack = " ".join([
+            c.title, c.body, c.handle.replace("-", " "),
+        ]).lower()
+        any_hit = False
+        for term in any_of_terms:
+            t = (term or "").lower().strip()
+            if not t:
+                continue
+            if t in haystack:
+                any_hit = True
+                if t in c.title.lower():
+                    score += 3.0
+                else:
+                    score += 1.0
+                break
+        if not any_hit:
+            return 0.0
+
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +792,74 @@ def find_products(engine_df: pd.DataFrame,
         score, fields_hit = _shopify_score(sp, query_tokens, any_of_terms)
         if score > 0:
             shopify_hits.append((score, fields_hit, sp))
+
+    # v2.67.14 — Shopify collections leg. Each collection (.md file
+    # under /data/shopify/collections/) is scored against the same
+    # query/any_of_terms. A matching collection like "White LED Strip"
+    # or "Outdoor LED Strips" gives every member product a score
+    # boost, and adds members that didn't directly match the product-
+    # level search to the shopify_hits set so they emit alongside
+    # individually-matched products.
+    shopify_collections = _index_shopify_collections()
+    collection_hits: list[tuple[float, ShopifyCollection]] = []
+    for c in shopify_collections:
+        cs = _score_collection(c, query_tokens, any_of_terms)
+        if cs > 0:
+            collection_hits.append((cs, c))
+
+    # Build product-handle → collection-derived boost. A product in
+    # multiple matching collections gets the strongest single
+    # collection's boost (not summed) so a product in many lists
+    # doesn't unfairly dominate.
+    collection_boost: dict[str, float] = {}
+    if collection_hits:
+        for col_score, col in collection_hits:
+            # Half of the collection's score so direct product matches
+            # still rank above pure collection-driven adds.
+            boost = col_score * 0.5
+            for ph in col.product_handles:
+                if collection_boost.get(ph, 0.0) < boost:
+                    collection_boost[ph] = boost
+
+    # Apply boost to existing shopify_hits.
+    if collection_boost:
+        existing_handles = {sp.handle for _, _, sp in shopify_hits}
+        for i, (score, fields_hit, sp) in enumerate(shopify_hits):
+            if sp.handle in collection_boost:
+                new_fields = (list(fields_hit)
+                              if "collection" not in fields_hit
+                              else fields_hit)
+                if "collection" not in new_fields:
+                    new_fields.append("collection")
+                shopify_hits[i] = (
+                    score + collection_boost[sp.handle],
+                    new_fields, sp)
+
+        # Add expansion products: those in matching collections but
+        # not already in shopify_hits. Apply the same exclude_types
+        # and family filters that direct hits go through, so a
+        # collection match doesn't bypass legitimate exclusions.
+        products_by_handle = {sp.handle: sp
+                               for sp in shopify_products}
+        for col_score, col in collection_hits:
+            for ph in col.product_handles:
+                if ph in existing_handles:
+                    continue
+                sp = products_by_handle.get(ph)
+                if sp is None:
+                    continue
+                if families:
+                    fam = sp.family
+                    if not fam or fam not in families:
+                        continue
+                exp_haystack = (
+                    f"{sp.title} {sp.product_type}").lower()
+                if any(e in exp_haystack for e in excludes_lower):
+                    continue
+                shopify_hits.append((
+                    collection_boost[ph], ["collection"], sp))
+                existing_handles.add(ph)
+
     shopify_hits.sort(key=lambda t: t[0], reverse=True)
 
     # ---- CIN7 leg (delegate to existing search_products_by_text
@@ -1044,9 +1281,11 @@ def find_products(engine_df: pd.DataFrame,
     # entry line above tells us how far we got.
     log.info(
         "find_products done: returned=%d shopify_indexed=%d "
-        "shopify_hits=%d cin7_rows=%d elapsed=%.2fs",
+        "shopify_hits=%d collection_hits=%d cin7_rows=%d "
+        "elapsed=%.2fs",
         len(out), len(shopify_products), len(shopify_hits),
-        len(cin7_rows), time.time() - _t_start,
+        len(collection_hits), len(cin7_rows),
+        time.time() - _t_start,
     )
 
     # ---- Warnings driven by freshness ----
@@ -1070,6 +1309,15 @@ def find_products(engine_df: pd.DataFrame,
         "shopify": {
             "products_indexed": len(shopify_products),
             "products_matched": len(shopify_hits),
+            # v2.67.14 — collection-driven discovery transparency.
+            # Lets the AI assistant explain why a particular family
+            # was promoted (e.g. "matched the 'White LED Strip'
+            # collection") and lets the diagnostic see how many
+            # collections fired.
+            "collections_indexed": len(shopify_collections),
+            "collections_matched": len(collection_hits),
+            "collection_titles_matched": [
+                c.title for _, c in collection_hits[:10]],
             "freshness": freshness,
         },
         "cin7": {
