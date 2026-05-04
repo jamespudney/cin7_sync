@@ -228,10 +228,19 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.8 — Kelvin-diverse pass-1 emission so each "
-                "family shows variety across warm-white temps.")
+    st.caption("🟢 v2.67.9 — Default exclude_types extended; LED "
+                "drivers no longer pollute strip queries.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.9** — _DEFAULT_EXCLUDES_FOR_STRIPS extended "
+            "with `driver`, `fixture`, `kit`, `module`, "
+            "`accessory`, `service`, `transformer`. Driver page "
+            "LED-NANO-60W-24 was appearing as the FIRST result of "
+            "a warm-white-strips query because driver titles "
+            "contain 'led' and their compatibility text mentions "
+            "'warm white' -- they passed both filter legs and "
+            "consumed limit-60 budget that should have gone to "
+            "Iris/Lily/etc.\n\n"
             "**v2.67.8** — Pass-1 emission grouped by kelvin within "
             "each family so multi-kelvin families show real variety. "
             "Iris .md lists SKUs alphabetically (LEDIRIS2200-* before "

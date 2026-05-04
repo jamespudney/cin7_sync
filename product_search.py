@@ -415,13 +415,28 @@ def _shopify_score(sp: ShopifyProduct,
 
 
 # Default exclude list when the caller asks about strips. These are
-# accessories that share search terms with strips but aren't strip
-# products themselves; without this filter the answer fills up with
-# dimmers/profiles and pushes real strips off the bottom.
+# non-strip products that share search terms with strips and pollute
+# the result set; without this filter the answer fills up with
+# accessories and pushes real strips off the bottom.
+#
+# v2.67.9 — added 'driver', 'fixture', 'kit', 'module', 'accessory',
+# 'service', 'transformer' after observing LED-NANO-60W-24 (an LED
+# driver) appearing as the FIRST result of a "warm white led strip"
+# query. Driver pages contain "led" in titles and "warm white" in
+# their compatibility-spec text, so they cleanly passed both the
+# AND-token and OR-leg filters; with no exclude they ate ~half the
+# limit-60 budget and pushed Iris/Lily off the bottom. The new
+# tokens collectively cover: drivers, fixtures (panel lights etc.),
+# tile kits, LED modules (sign modules, point lights), generic
+# accessory rows, Service-typed CIN7 entries, and transformers.
 _DEFAULT_EXCLUDES_FOR_STRIPS = (
+    # v2.67 originals
     "dimmer", "controller", "power supply", "channel",
     "profile", "diffuser", "connector", "extension cable",
     "amplifier", "repeater", "splitter", "psu",
+    # v2.67.9 additions
+    "driver", "fixture", "kit", "module", "accessory",
+    "service", "transformer",
 )
 
 
