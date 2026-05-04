@@ -1474,7 +1474,22 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if family and "Family" in df.columns:
         df = df[df["Family"].astype(str).str.upper() == family]
 
-    limit = min(int(args.get("limit", 25) or 25), 50)
+    # v2.67.5 — internal cap raised 50 → 500. Bug surfaced when
+    # find_products called this with limit=200 to get every warm-
+    # white candidate across all families: the old 50-row ceiling
+    # silently truncated the set, dropping the 61 LEDIRIS warm SKUs
+    # off the bottom (Elite Gold/Decor/Cardinal Flower/Liatris/
+    # Baltic Ivy warm rows came first in sort order). That made
+    # find_products' per-variant emission branch see sp_skus_passing
+    # empty for the Iris Shopify hit and incorrectly fall into the
+    # "Found in Shopify; CIN7 has variants but none passed the
+    # active filter (may be discontinued, off-topic, ...)" note.
+    # 500 is plenty for any single-family query and well within
+    # find_products' own final cap of 80 emitted rows. The schema
+    # description for this tool stays at "cap 50, default 25"
+    # because direct LLM callers rarely need more, and we don't
+    # want Claude over-fetching on simple SKU lookups.
+    limit = min(int(args.get("limit", 25) or 25), 500)
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
         "OnHand", "TargetStock", "ReorderSuggested",
