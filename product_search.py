@@ -96,6 +96,21 @@ STALE_THRESHOLD_HOURS = 48.0
 # ---------------------------------------------------------------------------
 _FAMILIES: list[tuple[str, re.Pattern]] = [
     ("ELITE_GOLD",      re.compile(r"\belite\s+gold\b", re.I)),
+    # v2.67.13 — RGBW Iris split from pure-white Iris so they don't
+    # compete for the same family kelvin cap. Pre-v2.67.13, RGBW
+    # variants (LEDIRSRGBWW/NW/CW) and pure-white variants (LEDIRIS-
+    # 2200/2700/3000) all detected as WHITE_IRIS. With cap=3 distinct
+    # kelvins per family, the RGBW variants' kelvins (sometimes
+    # 3000K/4000K/6000K embedded in their CIN7 Names) ate two of the
+    # three slots, leaving room for only one pure-white kelvin (2200K
+    # alphabetically first) and pushing LEDIRIS2700-* / LEDIRIS3000-*
+    # off the bottom. Splitting into IRIS_RGBW + WHITE_IRIS gives each
+    # its own 3-kelvin budget. Functionally they ARE different
+    # products (color-changing strip vs fixed-kelvin strip) so this
+    # also reflects reality.
+    ("IRIS_RGBW",       re.compile(
+        r"\brgb(c|n|w|cw|nw|ww|\+w|\s*\+\s*w|\s*\+\s*ww)?\b.*\biris\b"
+        r"|\biris\b.*\brgb", re.I)),
     ("WHITE_IRIS",      re.compile(
         r"\b(white\s+iris|iris\s+series)\b", re.I)),
     ("WHITE_LILY",      re.compile(
@@ -412,6 +427,32 @@ def _shopify_score(sp: ShopifyProduct,
             return (0.0, [])
 
     return (score, fields_hit)
+
+
+# v2.67.13 — when a SKU's CIN7 Name has no explicit kelvin number,
+# classify by color keyword so the preferred-kelvin filter still
+# applies. RGBW pages whose Names say "RGB + Warm white" / "RGB +
+# Cool white" / "RGB + Natural white" go into `_warm` / `_cool` /
+# `_natural` buckets respectively. This prevents the v2.67.12
+# `_unknown` exemption (designed for legitimate warm RGBW pages)
+# from also letting cool/natural RGBW variants slip into warm-white
+# answers. Returns one of: "_warm", "_cool", "_natural", "_unknown".
+def _classify_color_from_name(name: str) -> str:
+    """Map a name without explicit kelvin to a color-class bucket."""
+    nl = (name or "").lower()
+    # Order matters: "ultra warm white" contains "warm white", check
+    # specific phrases first. `cool` and `natural` are checked before
+    # `warm` because they're more discriminating (a name like "cool
+    # white plus warm-white-channel" is uncommon but possible).
+    if "cool white" in nl or " cool " in nl or nl.endswith(" cool"):
+        return "_cool"
+    if "natural white" in nl or " natural " in nl or nl.endswith(" natural"):
+        return "_natural"
+    if ("warm white" in nl or "ultra wm" in nl
+            or "ultra warm" in nl or " warm " in nl
+            or nl.endswith(" warm") or " wm " in nl):
+        return "_warm"
+    return "_unknown"
 
 
 # Default exclude list when the caller asks about strips. These are
@@ -808,13 +849,24 @@ def find_products(engine_df: pd.DataFrame,
             # Names look like "White IP20 LED Strip (24V) ~ White Iris
             # Series - Ultra Wm (2700K) 120 LEDs/m" -- we pull the 4-
             # digit kelvin number from the first "(NNNNK)" pattern.
-            # SKUs without a recognizable kelvin go into a special
-            # "_unknown" bucket so they still emit in some order.
+            #
+            # v2.67.13 — when no explicit kelvin number is found,
+            # classify by color keyword instead of dumping everything
+            # into a generic "_unknown" bucket. RGBW Iris CIN7 Names
+            # like "RGB + Cool white" have no kelvin number AND no
+            # warm intent, but the v2.67.12 _unknown exemption was
+            # letting them slip into warm-white answers. Color-class
+            # buckets (`_warm`/`_cool`/`_natural`) let the preferred-
+            # kelvin filter route them correctly: `_warm` is in the
+            # preferred set, `_cool` and `_natural` are not.
             sku_by_kelvin: dict[str, list[str]] = {}
             for sku in sp_skus_passing:
                 name = str(cin7_rows_by_sku.get(sku, {}).get("Name") or "")
                 m = re.search(r"\b(\d{4})\s*[Kk]\b", name)
-                kelvin = m.group(1) if m else "_unknown"
+                if m:
+                    kelvin = m.group(1)
+                else:
+                    kelvin = _classify_color_from_name(name)
                 sku_by_kelvin.setdefault(kelvin, []).append(sku)
 
             kelvins_already_emitted = (
@@ -827,20 +879,25 @@ def find_products(engine_df: pd.DataFrame,
                     break
                 bucket = sku_by_kelvin[kelvin]
                 # v2.67.12 — preferred-kelvin filter. When the caller
-                # passed kelvin tokens in any_of_terms (e.g. warm-
-                # white query with ['2200K','2700K','3000K',...]),
-                # SKIP buckets whose kelvin is outside that set. The
-                # `_unknown` bucket is always allowed (RGBW pages
-                # whose Name says "Warm white" with no explicit
-                # kelvin number land there). Without this filter,
-                # cool/natural variants were eating the family cap
-                # ahead of legitimate warm-white SKUs. Skipped SKUs
-                # are NOT deferred -- they're off-topic for the
-                # query and shouldn't surface in pass 2 either.
-                if (preferred_kelvins
-                        and kelvin != "_unknown"
-                        and kelvin not in preferred_kelvins):
-                    continue
+                # passed kelvin tokens in any_of_terms, SKIP buckets
+                # whose kelvin is outside that set.
+                #
+                # v2.67.13 — color-class buckets (`_warm`/`_cool`/
+                # `_natural`/`_unknown`) instead of a single
+                # `_unknown` exemption. `_warm` is always allowed on
+                # warm-white queries (RGBW WW page with no explicit
+                # kelvin in name still emits). `_unknown` is allowed
+                # too (truly unknown — fail open). `_cool` and
+                # `_natural` are explicitly blocked on warm-white
+                # queries -- this catches RGBW Cool / RGBW Natural
+                # variants that v2.67.12's blanket `_unknown` was
+                # letting slip through.
+                if preferred_kelvins:
+                    if kelvin in {"_cool", "_natural"}:
+                        continue
+                    if (kelvin not in {"_unknown", "_warm"}
+                            and kelvin not in preferred_kelvins):
+                        continue
                 family_at_cap = (len(kelvins_already_emitted)
                                   >= _PER_FAMILY_PASS_1)
                 already_done_this_kelvin = (
@@ -931,19 +988,25 @@ def find_products(engine_df: pd.DataFrame,
             family = detect_family(name)
             if families and family not in families:
                 continue
-            # v2.67.12 — preferred-kelvin filter on CIN7-only rows
-            # too. Without this, cool/natural variants whose Name has
-            # an explicit kelvin like "(4000K)" or "(6000K)" still
-            # leaked through (they pass the OR-leg via shared
-            # Description text mentioning "warm white"). _unknown
-            # kelvin is allowed -- those rows have no kelvin in name
-            # but might be warm-white if their description says so.
+            # v2.67.12/13 — preferred-kelvin filter on CIN7-only rows
+            # too, with v2.67.13's color-class fallback when no
+            # explicit kelvin number is in the Name. Drops cool /
+            # natural variants whose Name has an explicit kelvin
+            # like "(4000K)" or whose Name says "Cool white" /
+            # "Natural white" without a kelvin number (e.g. RGBW
+            # Cool variants).
             if preferred_kelvins:
                 m = _kelvin_in_term.search(name)
                 row_kelvin = m.group(1) if m else None
-                if (row_kelvin is not None
-                        and row_kelvin not in preferred_kelvins):
-                    continue
+                if row_kelvin is not None:
+                    if row_kelvin not in preferred_kelvins:
+                        continue
+                else:
+                    # No explicit kelvin in name — fall back to color
+                    # keyword classification.
+                    color_class = _classify_color_from_name(name)
+                    if color_class in {"_cool", "_natural"}:
+                        continue
             onhand_raw = r.get("OnHand")
             try:
                 onhand = (float(onhand_raw)

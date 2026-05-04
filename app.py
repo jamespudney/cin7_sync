@@ -228,10 +228,23 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.12 — Preferred-kelvin filter so cool/natural "
-                "variants don't eat the family cap on warm-white queries.")
+    st.caption("🟢 v2.67.13 — Family split (IRIS_RGBW vs WHITE_IRIS) "
+                "+ color-class detection so cool RGBW doesn't pollute.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.13** — Two complementary fixes after v2.67.12 "
+            "still missed 2700K Iris. (a) Family detector splits "
+            "RGBW Iris into its own family (IRIS_RGBW) so it "
+            "doesn't share the WHITE_IRIS cap=3 budget; pure-white "
+            "Iris now emits 2200K/2700K/3000K cleanly without RGBW "
+            "competition. (b) When a SKU's CIN7 Name has no "
+            "explicit kelvin number, classify by color keyword "
+            "(warm/cool/natural). Previously the v2.67.12 "
+            "_unknown bucket was a blanket exemption that let "
+            "RGBW Cool variants (Name: 'RGB + Cool white') slip "
+            "into warm-white answers. Now `_cool` and `_natural` "
+            "buckets are explicitly blocked on warm-white queries, "
+            "while `_warm` and truly-unknown stay allowed.\n\n"
             "**v2.67.12** — Extracted kelvin tokens from "
             "any_of_terms become a 'preferred kelvins' set; pass-1 "
             "kelvin emission and CIN7-only rows skip kelvin "
