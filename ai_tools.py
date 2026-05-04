@@ -620,6 +620,94 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["query"],
         },
     },
+    {
+        # v2.67 — unified product discovery across CIN7 inventory AND
+        # the Shopify product knowledge base. Implementation lives in
+        # product_search.py; ai_tools.find_products is a thin wrapper.
+        "name": "find_products",
+        "description": (
+            "PRODUCT DISCOVERY across CIN7 inventory AND the Shopify "
+            "product knowledge base. Use this — NOT "
+            "search_products_by_text — for broad category questions "
+            "like 'what warm white strips do we have', 'show me our "
+            "outdoor LED products', 'list our high-CRI strips'. "
+            "Unions both data sources, marking each row with "
+            "source ∈ {cin7, shopify, both}. Surfaces Shopify-only "
+            "families (White Lily, pure-white White Iris, etc.) that "
+            "aren't yet in CIN7. Shopify-only rows come back with "
+            "stock_status='unknown' and a `note` saying 'Found in "
+            "Shopify; stock data not available' — DO NOT silently "
+            "omit them, surface them with that note. CIN7 remains "
+            "the source of truth for stock numbers; Shopify is the "
+            "source of truth for customer-facing wording, families, "
+            "collections, and titles. Defaults to in-stock CIN7 rows "
+            "(in_stock_only=true). Pass any_of_terms for color-temp "
+            "alternatives, e.g. ['warm white', '2200K', '2400K', "
+            "'2700K', '2800K', '3000K']."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "AND-matched search phrase. Tokenized on "
+                        "whitespace; every token must appear in at "
+                        "least one searched field on each result."),
+                },
+                "any_of_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "OR-matched alternatives. At least one must "
+                        "appear in the searched fields. Multi-word "
+                        "phrases are supported (substring match), "
+                        "e.g. ['warm white', '2200K', '2400K', "
+                        "'2700K', '2800K', '3000K'] for warm-white "
+                        "Kelvin range."),
+                },
+                "exclude_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Block list — drop rows whose name/title "
+                        "contains any of these. If omitted and "
+                        "`query` includes 'strip', a default "
+                        "accessories block list is applied "
+                        "(dimmer, controller, profile, etc.)."),
+                },
+                "families": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Restrict results to these family codes. "
+                        "Known families (v2.67): ELITE_GOLD, "
+                        "WHITE_IRIS, WHITE_LILY, DECOR, "
+                        "CARDINAL_FLOWER, LIATRIS, BALTIC_IVY, "
+                        "HONEY_SUCKLE, SIERRA, SMOKIES, OSLO, "
+                        "SLIM8, SLIM, PLW80, PLW70, DISA. The "
+                        "family detector is a placeholder until "
+                        "the product_attributes table ships."),
+                },
+                "in_stock_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true. Filters CIN7-side rows to "
+                        "OnHand>0; Shopify-only rows are ALWAYS "
+                        "returned with stock_status='unknown' so "
+                        "the answer doesn't silently omit families "
+                        "that aren't in CIN7."),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max rows to return (default 40, hard "
+                        "max 80)."),
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -2141,9 +2229,22 @@ def get_relevant_slow_stock(engine_df: pd.DataFrame,
     }
 
 
+# v2.67 — find_products lives in product_search.py to keep ai_tools.py
+# focused on schemas + dispatch. Imported lazily inside the handler so
+# a parse error in product_search doesn't crash this whole module at
+# import time.
+def find_products(engine_df: pd.DataFrame,
+                   sale_lines_df: pd.DataFrame,
+                   args: dict) -> dict:
+    """Thin wrapper around product_search.find_products (v2.67)."""
+    from product_search import find_products as _impl
+    return _impl(engine_df, sale_lines_df, args)
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
+    "find_products": find_products,
     "find_similar_products": find_similar_products,
     "get_incoming_stock": get_incoming_stock,
     "get_compatible_accessories": get_compatible_accessories,
