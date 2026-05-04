@@ -514,6 +514,25 @@ def find_products(engine_df: pd.DataFrame,
     query_tokens = _tok(query)
     excludes_lower = [e.lower() for e in exclude_types]
 
+    # v2.67.12 — extract the kelvin tokens from any_of_terms so we
+    # can filter pass-1 kelvin buckets to only the temperatures the
+    # user actually asked about. Without this, a warm-white query
+    # was emitting 4000K natural and 6000K cool variants because
+    # cin7_matched_skus is too permissive (CIN7's Description field
+    # has shared product-line text mentioning "warm white" across
+    # the full kelvin range). For Iris specifically, the bucket-
+    # per-kelvin grouping let RGBW IP20 fill the family cap of 3
+    # with one Warm + one Natural + one Cool RGBW variant before
+    # pure-white Iris's LEDIRIS2200/2700 could emit. The
+    # `_unknown` bucket is exempt from this filter because RGBW
+    # pages whose CIN7 Name says "Warm white" without an explicit
+    # kelvin number land there legitimately and should still emit.
+    _kelvin_in_term = re.compile(r"\b(\d{4})\s*[Kk]?\b")
+    preferred_kelvins: set[str] = set()
+    for term in any_of_terms:
+        for m in _kelvin_in_term.finditer(term or ""):
+            preferred_kelvins.add(m.group(1))
+
     # v2.67.1 — entry log. If we OOM during this call, the line
     # before the SIGKILL in Render logs will be from here, telling
     # us which query triggered it.
@@ -783,6 +802,21 @@ def find_products(engine_df: pd.DataFrame,
                 if len(out) >= limit:
                     break
                 bucket = sku_by_kelvin[kelvin]
+                # v2.67.12 — preferred-kelvin filter. When the caller
+                # passed kelvin tokens in any_of_terms (e.g. warm-
+                # white query with ['2200K','2700K','3000K',...]),
+                # SKIP buckets whose kelvin is outside that set. The
+                # `_unknown` bucket is always allowed (RGBW pages
+                # whose Name says "Warm white" with no explicit
+                # kelvin number land there). Without this filter,
+                # cool/natural variants were eating the family cap
+                # ahead of legitimate warm-white SKUs. Skipped SKUs
+                # are NOT deferred -- they're off-topic for the
+                # query and shouldn't surface in pass 2 either.
+                if (preferred_kelvins
+                        and kelvin != "_unknown"
+                        and kelvin not in preferred_kelvins):
+                    continue
                 family_at_cap = (len(kelvins_already_emitted)
                                   >= _PER_FAMILY_PASS_1)
                 already_done_this_kelvin = (
@@ -873,6 +907,19 @@ def find_products(engine_df: pd.DataFrame,
             family = detect_family(name)
             if families and family not in families:
                 continue
+            # v2.67.12 — preferred-kelvin filter on CIN7-only rows
+            # too. Without this, cool/natural variants whose Name has
+            # an explicit kelvin like "(4000K)" or "(6000K)" still
+            # leaked through (they pass the OR-leg via shared
+            # Description text mentioning "warm white"). _unknown
+            # kelvin is allowed -- those rows have no kelvin in name
+            # but might be warm-white if their description says so.
+            if preferred_kelvins:
+                m = _kelvin_in_term.search(name)
+                row_kelvin = m.group(1) if m else None
+                if (row_kelvin is not None
+                        and row_kelvin not in preferred_kelvins):
+                    continue
             onhand_raw = r.get("OnHand")
             try:
                 onhand = (float(onhand_raw)

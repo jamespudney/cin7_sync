@@ -228,10 +228,22 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.11 — Internal CIN7 row limit bumped 200 → "
-                "1000 so all warm-white SKUs reach cin7_matched_skus.")
+    st.caption("🟢 v2.67.12 — Preferred-kelvin filter so cool/natural "
+                "variants don't eat the family cap on warm-white queries.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.12** — Extracted kelvin tokens from "
+            "any_of_terms become a 'preferred kelvins' set; pass-1 "
+            "kelvin emission and CIN7-only rows skip kelvin "
+            "buckets outside the set. Diagnosis showed Iris's "
+            "family cap=3 was being filled by RGBW variants in 3 "
+            "DIFFERENT kelvin buckets (Warm + Natural + Cool), "
+            "blocking pure-white LEDIRIS2700-* from emitting. "
+            "Same root cause polluted answers with non-warm "
+            "Cardinal Flower 4000K/6000K, Decor 4000K, etc. The "
+            "_unknown kelvin bucket is exempt from the filter so "
+            "RGBW pages whose Name says 'Warm white' (no explicit "
+            "kelvin) still emit.\n\n"
             "**v2.67.11** — find_products passes limit=1000 (was "
             "200) to search_products_by_text; the latter's internal "
             "cap raised 500 → 2000. Diagnostic dump showed LEDIRIS* "
