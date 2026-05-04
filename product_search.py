@@ -148,17 +148,13 @@ def detect_family(text: Optional[str]) -> Optional[str]:
 # memory accounting.
 _BODY_CAP_CHARS = 12288
 
-# v2.67.7 — per-family overall cap on pass-1 emissions, paired with a
-# per-shopify-hit cap of 1 (each Shopify .md page gets at most one
-# pass-1 row). Set to 3 so a multi-page family like White Iris (which
-# has separate Shopify .md pages for RGBW IP20, RGBW IP68, pure-white
-# IP20 24V, pure-white IP68 24V, pure-white 12V, UL...) gets up to
-# three of those .md pages represented in pass 1 -- typically one
-# RGBW + one pure-white IP20 + one pure-white IP68 -- giving the
-# user real variety. v2.67.6 had this set to 1 which meant whichever
-# Iris .md scored highest (RGBW) ate the only slot and pure-white
-# variants were starved. Pass 2 still drains deferred SKUs for
-# additional depth; this cap only governs pass-1 breadth.
+# v2.67.8 — per-family pass-1 cap interpreted as the maximum number
+# of distinct kelvin temperatures the family contributes in pass 1.
+# Iris with cap=3 emits 2200K + 2700K + 3000K (one SKU each) -- real
+# variety in the warm-white range. The cap also implicitly bounds how
+# many sibling Shopify .md pages can contribute (each new (family,
+# kelvin) bucket consumes one slot, regardless of which page it came
+# from). Pass 2 drains deferred SKUs for additional depth.
 _PER_FAMILY_PASS_1 = 3
 
 
@@ -648,6 +644,17 @@ def find_products(engine_df: pd.DataFrame,
             "note": None,
         })
 
+    # v2.67.8 — kelvin-diverse pass-1 emission. Within a family, emit
+    # one SKU per distinct kelvin temperature (2200K, 2700K, 3000K,
+    # …) rather than just the first SKUs in alphabetical sp.skus
+    # order. Iris .md lists SKUs alphabetically, so 2200K-prefixed
+    # SKUs come before 2700K-prefixed ones, and pass-1 was always
+    # emitting only 2200K Iris -- the 2700K and 3000K variants got
+    # pushed to deferred and rarely emitted within the limit budget.
+    # Now we group passing SKUs by extracted kelvin (parsed from the
+    # CIN7 Name field, e.g. "Ultra Wm (2700K)" -> "2700") and emit
+    # one per kelvin bucket per family, up to the per-family cap.
+
     # v2.67.7 — per-shopify-hit emission with family-aware fallback
     # decision and a modest per-family cap.
     #
@@ -696,8 +703,17 @@ def find_products(engine_df: pd.DataFrame,
             if s in cin7_sku_set:
                 family_has_any_in_cin7[family_key] = True
 
-    # Pass 1: one emission per shopify_hit (not per family) with a
-    # per-family overall cap.
+    # Track which kelvin temperatures each family has already
+    # contributed to pass-1 output. Used so a sibling Shopify hit for
+    # the same family doesn't emit a duplicate 2700K row when an
+    # earlier hit already covered 2700K -- each (family, kelvin)
+    # bucket gets at most one pass-1 emission.
+    emitted_kelvin_per_family: dict[str, set[str]] = {}
+
+    # Pass 1: kelvin-diverse emission. For each shopify_hit, group its
+    # passing SKUs by kelvin (parsed from CIN7 Name) and emit one SKU
+    # per kelvin bucket, capped at _PER_FAMILY_PASS_1 distinct kelvin
+    # temperatures per family.
     for score, fields_hit, sp in shopify_hits:
         if len(out) >= limit:
             break
@@ -706,23 +722,54 @@ def find_products(engine_df: pd.DataFrame,
         family_key = sp.family or f"_handle_{sp.handle}"
 
         if sp_skus_passing:
-            # Emit ONE passing SKU from this hit, then defer the rest
-            # of this hit's passing SKUs. Per-family cap caps how many
-            # hits from the same family contribute pass-1 emissions.
-            emitted_for_this_hit = False
+            # Group passing SKUs by kelvin extracted from CIN7 Name.
+            # Names look like "White IP20 LED Strip (24V) ~ White Iris
+            # Series - Ultra Wm (2700K) 120 LEDs/m" -- we pull the 4-
+            # digit kelvin number from the first "(NNNNK)" pattern.
+            # SKUs without a recognizable kelvin go into a special
+            # "_unknown" bucket so they still emit in some order.
+            sku_by_kelvin: dict[str, list[str]] = {}
             for sku in sp_skus_passing:
-                if sku in seen_skus:
-                    continue
-                if (emitted_per_family.get(family_key, 0)
-                        >= _PER_FAMILY_PASS_1) or emitted_for_this_hit:
-                    deferred.append((score, fields_hit, sp, sku))
-                    continue
-                _emit_both_row(sku, score, fields_hit, sp)
-                emitted_per_family[family_key] = (
-                    emitted_per_family.get(family_key, 0) + 1)
-                emitted_for_this_hit = True
+                name = str(cin7_rows_by_sku.get(sku, {}).get("Name") or "")
+                m = re.search(r"\b(\d{4})\s*[Kk]\b", name)
+                kelvin = m.group(1) if m else "_unknown"
+                sku_by_kelvin.setdefault(kelvin, []).append(sku)
+
+            kelvins_already_emitted = (
+                emitted_kelvin_per_family.setdefault(family_key, set()))
+
+            # Iterate kelvin buckets in ascending kelvin order so the
+            # answer reads coolest-warm to coolest-cool consistently.
+            for kelvin in sorted(sku_by_kelvin.keys()):
                 if len(out) >= limit:
                     break
+                bucket = sku_by_kelvin[kelvin]
+                family_at_cap = (len(kelvins_already_emitted)
+                                  >= _PER_FAMILY_PASS_1)
+                already_done_this_kelvin = (
+                    kelvin in kelvins_already_emitted)
+                if family_at_cap or already_done_this_kelvin:
+                    # Defer all SKUs in this bucket to pass 2.
+                    for sku in bucket:
+                        if sku not in seen_skus:
+                            deferred.append(
+                                (score, fields_hit, sp, sku))
+                    continue
+                # Emit the first not-yet-seen SKU in this bucket.
+                emitted_one = False
+                for sku in bucket:
+                    if sku in seen_skus:
+                        continue
+                    if not emitted_one:
+                        _emit_both_row(sku, score, fields_hit, sp)
+                        kelvins_already_emitted.add(kelvin)
+                        emitted_per_family[family_key] = (
+                            emitted_per_family.get(family_key, 0) + 1)
+                        emitted_one = True
+                        if len(out) >= limit:
+                            break
+                    else:
+                        deferred.append((score, fields_hit, sp, sku))
         else:
             # No passing SKUs on THIS hit. Skip the shopify-only
             # fallback if a sibling hit in the same family DOES have

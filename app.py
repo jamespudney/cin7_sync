@@ -228,10 +228,21 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.7 — Per-shopify-hit emission + family-aware "
-                "fallback so Iris pure-white and stocked Lily surface.")
+    st.caption("🟢 v2.67.8 — Kelvin-diverse pass-1 emission so each "
+                "family shows variety across warm-white temps.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.8** — Pass-1 emission grouped by kelvin within "
+            "each family so multi-kelvin families show real variety. "
+            "Iris .md lists SKUs alphabetically (LEDIRIS2200-* before "
+            "LEDIRIS2700-* before LEDIRIS3000-*); v2.67.7 always "
+            "picked the first one (2200K), so 2700K and 3000K Iris "
+            "got pushed to deferred and never emitted within budget. "
+            "Now pass-1 picks one SKU per (family, kelvin) bucket up "
+            "to the per-family cap of 3 -- Iris emits 2200K + 2700K "
+            "+ 3000K, Honey Suckle emits 2700K + 3000K + 3200K, and "
+            "so on. Kelvin extracted from CIN7 Name via "
+            "`\\b(\\d{4})\\s*[Kk]\\b` (matches '(2700K)' patterns).\n\n"
             "**v2.67.7** — Two union-loop bugs from v2.67.6 fixed: "
             "(a) Lily's older 'lilly' Shopify page was emitting a "
             "misleading 'stock data not available' note before the "
