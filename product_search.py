@@ -527,11 +527,35 @@ def find_products(engine_df: pd.DataFrame,
     # `_unknown` bucket is exempt from this filter because RGBW
     # pages whose CIN7 Name says "Warm white" without an explicit
     # kelvin number land there legitimately and should still emit.
+    #
+    # Warm-white expansion: when any_of_terms contains warm-white
+    # phrasing ("warm white", "ultra wm", "Wm", "Warm", etc.), we
+    # auto-expand preferred_kelvins to the full warm-white range
+    # 2200K-3500K. This catches 3200K (Honey Suckle IP68, Sauna
+    # Pro IP68), 3500K (Glow67 Pro), and other warm variants whose
+    # explicit kelvin token Claude may not have included in
+    # any_of_terms. Without this, a user-passed any_of_terms of
+    # ['warm white','2700K','3000K'] would silently drop legit
+    # 3200K warm-white SKUs.
     _kelvin_in_term = re.compile(r"\b(\d{4})\s*[Kk]?\b")
     preferred_kelvins: set[str] = set()
     for term in any_of_terms:
         for m in _kelvin_in_term.finditer(term or ""):
             preferred_kelvins.add(m.group(1))
+    _warm_phrases = {"warm", "warm white", "wm", "ultra wm",
+                     "ultra warm white", "ultra warm"}
+    _is_warm_query = any(
+        (t or "").lower().strip() in _warm_phrases
+        for t in any_of_terms)
+    if _is_warm_query:
+        # Industry-standard warm-white range. 3500K is the upper
+        # boundary commonly accepted as warm-to-neutral-warm; some
+        # spec sheets call 3500K "neutral" but in practice it reads
+        # warm to most customers, so we include it. 3200K is
+        # definitively warm.
+        for k in ("2200", "2400", "2700", "2800",
+                  "3000", "3200", "3500"):
+            preferred_kelvins.add(k)
 
     # v2.67.1 — entry log. If we OOM during this call, the line
     # before the SIGKILL in Render logs will be from here, telling
