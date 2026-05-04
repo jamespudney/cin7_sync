@@ -145,6 +145,16 @@ def detect_family(text: Optional[str]) -> Optional[str]:
 # enough for memory accounting.
 _BODY_CAP_CHARS = 4096
 
+# v2.67.2 — per-family variant cap on the first emission pass. With a
+# default limit of 60 and 4 per family, pass 1 represents up to 15
+# families before any deferral; pass 2 then drains the deferred SKUs
+# until the limit is reached. Tuned so a query like "warm white led
+# strips" doesn't let the top-scoring family (Elite Gold) eat the
+# entire budget and starve White Iris / White Lily / etc. Kept low —
+# breadth matters more than depth at first; users can drill into a
+# specific family with a follow-up query that passes ``families=[…]``.
+_PER_FAMILY_PASS_1 = 4
+
 
 @dataclass
 class ShopifyProduct:
@@ -452,9 +462,13 @@ def find_products(engine_df: pd.DataFrame,
     families: list[str] = [f.upper() for f in (args.get("families") or [])]
     in_stock_only = bool(args.get("in_stock_only", True))
     try:
-        limit = int(args.get("limit", 40) or 40)
+        # v2.67.2 — bumped default 40 → 60 for more headroom after
+        # the per-family cap was added; a "warm white led strips"
+        # query now spans 12-15 families and 60 keeps each family's
+        # pass-1 share intact while leaving room for pass-2 depth.
+        limit = int(args.get("limit", 60) or 60)
     except (TypeError, ValueError):
-        limit = 40
+        limit = 60
     limit = max(1, min(limit, 80))
 
     query_tokens = _tok(query)
@@ -548,75 +562,120 @@ def find_products(engine_df: pd.DataFrame,
             cin7_rows_by_sku[sku] = r
 
     # ---- Union ----
+    #
+    # v2.67.2 fixes two bugs found by Render-log inspection:
+    #
+    # Bug #1 — Lily-explicit returned 0 despite shopify_hits=2.
+    # Old code used ``if sp_skus_in_cin7:`` as the fork. White Lily's
+    # Shopify pages list discontinued connector SKUs (LED-BCI8BB-2,
+    # LED-BCI8XB-2W) that DO exist in CIN7 — so sp_skus_in_cin7 was
+    # non-empty — but those connectors get dropped by the strip-
+    # accessory exclude_types filter, so sp_skus_passing was empty,
+    # the for-loop iterated zero times, and the shopify-only fallback
+    # never fired. Now we fork on ``if sp_skus_passing:`` instead, so
+    # whenever no variants pass the per-row filter we still surface
+    # the family as a shopify-only row — with a slightly different
+    # note depending on whether CIN7 has *any* SKUs for the family.
+    #
+    # Bug #2 — warm-white returned 40 with no Iris despite
+    # shopify_hits=123. The first 5-6 hits (high-scoring Elite Gold
+    # pages) each emitted 6-8 warm-white variants, exhausting the
+    # limit budget before lower-ranked but legitimate hits (Iris,
+    # Lily, etc.) got a chance. v2.67.2 splits emission into two
+    # passes: pass 1 caps each family at ``_PER_FAMILY_PASS_1`` (4)
+    # variants for breadth; pass 2 drains the deferred SKUs until
+    # the limit is reached.
     seen_skus: set[str] = set()
     out: list[dict] = []
+    emitted_per_family: dict[str, int] = {}
+    deferred: list[tuple[float, list[str], "ShopifyProduct", str]] = []
 
-    # 1) Shopify-driven rows first so Shopify-only families always show.
-    #
-    # Per-variant filter rule: when a Shopify product has SKUs that
-    # exist in CIN7, emit ONLY the SKUs that ALSO passed the
-    # per-row CIN7 filter (cin7_matched_skus). Otherwise a Shopify
-    # product page that mentions both 2700K and 6000K variants would
-    # leak the cool-white SKUs into a warm-white answer.
-    #
-    # Shopify-only fallback (e.g. White Lily): if NONE of the
-    # product's SKUs exist in CIN7 at all, treat the whole product
-    # as a shopify-only row so the family isn't silently omitted.
+    def _emit_both_row(sku: str, score: float,
+                        fields_hit: list[str],
+                        sp: "ShopifyProduct") -> None:
+        """Append a source='both' row for a SKU that passed both the
+        Shopify scorer and the per-row CIN7 filter. No-op if dedup
+        already saw this SKU."""
+        if sku in seen_skus:
+            return
+        cin7_row = cin7_rows_by_sku.get(sku, {})
+        onhand_raw = (cin7_row.get("OnHand")
+                       if "OnHand" in cin7_row
+                       else cin7_by_sku.get(sku, {}).get("OnHand"))
+        try:
+            onhand_v = (float(onhand_raw)
+                         if onhand_raw not in (None, "")
+                            and not pd.isna(onhand_raw)
+                         else None)
+        except (TypeError, ValueError):
+            onhand_v = None
+        stock_status_v = ("in_stock" if (onhand_v or 0) > 0
+                          else ("out_of_stock"
+                                if onhand_v is not None
+                                else "unknown"))
+        seen_skus.add(sku)
+        out.append({
+            "sku": sku,
+            "name": (cin7_row.get("Name")
+                      or cin7_by_sku.get(sku, {}).get("Name")
+                      or sp.title),
+            "shopify_handle": sp.handle,
+            "shopify_title": sp.title,
+            "shopify_url": sp.storefront_url,
+            "family": sp.family,
+            "source": "both",
+            "stock": onhand_v,
+            "stock_status": stock_status_v,
+            "matched_in": fields_hit,
+            "score": round(score, 2),
+            "note": None,
+        })
+
+    # Pass 1: per-family breadth-capped emission.
     for score, fields_hit, sp in shopify_hits:
+        if len(out) >= limit:
+            break
         sp_skus = sp.skus or []
         sp_skus_in_cin7 = [s for s in sp_skus if s in cin7_sku_set]
         sp_skus_passing = [s for s in sp_skus if s in cin7_matched_skus]
-        if sp_skus_in_cin7:
-            # Family represented in CIN7. Emit only variants that
-            # passed the per-row text/any_of_terms/in_stock filter.
+        family_key = sp.family or f"_handle_{sp.handle}"
+
+        if sp_skus_passing:
             for sku in sp_skus_passing:
                 if sku in seen_skus:
                     continue
-                cin7_row = cin7_rows_by_sku.get(sku, {})
-                # search_products_by_text already applied
-                # in_stock_only; we re-derive stock for the response
-                # payload (consumer needs to render stock numbers).
-                onhand_raw = (cin7_row.get("OnHand")
-                               if "OnHand" in cin7_row
-                               else cin7_by_sku.get(sku, {}).get("OnHand"))
-                try:
-                    onhand = (float(onhand_raw)
-                               if onhand_raw not in (None, "")
-                                  and not pd.isna(onhand_raw)
-                               else None)
-                except (TypeError, ValueError):
-                    onhand = None
-                stock_status = ("in_stock" if (onhand or 0) > 0
-                                else ("out_of_stock"
-                                      if onhand is not None
-                                      else "unknown"))
-                seen_skus.add(sku)
-                out.append({
-                    "sku": sku,
-                    "name": (cin7_row.get("Name")
-                              or cin7_by_sku.get(sku, {}).get("Name")
-                              or sp.title),
-                    "shopify_handle": sp.handle,
-                    "shopify_title": sp.title,
-                    "shopify_url": sp.storefront_url,
-                    "family": sp.family,
-                    "source": "both",
-                    "stock": onhand,
-                    "stock_status": stock_status,
-                    "matched_in": fields_hit,
-                    "score": round(score, 2),
-                    "note": None,
-                })
+                if (emitted_per_family.get(family_key, 0)
+                        >= _PER_FAMILY_PASS_1):
+                    deferred.append((score, fields_hit, sp, sku))
+                    continue
+                _emit_both_row(sku, score, fields_hit, sp)
+                emitted_per_family[family_key] = (
+                    emitted_per_family.get(family_key, 0) + 1)
                 if len(out) >= limit:
                     break
-            # Don't emit a shopify-only fallback row when sp_skus_in_cin7
-            # is non-empty: the family IS in CIN7, just maybe not all
-            # variants matched the current filter. Suppressing the
-            # fallback avoids a confusing duplicate.
         else:
-            # No SKU intersection with CIN7 — treat as Shopify-only
-            # family (White Lily case). Surface with stock_status
-            # 'unknown' so the user sees the family exists.
+            # No variants passed the per-row CIN7 filter — surface a
+            # shopify-only row so the family isn't silently omitted.
+            # Skip if a sibling shopify hit for the same family already
+            # contributed something (avoids duplicate display rows).
+            if emitted_per_family.get(family_key, 0) > 0:
+                continue
+            if sp_skus_in_cin7:
+                # Family is represented in CIN7 but the active filter
+                # excluded every variant (e.g. White Lily's only CIN7
+                # rows are discontinued connectors that the strip-
+                # accessory exclude_types filter dropped).
+                note = (
+                    "Found in Shopify; CIN7 has variants for this "
+                    "family but none passed the active filter (may "
+                    "be discontinued, off-topic, or excluded by "
+                    "accessory rules)."
+                )
+            else:
+                note = (
+                    "Found in Shopify; stock data not available "
+                    "(no CIN7 SKU match)."
+                )
             out.append({
                 "sku": None,
                 "name": sp.title,
@@ -629,13 +688,19 @@ def find_products(engine_df: pd.DataFrame,
                 "stock_status": "unknown",
                 "matched_in": fields_hit,
                 "score": round(score, 2),
-                "note": (
-                    "Found in Shopify; stock data not available "
-                    "(no CIN7 SKU match)."
-                ),
+                "note": note,
             })
-        if len(out) >= limit:
-            break
+            emitted_per_family[family_key] = (
+                emitted_per_family.get(family_key, 0) + 1)
+
+    # Pass 2: drain deferred variants up to limit. By this point every
+    # family that had hits has at least its top-_PER_FAMILY_PASS_1
+    # variants represented; pass 2 simply backfills depth.
+    if len(out) < limit:
+        for score, fields_hit, sp, sku in deferred:
+            if len(out) >= limit:
+                break
+            _emit_both_row(sku, score, fields_hit, sp)
 
     # 2) CIN7-only rows: SKUs the Shopify index didn't claim.
     if len(out) < limit:

@@ -701,8 +701,13 @@ TOOL_SCHEMAS: list[dict] = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Max rows to return (default 40, hard "
-                        "max 80)."),
+                        "Max rows to return (default 60, hard "
+                        "max 80). v2.67.2 emits at most 4 variants "
+                        "per family on the first pass so families "
+                        "like White Iris / White Lily get a fair "
+                        "share even when higher-scoring families "
+                        "(e.g. Elite Gold) have many warm-white "
+                        "variants."),
                 },
             },
             "required": ["query"],

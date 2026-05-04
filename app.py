@@ -225,7 +225,18 @@ with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
     st.caption(
-        "🟢 v2.67.1 — Unified product discovery (CIN7 ⋃ Shopify) + "
+        "🟢 v2.67.2 — Two union-loop fixes for find_products. "
+        "Bug #1 (Lily-explicit returned 0): fork on sp_skus_passing "
+        "not sp_skus_in_cin7 so the Shopify-only fallback fires "
+        "when no variants pass the per-row filter. White Lily's "
+        "two Shopify pages list discontinued connector SKUs that "
+        "DO exist in CIN7 — old code took the per-variant branch "
+        "and emitted nothing. Bug #2 (warm-white returned 40 with "
+        "no Iris despite shopify_hits=123): added a 4-variant-per-"
+        "family cap on the first emission pass with a deferred "
+        "second pass that drains remaining SKUs up to the overall "
+        "limit. Default limit bumped 40→60. v2.67.1 retained: "
+        "Unified product discovery (CIN7 ⋃ Shopify) + "
         "memory hygiene. v2.67 was reverted after a Render OOM; "
         "this re-attempt drops ShopifyProduct.raw_text (full "
         "markdown was cached but never read by the scorer), caps "
