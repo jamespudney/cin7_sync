@@ -228,10 +228,18 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.9 — Default exclude_types extended; LED "
-                "drivers no longer pollute strip queries.")
+    st.caption("🟢 v2.67.10 — exclude_types is now UNIONed with "
+                "defaults so 'driver' is always blocked on strip queries.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.10** — Claude has been passing its own "
+            "exclude_types list (almost-complete but missing "
+            "'driver'), so the v2.67.9 default never kicked in "
+            "and LED drivers still polluted strip results. Now we "
+            "union Claude's exclude_types with the defaults when "
+            "the query mentions 'strip'. Critical tokens like "
+            "'driver' are always blocked regardless of what Claude "
+            "passes.\n\n"
             "**v2.67.9** — _DEFAULT_EXCLUDES_FOR_STRIPS extended "
             "with `driver`, `fixture`, `kit`, `module`, "
             "`accessory`, `service`, `transformer`. Driver page "

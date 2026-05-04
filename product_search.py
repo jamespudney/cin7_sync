@@ -485,8 +485,20 @@ def find_products(engine_df: pd.DataFrame,
     query = (args.get("query") or "").strip()
     any_of_terms: list[str] = list(args.get("any_of_terms") or [])
     exclude_types: list[str] = list(args.get("exclude_types") or [])
-    if not exclude_types and "strip" in query.lower():
-        exclude_types = list(_DEFAULT_EXCLUDES_FOR_STRIPS)
+    # v2.67.10 — for strip queries, UNION Claude's exclude_types with
+    # the defaults rather than only using the defaults when Claude
+    # passes nothing. v2.67.9 added 'driver' to the defaults but
+    # Claude has been passing its own exclude_types list (which is
+    # *almost* complete but missing 'driver'), so the defaults never
+    # kicked in and LED drivers still polluted strip results. The
+    # union ensures critical tokens like 'driver' are always present
+    # regardless of what Claude chose to include.
+    if "strip" in query.lower():
+        _existing_lower = {e.lower() for e in exclude_types}
+        for _default in _DEFAULT_EXCLUDES_FOR_STRIPS:
+            if _default.lower() not in _existing_lower:
+                exclude_types.append(_default)
+                _existing_lower.add(_default.lower())
     families: list[str] = [f.upper() for f in (args.get("families") or [])]
     in_stock_only = bool(args.get("in_stock_only", True))
     try:
