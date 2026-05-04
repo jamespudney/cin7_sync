@@ -556,7 +556,19 @@ def find_products(engine_df: pd.DataFrame,
                 "fields": ["title", "name", "description", "tags",
                             "product_type", "category"],
                 "in_stock_only": in_stock_only,
-                "limit": 200,  # we dedupe + cap further down
+                # v2.67.11 — bumped 200 → 1000. With 200 we were
+                # getting only the alphabetically/CSV-first 200
+                # warm-white-matching CIN7 rows; LED-31.* and
+                # LED-DECOR-* variants alone consumed that, leaving
+                # LEDIRIS-* and LED-WL-* (which sort later) entirely
+                # out of cin7_matched_skus. That made pure-white Iris
+                # and Lily Shopify hits' sp_skus_passing empty even
+                # though those SKUs DO match the warm-white filter.
+                # 1000 covers the full warm-white candidate pool with
+                # room to spare; the search_products_by_text cap is
+                # 2000 (also bumped this version) so the 1000 we ask
+                # for actually lands.
+                "limit": 1000,
             }
             if families and len(families) == 1:
                 cin7_args["family"] = families[0]

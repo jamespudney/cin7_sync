@@ -1474,22 +1474,21 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if family and "Family" in df.columns:
         df = df[df["Family"].astype(str).str.upper() == family]
 
-    # v2.67.5 — internal cap raised 50 → 500. Bug surfaced when
-    # find_products called this with limit=200 to get every warm-
-    # white candidate across all families: the old 50-row ceiling
-    # silently truncated the set, dropping the 61 LEDIRIS warm SKUs
-    # off the bottom (Elite Gold/Decor/Cardinal Flower/Liatris/
-    # Baltic Ivy warm rows came first in sort order). That made
-    # find_products' per-variant emission branch see sp_skus_passing
-    # empty for the Iris Shopify hit and incorrectly fall into the
-    # "Found in Shopify; CIN7 has variants but none passed the
-    # active filter (may be discontinued, off-topic, ...)" note.
-    # 500 is plenty for any single-family query and well within
-    # find_products' own final cap of 80 emitted rows. The schema
-    # description for this tool stays at "cap 50, default 25"
-    # because direct LLM callers rarely need more, and we don't
-    # want Claude over-fetching on simple SKU lookups.
-    limit = min(int(args.get("limit", 25) or 25), 500)
+    # v2.67.11 — internal cap raised 500 → 2000 after observing that
+    # even with 500 (per v2.67.5) and find_products passing limit=200
+    # (since bumped to 1000), LEDIRIS-* and LED-WL-* warm-white SKUs
+    # were still being silently truncated. CIN7 has thousands of
+    # warm-white "led strip" matches; LED-31.* and LED-DECOR-*
+    # variants alone consumed the first ~200-300 of them in CSV
+    # order, leaving everything alphabetically later off the bottom.
+    # Bumping to 2000 lets find_products pull the full warm-white
+    # candidate pool into cin7_matched_skus so per-Shopify-hit
+    # variant matching works for every family, not just the
+    # alphabetically-early ones. The schema description for direct
+    # LLM callers still says "cap 50, default 25" so Claude doesn't
+    # over-fetch on simple SKU lookups; the higher cap only matters
+    # when find_products explicitly asks for it.
+    limit = min(int(args.get("limit", 25) or 25), 2000)
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
         "OnHand", "TargetStock", "ReorderSuggested",

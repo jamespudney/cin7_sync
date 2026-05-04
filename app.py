@@ -228,10 +228,19 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.10 — exclude_types is now UNIONed with "
-                "defaults so 'driver' is always blocked on strip queries.")
+    st.caption("🟢 v2.67.11 — Internal CIN7 row limit bumped 200 → "
+                "1000 so all warm-white SKUs reach cin7_matched_skus.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.11** — find_products passes limit=1000 (was "
+            "200) to search_products_by_text; the latter's internal "
+            "cap raised 500 → 2000. Diagnostic dump showed LEDIRIS* "
+            "and LED-WL* SKUs entirely absent from cin7_matched_"
+            "skus — CIN7 has thousands of warm-white 'led strip' "
+            "matches and LED-31.* + LED-DECOR-* alone consumed the "
+            "first 200 in CSV order, truncating Iris and Lily off "
+            "the bottom. Bumped limits ensure the full warm-white "
+            "candidate pool flows through.\n\n"
             "**v2.67.10** — Claude has been passing its own "
             "exclude_types list (almost-complete but missing "
             "'driver'), so the v2.67.9 default never kicked in "
