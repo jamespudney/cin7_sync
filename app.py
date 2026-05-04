@@ -228,10 +228,24 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.15 — Collection titles filtered by "
-                "exclude_types so accessory collections don't pollute.")
+    st.caption("🟢 v2.67.16 — Round-robin pass-2 + cap=2 per "
+                "(family, kelvin) so depth fills evenly across families.")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.16** — Two depth-distribution fixes. "
+            "(a) Pass-1 per-(family, kelvin) cap raised 1 → 2 so "
+            "each kelvin bucket emits 2 SKUs upfront (e.g. both "
+            "the per-foot AND the bulk-roll variant of a kelvin "
+            "appear together). (b) Pass 2 reorganized as a round-"
+            "robin drain across (family, kelvin) tuples — each "
+            "tuple emits one SKU per round, cycling through "
+            "non-empty buckets until limit reached. v2.67.7's "
+            "append-order pass 2 was dumping high-scored families' "
+            "depth before low-scored families got any share, so "
+            "Iris (low score) couldn't surface variants like "
+            "LEDIRIS2700-180-100M (6th alphabetical in the 2700K "
+            "bucket). Now Iris 2700K should land 4-5 SKUs total "
+            "within the limit-60 budget.\n\n"
             "**v2.67.15** — Apply exclude_types to collection "
             "titles before scoring. v2.67.14's first run matched "
             "49 collections for a warm-white-strip query, "

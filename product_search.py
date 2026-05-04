@@ -179,6 +179,15 @@ _BODY_CAP_CHARS = 12288
 # from). Pass 2 drains deferred SKUs for additional depth.
 _PER_FAMILY_PASS_1 = 3
 
+# v2.67.16 — per-(family, kelvin) emission cap on pass 1. Was
+# implicitly 1 (only the first not-yet-seen SKU in a bucket emitted,
+# rest deferred). Bumped to 2 so each kelvin bucket emits two SKUs
+# upfront — gives users immediate variety within a kelvin (e.g. both
+# the per-foot AND the bulk-roll variant of LEDIRIS2700) without
+# waiting on pass-2 round-robin to reach them. Pass 2 still drains
+# the rest in round-robin order.
+_PER_FAMILY_KELVIN_PASS_1 = 2
+
 
 @dataclass
 class ShopifyProduct:
@@ -1081,11 +1090,19 @@ def find_products(engine_df: pd.DataFrame,
                 family_has_any_in_cin7[family_key] = True
 
     # Track which kelvin temperatures each family has already
-    # contributed to pass-1 output. Used so a sibling Shopify hit for
-    # the same family doesn't emit a duplicate 2700K row when an
-    # earlier hit already covered 2700K -- each (family, kelvin)
-    # bucket gets at most one pass-1 emission.
+    # contributed to pass-1 output, and HOW MANY emissions each
+    # (family, kelvin) bucket has produced.
+    #
+    # v2.67.16 — pass-1 per-(family, kelvin) cap raised from 1 to
+    # `_PER_FAMILY_KELVIN_PASS_1` so each kelvin bucket can emit
+    # multiple variants in pass 1. Previously a kelvin like Iris
+    # 2700K emitted only 1 SKU upfront, leaving 10+ deferred SKUs
+    # to fight for pass-2 slots in append order — and pass-2's
+    # alphabetical ordering put per-foot variants first, so the
+    # bulk/density variants users want to see (e.g. LEDIRIS2700-
+    # 180-100M) never surfaced within the limit-60 budget.
     emitted_kelvin_per_family: dict[str, set[str]] = {}
+    emitted_count_per_kelvin: dict[tuple[str, str], int] = {}
 
     # Pass 1: kelvin-diverse emission. For each shopify_hit, group its
     # passing SKUs by kelvin (parsed from CIN7 Name) and emit one SKU
@@ -1156,24 +1173,46 @@ def find_products(engine_df: pd.DataFrame,
                                   >= _PER_FAMILY_PASS_1)
                 already_done_this_kelvin = (
                     kelvin in kelvins_already_emitted)
-                if family_at_cap or already_done_this_kelvin:
-                    # Defer all SKUs in this bucket to pass 2.
+                # v2.67.16 — emit up to _PER_FAMILY_KELVIN_PASS_1 (2)
+                # SKUs from this bucket in pass 1, not just 1. Family
+                # cap still gates whether the bucket gets emissions
+                # at all (3 distinct kelvins per family); per-kelvin
+                # cap controls depth within an active kelvin.
+                if (family_at_cap and not already_done_this_kelvin):
+                    # Family at distinct-kelvin cap AND this kelvin
+                    # is brand new — defer all.
                     for sku in bucket:
                         if sku not in seen_skus:
                             deferred.append(
                                 (score, fields_hit, sp, sku))
                     continue
-                # Emit the first not-yet-seen SKU in this bucket.
-                emitted_one = False
+                bucket_key = (family_key, kelvin)
+                bucket_emitted = emitted_count_per_kelvin.get(
+                    bucket_key, 0)
+                if bucket_emitted >= _PER_FAMILY_KELVIN_PASS_1:
+                    # This (family, kelvin) bucket has already emitted
+                    # its pass-1 share — defer remaining SKUs.
+                    for sku in bucket:
+                        if sku not in seen_skus:
+                            deferred.append(
+                                (score, fields_hit, sp, sku))
+                    continue
+                # Emit up to (cap - already_emitted) more SKUs from
+                # this bucket. Defer the rest.
+                slots_left = _PER_FAMILY_KELVIN_PASS_1 - bucket_emitted
+                emitted_in_this_call = 0
                 for sku in bucket:
                     if sku in seen_skus:
                         continue
-                    if not emitted_one:
+                    if emitted_in_this_call < slots_left:
                         _emit_both_row(sku, score, fields_hit, sp)
                         kelvins_already_emitted.add(kelvin)
+                        emitted_count_per_kelvin[bucket_key] = (
+                            emitted_count_per_kelvin.get(bucket_key,
+                                                          0) + 1)
                         emitted_per_family[family_key] = (
                             emitted_per_family.get(family_key, 0) + 1)
-                        emitted_one = True
+                        emitted_in_this_call += 1
                         if len(out) >= limit:
                             break
                     else:
@@ -1219,14 +1258,58 @@ def find_products(engine_df: pd.DataFrame,
             emitted_per_family[family_key] = (
                 emitted_per_family.get(family_key, 0) + 1)
 
-    # Pass 2: drain deferred variants up to limit. Pass 1 guarantees
-    # every hit (and every family with at least one passing-SKU hit)
-    # got pass-1 representation; pass 2 just backfills depth.
+    # Pass 2: round-robin drain of deferred SKUs across (family,
+    # kelvin) tuples. v2.67.7's pass 2 drained deferred in append
+    # order, which dumped high-scored families' depth before low-
+    # scored families got any pass-2 share. For families like Iris
+    # (low score, many warm SKUs deferred), this meant only the
+    # alphabetically-first deferred SKU made it. v2.67.16 round-
+    # robins: each (family, kelvin) bucket emits one SKU per round,
+    # cycling through all non-empty buckets. Iris 2700K's full
+    # deferred queue (10+ SKUs) gets fair share until the limit-60
+    # budget is reached, surfacing variants like LEDIRIS2700-180-
+    # 100M that previously never appeared.
     if len(out) < limit:
-        for score, fields_hit, sp, sku in deferred:
-            if len(out) >= limit:
+        deferred_buckets: dict[tuple[str, str],
+                                list[tuple[float, list[str],
+                                            "ShopifyProduct", str]]] = {}
+        bucket_order: list[tuple[str, str]] = []
+        for entry in deferred:
+            score, fields_hit, sp, sku = entry
+            family_key = sp.family or f"_handle_{sp.handle}"
+            name = str(cin7_rows_by_sku.get(sku, {}).get("Name") or "")
+            m = re.search(r"\b(\d{4})\s*[Kk]\b", name)
+            if m:
+                kelvin = m.group(1)
+            else:
+                kelvin = _classify_color_from_name(name)
+            bucket_key = (family_key, kelvin)
+            if bucket_key not in deferred_buckets:
+                deferred_buckets[bucket_key] = []
+                bucket_order.append(bucket_key)
+            deferred_buckets[bucket_key].append(entry)
+
+        # Round-robin: each round, emit one SKU from each non-empty
+        # bucket in `bucket_order` (which preserves first-seen order
+        # — roughly score-descending since deferred was appended
+        # during pass 1's score-sorted iteration).
+        while len(out) < limit:
+            progress = False
+            for bucket_key in bucket_order:
+                if len(out) >= limit:
+                    break
+                bucket = deferred_buckets.get(bucket_key) or []
+                # Pop the first entry whose SKU isn't already seen.
+                emitted_this_round = False
+                while bucket and not emitted_this_round:
+                    score, fields_hit, sp, sku = bucket.pop(0)
+                    if sku in seen_skus:
+                        continue
+                    _emit_both_row(sku, score, fields_hit, sp)
+                    progress = True
+                    emitted_this_round = True
+            if not progress:
                 break
-            _emit_both_row(sku, score, fields_hit, sp)
 
     # 2) CIN7-only rows: SKUs the Shopify index didn't claim.
     if len(out) < limit:
