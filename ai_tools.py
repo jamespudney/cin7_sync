@@ -638,12 +638,18 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": (
                         "If true (recommended for stock questions), "
                         "only return supplier-orderable parent SKUs "
-                        "— child variants (per-foot cuts, BOM "
-                        "derivatives, fractional sources) are "
-                        "hidden. Mirrors the Ordering page's "
-                        "PO-suggestion logic. Default false; pass "
-                        "true for clean buyer/sales answers like "
-                        "'what warm white strips do we have'."),
+                        "+ standalone products — child variants "
+                        "(per-foot cuts, BOM derivatives, "
+                        "fractional sources) are hidden. Reuses "
+                        "the engine's `is_non_master_tube` column, "
+                        "which correctly handles BOTH bulk-roll "
+                        "parents (LEDIRIS2700-120-100M) AND "
+                        "standalones with no derivative children "
+                        "(LED-CFWW-3000K-24-3 Cardinal Flower, "
+                        "LED-HSWW-27K-16-IP20 Honey Suckle). "
+                        "Mirrors the Ordering page's PO-suggestion "
+                        "logic. Default false; pass true for "
+                        "clean buyer/sales stock answers."),
                 },
                 "family": {
                     "type": "string",
@@ -654,10 +660,18 @@ TOOL_SCHEMAS: list[dict] = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Max rows to return (cap 50, default 25). "
-                        "For stock-listing questions ('what do we "
-                        "have'), pass limit=50 — buyer crew wants "
-                        "to see everything."),
+                        "Max rows to return (cap 200, default 25). "
+                        "v2.67.28 — for STOCK-LISTING questions "
+                        "('what warm white strips do we have', "
+                        "'what's in stock', 'show me our slow "
+                        "movers'), PASS LIMIT=200 to ensure every "
+                        "parent/standalone family is represented. "
+                        "Iris alone has ~9 warm-white parents (3 "
+                        "kelvins × 3 densities); plus Lily, "
+                        "Cardinal, Honey Suckle, Decor, Elite "
+                        "Gold, Liatris, Sierra, Smokies → 40-60 "
+                        "parents total. Default 25 is for narrow "
+                        "lookups only."),
                 },
             },
             "required": ["query"],
@@ -1575,6 +1589,21 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if isinstance(exclude_types, str):
         exclude_types = [exclude_types]
     exclude_types = [str(e).strip().lower() for e in exclude_types if e]
+    # v2.67.28 — for strip queries, UNION the caller's exclude_types
+    # with the strip-accessory defaults from product_search.py so
+    # connectors / drivers / dimmers / channels / etc. don't eat
+    # limit slots and crowd out actual strip families. Mirrors
+    # find_products' behaviour (which already auto-adds these). The
+    # symptom was: ai assistant called search_products_by_text with
+    # limit=50, accessories ate ~25 slots, and major families like
+    # White Iris / White Lily fell off the bottom of the result.
+    if "strip" in query:
+        from product_search import _DEFAULT_EXCLUDES_FOR_STRIPS
+        _existing_lower = set(exclude_types)
+        for _default in _DEFAULT_EXCLUDES_FOR_STRIPS:
+            if _default.lower() not in _existing_lower:
+                exclude_types.append(_default.lower())
+                _existing_lower.add(_default.lower())
     excluded_count = 0
     if exclude_types:
         ex_mask = pd.Series(False, index=df.index)
