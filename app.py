@@ -177,6 +177,49 @@ def _to_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True)
 
 
+def _headline_stock_value(stock_df: pd.DataFrame,
+                            products_df: Optional[pd.DataFrame] = None
+                            ) -> float:
+    """v2.67.37 — single source of truth for the "Current stock value"
+    headline number. Used by Overview, Ordering, AND Monthly Metrics
+    so they all show exactly the same dollar amount. James works
+    sales-team commissions off the Monthly Metrics report, so this
+    HAS to tie out to the cent.
+
+    Calculation: sum CIN7's `StockOnHand` field across all SKU/
+    location rows. CIN7 already publishes a FIFO-based dollar value
+    in this field (matches CIN7's Product Availability totals). No
+    AverageCost fallback for missing values — those genuinely have
+    no cost basis in CIN7 and including a fabricated value would
+    inflate the headline above what CIN7 itself reports.
+
+    Fallback path: if `StockOnHand` is missing entirely (very old
+    syncs predating the field), compute `OnHand × AverageCost` —
+    same legacy fallback Overview and Monthly Metrics already use.
+
+    Per-SKU optimum/excess calculations on the Ordering page still
+    use a richer per-SKU cost chain (engine_df["OnHandValue"], with
+    family/category-median fallbacks for missing costs). That chain
+    is necessary for sensible math when CIN7 hasn't computed FIFO
+    for some SKUs, but it's NOT what we publish as the headline."""
+    if stock_df is None or stock_df.empty:
+        return 0.0
+    if "StockOnHand" in stock_df.columns:
+        return float(_to_num(stock_df["StockOnHand"]).fillna(0).sum())
+    # Legacy fallback — same as Overview's existing behaviour.
+    if products_df is None or products_df.empty:
+        return 0.0
+    if "OnHand" not in stock_df.columns:
+        return 0.0
+    p_cost = products_df.set_index("SKU")["AverageCost"].to_dict()
+    on_hand = _to_num(stock_df["OnHand"]).fillna(0)
+    skus_stk = stock_df["SKU"].astype(str)
+    return float(sum(
+        on_hand.iloc[i] * float(p_cost.get(skus_stk.iloc[i], 0) or 0)
+        for i in range(len(stock_df))
+    ))
+
+
 def rows_selector(label: str = "Rows to show", key: str = "rows",
                   default: int = 100) -> int:
     """Standard page-size selector. Returns row limit (large int for 'All')."""
@@ -228,12 +271,12 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.36 — Engine pre-warm. The ABC engine "
-                "now warms automatically after every sync (Render "
-                "sync_loop, Windows daily_sync.bat, nearsync.bat) "
-                "so the first user post-sync gets a cache hit "
-                "instead of waiting 30-60s. Sidebar shows engine "
-                "cache age below.")
+    st.caption("🟢 v2.67.37 — Stock value reconciliation. The "
+                "'Current stock value' tile in the Ordering "
+                "section now uses the same CIN7 StockOnHand sum "
+                "as the Overview tile and the Monthly Metrics "
+                "report — all three tie out to the cent. "
+                "Commissions reference matches what buyers see.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -269,6 +312,26 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.37** — Stock-value reconciliation across "
+            "Overview / Ordering / Monthly Metrics. The three "
+            "pages had diverged: Overview and Monthly Metrics "
+            "summed CIN7's StockOnHand directly ($721,528 in "
+            "the user's data), while the Ordering 'Current "
+            "stock value' summed engine_df.OnHandValue which "
+            "falls back to OnHand × AverageCost when CIN7's "
+            "FIFO field is empty ($798,248 — ~$77k higher). "
+            "Sales-team commissions are computed off the Monthly "
+            "Metrics report, so the discrepancy mattered. New "
+            "shared helper `_headline_stock_value(stock, "
+            "products)` is the single source of truth — all "
+            "three pages now use it. The richer fallback-aware "
+            "OnHandValue column on engine_df is preserved for "
+            "per-SKU excess/optimum math (where each row needs "
+            "a sensible cost basis even when CIN7 hasn't "
+            "published a FIFO value), but it's no longer the "
+            "headline number."
+        )
         st.caption(
             "**v2.67.36** — Engine pre-warm via post-sync hook. "
             "New `warm_engine.py` + `warm_engine_helpers.py` "
@@ -4896,26 +4959,17 @@ if page == "Overview":
     st.divider()
 
     c1, c2, c3, c4 = st.columns(4)
-    # Stock value: use CIN7's StockOnHand field (FIFO) — NOT
-    # OnHand × AverageCost (that would give an average-cost valuation).
-    # CIN7 tracks inventory on FIFO and writes the FIFO dollar value
-    # into the StockOnHand field of productavailability.
-    stock_value = 0.0
-    if not stock.empty and "StockOnHand" in stock.columns:
-        stock_value = float(_to_num(stock["StockOnHand"]).fillna(0).sum())
-    elif not stock.empty and not products.empty:
-        # Legacy fallback if the FIFO field isn't present on old syncs
-        p_cost = products.set_index("SKU")["AverageCost"].to_dict()
-        on_hand = _to_num(stock["OnHand"])
-        values = [
-            on_hand.iloc[i] * float(p_cost.get(sku, 0) or 0)
-            for i, sku in enumerate(stock["SKU"])
-        ]
-        stock_value = sum(v for v in values if pd.notna(v))
+    # v2.67.37 — single source of truth helper. Same number on
+    # Overview / Ordering / Monthly Metrics so commissions tie out.
+    stock_value = _headline_stock_value(stock, products)
     c1.metric("Stock value (FIFO, CIN7)", _fmt_money(stock_value),
-               help="CIN7's FIFO inventory value — the same number you "
-                    "see in CIN7's valuation reports. Uses the "
-                    "StockOnHand field, not OnHand × AverageCost.")
+               help="CIN7's FIFO inventory value — sums the "
+                    "StockOnHand field across all locations. Same "
+                    "number on the Ordering page's Stock "
+                    "Optimisation overview and the Monthly Metrics "
+                    "report (your commissions reference). v2.67.37 "
+                    "unified the three sources so they tie to the "
+                    "cent.")
 
     # Sales invoiced in the last 30 days.
     #
@@ -8806,9 +8860,20 @@ engine shows every input and how it got to the suggestion.
     # from returns/over-production are real working capital.
     master_only = engine_df[~engine_df["is_non_master_tube"]]
 
-    # Current stock: CIN7 StockOnHand across ALL SKUs (matches CIN7's
-    # own Product Availability screen total).
-    total_onhand_value = float(engine_df["OnHandValue"].sum())
+    # v2.67.37 — headline must match CIN7 / Overview / Monthly
+    # Metrics. Use the shared `_headline_stock_value` helper which
+    # sums CIN7's StockOnHand directly (no AverageCost fallback).
+    # The richer per-SKU `OnHandValue` column on engine_df (with
+    # family/category-median fallbacks for missing costs) is still
+    # used downstream for excess/optimum calculations — those need
+    # a sensible number for every row, but the headline does not.
+    # Sum-of-OnHandValue and headline differ by exactly the dollar
+    # contribution of SKUs where CIN7 hasn't published a FIFO value
+    # but our cost chain estimated one.
+    total_onhand_value = _headline_stock_value(stock, products)
+    # Internal/diagnostic: total-with-fallback for cost-coverage
+    # logging. NOT shown as the headline tile.
+    total_onhand_value_with_fallback = float(engine_df["OnHandValue"].sum())
 
     # Optimum / target: master SKUs only (non-masters have target=0).
     total_target_value = float(master_only["TargetValue"].sum())
@@ -8870,9 +8935,23 @@ engine shows every input and how it got to the suggestion.
     )
 
     oc1, oc2, oc3, oc4 = st.columns(4)
+    # v2.67.37 — headline now ties to Overview + Monthly Metrics.
+    # Help text spells out the tie-out so the buyer trusts it.
+    _fallback_delta = total_onhand_value_with_fallback - total_onhand_value
     oc1.metric("Current stock value",
                _fmt_money(total_onhand_value),
-               help="Total OnHand × AverageCost across all Stock-type items.")
+               help=(
+                   "CIN7's FIFO inventory value (sum of StockOnHand "
+                   "across all SKUs). MATCHES the Overview page's "
+                   "'Stock value (FIFO, CIN7)' tile and the Monthly "
+                   "Metrics report (commissions reference). v2.67.37 "
+                   "unified the three so they tie out exactly. "
+                   f"For internal diagnostics, an OnHand × cost-chain "
+                   f"fallback estimate would add "
+                   f"~{_fmt_money(_fallback_delta)} for SKUs where "
+                   "CIN7 hasn't published a FIFO number — that "
+                   "estimate is used for per-SKU excess/optimum "
+                   "math, NOT the headline."))
     oc2.metric("Optimum stock value",
                _fmt_money(total_target_value),
                help="Sum of target_stock × AverageCost per SKU. "
@@ -12592,24 +12671,12 @@ elif page == "Monthly Metrics":
              _per_month(_repeat_customer_pct),
              fmt="pct")
 
-        # INVENTORY — use CIN7's FIFO-based StockOnHand field (not
-        # OnHand × AverageCost, which would give us an average-cost
-        # valuation that drifts with every PO). This is the real
-        # inventory value that matches CIN7's reporting.
-        inv_value_now = 0.0
-        if not stock.empty and "StockOnHand" in stock.columns:
-            inv_value_now = float(
-                _to_num(stock["StockOnHand"]).fillna(0).sum())
-        elif not stock.empty and not products.empty:
-            # Fallback only if FIFO field is missing
-            p_cost = products.set_index("SKU")["AverageCost"].to_dict()
-            on_hand = _to_num(stock["OnHand"]).fillna(0)
-            skus_stk = stock["SKU"].astype(str)
-            inv_value_now = float(sum(
-                on_hand.iloc[i]
-                * float(p_cost.get(skus_stk.iloc[i], 0) or 0)
-                for i in range(len(stock))
-            ))
+        # v2.67.37 — use the shared headline-stock helper so the
+        # Monthly Metrics report ties exactly to the Overview tile
+        # and the Ordering page's "Current stock value". Sales-team
+        # commissions are computed off this report — the number has
+        # to be consistent across every page that displays it.
+        inv_value_now = _headline_stock_value(stock, products)
 
         # End-of-month inventory per month (walking back from now).
         # Reasoning: during month (m+1) we consumed COGS (reducing inventory
