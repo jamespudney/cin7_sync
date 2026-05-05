@@ -228,11 +228,24 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.20 — find_products limit raised "
-                "(default 100, max 200) with a 70/30 pass-1/pass-2 "
-                "budget split so density variants (60/120/180 "
-                "LEDs/m) all surface on warm-white queries.")
+    st.caption("🟢 v2.67.21 — Assistant now lists every SKU "
+                "from find_products responses (no 'multiple "
+                "other variants' summarization), so the buyer "
+                "crew sees every density / voltage / length "
+                "parent for stock decisions.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.21** — Assistant prompt rule added: when "
+            "find_products returns N rows, list every one "
+            "individually. The 3-6 bullet conciseness rule was "
+            "collapsing density variants into 'multiple other "
+            "Iris variants (60/120/180 LEDs/m)', so the 60-LEDs/m "
+            "parent never appeared by SKU even when the tool "
+            "returned it. Buyer crew needs every parent (family "
+            "× kelvin × density × voltage × length) visible to "
+            "make stock decisions — long is the right shape "
+            "here, not curated highlights."
+        )
         st.caption(
             "**v2.67.20** — find_products comprehensive-mode "
             "fix. Pass-1 (family + kelvin breadth) was filling "
@@ -14793,6 +14806,31 @@ elif page == "AI Assistant":
                 "`search_products_by_text` only for narrow SKU/"
                 "string lookups where Shopify content adds nothing "
                 "(e.g. 'find SKUs containing LED-31.164').\n\n"
+                # v2.67.21 — comprehensive listing rule. Override the
+                # default "3-6 bullet" conciseness for find_products
+                # results because the buyer crew uses these answers
+                # to make stock decisions; missing a density variant
+                # (e.g. 60 LEDs/m vs 120 vs 180) hides a real product
+                # they need to evaluate. Mirrors the slow-movers
+                # "list ALL returned rows" rule.
+                "**find_products comprehensive-listing rule "
+                "(v2.67.21) — OVERRIDES the 3-6 bullet conciseness "
+                "rule:** when find_products returns N rows, list "
+                "ALL N rows individually in the answer. Do NOT "
+                "abbreviate to 'highlights', 'multiple other "
+                "variants', '60/120/180 LEDs/m available', or "
+                "'similar variants in stock'. The buyer crew is "
+                "using this answer to decide what to reorder, "
+                "promote, or discontinue — every density (60 / 120 "
+                "/ 180 LEDs/m), every voltage (12V vs 24V), every "
+                "length (per-foot 0305 / 5m / 6m / 100M bulk) is a "
+                "distinct product they need to see. Group by family "
+                "for readability, but every SKU must appear by "
+                "name with its on-hand quantity. If `matched` is "
+                "very large (>40), still list every SKU — long is "
+                "the right shape here, not a summary. Cite the "
+                "`matched` count up front so the user can sanity-"
+                "check coverage against what they expect.\n\n"
                 "**Title-abbreviation reality (v2.67):** CIN7 "
                 "product titles abbreviate freely. 'Ultra Wm', "
                 "'Wm', or 'Warm' may appear instead of 'warm white' "
