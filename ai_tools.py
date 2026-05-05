@@ -793,55 +793,6 @@ TOOL_SCHEMAS: list[dict] = [
 # page; we don't recompute it per-tool-call (would be too slow).
 # ---------------------------------------------------------------------------
 
-def _ensure_classification_column(df: pd.DataFrame) -> pd.DataFrame:
-    """v2.67.22 — derive a `Classification` column from the engine's
-    existing dormancy / excess / demand signals when the DataFrame
-    doesn't already have one.
-
-    The Ordering page tracks slow / dead / excess via several distinct
-    columns (`is_dormant`, `excess_units`, `effective_units_12mo`) but
-    the AI assistant prompt + tool schemas reference a single
-    consolidated label ('active' / 'slow' / 'dead' / 'excess') for
-    classification-based filters. Without this derivation, the
-    `classification='slow'` filter in search_products / search_products_
-    by_text was a silent no-op (the `if "Classification" in df.columns`
-    guard was always false), so the AI couldn't surface slow movers
-    even though the engine knew which SKUs they were.
-
-    Mapping (mirrors RULES.md §3 + §4):
-      - holding stock with zero 12mo effective demand → 'dead'
-      - dormant (90d activity dropped vs 12mo baseline) with stock → 'slow'
-      - excess (over-target stock with no recent direct sales) → 'excess'
-      - everything else → 'active'
-
-    Idempotent: if `Classification` already exists with non-empty
-    values they're preserved; only blank rows are filled in.
-    """
-    if df is None or df.empty:
-        return df
-    onhand = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
-    eff = (df["effective_units_12mo"].fillna(0)
-            if "effective_units_12mo" in df.columns else 0)
-    dormant = (df["is_dormant"].fillna(False)
-                if "is_dormant" in df.columns else False)
-    excess = (df["excess_units"].fillna(0)
-               if "excess_units" in df.columns else 0)
-    derived = pd.Series("active", index=df.index)
-    # Order matters: dead beats slow beats excess (most severe first).
-    # excess is the gentlest signal (over-target but still moving).
-    derived = derived.mask(excess > 0, "excess")
-    derived = derived.mask(dormant & (onhand > 0), "slow")
-    derived = derived.mask((onhand > 0) & (eff == 0), "dead")
-    if "Classification" in df.columns:
-        existing = df["Classification"].fillna("").astype(str).str.strip()
-        df = df.copy()
-        df["Classification"] = existing.where(existing != "", derived)
-    else:
-        df = df.copy()
-        df["Classification"] = derived
-    return df
-
-
 def _serialise_row(row: dict) -> dict:
     """Make a row JSON-friendly: convert NaN/None, dates to strings."""
     out = {}
@@ -873,9 +824,13 @@ def search_products(engine_df: pd.DataFrame,
     parents_only = bool(args.get("parents_only", True))
     limit = min(int(args.get("limit", 25) or 25), 50)
 
-    # v2.67.22 — same Classification derivation as search_products_
-    # by_text so the classification filter below actually fires.
-    df = _ensure_classification_column(engine_df.copy())
+    # v2.67.27 — read engine_df as-is. Earlier versions tried to
+    # derive a synthesised Classification column, but that:
+    #   (a) caused a "shape mismatch" runtime error in production,
+    #   (b) duplicated information the engine already computes
+    #       (is_dormant, excess_units, trend_flag).
+    # The AI now reads those raw engine signals instead.
+    df = engine_df.copy()
     if parents_only and "is_non_master_tube" in df.columns:
         df = df[~df["is_non_master_tube"].fillna(False)]
     if query:
@@ -886,7 +841,21 @@ def search_products(engine_df: pd.DataFrame,
         df = df[mask_sku | mask_name]
     if family and "Family" in df.columns:
         df = df[df["Family"].astype(str).str.upper() == family]
-    if classification != "any" and "Classification" in df.columns:
+    # v2.67.27 — classification arg maps to engine columns directly
+    # (same logic as search_products_by_text). See that function for
+    # the mapping rationale.
+    if classification == "slow" and "is_dormant" in df.columns:
+        _onh = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+        df = df[df["is_dormant"].fillna(False) & (_onh > 0)]
+    elif classification == "dead" and "effective_units_12mo" in df.columns:
+        _onh = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+        df = df[(_onh > 0)
+                & (df["effective_units_12mo"].fillna(0) == 0)]
+    elif classification == "excess" and "excess_units" in df.columns:
+        df = df[df["excess_units"].fillna(0) > 0]
+    elif classification != "any" and "Classification" in df.columns:
+        # Fallback: literal Classification column match (legacy path
+        # for any engine output that does populate the column).
         df = df[df["Classification"].astype(str).str.lower()
                   == classification]
     if abc_class != "ANY" and "ABC" in df.columns:
@@ -894,9 +863,14 @@ def search_products(engine_df: pd.DataFrame,
     if in_stock_only and "OnHand" in df.columns:
         df = df[df["OnHand"].fillna(0) > 0]
 
+    # v2.67.27 — surface the engine's actual signal columns so the
+    # AI can read them directly instead of hoping for a synthesised
+    # Classification field.
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
         "OnHand", "TargetStock", "ReorderSuggested",
+        "trend_flag", "is_dormant", "excess_units",
+        "effective_units_12mo",
     ] if c in df.columns]
     df = df.head(limit)[cols_we_want]
     rows = [_serialise_row(r._asdict() if hasattr(r, "_asdict") else dict(r))
@@ -1523,12 +1497,12 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if not requested:
         requested = ["title"]
 
-    # v2.67.22 — derive a Classification column upfront so the
-    # `classification='slow'` filter below can actually fire (it was a
-    # silent no-op before because engine_df has no literal
-    # Classification column today). Also makes the column available
-    # for passthrough into result rows.
-    df = _ensure_classification_column(engine_df.copy())
+    # v2.67.27 — read engine_df as-is. The synthesised Classification
+    # column from v2.67.22 was buggy AND duplicated work the engine
+    # already does. The AI now reads is_dormant, excess_units,
+    # effective_units_12mo, and trend_flag directly to determine
+    # slow/dead/excess intent — these are the authoritative signals.
+    df = engine_df.copy()
     searched_cols: list = []
     missing_fields: list = []
     actual_columns: list = []   # the real DataFrame columns we'll
@@ -1615,10 +1589,40 @@ def search_products_by_text(engine_df: pd.DataFrame,
         df = df[~ex_mask]
 
     # Optional secondary filters Claude can stack on top.
+    # v2.67.27 — `classification` arg now maps to engine columns
+    # (no synthesised Classification column). Mappings:
+    #   'slow'     → is_dormant=True  (dormant = 90d activity dropped
+    #                                  vs 12mo baseline; the engine's
+    #                                  authoritative slow-mover flag)
+    #   'dead'     → OnHand>0 AND effective_units_12mo==0
+    #                                 (RULES.md §4.3 — holding stock
+    #                                 with zero 12mo demand)
+    #   'excess'   → excess_units>0   (RULES.md §4.1 — over-target)
+    #   'active'   → none of the above
+    #   'watchlist' → reserved; same as 'slow' until we wire it
     classification = (args.get("classification") or "any").strip().lower()
-    if classification != "any" and "Classification" in df.columns:
-        df = df[df["Classification"].astype(str).str.lower()
-                  == classification]
+    if classification == "slow" and "is_dormant" in df.columns:
+        _onh = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+        df = df[df["is_dormant"].fillna(False) & (_onh > 0)]
+    elif classification == "dead" and "effective_units_12mo" in df.columns:
+        _onh = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+        df = df[(_onh > 0)
+                & (df["effective_units_12mo"].fillna(0) == 0)]
+    elif classification == "excess" and "excess_units" in df.columns:
+        df = df[df["excess_units"].fillna(0) > 0]
+    elif classification == "active" and "is_dormant" in df.columns:
+        _onh = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+        _eff = (df["effective_units_12mo"].fillna(0)
+                 if "effective_units_12mo" in df.columns else 0)
+        _exc = (df["excess_units"].fillna(0)
+                 if "excess_units" in df.columns else 0)
+        df = df[~df["is_dormant"].fillna(False)
+                & ~((_onh > 0) & (_eff == 0))
+                & (_exc == 0)]
+    elif classification == "watchlist" and "is_dormant" in df.columns:
+        # Treat watchlist same as slow until the column ships.
+        _onh = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+        df = df[df["is_dormant"].fillna(False) & (_onh > 0)]
     in_stock_only = bool(args.get("in_stock_only", False))
     if in_stock_only and "OnHand" in df.columns:
         df = df[df["OnHand"].fillna(0) > 0]
