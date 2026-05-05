@@ -228,14 +228,20 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.29 — parents_only=true is now the "
-                "DEFAULT in search_products_by_text (no longer "
-                "depends on the AI remembering to pass it). "
-                "Slow/dead/excess flags are now MANDATORY in "
-                "answer format — every is_dormant row must be "
-                "prefixed with ⚠️ SLOW, every dead-stock row "
-                "with 🔴 DEAD, every excess row with 📦 EXCESS.")
+    st.caption("🟢 v2.67.30 — trend_flag is now ALWAYS appended "
+                "to every product row (Stable / 📈 Trend / 🎯 "
+                "Project / 🔀 Mixed / 📉 Decline). Was conditional "
+                "on non-Stable in v2.67.29, but sales staff "
+                "wanted the rating shown consistently rather "
+                "than inferring it from absence.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.30** — Stock trend indicator always "
+            "visible. v2.67.29's rule appended trend_flag only "
+            "when non-Stable; v2.67.30 makes it mandatory on "
+            "every row so sales staff can scan the rating "
+            "consistently."
+        )
         st.caption(
             "**v2.67.29** — Two failure modes locked down. "
             "(1) parents_only default flipped to True at the "
@@ -15224,14 +15230,21 @@ elif page == "AI Assistant":
                 "→ prefix with `🔴 DEAD —`\n"
                 "  - If `excess_units`>0 → prefix with "
                 "`📦 EXCESS —`\n"
-                "  - If `trend_flag` is non-Stable → append the "
-                "trend_flag (e.g. ` 📉 Decline` or ` 🎯 Project`)\n"
+                "  - ALWAYS append `trend_flag` to every row "
+                "(v2.67.30) — including Stable. Sales staff want "
+                "to see the rating consistently, not infer "
+                "absence. Use the literal value from the column: "
+                "`Stable`, `📈 Trend`, `🎯 Project`, `🔀 Mixed`, "
+                "or `📉 Decline`.\n"
                 "Required format example:\n"
                 "  `⚠️ SLOW — LED-31.171-6 — Elite Gold 2400K "
                 "15W/m 6m — **0.07 on hand** — ABC=C — 📉 "
                 "Decline`\n"
                 "  `LEDIRIS2700-120-100M — White Iris 2700K "
-                "120LEDs/m 100m — **1.02 on hand** — ABC=B`\n"
+                "120LEDs/m 100m — **1.02 on hand** — ABC=B — "
+                "Stable`\n"
+                "  `LED-CFWW-3000K-24-3 — Cardinal Flower 3000K "
+                "3m — **5.0 on hand** — ABC=A — 🎯 Project`\n"
                 "Do NOT just list SKUs and qty — that hides the "
                 "stock-reduction signal which is the whole point "
                 "of this app. If a row in the result has "
