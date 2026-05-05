@@ -554,18 +554,25 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "search_products_by_text",
         "description": (
-            "Substring search across one or more product TEXT fields "
-            "(title / description / tags / product_type / collections). "
-            "Use when the user asks for products matching a "
-            "descriptive phrase ('warm white', 'IP67 outdoor', "
-            "'diffused lens') OR when an alias rule of type='text_"
-            "search' fires. v2.65.1 supports tokenized AND-match "
-            "(every word in `query` must hit), OR-match via "
-            "`any_of_terms` (at least one of these must hit — used "
-            "for Kelvin alternatives), and `exclude_types` (block "
-            "list of forbidden keywords in Name/Type). Combine with "
-            "classification + in_stock_only + family for full "
-            "structured filtering."
+            "PRIMARY STOCK-LISTING TOOL (v2.67.25). Use this for "
+            "any 'what do we have', 'what's in stock', 'do we have "
+            "X' question — CIN7 is the source of truth for stock "
+            "quantities, classification (active/slow/dead/excess), "
+            "and the trend rating (Stable / 📈 Trend / 🎯 Project / "
+            "🔀 Mixed / 📉 Decline). Pass parents_only=true and "
+            "in_stock_only=true for the buyer/sales-staff stock "
+            "answer. Each row returns SKU + Name + OnHand qty + "
+            "Classification + trend_flag, so the staff can see "
+            "what's available AND what to prioritise selling. "
+            "Substring search across product TEXT fields "
+            "(title / description / tags / product_type / "
+            "collections). Tokenized AND-match (every word in "
+            "`query` must hit) + OR-match via `any_of_terms` (at "
+            "least one — used for Kelvin alternatives) + "
+            "`exclude_types` block list. For the catalog-discovery "
+            "case ('tell me about the White Iris series'), use "
+            "`find_products` instead — it unions Shopify "
+            "descriptions and family info."
         ),
         "input_schema": {
             "type": "object",
@@ -626,6 +633,18 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": (
                         "If true, only return SKUs with on-hand > 0."),
                 },
+                "parents_only": {
+                    "type": "boolean",
+                    "description": (
+                        "If true (recommended for stock questions), "
+                        "only return supplier-orderable parent SKUs "
+                        "— child variants (per-foot cuts, BOM "
+                        "derivatives, fractional sources) are "
+                        "hidden. Mirrors the Ordering page's "
+                        "PO-suggestion logic. Default false; pass "
+                        "true for clean buyer/sales answers like "
+                        "'what warm white strips do we have'."),
+                },
                 "family": {
                     "type": "string",
                     "description": (
@@ -635,7 +654,10 @@ TOOL_SCHEMAS: list[dict] = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Max rows to return (cap 50, default 25)."),
+                        "Max rows to return (cap 50, default 25). "
+                        "For stock-listing questions ('what do we "
+                        "have'), pass limit=50 — buyer crew wants "
+                        "to see everything."),
                 },
             },
             "required": ["query"],
@@ -647,32 +669,30 @@ TOOL_SCHEMAS: list[dict] = [
         # product_search.py; ai_tools.find_products is a thin wrapper.
         "name": "find_products",
         "description": (
-            "PRODUCT DISCOVERY across CIN7 inventory AND the Shopify "
-            "product knowledge base. Use this — NOT "
-            "search_products_by_text — for broad category questions "
-            "like 'what warm white strips do we have', 'show me our "
-            "outdoor LED products', 'list our high-CRI strips'. "
-            "Unions both data sources, marking each row with "
-            "source ∈ {cin7, shopify, both}. Surfaces Shopify-only "
-            "families (White Lily, pure-white White Iris, etc.) that "
-            "aren't yet in CIN7. Shopify-only rows come back with "
-            "stock_status='unknown' and a `note` saying 'Found in "
-            "Shopify; stock data not available' — DO NOT silently "
-            "omit them, surface them with that note. CIN7 remains "
-            "the source of truth for stock numbers; Shopify is the "
-            "source of truth for customer-facing wording, families, "
-            "collections, and titles. Defaults to in-stock CIN7 rows "
-            "(in_stock_only=true) AND parent-orderable SKUs only "
-            "(parents_only=true) — child variants like per-foot cuts "
-            "are hidden in favor of the supplier-orderable parent "
-            "(matches the Ordering page's PO-suggestion logic). "
-            "Each row includes a `classification` field "
-            "(active/slow/dead/excess) derived from the engine's "
-            "dormancy + excess + 12mo-demand signals — surface this "
-            "so the buyer crew can spot stock-reduction candidates. "
-            "Pass any_of_terms for color-temp alternatives, e.g. "
-            "['warm white', '2200K', '2400K', '2700K', '2800K', "
-            "'3000K']."
+            "PRODUCT-KNOWLEDGE / CATALOG-DISCOVERY tool (v2.67.25). "
+            "Use this when the user wants to UNDERSTAND the "
+            "catalog — family relationships, customer-facing "
+            "descriptions, what series exist, Shopify URLs, "
+            "differences between product lines. NOT for stock "
+            "questions — for 'what do we have in stock', use "
+            "`search_products_by_text` with parents_only=true "
+            "(CIN7 is the stock truth and find_products produces "
+            "messy Shopify-only fallback rows when bulk-roll "
+            "parents aren't in the customer-facing .md catalog). "
+            "Use find_products for: 'tell me about the White Iris "
+            "series', 'what families do we sell', 'what's the "
+            "difference between Decor and Elite Gold', 'show me "
+            "our high-CRI options'. Unions CIN7 + Shopify, marking "
+            "each row with source ∈ {cin7, shopify, both}. "
+            "Surfaces Shopify-only families (White Lily, etc.) "
+            "that aren't yet in CIN7 — these come back with "
+            "stock_status='unknown' and a `note` — surface them "
+            "with the note, don't silently omit. Each row also "
+            "carries `classification` (active/slow/dead/excess) "
+            "and `trend_flag` (Stable/📈/🎯/🔀/📉) when CIN7 has "
+            "the SKU. Pass any_of_terms for color-temp "
+            "alternatives, e.g. ['warm white', '2200K', '2400K', "
+            "'2700K', '2800K', '3000K']."
         ),
         "input_schema": {
             "type": "object",

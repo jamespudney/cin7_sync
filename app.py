@@ -228,12 +228,33 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.24 — Today/MTD dashboard tiles read "
-                "better. New column order: Today → Same weekday "
-                "1 yr ago → YoY % → Yesterday. Yesterday now has "
-                "a date + orders/units like Today; YoY label "
-                "spells out what's being compared.")
+    st.caption("🟢 v2.67.25 — Stock vs Product-Knowledge intent "
+                "split. Stock questions ('what do we have in "
+                "stock') now route to search_products_by_text "
+                "(CIN7 truth) instead of find_products (which "
+                "muddled Shopify-only fallback rows into stock "
+                "answers). find_products is now positioned as "
+                "the catalog-discovery tool only.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.25** — System prompt refactor. The "
+            "long-running 'find_products returns 70 Shopify-"
+            "only fallback rows' symptom was caused by the AI "
+            "calling find_products for STOCK questions ('what "
+            "warm white strips do we have'). find_products "
+            "unions Shopify catalog with CIN7, but customer-"
+            "facing Shopify .md files don't list bulk-roll "
+            "parent SKUs — only per-foot variants. With the "
+            "parents_only filter on, every Shopify family "
+            "page falls into 'Found in Shopify; stock data not "
+            "available'. New routing: stock → "
+            "search_products_by_text with parents_only=true "
+            "(CIN7 stock truth, clean qty + classification + "
+            "trend_flag rows); product-knowledge → "
+            "find_products (catalog descriptions). When the "
+            "intent is ambiguous, the assistant now asks one "
+            "clarifying question instead of guessing."
+        )
         st.caption(
             "**v2.67.24** — Dashboard label + ordering cleanup "
             "on the Today & Month-to-date vs prior years section. "
@@ -14404,10 +14425,68 @@ elif page == "AI Assistant":
                                     f"→ {tc.get('result_summary', '')}",
                                     language="text")
 
+        # v2.67.25 — intent picker. Asks the user upfront whether
+        # they're after stock numbers, product info, or both. The
+        # picked intent is appended to their message as a system-
+        # readable hint so the AI routes correctly the first time
+        # — instead of guessing and producing muddled answers.
+        # Default 'stock' because that's the most common use-case
+        # for the buyer/sales staff.
+        if "_ai_intent" not in st.session_state:
+            st.session_state["_ai_intent"] = "stock"
+        st.markdown("**What are you asking about?**")
+        _intent_cols = st.columns([1, 1, 1, 3])
+        if _intent_cols[0].button(
+                "💰 Stock & qty",
+                type=("primary"
+                       if st.session_state["_ai_intent"] == "stock"
+                       else "secondary"),
+                width="stretch",
+                help=("Buyer/sales view — what we have on the shelf, "
+                      "qty, slow movers, what to push.")):
+            st.session_state["_ai_intent"] = "stock"
+            st.rerun()
+        if _intent_cols[1].button(
+                "📚 Product info",
+                type=("primary"
+                       if st.session_state["_ai_intent"] == "product"
+                       else "secondary"),
+                width="stretch",
+                help=("Catalog view — family relationships, "
+                      "descriptions, Shopify URLs, what series "
+                      "exist.")):
+            st.session_state["_ai_intent"] = "product"
+            st.rerun()
+        if _intent_cols[2].button(
+                "🤝 Both / not sure",
+                type=("primary"
+                       if st.session_state["_ai_intent"] == "both"
+                       else "secondary"),
+                width="stretch",
+                help=("Mixed — assistant will surface stock AND "
+                      "catalog info, or ask a clarifying question.")):
+            st.session_state["_ai_intent"] = "both"
+            st.rerun()
+
         # Input
         _user_question = st.chat_input(
             "Ask anything about your inventory…")
         if _user_question:
+            # v2.67.25 — append the picked intent to the user's
+            # message as a system-readable hint. Stays attached
+            # through the audit log so we can later analyse which
+            # intents trigger which tools.
+            _intent_hint = {
+                "stock": "[Intent: STOCK — focus on qty, "
+                          "classification, trend rating]",
+                "product": "[Intent: PRODUCT KNOWLEDGE — focus on "
+                            "catalog descriptions, family info, "
+                            "Shopify URLs]",
+                "both": "[Intent: BOTH — show stock first, then "
+                         "catalog context]",
+            }.get(st.session_state.get("_ai_intent", "stock"), "")
+            if _intent_hint:
+                _user_question = f"{_user_question}\n\n{_intent_hint}"
             st.session_state["_ai_transcript"].append({
                 "role": "user", "content": _user_question})
             with st.chat_message("user"):
@@ -14858,37 +14937,66 @@ elif page == "AI Assistant":
                 "'controller','power supply','channel','profile',"
                 "'accessory','service','module'], "
                 "classification='slow').\n\n"
-                # v2.67 — product-discovery routing. The bare
-                # search_products_by_text tool only sees CIN7 data,
-                # so questions like 'what warm white strips do we
-                # have' silently miss Shopify-only families (White
-                # Lily, pure-white White Iris). For those questions
-                # Claude MUST use find_products, which unions both
-                # data sources.
-                "**Product-discovery routing (v2.67) — IMPORTANT:** "
-                "for BROAD CATEGORY questions about what products "
-                "we have ('what warm white strips do we have', "
-                "'show me our outdoor LED products', 'list our "
-                "high-CRI strips', 'do we have any cardinal flower "
-                "strips'), call `find_products`, NOT bare "
-                "`search_products_by_text`. find_products unions "
-                "CIN7 inventory with the Shopify product knowledge "
-                "base, so Shopify-only families (White Lily, pure-"
-                "white White Iris, etc.) are surfaced — these have "
-                "no CIN7 stock row, and bare text_search would omit "
-                "them. find_products marks each result with a "
-                "`source` field ∈ {cin7, shopify, both}. Rows with "
+                # v2.67.25 — STOCK vs PRODUCT-KNOWLEDGE intent
+                # split. Previous routing pushed every product
+                # question through find_products (the catalog-union
+                # tool). For STOCK questions that produced messy
+                # answers full of "Found in Shopify; stock data not
+                # available" fallback rows because the customer-
+                # facing Shopify .md files don't list bulk-roll
+                # parent SKUs — only per-foot variants. The clean
+                # split: stock = search_products_by_text (CIN7 is
+                # the stock truth), product-knowledge = find_products
+                # (Shopify catalog).
+                "**Stock vs Product-Knowledge intent (v2.67.25) — "
+                "PICK THE RIGHT TOOL FIRST:** the user's message "
+                "may be tagged with an intent hint at the bottom: "
+                "`[Intent: STOCK ...]`, `[Intent: PRODUCT KNOWLEDGE "
+                "...]`, or `[Intent: BOTH ...]`. If the hint is "
+                "present, IT IS AUTHORITATIVE — route accordingly. "
+                "If absent (older transcripts or direct API calls), "
+                "classify the question yourself using the rules "
+                "below:\n"
+                "  - **STOCK question** — they want to know what "
+                "we have on the shelf right now, qty available, "
+                "what's running low, what's slow-moving, what to "
+                "sell. Phrases: 'what ___ do we have', 'do we "
+                "have ___ in stock', 'how many ___', 'show me "
+                "our stock of ___', 'what warm white strips do "
+                "we have', 'what's in stock'. → CALL "
+                "`search_products_by_text` with parents_only=true "
+                "and in_stock_only=true. CIN7 is the source of "
+                "truth for stock; do NOT use find_products for "
+                "this — it produces messy Shopify-only fallback "
+                "rows when bulk-roll parents aren't in the .md "
+                "catalog.\n"
+                "  - **PRODUCT KNOWLEDGE question** — they want "
+                "to understand the catalog, family relationships, "
+                "differences between series, customer-facing "
+                "descriptions, Shopify URLs. Phrases: 'tell me "
+                "about ___', 'what's the difference between X and "
+                "Y', 'what families do we sell', 'what does ___ "
+                "look like', 'how does ___ compare'. → CALL "
+                "`find_products`, which unions CIN7 + Shopify "
+                "and surfaces customer-facing wording.\n"
+                "  - **AMBIGUOUS** — if the question could go "
+                "either way, ASK ONE CLARIFYING QUESTION: 'Are "
+                "you looking for current stock levels, or general "
+                "product info?'. Don't guess and produce a "
+                "muddled answer.\n"
+                "When you DO call find_products (product-knowledge "
+                "branch only), it marks each row with "
+                "`source` ∈ {cin7, shopify, both}. Rows with "
                 "source='shopify' come back with stock_status="
                 "'unknown' and a `note` saying 'Found in Shopify; "
                 "stock data not available' — INCLUDE these in your "
-                "answer with that note, do not silently skip them. "
-                "When find_products returns Shopify-side warnings "
-                "(e.g. 'Shopify product index is stale'), surface "
-                "the warning to the user briefly so they know the "
-                "answer's coverage may be incomplete. Use bare "
-                "`search_products_by_text` only for narrow SKU/"
-                "string lookups where Shopify content adds nothing "
-                "(e.g. 'find SKUs containing LED-31.164').\n\n"
+                "catalog answer with that note. When find_products "
+                "returns Shopify-side warnings (e.g. 'Shopify "
+                "product index is stale'), surface the warning to "
+                "the user briefly so they know the answer's "
+                "coverage may be incomplete. The narrow-lookup "
+                "case ('find SKUs containing LED-31.164') is just "
+                "search_products_by_text without parents_only.\n\n"
                 # v2.67.21 — comprehensive listing rule. Override the
                 # default "3-6 bullet" conciseness for find_products
                 # results because the buyer crew uses these answers
