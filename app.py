@@ -228,14 +228,25 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.25 — Stock vs Product-Knowledge intent "
-                "split. Stock questions ('what do we have in "
-                "stock') now route to search_products_by_text "
-                "(CIN7 truth) instead of find_products (which "
-                "muddled Shopify-only fallback rows into stock "
-                "answers). find_products is now positioned as "
-                "the catalog-discovery tool only.")
+    st.caption("🟢 v2.67.26 — Yesterday tile now shows an "
+                "OrderDate breakdown ('of 71 orders invoiced "
+                "Mon: 60 placed Mon, 8 from weekend, 3 earlier') "
+                "so you can tell whether a big Monday is real or "
+                "just delayed weekend posts. Headline numbers "
+                "still use InvoiceDate to match CIN7.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.26** — Yesterday tile breakdown. Adds a "
+            "small caption beneath the Today/MTD tiles that "
+            "splits yesterday's invoiced orders by their "
+            "actual OrderDate: same-day vs from the most-recent "
+            "weekend (Sat-Sun within the past 6 days) vs "
+            "earlier. Only renders when there's a meaningful "
+            "split (weekend or earlier > 0); otherwise stays "
+            "out of the way. Resolves the 'is Monday's number "
+            "actually a big Monday or weekend orders posting "
+            "late' question."
+        )
         st.caption(
             "**v2.67.25** — System prompt refactor. The "
             "long-running 'find_products returns 70 Shopify-"
@@ -3433,6 +3444,43 @@ if page == "Overview":
         yest_rev = _rev_for_dates(
             lambda d: d["InvoiceDate"].dt.date == yesterday_only)
 
+        # v2.67.26 — OrderDate-vs-InvoiceDate breakdown for the
+        # Yesterday tile. The "71 orders Monday" headline is by
+        # InvoiceDate (when CIN7 finalised the invoice), so weekend
+        # orders that didn't get invoiced until Monday land in
+        # Monday's bucket. The breakdown below splits those orders
+        # by when the customer ACTUALLY placed them: same-day vs
+        # most-recent-weekend vs earlier. Surfaces the "is this
+        # really a big Monday or just delayed weekend posts"
+        # question without changing the headline number.
+        yest_breakdown = None
+        if not yest_df.empty and "OrderDate" in yest_df.columns:
+            yest_with_order = yest_df.copy()
+            yest_with_order["OrderDate"] = (
+                _to_date(yest_with_order["OrderDate"])
+                .dt.tz_localize(None))
+            order_date_per_sale = (
+                yest_with_order.dropna(subset=["OrderDate"])
+                .groupby("SaleID")["OrderDate"].first())
+            if not order_date_per_sale.empty:
+                ord_dates = order_date_per_sale.dt.date
+                # Most recent Sat/Sun before yesterday. Walk back up
+                # to 6 days to find any weekend dates strictly before
+                # yesterday's date — covers the common cases where
+                # yesterday was Mon (weekend = the immediately prior
+                # Sat/Sun) and where yesterday was a midweek day
+                # (weekend = the previous Sat/Sun).
+                weekend_dates = []
+                for back in range(1, 7):
+                    d = (yesterday - pd.Timedelta(days=back)).date()
+                    if d.weekday() in (5, 6):  # Sat=5, Sun=6
+                        weekend_dates.append(d)
+                same_day = int((ord_dates == yesterday_only).sum())
+                from_weekend = int(ord_dates.isin(weekend_dates).sum())
+                earlier = int(len(ord_dates)
+                                - same_day - from_weekend)
+                yest_breakdown = (same_day, from_weekend, earlier)
+
         # Matching weekday 52 weeks ago (Shopify-style). 364 days = 52 × 7,
         # so subtracting it gives the same day-of-week one year back.
         # This avoids the Mon-vs-Sun mismatch you'd get from same-date YoY.
@@ -3476,6 +3524,28 @@ if page == "Overview":
             f"Yesterday ({yest_weekday} {yesterday_only.strftime('%b %d')})",
             _fmt_money(yest_rev),
             delta=f"{yest_orders} orders, {int(yest_units)} units")
+
+        # v2.67.26 — OrderDate breakdown caption. Tells the user
+        # "of the N orders invoiced yesterday, X were placed
+        # yesterday, Y came in over the weekend, Z were earlier".
+        # Only shows when there's a meaningful split (i.e. weekend
+        # orders > 0 OR earlier orders > 0); otherwise the
+        # invoice-date and order-date numbers match and the caption
+        # would just be noise.
+        if yest_breakdown:
+            sd, ww, er = yest_breakdown
+            if ww > 0 or er > 0:
+                _parts = [f"**{sd}** placed {yest_weekday}"]
+                if ww > 0:
+                    _parts.append(f"**{ww}** from the weekend")
+                if er > 0:
+                    _parts.append(f"**{er}** earlier")
+                st.caption(
+                    f"💡 _Of yesterday's {yest_orders} invoiced "
+                    f"orders: {', '.join(_parts)}._ "
+                    f"(Headline numbers use InvoiceDate to match "
+                    f"CIN7's dashboard — weekend orders that "
+                    f"posted Monday count under Monday.)")
 
         # Month-to-date: from 1st of current month up to today.
         # Revenue from headers (CIN7-aligned), units/orders from lines.
