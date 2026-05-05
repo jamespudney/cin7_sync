@@ -228,13 +228,26 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.23 — Hotfix + sales rating. parents_only "
-                "filter moved to emission time (was over-aggressive "
-                "in v2.67.22 and produced 70 Shopify-only fallback "
-                "rows with no qty). Result rows now include "
-                "trend_flag (Stable / 📈 / 🎯 / 🔀 / 📉) so sales "
-                "staff see the rating alongside stock qty.")
+    st.caption("🟢 v2.67.24 — Today/MTD dashboard tiles read "
+                "better. New column order: Today → Same weekday "
+                "1 yr ago → YoY % → Yesterday. Yesterday now has "
+                "a date + orders/units like Today; YoY label "
+                "spells out what's being compared.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.24** — Dashboard label + ordering cleanup "
+            "on the Today & Month-to-date vs prior years section. "
+            "New column order: Today → Same weekday 1 yr ago → "
+            "YoY % → Yesterday. The YoY % now sits between its "
+            "two operands so the comparison reads left-to-right; "
+            "Yesterday is supporting context, not part of the "
+            "YoY chain. Yesterday tile gets its date and "
+            "orders/units delta (was a bare $-value before). "
+            "Third tile shortened from 'Matching weekday last "
+            "year (Tue May 06, 2025)' to 'Same Tue, 1 yr ago "
+            "(May 6, '25)'. YoY tile renamed 'Today vs same Tue' "
+            "so it's obvious what's being compared."
+        )
         st.caption(
             "**v2.67.23** — Hotfix for the v2.67.22 regression "
             "where parents_only filter at search_products_by_text "
@@ -3385,10 +3398,19 @@ if page == "Overview":
         today_rev = _rev_for_dates(
             lambda d: d["InvoiceDate"].dt.date == today_only)
 
-        # Yesterday for delta context
+        # Yesterday for delta context.
+        # v2.67.24 — also pull units/orders so Yesterday's tile reads
+        # symmetrically with Today's (the dashboard previously left
+        # Yesterday as a bare $-value with no day/qty context).
         yesterday = today - pd.Timedelta(days=1)
+        yesterday_only = yesterday.date()
+        yest_weekday = yesterday.strftime("%a")
+        yest_mask_lines = df["InvoiceDate"].dt.date == yesterday_only
+        yest_df = df[yest_mask_lines]
+        yest_orders = yest_df["SaleID"].nunique()
+        yest_units = float(yest_df["Quantity"].sum())
         yest_rev = _rev_for_dates(
-            lambda d: d["InvoiceDate"].dt.date == yesterday.date())
+            lambda d: d["InvoiceDate"].dt.date == yesterday_only)
 
         # Matching weekday 52 weeks ago (Shopify-style). 364 days = 52 × 7,
         # so subtracting it gives the same day-of-week one year back.
@@ -3397,21 +3419,42 @@ if page == "Overview":
         match_last_rev = _rev_for_dates(
             lambda d: d["InvoiceDate"].dt.date == match_last.date())
 
+        # v2.67.24 — column order: Today → Same weekday last year
+        # → YoY % → Yesterday. The YoY % sits next to its two
+        # operands (Today and Same-weekday-last-year) so the
+        # comparison reads left-to-right; Yesterday goes last as
+        # supporting context, not part of the YoY chain.
         tc1, tc2, tc3, tc4 = st.columns(4)
         tc1.metric(f"Today ({today_weekday} {today_only.strftime('%b %d')})",
                    _fmt_money(today_rev),
                    delta=f"{today_orders} orders, {int(today_units)} units")
-        tc2.metric("Yesterday", _fmt_money(yest_rev))
-        tc3.metric(
-            f"Matching weekday last year ({match_last.strftime('%a %b %d, %Y')})",
+        # Tighter label than the v2.67.23 wording. Was "Matching
+        # weekday last year (Tue May 06, 2025)" — long, and the
+        # relationship to Today was non-obvious. New label leads
+        # with what it IS (Same Tue, 1 yr ago) and shows the date
+        # in compact form. Full explanation stays in the help
+        # tooltip.
+        tc2.metric(
+            f"Same {today_weekday}, 1 yr ago "
+            f"({match_last.strftime('%b %d, ’%y')})",
             _fmt_money(match_last_rev),
             help="Same day-of-week, 52 weeks ago. Subtracts 364 days "
-                 "(52×7) so Tue→Tue, Sat→Sat — NOT calendar date.")
+                 "(52×7) so Tue→Tue, Sat→Sat — NOT calendar date. "
+                 "This is what the YoY column compares Today against.")
+        # YoY label spelled out: it compares Today vs the same
+        # weekday last year (the column to its left).
         if match_last_rev > 0:
             yoy_pct = (today_rev - match_last_rev) / match_last_rev * 100
-            tc4.metric("YoY (matching weekday)", f"{yoy_pct:+.1f}%")
+            tc3.metric(f"Today vs same {today_weekday}", f"{yoy_pct:+.1f}%")
         else:
-            tc4.metric("YoY (matching weekday)", "—")
+            tc3.metric(f"Today vs same {today_weekday}", "—")
+        # Yesterday now mirrors Today's format (weekday + date in
+        # the label, orders/units in the delta line). Sits last so
+        # it doesn't break the Today → 1-yr-ago → YoY visual chain.
+        tc4.metric(
+            f"Yesterday ({yest_weekday} {yesterday_only.strftime('%b %d')})",
+            _fmt_money(yest_rev),
+            delta=f"{yest_orders} orders, {int(yest_units)} units")
 
         # Month-to-date: from 1st of current month up to today.
         # Revenue from headers (CIN7-aligned), units/orders from lines.
