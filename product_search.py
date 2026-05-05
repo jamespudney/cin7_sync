@@ -780,6 +780,16 @@ def find_products(engine_df: pd.DataFrame,
                 _existing_lower.add(_default.lower())
     families: list[str] = [f.upper() for f in (args.get("families") or [])]
     in_stock_only = bool(args.get("in_stock_only", True))
+    # v2.67.22 — parents_only filter (default True). Forwards through
+    # to search_products_by_text which actually executes the filter
+    # using engine_df's `is_non_master_tube` column. Hides child SKUs
+    # like per-foot LEDIRIS2700-120-0305 in favor of the supplier-
+    # orderable parent LEDIRIS2700-120-100M, matching the Ordering
+    # page's behaviour. The buyer crew uses these answers to make
+    # stock decisions; child variants duplicate their parent
+    # visually and crowd out other families. When the user wants the
+    # full variant breakdown, they can pass parents_only=false.
+    parents_only = bool(args.get("parents_only", True))
     try:
         # v2.67.20 — bumped default 60 → 100 and max 80 → 200. With
         # ~10-12 warm-white families × 3 kelvins × 3 densities (60/
@@ -971,6 +981,11 @@ def find_products(engine_df: pd.DataFrame,
                 "fields": ["title", "name", "description", "tags",
                             "product_type", "category"],
                 "in_stock_only": in_stock_only,
+                # v2.67.22 — forward parents_only so child SKUs are
+                # excluded from cin7_matched_skus. Without this, the
+                # Shopify-side scoring loop would still find child
+                # SKUs in sp.skus and emit them.
+                "parents_only": parents_only,
                 # v2.67.11 — bumped 200 → 1000. With 200 we were
                 # getting only the alphabetically/CSV-first 200
                 # warm-white-matching CIN7 rows; LED-31.* and
@@ -1081,6 +1096,11 @@ def find_products(engine_df: pd.DataFrame,
                                 if onhand_v is not None
                                 else "unknown"))
         seen_skus.add(sku)
+        # v2.67.22 — propagate Classification (active/slow/dead/excess)
+        # from the cin7 row so the AI can flag stock-reduction
+        # candidates inline. Classification is derived in
+        # search_products_by_text via _ensure_classification_column,
+        # so cin7_row already has the field.
         out.append({
             "sku": sku,
             "name": (cin7_row.get("Name")
@@ -1093,6 +1113,7 @@ def find_products(engine_df: pd.DataFrame,
             "source": "both",
             "stock": onhand_v,
             "stock_status": stock_status_v,
+            "classification": cin7_row.get("Classification"),
             "matched_in": fields_hit,
             "score": round(score, 2),
             "note": None,
@@ -1453,6 +1474,9 @@ def find_products(engine_df: pd.DataFrame,
                 "source": "cin7",
                 "stock": onhand,
                 "stock_status": stock_status,
+                # v2.67.22 — propagate Classification from cin7 row
+                # so slow/dead/excess flags surface in the answer.
+                "classification": r.get("Classification"),
                 "matched_in": ["cin7-text-search"],
                 "score": float(r.get("score") or 0.0),
                 "note": None,
@@ -1517,6 +1541,7 @@ def find_products(engine_df: pd.DataFrame,
             "exclude_types": exclude_types,
             "families": families,
             "in_stock_only": in_stock_only,
+            "parents_only": parents_only,
         },
         "warnings": warnings,
         "note": (

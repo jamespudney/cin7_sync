@@ -662,9 +662,17 @@ TOOL_SCHEMAS: list[dict] = [
             "the source of truth for stock numbers; Shopify is the "
             "source of truth for customer-facing wording, families, "
             "collections, and titles. Defaults to in-stock CIN7 rows "
-            "(in_stock_only=true). Pass any_of_terms for color-temp "
-            "alternatives, e.g. ['warm white', '2200K', '2400K', "
-            "'2700K', '2800K', '3000K']."
+            "(in_stock_only=true) AND parent-orderable SKUs only "
+            "(parents_only=true) — child variants like per-foot cuts "
+            "are hidden in favor of the supplier-orderable parent "
+            "(matches the Ordering page's PO-suggestion logic). "
+            "Each row includes a `classification` field "
+            "(active/slow/dead/excess) derived from the engine's "
+            "dormancy + excess + 12mo-demand signals — surface this "
+            "so the buyer crew can spot stock-reduction candidates. "
+            "Pass any_of_terms for color-temp alternatives, e.g. "
+            "['warm white', '2200K', '2400K', '2700K', '2800K', "
+            "'3000K']."
         ),
         "input_schema": {
             "type": "object",
@@ -719,6 +727,25 @@ TOOL_SCHEMAS: list[dict] = [
                         "the answer doesn't silently omit families "
                         "that aren't in CIN7."),
                 },
+                "parents_only": {
+                    "type": "boolean",
+                    "description": (
+                        "Default true (v2.67.22). Hides child SKUs "
+                        "that are derived from a parent via BOM "
+                        "rules or sourcing-fraction rules — e.g. "
+                        "the per-foot LEDIRIS2700-120-0305 is "
+                        "hidden in favor of the supplier-orderable "
+                        "parent LEDIRIS2700-120-100M. Mirrors the "
+                        "Ordering page's behaviour: the buyer crew "
+                        "asks 'what warm white strips do we have?' "
+                        "to make stock decisions, and child variants "
+                        "duplicate their parent visually while "
+                        "crowding out other families. Pass false "
+                        "ONLY when the user explicitly asks for "
+                        "every variant ('show me every length and "
+                        "voltage of Iris 2700K') or when they're "
+                        "looking up a specific child SKU by name."),
+                },
                 "limit": {
                     "type": "integer",
                     "description": (
@@ -745,6 +772,55 @@ TOOL_SCHEMAS: list[dict] = [
 # engine_df is the cached ABC engine output passed in by the Streamlit
 # page; we don't recompute it per-tool-call (would be too slow).
 # ---------------------------------------------------------------------------
+
+def _ensure_classification_column(df: pd.DataFrame) -> pd.DataFrame:
+    """v2.67.22 — derive a `Classification` column from the engine's
+    existing dormancy / excess / demand signals when the DataFrame
+    doesn't already have one.
+
+    The Ordering page tracks slow / dead / excess via several distinct
+    columns (`is_dormant`, `excess_units`, `effective_units_12mo`) but
+    the AI assistant prompt + tool schemas reference a single
+    consolidated label ('active' / 'slow' / 'dead' / 'excess') for
+    classification-based filters. Without this derivation, the
+    `classification='slow'` filter in search_products / search_products_
+    by_text was a silent no-op (the `if "Classification" in df.columns`
+    guard was always false), so the AI couldn't surface slow movers
+    even though the engine knew which SKUs they were.
+
+    Mapping (mirrors RULES.md §3 + §4):
+      - holding stock with zero 12mo effective demand → 'dead'
+      - dormant (90d activity dropped vs 12mo baseline) with stock → 'slow'
+      - excess (over-target stock with no recent direct sales) → 'excess'
+      - everything else → 'active'
+
+    Idempotent: if `Classification` already exists with non-empty
+    values they're preserved; only blank rows are filled in.
+    """
+    if df is None or df.empty:
+        return df
+    onhand = df["OnHand"].fillna(0) if "OnHand" in df.columns else 0
+    eff = (df["effective_units_12mo"].fillna(0)
+            if "effective_units_12mo" in df.columns else 0)
+    dormant = (df["is_dormant"].fillna(False)
+                if "is_dormant" in df.columns else False)
+    excess = (df["excess_units"].fillna(0)
+               if "excess_units" in df.columns else 0)
+    derived = pd.Series("active", index=df.index)
+    # Order matters: dead beats slow beats excess (most severe first).
+    # excess is the gentlest signal (over-target but still moving).
+    derived = derived.mask(excess > 0, "excess")
+    derived = derived.mask(dormant & (onhand > 0), "slow")
+    derived = derived.mask((onhand > 0) & (eff == 0), "dead")
+    if "Classification" in df.columns:
+        existing = df["Classification"].fillna("").astype(str).str.strip()
+        df = df.copy()
+        df["Classification"] = existing.where(existing != "", derived)
+    else:
+        df = df.copy()
+        df["Classification"] = derived
+    return df
+
 
 def _serialise_row(row: dict) -> dict:
     """Make a row JSON-friendly: convert NaN/None, dates to strings."""
@@ -774,9 +850,14 @@ def search_products(engine_df: pd.DataFrame,
     classification = (args.get("classification") or "any").strip().lower()
     abc_class = (args.get("abc_class") or "any").strip().upper()
     in_stock_only = bool(args.get("in_stock_only", False))
+    parents_only = bool(args.get("parents_only", True))
     limit = min(int(args.get("limit", 25) or 25), 50)
 
-    df = engine_df.copy()
+    # v2.67.22 — same Classification derivation as search_products_
+    # by_text so the classification filter below actually fires.
+    df = _ensure_classification_column(engine_df.copy())
+    if parents_only and "is_non_master_tube" in df.columns:
+        df = df[~df["is_non_master_tube"].fillna(False)]
     if query:
         mask_sku = df["SKU"].astype(str).str.lower().str.contains(
             query, na=False)
@@ -1422,7 +1503,12 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if not requested:
         requested = ["title"]
 
-    df = engine_df.copy()
+    # v2.67.22 — derive a Classification column upfront so the
+    # `classification='slow'` filter below can actually fire (it was a
+    # silent no-op before because engine_df has no literal
+    # Classification column today). Also makes the column available
+    # for passthrough into result rows.
+    df = _ensure_classification_column(engine_df.copy())
     searched_cols: list = []
     missing_fields: list = []
     actual_columns: list = []   # the real DataFrame columns we'll
@@ -1520,6 +1606,23 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if family and "Family" in df.columns:
         df = df[df["Family"].astype(str).str.upper() == family]
 
+    # v2.67.22 — parents_only filter. Reuses the Ordering page's
+    # `is_non_master_tube` column on engine_df, which is computed by
+    # `_final_is_non_master()` (app.py) using the same authoritative
+    # rules: BOM child detection, sourcing-rule SourceFraction, and
+    # supplier-assignment heuristics. When True (the default for
+    # broad-discovery questions), we drop child SKUs that are derived
+    # from a parent — e.g. per-foot LEDIRIS2700-120-0305 is hidden in
+    # favor of the supplier-orderable parent LEDIRIS2700-120-100M.
+    # The buyer crew uses these answers to decide what to reorder /
+    # promote / discontinue, and child SKUs duplicate the same parent
+    # product visually — surfacing both clutters the answer and
+    # crowds out other families. Default True; pass False explicitly
+    # to see all variants.
+    parents_only = bool(args.get("parents_only", True))
+    if parents_only and "is_non_master_tube" in df.columns:
+        df = df[~df["is_non_master_tube"].fillna(False)]
+
     # v2.67.11 — internal cap raised 500 → 2000 after observing that
     # even with 500 (per v2.67.5) and find_products passing limit=200
     # (since bumped to 1000), LEDIRIS-* and LED-WL-* warm-white SKUs
@@ -1535,9 +1638,15 @@ def search_products_by_text(engine_df: pd.DataFrame,
     # over-fetch on simple SKU lookups; the higher cap only matters
     # when find_products explicitly asks for it.
     limit = min(int(args.get("limit", 25) or 25), 2000)
+    # v2.67.22 — include the columns that feed derived Classification
+    # (is_dormant, effective_units_12mo, excess_units, OnHand) so the
+    # post-process below can compute slow/dead/active flags even when
+    # engine_df doesn't have a literal `Classification` column.
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
         "OnHand", "TargetStock", "ReorderSuggested",
+        "is_dormant", "effective_units_12mo", "excess_units",
+        "is_non_master_tube",
     ] if c in df.columns]
     df = df.head(limit)[cols_we_want] if cols_we_want else df.head(limit)
     rows = [_serialise_row(r) for r in df.to_dict(orient="records")]
@@ -1549,6 +1658,7 @@ def search_products_by_text(engine_df: pd.DataFrame,
         "missing_fields": missing_fields,
         "excluded_count": excluded_count,
         "exclude_types_applied": exclude_types,
+        "parents_only_applied": parents_only,
         "note": (
             f"Showing first {limit} of potentially many. Refine the "
             "query (or add more filters) if you need a narrower set."
