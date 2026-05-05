@@ -636,20 +636,18 @@ TOOL_SCHEMAS: list[dict] = [
                 "parents_only": {
                     "type": "boolean",
                     "description": (
-                        "If true (recommended for stock questions), "
-                        "only return supplier-orderable parent SKUs "
-                        "+ standalone products — child variants "
-                        "(per-foot cuts, BOM derivatives, "
-                        "fractional sources) are hidden. Reuses "
-                        "the engine's `is_non_master_tube` column, "
-                        "which correctly handles BOTH bulk-roll "
-                        "parents (LEDIRIS2700-120-100M) AND "
-                        "standalones with no derivative children "
-                        "(LED-CFWW-3000K-24-3 Cardinal Flower, "
-                        "LED-HSWW-27K-16-IP20 Honey Suckle). "
-                        "Mirrors the Ordering page's PO-suggestion "
-                        "logic. Default false; pass true for "
-                        "clean buyer/sales stock answers."),
+                        "**Default TRUE (v2.67.31).** Hides child "
+                        "SKUs (per-foot cuts, BOM derivatives, "
+                        "fractional sources) so only supplier-"
+                        "orderable parents and standalone products "
+                        "are returned. Reuses the engine's "
+                        "`is_non_master_tube` column. DO NOT pass "
+                        "false for stock questions — children "
+                        "duplicate their parent visually and "
+                        "crowd out other families. Pass false ONLY "
+                        "when the user explicitly asks for every "
+                        "variant ('show me every length and "
+                        "voltage of Iris 2700K')."),
                 },
                 "family": {
                     "type": "string",

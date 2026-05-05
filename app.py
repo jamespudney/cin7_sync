@@ -228,13 +228,33 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.30 — trend_flag is now ALWAYS appended "
-                "to every product row (Stable / 📈 Trend / 🎯 "
-                "Project / 🔀 Mixed / 📉 Decline). Was conditional "
-                "on non-Stable in v2.67.29, but sales staff "
-                "wanted the rating shown consistently rather "
-                "than inferring it from absence.")
+    st.caption("🟢 v2.67.31 — Two fixes. parents_only schema "
+                "now says default=true (AI was reading old text "
+                "and explicitly passing false, leaking children). "
+                "Plus new 🪫 REMNANT flag for bulk-roll parents "
+                "with OnHand<1.0 — engine considers them active "
+                "via rollup, but sales-side they're stock-to-"
+                "clear.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.31** — Two issues addressed. (1) Schema "
+            "description for parents_only said 'Default false' "
+            "when v2.67.29 actually flipped the code default to "
+            "True; the AI was reading the old text and "
+            "explicitly passing parents_only=false, which is why "
+            "child SKUs (LEDIRIS3000-60-0305 etc.) kept leaking. "
+            "Schema now matches code: TRUE is default, false "
+            "should not be used for stock questions. "
+            "(2) Added 🪫 REMNANT flag for bulk-roll parents "
+            "with OnHand<1.0 (less than one full roll left). "
+            "These items are 'active' per the engine because "
+            "per-foot child sales roll up to them, but they're "
+            "practically stock-to-clear from a sales "
+            "perspective. Plus a system prompt rule: when no "
+            "rows trigger any flag, the AI must explain the "
+            "rollup logic so the user doesn't think the AI "
+            "missed slow movers."
+        )
         st.caption(
             "**v2.67.30** — Stock trend indicator always "
             "visible. v2.67.29's rule appended trend_flag only "
@@ -15230,6 +15250,21 @@ elif page == "AI Assistant":
                 "→ prefix with `🔴 DEAD —`\n"
                 "  - If `excess_units`>0 → prefix with "
                 "`📦 EXCESS —`\n"
+                # v2.67.31 — remnant signal. The engine's slow/dead/
+                # excess flags don't capture "we have 0.4 of a 100m
+                # roll left". Sales staff treat those as stock to
+                # clear. Trigger: OnHand < 1.0 — fractional bulk
+                # rolls and partial cuts. Catches LED-31.171-6 at
+                # 0.07, LEDWIRIS3200-120-50 at 0.01, LEDIRIS3000-60-
+                # 100m at 0.09 — items the engine calls active
+                # because rollup demand exists, but are practically
+                # remnants.
+                "  - If `OnHand` < 1.0 (partial roll / remnant) → "
+                "prefix with `🪫 REMNANT —` (v2.67.31). The engine "
+                "considers these active because per-foot child "
+                "sales roll up to the parent, but with less than "
+                "a full roll's worth left, they're stock-to-clear "
+                "from the sales perspective.\n"
                 "  - ALWAYS append `trend_flag` to every row "
                 "(v2.67.30) — including Stable. Sales staff want "
                 "to see the rating consistently, not infer "
@@ -15250,7 +15285,25 @@ elif page == "AI Assistant":
                 "of this app. If a row in the result has "
                 "is_dormant=true and you don't flag it, the "
                 "answer is wrong. Sales staff scan for the "
-                "⚠️ / 🔴 / 📦 markers to spot what to push.\n\n"
+                "⚠️ / 🔴 / 📦 / 🪫 markers to spot what to push.\n"
+                # v2.67.31 — explanation rule. When NO rows in a
+                # stock-listing answer trigger any of the 4 flags
+                # (everything is plain Stable / no flag), explicitly
+                # explain why so the user doesn't suspect a bug.
+                "**When NO rows trigger any flag (v2.67.31):** "
+                "if your stock-listing answer has zero ⚠️ / 🔴 / "
+                "📦 / 🪫 prefixes across all returned SKUs, "
+                "ADD A NOTE at the top explaining the engine's "
+                "rollup logic: 'Note: the engine rolls up per-"
+                "foot child sales to bulk-roll parents, so "
+                "parents look active even when direct roll sales "
+                "are infrequent. None of these SKUs trigger the "
+                "engine's dormancy / excess / dead-stock signals. "
+                "If you want to see genuinely slow stock at the "
+                "parent level, ask: \"what dormant strips do we "
+                "have\" or \"what's our oldest unmoved bulk \"'. "
+                "This prevents the user from wrongly concluding "
+                "the AI missed slow movers.\n\n"
                 "**Engine signals — the ABC analytics intelligence "
                 "the app already produces (v2.67.27):** every "
                 "search_products / search_products_by_text row "
