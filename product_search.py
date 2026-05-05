@@ -188,6 +188,17 @@ _PER_FAMILY_PASS_1 = 3
 # the rest in round-robin order.
 _PER_FAMILY_KELVIN_PASS_1 = 2
 
+# v2.67.20 — fraction of the limit budget that pass 1 (breadth across
+# family/kelvin) is allowed to consume. The remainder is reserved for
+# pass 2 (density-variety drain of the deferred queue). Without this
+# reserve, pass 1's 2-SKU emission per (family, kelvin) bucket
+# exhausted the default limit-60 alone (~10 warm-white families × 3
+# kelvin slots × 2 SKUs ≈ 60), leaving nothing for pass 2 — and the
+# 60-LEDs/m density variant was always 3rd in the diversified bucket
+# order (after 120 + 180), so it never surfaced. With 70/30 split,
+# pass 2 always runs and density depth comes through.
+_PASS_1_BUDGET_FRAC = 0.7
+
 
 @dataclass
 class ShopifyProduct:
@@ -727,7 +738,7 @@ def find_products(engine_df: pd.DataFrame,
             rows; Shopify-only rows are ALWAYS surfaced (with
             stock_status="unknown") so the answer doesn't silently
             omit families like White Lily that aren't in CIN7.
-        limit: int — cap on returned rows (default 40, hard max 80).
+        limit: int — cap on returned rows (default 100, hard max 200).
 
     Result shape (relevant keys for the assistant + debug panel):
         matched: int
@@ -770,14 +781,22 @@ def find_products(engine_df: pd.DataFrame,
     families: list[str] = [f.upper() for f in (args.get("families") or [])]
     in_stock_only = bool(args.get("in_stock_only", True))
     try:
-        # v2.67.2 — bumped default 40 → 60 for more headroom after
-        # the per-family cap was added; a "warm white led strips"
-        # query now spans 12-15 families and 60 keeps each family's
-        # pass-1 share intact while leaving room for pass-2 depth.
-        limit = int(args.get("limit", 60) or 60)
+        # v2.67.20 — bumped default 60 → 100 and max 80 → 200. With
+        # ~10-12 warm-white families × 3 kelvins × 3 densities (60/
+        # 120/180 LEDs/m), comprehensive "what warm-white strip do
+        # we have" answers need ~120-150 rows to show every parent.
+        # The buyer-facing crew wants ALL options visible, not a
+        # tasting plate — so we widen the budget. Pass-1 budget
+        # reserve (see _PASS_1_BUDGET_FRAC) ensures pass-2 still
+        # runs for density variety.
+        limit = int(args.get("limit", 100) or 100)
     except (TypeError, ValueError):
-        limit = 60
-    limit = max(1, min(limit, 80))
+        limit = 100
+    limit = max(1, min(limit, 200))
+    # Pass-1 budget reserve. Pass 1 stops emitting once it hits this
+    # cap, leaving the remainder for pass-2 round-robin. See the
+    # comment on _PASS_1_BUDGET_FRAC for why this is needed.
+    pass_1_budget = max(1, int(limit * _PASS_1_BUDGET_FRAC))
 
     query_tokens = _tok(query)
     excludes_lower = [e.lower() for e in exclude_types]
@@ -1158,7 +1177,9 @@ def find_products(engine_df: pd.DataFrame,
     # per kelvin bucket, capped at _PER_FAMILY_PASS_1 distinct kelvin
     # temperatures per family.
     for score, fields_hit, sp in shopify_hits:
-        if len(out) >= limit:
+        # v2.67.20 — pass-1 stops at pass_1_budget (not limit) so the
+        # remaining slots are reserved for pass-2 density depth.
+        if len(out) >= pass_1_budget:
             break
         sp_skus = sp.skus or []
         sp_skus_passing = [s for s in sp_skus if s in cin7_matched_skus]
@@ -1204,7 +1225,8 @@ def find_products(engine_df: pd.DataFrame,
             # Iterate kelvin buckets in ascending kelvin order so the
             # answer reads coolest-warm to coolest-cool consistently.
             for kelvin in sorted(sku_by_kelvin.keys()):
-                if len(out) >= limit:
+                # v2.67.20 — pass-1 budget reserve (see top of pass).
+                if len(out) >= pass_1_budget:
                     break
                 bucket = sku_by_kelvin[kelvin]
                 # v2.67.12 — preferred-kelvin filter. When the caller
@@ -1271,7 +1293,11 @@ def find_products(engine_df: pd.DataFrame,
                         emitted_per_family[family_key] = (
                             emitted_per_family.get(family_key, 0) + 1)
                         emitted_in_this_call += 1
-                        if len(out) >= limit:
+                        # v2.67.20 — pass-1 budget reserve (see top
+                        # of pass). Once pass-1 quota is hit, any
+                        # remaining bucket SKUs go to deferred for
+                        # pass-2 round-robin to drain.
+                        if len(out) >= pass_1_budget:
                             break
                     else:
                         deferred.append((score, fields_hit, sp, sku))

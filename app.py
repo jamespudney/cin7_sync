@@ -228,10 +228,23 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.19 — get_sales_totals now accepts "
-                "start_date/end_date for arbitrary historical "
-                "ranges (April 2026, Q1 2026, etc.).")
+    st.caption("🟢 v2.67.20 — find_products limit raised "
+                "(default 100, max 200) with a 70/30 pass-1/pass-2 "
+                "budget split so density variants (60/120/180 "
+                "LEDs/m) all surface on warm-white queries.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.20** — find_products comprehensive-mode "
+            "fix. Pass-1 (family + kelvin breadth) was filling "
+            "the entire limit-60 budget on warm-white queries, "
+            "starving pass-2 (density depth). The 60-LEDs/m "
+            "Iris/Lily variants — which always landed 3rd in "
+            "the diversified bucket order, after 120 + 180 — "
+            "never surfaced. Default limit bumped 60 → 100, "
+            "hard max 80 → 200, and pass-1 capped at 70% of "
+            "limit so pass-2 round-robin always runs. The crew "
+            "now sees every parent (family × kelvin × density)."
+        )
         st.caption(
             "**v2.67.19** — get_sales_totals gained "
             "`start_date` / `end_date` params (ISO YYYY-MM-DD, "

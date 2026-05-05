@@ -722,13 +722,15 @@ TOOL_SCHEMAS: list[dict] = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Max rows to return (default 60, hard "
-                        "max 80). v2.67.2 emits at most 4 variants "
-                        "per family on the first pass so families "
-                        "like White Iris / White Lily get a fair "
-                        "share even when higher-scoring families "
-                        "(e.g. Elite Gold) have many warm-white "
-                        "variants."),
+                        "Max rows to return (default 100, hard "
+                        "max 200). v2.67.20 widened the budget so "
+                        "comprehensive answers (e.g. 'all warm-white "
+                        "strips') can surface every family × kelvin "
+                        "× density (60/120/180 LEDs/m) parent. "
+                        "Pass-1 emits up to 70% of limit for breadth "
+                        "(family + kelvin variety); the remaining "
+                        "30% drains the deferred queue in pass-2 so "
+                        "density variants always come through."),
                 },
             },
             "required": ["query"],
