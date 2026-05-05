@@ -228,15 +228,29 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.32 — Root cause fix. AI Assistant "
-                "page now calls the full _abc_engine (lifted to "
-                "module scope) instead of building a stripped-"
-                "down engine_df. All ABC engine columns "
-                "(is_non_master_tube, trend_flag, is_dormant, "
-                "excess_units, ABC) now reach the AI tools — "
-                "parents_only filter actually filters, slow-"
-                "mover flags actually fire.")
+    st.caption("🟢 v2.67.33 — On-the-fly feedback. Type a "
+                "one-line correction under any AI answer and it "
+                "becomes a standing rule the assistant follows on "
+                "every future question. Active corrections are "
+                "shown in a 🧠 panel above the chat input; archive "
+                "any that are no longer wanted.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.33** — Feedback fly-wheel. Replaced the "
+            "👍/👎 buttons + separate Feedback page with an "
+            "inline correction textbox under each AI answer. "
+            "When a user types a correction (e.g. \"don't "
+            "show 12V variants\" or \"missed the King Protea "
+            "series\"), it's stored against the audit row AND "
+            "automatically injected into the system prompt on "
+            "every subsequent question — so the model gets "
+            "sharper from team feedback in real time, no code "
+            "changes needed. New 🧠 Active corrections panel "
+            "above the chat input lets the user see and "
+            "archive standing rules. Built on existing "
+            "ai_audit_logs.feedback_note column — no schema "
+            "migration."
+        )
         st.caption(
             "**v2.67.32** — THE root cause. The AI Assistant "
             "page was building a lightweight engine_df from "
@@ -14604,28 +14618,59 @@ elif page == "AI Assistant":
                             st.line_chart(
                                 _df, height=200, use_container_width=True)
                 if entry["role"] == "assistant" and entry.get("audit_id"):
-                    fb_cols = st.columns([1, 1, 6])
+                    # v2.67.33 — on-the-fly feedback that improves
+                    # FUTURE answers. Replace the bare 👍/👎 buttons
+                    # with an inline correction textbox: the user
+                    # types one sentence ("don't show 12V variants"
+                    # or "missed the King Protea series") and on
+                    # submit we (a) save it as the feedback_note
+                    # on this audit row, (b) include it in the next
+                    # turn's system prompt as a "past correction
+                    # to remember". Over time the corrections
+                    # accumulate as durable memory — the model
+                    # gets sharper without code changes.
+                    _aud_id = entry["audit_id"]
+                    _corr_key = f"corr_{_aud_id}"
+                    fb_cols = st.columns([1, 6, 2])
                     if fb_cols[0].button(
                             "👍",
-                            key=f"fb_pos_{entry['audit_id']}",
-                            help="This answer was helpful and accurate"):
+                            key=f"fb_pos_{_aud_id}",
+                            help="Mark this answer as helpful"):
                         db.record_ai_feedback(
-                            entry["audit_id"], "positive",
+                            _aud_id, "positive",
                             user_id=current_user or "anonymous")
-                        st.toast("Thanks — feedback recorded.",
-                                  icon="👍")
-                    if fb_cols[1].button(
-                            "👎",
-                            key=f"fb_neg_{entry['audit_id']}",
-                            help="This answer was wrong or unhelpful"):
+                        st.toast("Thanks — recorded.", icon="👍")
+                    _correction = fb_cols[1].text_input(
+                        "Improve this answer (one line)",
+                        key=_corr_key,
+                        placeholder=(
+                            "e.g. 'don't show 12V variants in stock "
+                            "lists' or 'missed the King Protea "
+                            "series — please include it next time'"),
+                        label_visibility="collapsed",
+                    )
+                    if fb_cols[2].button(
+                            "Save correction",
+                            key=f"save_corr_{_aud_id}",
+                            disabled=not _correction.strip(),
+                            help=("Saved corrections are fed into the "
+                                  "AI's system prompt on every future "
+                                  "question, so the model learns from "
+                                  "your team in real time.")):
                         db.record_ai_feedback(
-                            entry["audit_id"], "negative",
+                            _aud_id, "negative",
+                            note=_correction.strip(),
                             user_id=current_user or "anonymous")
                         st.toast(
-                            "Thanks — flagged for review.", icon="👎")
+                            "Saved — will apply to future answers.",
+                            icon="🧠")
+                        # Clear the textbox so it's not re-saved on
+                        # the next rerun.
+                        if _corr_key in st.session_state:
+                            del st.session_state[_corr_key]
+                        st.rerun()
                     if entry.get("tool_calls"):
-                        with fb_cols[2].popover(
-                                ":wrench: Why this answer"):
+                        with st.popover(":wrench: Why this answer"):
                             st.markdown(
                                 "**Tools the AI called to gather data:**")
                             for tc in entry["tool_calls"]:
@@ -14633,6 +14678,57 @@ elif page == "AI Assistant":
                                     f"{tc['tool']}({tc['args']})\n"
                                     f"→ {tc.get('result_summary', '')}",
                                     language="text")
+
+        # v2.67.33 — Active corrections panel. Shows the on-the-fly
+        # corrections currently shaping AI answers. User can archive
+        # any rule that's no longer wanted. Folded by default so it
+        # doesn't dominate the page; a count in the label tells the
+        # user at a glance how many rules are active.
+        try:
+            _active_corrs = db.list_ai_corrections(limit=30)
+        except Exception:
+            _active_corrs = []
+        with st.expander(
+                f"🧠 Active corrections "
+                f"({len(_active_corrs)} in play)",
+                expanded=False):
+            if not _active_corrs:
+                st.caption(
+                    "No corrections yet. Type one in the box "
+                    "below any answer to start teaching the "
+                    "assistant.")
+            else:
+                st.caption(
+                    "Each correction below is fed into the AI's "
+                    "system prompt on every question. If a rule "
+                    "is no longer wanted, click Archive — the AI "
+                    "stops applying it on the next turn.")
+                for _row in _active_corrs:
+                    _ck1, _ck2 = st.columns([8, 1])
+                    _q = (_row["user_question"] or "").strip()
+                    _q_short = (_q[:80] + "…") if len(_q) > 80 else _q
+                    _note = (_row["feedback_note"] or "").strip()
+                    _when = str(_row["created_at"] or "")[:16]
+                    _ck1.markdown(
+                        f"**\"{_note}\"**  \n"
+                        f"<small>after _{_q_short}_ "
+                        f"— {_when}</small>",
+                        unsafe_allow_html=True)
+                    if _ck2.button(
+                            "Archive",
+                            key=f"arch_corr_{_row['id']}",
+                            help=("Remove this rule from the AI's "
+                                  "system prompt. The original "
+                                  "audit row is preserved for "
+                                  "history.")):
+                        db.archive_ai_correction(
+                            int(_row["id"]),
+                            user_id=current_user or "anonymous")
+                        st.toast(
+                            "Archived. Won't apply to future "
+                            "answers.",
+                            icon="🗄️")
+                        st.rerun()
 
         # v2.67.25 — intent picker. Asks the user upfront whether
         # they're after stock numbers, product info, or both. The
@@ -15477,6 +15573,39 @@ elif page == "AI Assistant":
                 "product family), or `[via none]` (no resolution "
                 "possible). Lets the buyer audit how the AI decided.")
 
+            # v2.67.33 — on-the-fly corrections from the team. Every
+            # time a user types a one-line correction under an AI
+            # answer, it's stored on the audit row's feedback_note.
+            # We pull the most recent N here and inject them as
+            # standing rules the AI must obey on EVERY question. This
+            # is the feedback fly-wheel: each correction makes future
+            # answers sharper without a single code change. Capped to
+            # keep the prompt size bounded.
+            try:
+                _recent_corrections = db.list_ai_corrections(limit=20)
+            except Exception:
+                _recent_corrections = []
+            _corrections_addendum = ""
+            if _recent_corrections:
+                _lines = []
+                for _row in _recent_corrections:
+                    _q = (_row["user_question"] or "").strip()[:120]
+                    _note = (_row["feedback_note"] or "").strip()
+                    if not _note:
+                        continue
+                    _lines.append(
+                        f"- After the question {_q!r}, the team "
+                        f"corrected: \"{_note}\". Apply this rule to "
+                        f"any similar question going forward.")
+                if _lines:
+                    _corrections_addendum = (
+                        "\n\n**On-the-fly corrections from the team "
+                        "(v2.67.33) — these are STANDING RULES, not "
+                        "one-off feedback. Apply them to every "
+                        "matching question; they override softer "
+                        "guidance in the base prompt:**\n"
+                        + "\n".join(_lines)
+                        + "\n")
             # Append any alias-correction hints captured above. Putting
             # these AFTER the base prompt means they show up as recent
             # context Claude can use without overriding the core
@@ -15484,7 +15613,8 @@ elif page == "AI Assistant":
             _system_prompt = (_system_prompt
                               + (_alias_addendum or "")
                               + (_similarity_addendum or "")
-                              + (_accessory_addendum or ""))
+                              + (_accessory_addendum or "")
+                              + _corrections_addendum)
 
             _tool_calls_log: list = []
             # Charts collected from tool results during this turn.

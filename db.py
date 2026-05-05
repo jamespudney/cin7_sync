@@ -2399,6 +2399,63 @@ def log_ai_query(*,
         return int(cur.lastrowid)
 
 
+def list_ai_corrections(limit: int = 30) -> List[sqlite3.Row]:
+    """v2.67.33 — return recent on-the-fly corrections users have
+    written under AI answers. These accumulate over time as a
+    'memory' the AI references in its system prompt — every
+    correction sharpens future answers without requiring code
+    changes or schema additions.
+
+    Source: ai_audit_logs.feedback_note where the user explicitly
+    typed a correction. Sorted newest first; the AI gets the most
+    recent N.
+
+    Excludes empty notes and rows where the user has explicitly
+    archived the correction (feedback='archived')."""
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT id,
+                   user_question,
+                   feedback_note,
+                   feedback,
+                   user_id,
+                   created_at
+              FROM ai_audit_logs
+             WHERE feedback_note IS NOT NULL
+               AND TRIM(feedback_note) != ''
+               AND COALESCE(feedback, '') != 'archived'
+             ORDER BY created_at DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return list(rows)
+
+
+def archive_ai_correction(audit_id: int,
+                            user_id: str = "") -> None:
+    """v2.67.33 — flag a correction as archived so it stops being
+    fed back into the system prompt. Sets feedback='archived' on
+    the audit row. The original feedback_note text is preserved
+    so we still have a record of what the user wanted."""
+    with connect() as c:
+        c.execute(
+            "UPDATE ai_audit_logs SET feedback = 'archived' "
+            "WHERE id = ?",
+            (int(audit_id),),
+        )
+        c.execute(
+            """
+            INSERT INTO feedback_events
+                (source, entity_type, entity_id, feedback, note, user_id)
+            VALUES ('ai_chat', 'ai_audit_log', ?, 'archived',
+                    'correction archived', ?)
+            """,
+            (str(audit_id), user_id),
+        )
+
+
 def record_ai_feedback(audit_id: int, feedback: str,
                         note: str = "",
                         user_id: str = "") -> None:
