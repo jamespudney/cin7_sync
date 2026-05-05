@@ -10,4 +10,11 @@ REM ============================================================
 cd /d "%~dp0"
 call .venv\Scripts\activate.bat
 python cin7_sync.py nearsync --days 1 >> output\nearsync.log 2>&1
+
+REM v2.67.36 — warm the engine cache after each near-sync. The
+REM 15-min cadence means the cache stays fresh throughout the
+REM workday, so any user opening the dashboard gets an instant
+REM page load. Best-effort; failures are logged silently.
+python warm_engine.py >> output\nearsync.log 2>&1
+
 exit /b %ERRORLEVEL%

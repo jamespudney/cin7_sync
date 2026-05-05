@@ -228,16 +228,60 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.35 — Two new features. (1) AI tools "
-                "now know warehouse Bin location for every SKU "
-                "(answers 'where do we keep X?'). (2) Dormancy "
-                "provenance: SKUs that have ever been flagged "
-                "slow-moving get a ❗ prefix in the Ordering "
-                "page Status column + an auto-note 'WAS slow-"
-                "moving — verify demand before reordering'. "
-                "Auto-lifts after 90d sustained recovery; buyer "
-                "can manually dismiss.")
+    st.caption("🟢 v2.67.36 — Engine pre-warm. The ABC engine "
+                "now warms automatically after every sync (Render "
+                "sync_loop, Windows daily_sync.bat, nearsync.bat) "
+                "so the first user post-sync gets a cache hit "
+                "instead of waiting 30-60s. Sidebar shows engine "
+                "cache age below.")
+    # v2.67.36 — engine cache age indicator. Reads the mtime of
+    # Streamlit's persisted cache directory. Mostly informational —
+    # if it shows an age in seconds you know the warmer is running;
+    # if it shows hours, the cache is stale or the warmer broke.
+    try:
+        from pathlib import Path as _Path
+        from datetime import datetime as _dt
+        _cache_root = _Path(
+            os.environ.get("STREAMLIT_HOME") or
+            (DATA_DIR / ".streamlit"))
+        _cache_dir = _cache_root / "cache"
+        if _cache_dir.exists():
+            _files = list(_cache_dir.glob("*"))
+            if _files:
+                _newest = max(f.stat().st_mtime for f in _files)
+                _age_min = (_dt.now().timestamp() - _newest) / 60.0
+                if _age_min < 60:
+                    _age_str = f"{_age_min:.0f}m ago"
+                elif _age_min < 1440:
+                    _age_str = f"{_age_min / 60:.1f}h ago"
+                else:
+                    _age_str = f"{_age_min / 1440:.1f}d ago"
+                _icon = "🟢" if _age_min < 1440 else "🟡"
+                st.caption(
+                    f"{_icon} ABC engine cache: warmed {_age_str}")
+            else:
+                st.caption(
+                    "🟡 ABC engine cache: empty — first user "
+                    "after the next sync will trigger a recompute")
+        else:
+            st.caption("🟡 ABC engine cache: not yet created")
+    except Exception:  # noqa: BLE001
+        # Don't break the sidebar over a status caption.
+        pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.36** — Engine pre-warm via post-sync hook. "
+            "New `warm_engine.py` + `warm_engine_helpers.py` "
+            "imports the lifted `_abc_engine` and calls it once "
+            "with the freshest CSVs after every sync iteration. "
+            "Wired into Render's `sync_loop.sh` and the Windows "
+            "`daily_sync.bat` + `nearsync.bat`. Result: the first "
+            "user post-sync hits a hot @st.cache_data cache "
+            "instead of waiting for the engine to recompute. "
+            "Sidebar caption above shows cache age — green if "
+            "<24h, yellow otherwise. Best-effort: a warmer "
+            "failure logs but never blocks the sync exit."
+        )
         st.caption(
             "**v2.67.35** — Bin location now flows through to "
             "the AI assistant (merged from stock_on_hand into "

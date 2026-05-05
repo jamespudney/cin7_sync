@@ -40,4 +40,14 @@ while true; do
     ./daily_sync.sh || \
       echo "[$(stamp)] daily_sync.sh exited with non-zero status" \
         | tee -a "$LOG"
+
+    # v2.67.36 — warm the ABC engine cache after every sync so the
+    # first user post-sync gets a cache hit instead of waiting
+    # 30-60s for the engine to recompute against fresh CSVs. Best-
+    # effort; a failure here is logged but doesn't block the next
+    # iteration.
+    echo "[$(stamp)] warming engine cache" | tee -a "$LOG"
+    python warm_engine.py 2>&1 | tee -a "$LOG" || \
+      echo "[$(stamp)] warm_engine.py exited with non-zero status" \
+        | tee -a "$LOG"
 done
