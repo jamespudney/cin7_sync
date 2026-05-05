@@ -228,14 +228,31 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.31 — Two fixes. parents_only schema "
-                "now says default=true (AI was reading old text "
-                "and explicitly passing false, leaking children). "
-                "Plus new 🪫 REMNANT flag for bulk-roll parents "
-                "with OnHand<1.0 — engine considers them active "
-                "via rollup, but sales-side they're stock-to-"
-                "clear.")
+    st.caption("🟢 v2.67.32 — Root cause fix. AI Assistant "
+                "page now calls the full _abc_engine (lifted to "
+                "module scope) instead of building a stripped-"
+                "down engine_df. All ABC engine columns "
+                "(is_non_master_tube, trend_flag, is_dormant, "
+                "excess_units, ABC) now reach the AI tools — "
+                "parents_only filter actually filters, slow-"
+                "mover flags actually fire.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.32** — THE root cause. The AI Assistant "
+            "page was building a lightweight engine_df from "
+            "products + stock only — the full _abc_engine "
+            "function was nested inside the `elif page == "
+            "'Ordering':` block and unreachable from any other "
+            "page. So when the AI called search_products_by_text "
+            "with parents_only=true, the filter was a silent "
+            "no-op (`is_non_master_tube` column didn't exist). "
+            "Same for trend_flag, is_dormant, excess_units, ABC. "
+            "Every fix shipped today (v2.67.20-31) was a band-"
+            "aid because the underlying engine signals never "
+            "reached the AI. Now lifted to module scope; "
+            "@st.cache_data(persist='disk') means zero "
+            "recomputation cost when called from a second page."
+        )
         st.caption(
             "**v2.67.31** — Two issues addressed. (1) Schema "
             "description for parents_only said 'Default false' "
@@ -3298,6 +3315,1436 @@ if stock_only and _filtered_count > 0:
 # ---------------------------------------------------------------------------
 # Page: Overview
 # ---------------------------------------------------------------------------
+
+# ===========================================================================
+# v2.67.32 - HOISTED: _abc_engine and the page-conditional ABC computation
+# moved to module scope so the AI Assistant page can call the same cached
+# function as the Ordering page. Was nested inside the
+# `elif page == 'Ordering':` block, which meant engine_df reaching
+# ai_tools was missing is_non_master_tube, trend_flag, is_dormant,
+# excess_units, ABC - every column needed for parents_only filtering
+# and stock-reduction signals on the AI page. With @st.cache_data
+# (persist='disk') the function returns the cached result instantly when
+# inputs haven't changed, so this lift adds zero compute cost.
+# ===========================================================================
+
+@st.cache_data(
+    persist="disk",
+    show_spinner="Computing ABC engine…")
+def _abc_engine(products: pd.DataFrame,
+                stock: pd.DataFrame,
+                sale_lines: pd.DataFrame,
+                purchase_lines: pd.DataFrame,
+                window_days: int = 365) -> pd.DataFrame:
+    """Compute per-SKU ABC, velocity, target, reorder for Stock items.
+    Uses hybrid ABC: 60% value + 40% qty percentile rank."""
+    # 1. Filter to Stock items only (already done by global filter)
+    prods = products[["SKU", "Name", "Type", "Category", "Brand",
+                      "Status", "AverageCost",
+                      "MinimumBeforeReorder", "ReorderQuantity",
+                      "AdditionalAttribute1", "BillOfMaterial",
+                      "BOMType"]].copy()
+    prods = prods[prods["Type"] == "Stock"]
+    # Dedupe on SKU so downstream .map() operations don't hit
+    # pandas Arrow-backend InvalidIndexError on duplicate indices.
+    prods = prods.drop_duplicates(subset=["SKU"])
+    # Also normalise SKU to plain strings (not Arrow StringArray)
+    prods["SKU"] = prods["SKU"].astype(str)
+    prods["AverageCost"] = _to_num(prods["AverageCost"]).fillna(0)
+
+    # 2. 12-month velocity per SKU — filter by InvoiceDate >= today-window
+    # EXCLUDE CREDITED lines so returned/refunded units don't inflate
+    # demand. A sale that was fully returned should net to zero
+    # contribution — CIN7's Status = 'CREDITED' marks invoices that
+    # were later credited (returned).
+    sl = sale_lines.copy()
+    sl["InvoiceDate"] = _to_date(sl["InvoiceDate"]).dt.tz_localize(None)
+    cutoff = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=window_days)
+    sl = sl[sl["InvoiceDate"] >= cutoff].dropna(subset=["InvoiceDate"])
+    # Exclude credited / voided / cancelled to reflect NET demand
+    if "Status" in sl.columns:
+        excluded_statuses = ("CREDITED", "VOIDED", "CANCELLED")
+        sl = sl[~sl["Status"].astype(str).str.upper()
+                               .isin(excluded_statuses)]
+    sl["Quantity"] = _to_num(sl["Quantity"]).fillna(0)
+    sl["Total"] = _to_num(sl["Total"]).fillna(0)
+    vel = (sl.groupby("SKU")
+             .agg(units_12mo=("Quantity", "sum"),
+                  rev_12mo=("Total", "sum"),
+                  last_sold=("InvoiceDate", "max"),
+                  first_sold=("InvoiceDate", "min"))
+             .reset_index())
+
+    # --- Trend vs. project detection (45-day window) --------------
+    # For each SKU, compute:
+    #   units_45d       — units sold in last 45 days
+    #   units_prior_45d — units sold in days 45-90 ago (prior period)
+    #   customers_45d   — distinct customers in last 45d
+    #   top_cust_pct    — % of 45d volume from the single biggest buyer
+    #   top_cust_name   — who that buyer is
+    #   top_cust_units_12mo — how much THIS customer bought this SKU
+    #                         over the full 12mo (used for project
+    #                         baseline-correction)
+    #   momentum        — units_45d / max(units_prior_45d, 1)
+    #   trend_flag      — Stable / 📈 Trend / 🎯 Project / 🔀 Mixed / 📉 Decline
+    #
+    # 45 days catches spikes faster than 90 days; the trade-off is a
+    # noisier signal on low-volume SKUs (hence the 3-unit low-volume
+    # guard below, down from 5 when this was a 90d window).
+    today_ts = pd.Timestamp(datetime.now().date())
+    cutoff_recent = today_ts - pd.Timedelta(days=45)
+    cutoff_prior = today_ts - pd.Timedelta(days=90)
+    cutoff_90 = today_ts - pd.Timedelta(days=90)
+    sl_recent = sl[sl["InvoiceDate"] >= cutoff_recent]
+    sl_prior = sl[(sl["InvoiceDate"] >= cutoff_prior)
+                   & (sl["InvoiceDate"] < cutoff_recent)]
+    sl_90d = sl[sl["InvoiceDate"] >= cutoff_90]
+
+    u45 = sl_recent.groupby("SKU")["Quantity"].sum().rename("units_45d")
+    uprior = sl_prior.groupby("SKU")["Quantity"].sum().rename(
+        "units_prior_45d")
+    c45 = sl_recent.groupby("SKU")["CustomerID"].nunique().rename(
+        "customers_45d")
+    # 90-day units — used for dormancy detection. A SKU with strong
+    # 12mo history but zero 90d activity is treated as dormant; the
+    # engine uses the 90d rate (≈0) instead of the inflated 12mo rate
+    # to avoid suggesting reorders against demand that's stopped.
+    u90 = sl_90d.groupby("SKU")["Quantity"].sum().rename("units_90d")
+
+    # Top customer(s) per SKU in 45d:
+    #   top_cust_pct       — share going to the single biggest buyer
+    #   top_2_cust_pct     — share going to top 2 combined (concentration
+    #                        check; 2 customers taking >70% is still
+    #                        project-like even if there are 6+ others)
+    #   non_top_avg_units  — avg units per non-top customer (measures
+    #                        whether the "many customers" actually
+    #                        buy meaningful quantities)
+    #   top_cust_name      — the top buyer's name (for transparency)
+    #   top_cust_units_12mo — top buyer's full 12mo contribution on
+    #                        this SKU (for project baseline correction)
+    top_info = []
+    for sku, g in sl_recent.groupby("SKU"):
+        if g.empty:
+            continue
+        cust_tot = g.groupby("CustomerID").agg(
+            qty=("Quantity", "sum"),
+            name=("Customer", "first"),
+        ).sort_values("qty", ascending=False)
+        if cust_tot.empty:
+            continue
+        total = float(g["Quantity"].sum())
+        if total <= 0:
+            continue
+        top_qty = float(cust_tot.iloc[0]["qty"])
+        top_name = cust_tot.iloc[0]["name"]
+        top_cid = cust_tot.index[0]
+        share1 = top_qty / total
+        share2 = share1
+        if len(cust_tot) >= 2:
+            share2 = (top_qty + float(cust_tot.iloc[1]["qty"])) / total
+        # Non-top: average units per customer excluding the biggest
+        non_top_qty = total - top_qty
+        non_top_n = max(len(cust_tot) - 1, 0)
+        non_top_avg = (non_top_qty / non_top_n) if non_top_n > 0 else 0.0
+        cust_12mo = float(
+            sl[(sl["SKU"] == sku) & (sl["CustomerID"] == top_cid)
+                ]["Quantity"].sum())
+        top_info.append({
+            "SKU": sku,
+            "top_cust_pct": share1,
+            "top_2_cust_pct": share2,
+            "non_top_avg_units": non_top_avg,
+            "top_cust_name": str(top_name)[:50] if top_name else "",
+            "top_cust_units_12mo": cust_12mo,
+        })
+    top_df = (pd.DataFrame(top_info)
+                if top_info else pd.DataFrame(
+                  columns=["SKU", "top_cust_pct", "top_2_cust_pct",
+                            "non_top_avg_units",
+                            "top_cust_name",
+                            "top_cust_units_12mo"]))
+
+    vel = vel.merge(u45, on="SKU", how="left")
+    vel = vel.merge(uprior, on="SKU", how="left")
+    vel = vel.merge(c45, on="SKU", how="left")
+    vel = vel.merge(u90, on="SKU", how="left")
+    vel = vel.merge(top_df, on="SKU", how="left")
+    vel["units_45d"] = vel["units_45d"].fillna(0)
+    vel["units_prior_45d"] = vel["units_prior_45d"].fillna(0)
+    vel["units_90d"] = vel["units_90d"].fillna(0)
+    vel["customers_45d"] = vel["customers_45d"].fillna(0).astype(int)
+    vel["top_cust_pct"] = vel["top_cust_pct"].fillna(0)
+    vel["top_cust_units_12mo"] = vel["top_cust_units_12mo"].fillna(0)
+    vel["top_cust_name"] = vel["top_cust_name"].fillna("")
+    # momentum (avoid div-by-zero)
+    vel["momentum"] = vel.apply(
+        lambda r: (r["units_45d"] / max(r["units_prior_45d"], 1.0)
+                     if r["units_prior_45d"] > 0
+                     else (float("inf")
+                            if r["units_45d"] > 0 else 1.0)),
+        axis=1,
+    )
+
+    # Classify — tightened rules per buyer feedback:
+    #   📈 Trend  requires ALL of:
+    #     - momentum > 1.5
+    #     - 4+ distinct customers in 45d
+    #     - top customer < 40%  (was 60%)
+    #     - non-top customers avg ≥ 2 units each (real spread, not noise)
+    #   🎯 Project triggers if ANY of:
+    #     - ≤ 2 customers
+    #     - top customer ≥ 50%  (was 70%)
+    #     - top 2 customers ≥ 70% combined (new — catches "8 customers
+    #       but 2 took most of it")
+    #   🔀 Mixed = spike but neither pure trend nor pure project.
+    def _trend_flag(r):
+        u45v = float(r["units_45d"])
+        uprv = float(r["units_prior_45d"])
+        mom = r["momentum"]
+        # Low-volume guard — not enough signal to classify at 45d
+        if u45v < 3:
+            return "Stable"
+        # Decline
+        if uprv > 0 and mom < 0.5:
+            return "📉 Decline"
+        # Spike — decompose
+        if mom > 1.5:
+            n_cust = int(r["customers_45d"])
+            top_share = float(r["top_cust_pct"])
+            top_2_share = float(r.get("top_2_cust_pct", top_share))
+            non_top_avg = float(r.get("non_top_avg_units", 0))
+            # Project-like concentrations (ANY of these)
+            if n_cust <= 2:
+                return "🎯 Project"
+            if top_share >= 0.50:
+                return "🎯 Project"
+            if top_2_share >= 0.70:
+                return "🎯 Project"
+            # Real trend (ALL of these)
+            if (n_cust >= 4
+                    and top_share < 0.40
+                    and non_top_avg >= 2.0):
+                return "📈 Trend"
+            return "🔀 Mixed"
+        return "Stable"
+
+    vel["trend_flag"] = vel.apply(_trend_flag, axis=1)
+
+    # 3. Stock — include Allocated AND CIN7's StockOnHand (FIFO $ value)
+    if not stock.empty:
+        st_df = stock.copy()
+        st_df["OnHand"] = _to_num(st_df["OnHand"]).fillna(0)
+        st_df["Available"] = _to_num(st_df["Available"]).fillna(0)
+        st_df["OnOrder"] = _to_num(st_df["OnOrder"]).fillna(0)
+        if "Allocated" in st_df.columns:
+            st_df["Allocated"] = _to_num(st_df["Allocated"]).fillna(0)
+        else:
+            st_df["Allocated"] = 0
+        # CIN7's authoritative FIFO stock value per SKU per location
+        if "StockOnHand" in st_df.columns:
+            st_df["StockOnHand"] = _to_num(
+                st_df["StockOnHand"]).fillna(0)
+        else:
+            st_df["StockOnHand"] = 0
+        st_agg = (st_df.groupby("SKU")
+                   .agg(OnHand=("OnHand", "sum"),
+                        Allocated=("Allocated", "sum"),
+                        Available=("Available", "sum"),
+                        OnOrder=("OnOrder", "sum"),
+                        StockOnHand=("StockOnHand", "sum"))
+                   .reset_index())
+    else:
+        st_agg = pd.DataFrame(columns=["SKU", "OnHand", "Allocated",
+                                         "Available", "OnOrder",
+                                         "StockOnHand"])
+
+    # 3b. Unfulfilled sale demand per SKU — backorders + open ordered
+    # Not yet shipped; eats into future stock position.
+    # Excludes ESTIMATING (pre-quote) and PICKING/PICKED/PACKING (those
+    # are typically already in Allocated, so double-counting to be
+    # avoided).
+    UNFULFILLED_STATUSES = ("BACKORDERED", "ORDERED", "ORDERING")
+    unfulfilled_by_sku = {}
+    if "Status" in sale_lines.columns:
+        unful_lines = sale_lines[sale_lines["Status"]
+                                   .astype(str).str.upper()
+                                   .isin(UNFULFILLED_STATUSES)].copy()
+        unful_lines["Quantity"] = _to_num(
+            unful_lines["Quantity"]).fillna(0)
+        ug = unful_lines.groupby("SKU")["Quantity"].sum()
+        unfulfilled_by_sku = ug.to_dict()
+
+    # 3c. Apply unfulfilled-order lookup to the main frame later
+    # (defer until df is built).
+
+    # 4. Supplier per SKU using 4-tier resolution:
+    # override > CIN7 native Suppliers > PO history > family default > unassigned
+    sku_overrides_local = db.all_sku_supplier_overrides()
+    fam_assignments_local = {r["family"]: r["supplier_name"]
+                              for r in db.all_family_suppliers()}
+
+    # CIN7 native supplier from product.Suppliers. Key is 'SupplierName'.
+    # Also capture FixedCost and Lead time from ProductSupplierOptions.
+    cin7_supplier_local: dict = {}
+    cin7_cost_local: dict = {}
+    cin7_lead_local: dict = {}
+    cin7_currency_local: dict = {}
+    for _, p in products.iterrows():
+        sups_raw = p.get("Suppliers")
+        if not sups_raw or sups_raw in ("[]", "None", None):
+            continue
+        sups = sups_raw
+        if isinstance(sups, str):
+            try:
+                sups = json.loads(sups)
+            except (ValueError, TypeError):
+                continue
+        if not isinstance(sups, list) or not sups:
+            continue
+        primary = next(
+            (s for s in sups if isinstance(s, dict) and s.get("SupplierName")),
+            None,
+        )
+        if not primary:
+            continue
+        sku = p["SKU"]
+        cin7_supplier_local[sku] = primary["SupplierName"]
+        fc = primary.get("FixedCost") or primary.get("Cost") or primary.get("PurchaseCost")
+        if fc and float(fc) > 0:
+            cin7_cost_local[sku] = float(fc)
+        if primary.get("Currency"):
+            cin7_currency_local[sku] = primary["Currency"]
+        opts = primary.get("ProductSupplierOptions") or []
+        if isinstance(opts, list):
+            for opt in opts:
+                if isinstance(opt, dict):
+                    lead = opt.get("Lead")
+                    if lead and int(lead) > 0:
+                        cin7_lead_local[sku] = int(lead)
+                        break
+
+    sup_by_sku_local: dict = {}
+    if not purchase_lines.empty:
+        pl = purchase_lines.copy()
+        pl["Total"] = _to_num(pl["Total"]).fillna(0)
+        sup_group = (pl.groupby(["SKU", "Supplier"])["Total"]
+                       .sum().reset_index())
+        for sku, grp in sup_group.groupby("SKU"):
+            sup_by_sku_local[sku] = grp.sort_values(
+                "Total", ascending=False)["Supplier"].iloc[0]
+
+    def _resolve_sup(sku: str, category: str) -> str:
+        if sku in sku_overrides_local:
+            return sku_overrides_local[sku]
+        if sku in cin7_supplier_local:
+            return cin7_supplier_local[sku]
+        if sku in sup_by_sku_local:
+            return sup_by_sku_local[sku]
+        return "(unassigned)"
+
+    # 5. Merge everything
+    df = prods.merge(vel, on="SKU", how="left")
+    df = df.merge(st_agg, on="SKU", how="left")
+    for c in ["units_12mo", "rev_12mo", "OnHand", "Allocated",
+              "Available", "OnOrder", "StockOnHand",
+              # Trend-detection fields — NaN for products with no sales
+              # in the recent window. Must be numeric-0 for downstream
+              # int() casts in _compute_target_and_reorder.
+              "units_45d", "units_prior_45d", "units_90d",
+              "customers_45d",
+              "top_cust_pct", "top_2_cust_pct", "non_top_avg_units",
+              "top_cust_units_12mo", "momentum"]:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    # trend_flag and top_cust_name are strings — default to empty/Stable.
+    if "trend_flag" not in df.columns:
+        df["trend_flag"] = "Stable"
+    df["trend_flag"] = df["trend_flag"].fillna("Stable")
+    if "top_cust_name" not in df.columns:
+        df["top_cust_name"] = ""
+    df["top_cust_name"] = df["top_cust_name"].fillna("")
+
+    # Unfulfilled open orders per SKU
+    df["unfulfilled"] = df["SKU"].apply(
+        lambda s: float(unfulfilled_by_sku.get(s, 0))).fillna(0)
+
+    df["Supplier"] = df["SKU"].apply(lambda s: _resolve_sup(s, ""))
+
+    # 5b. Apply MIGRATION demand — retiring SKUs' sales roll into successors
+    # (same logic used on LED Tubes page). Saved mappings take priority;
+    # auto-proposed Sierra successors fill in the rest.
+    saved_migrations = {m["retiring_sku"]: dict(m)
+                         for m in db.all_migrations()}
+
+    # Parse tubes so we can compute auto-proposed successors AND rollup
+    # cut/MP consumption onto masters.
+    tube_records = []
+    for _, p in products.iterrows():
+        rec = _parse_tube_sku(p.get("SKU"), p.get("Name", ""))
+        if rec:
+            rule = parse_sourcing_rule(p.get("AdditionalAttribute1"))
+            rec["RuleCode"] = rule["RuleCode"]
+            rec["IsMaster"] = rule["IsMaster"]
+            rec["SourceFraction"] = rule["SourceFraction"]
+            rec["SourceLengthMM"] = rule["SourceLengthMM"]
+            tube_records.append(rec)
+    tube_df = pd.DataFrame(tube_records) if tube_records else pd.DataFrame()
+
+    # Auto-detect retiring → successor family rules (from LED Tubes logic)
+    tube_fams = (tube_df["Family"].unique().tolist()
+                  if not tube_df.empty else [])
+    family_migration_rules = {}
+    for fam in tube_fams:
+        if fam.startswith("SMOKIES") and fam[7:].isdigit():
+            cand = f"SIERRA{fam[7:]}"
+            if cand in tube_fams:
+                family_migration_rules[fam] = cand
+        elif fam.startswith("CASCADE") and fam[7:].isdigit():
+            cand = f"SIERRA{fam[7:]}"
+            if cand in tube_fams:
+                family_migration_rules[fam] = cand
+
+    def _auto_successor_for(row) -> Optional[str]:
+        fam = row.get("Family")
+        succ_fam = family_migration_rules.get(fam)
+        if not succ_fam:
+            return None
+        color = row.get("Color")
+        has_mp = row.get("HasMP")
+        length_mm = row.get("LengthMM")
+        if length_mm is None:
+            return None
+        if length_mm >= 1000 and length_mm % 1000 == 0:
+            len_str = str(length_mm // 1000)
+        elif length_mm >= 1000:
+            len_str = str(length_mm)
+        else:
+            len_str = f"{length_mm:04d}"
+        mp_part = "-MP" if has_mp else ""
+        cand = f"LED-{succ_fam}-{color}{mp_part}-{len_str}"
+        if (products["SKU"] == cand).any():
+            return cand
+        return None
+
+    # 5c. Compute EFFECTIVE demand per SKU = direct + migrated_in
+    # Also track where migrated demand came from (for transparency).
+    migration_notes: dict = {s: [] for s in df["SKU"]}
+    migration_inflow: dict = {s: 0.0 for s in df["SKU"]}
+    migration_outflow: dict = {s: 0.0 for s in df["SKU"]}  # retiring SKUs
+
+    # Track which retiring SKUs we've already credited so we don't
+    # double-count if a SKU is both a tube AND has an IP-imported
+    # migration record.
+    handled_retiring: set = set()
+
+    if not tube_df.empty:
+        # For every retiring tube SKU that has sales, compute share and
+        # add to the successor's inflow.
+        retiring_fams = list(family_migration_rules.keys())
+        retiring_tubes = tube_df[tube_df["Family"].isin(retiring_fams)]
+        for _, r in retiring_tubes.iterrows():
+            retiring_sku = r["SKU"]
+            # Successor from saved mapping OR auto-proposal
+            saved = saved_migrations.get(retiring_sku, {})
+            successor = (saved.get("successor_sku")
+                          or _auto_successor_for(r))
+            if not successor:
+                continue
+            share = float(saved.get("share_pct", 100.0)) / 100.0
+            units_here = float(vel.loc[vel["SKU"] == retiring_sku,
+                                        "units_12mo"].sum())
+            if units_here == 0 or share <= 0:
+                continue
+            migrated_units = units_here * share
+
+            # Successor gets the migrated units
+            if successor in migration_inflow:
+                migration_inflow[successor] += migrated_units
+                migration_notes.setdefault(successor, []).append(
+                    f"{retiring_sku}: +{migrated_units:.0f} units")
+
+            # Retiring SKU shrinks by that share
+            if retiring_sku in migration_outflow:
+                migration_outflow[retiring_sku] += migrated_units
+
+            handled_retiring.add(retiring_sku)
+
+    # === Generalised migration application (non-tube) =================
+    # Applies ANY db.set_migration() entry — not just tube-family
+    # ones. This is what makes the 71 IP-imported migrations
+    # (LED-XRD, LED-V3000, LED-AL-SL7, LEDEXTA42, etc.) actually
+    # affect successor reorder math.
+    #
+    # Same math as the tube loop: retiring SKU's 12mo units × share
+    # → added to successor's inflow, subtracted from retiring's
+    # outflow. Skips entries already handled by the tube loop above
+    # to avoid double-counting.
+    for retiring_sku, saved in saved_migrations.items():
+        if retiring_sku in handled_retiring:
+            continue
+        successor = saved.get("successor_sku")
+        if not successor or successor not in migration_inflow:
+            # Successor SKU isn't in the engine's product set —
+            # could be discontinued itself or filtered out. Skip
+            # gracefully.
+            continue
+        share = float(saved.get("share_pct", 100.0)) / 100.0
+        if share <= 0:
+            continue
+        units_match = vel.loc[vel["SKU"] == retiring_sku, "units_12mo"]
+        if units_match.empty:
+            continue
+        units_here = float(units_match.sum())
+        if units_here == 0:
+            continue
+        migrated_units = units_here * share
+
+        migration_inflow[successor] += migrated_units
+        migration_notes.setdefault(successor, []).append(
+            f"{retiring_sku}: +{migrated_units:.0f} units")
+        if retiring_sku in migration_outflow:
+            migration_outflow[retiring_sku] += migrated_units
+        handled_retiring.add(retiring_sku)
+
+    df["migrated_in"] = df["SKU"].apply(
+        lambda s: float(migration_inflow.get(s, 0))).fillna(0)
+    df["migrated_out"] = df["SKU"].apply(
+        lambda s: float(migration_outflow.get(s, 0))).fillna(0)
+    df["migrated_from"] = df["SKU"].apply(
+        lambda s: "; ".join(migration_notes.get(s, []))[:200])
+
+    # 5d. GLOBAL IsMaster flag + rollup for EVERY product with a
+    # sourcing rule — not just tubes. Covers B2060020-2390, other cut
+    # SKUs with Assemble-from rules, and BOM-based assemblies.
+    # Rule priority: parsed AdditionalAttribute1 → BOM lookup → default.
+    master_rollup_notes: dict = {}
+    master_rollup_inflow: dict = {}
+    # Parallel 90d rollup tracking — used for dormancy detection on
+    # masters whose own 90d sales are zero but whose children's 90d
+    # sales tell us whether the family still has active demand.
+    master_rollup_inflow_90d: dict = {}
+
+    # Index: SKU -> sourcing rule dict
+    rule_by_sku: dict = {}
+    for _, p in products.iterrows():
+        rule_by_sku[p["SKU"]] = parse_sourcing_rule(
+            p.get("AdditionalAttribute1"))
+
+    # Index: AssemblySKU -> list of (ComponentSKU, Quantity) from BOMs
+    bom_components_by_asm: dict = {}
+    if not boms.empty:
+        for _, b in boms.iterrows():
+            asm = b.get("AssemblySKU")
+            comp = b.get("ComponentSKU")
+            qty = b.get("Quantity")
+            if asm and comp and pd.notna(qty):
+                bom_components_by_asm.setdefault(asm, []).append(
+                    (comp, float(qty)))
+
+    # Build tube family+color+length master lookup (fallback for tubes)
+    tube_master_by_key: dict = {}
+    if not tube_df.empty:
+        for _, r in tube_df.iterrows():
+            if r.get("IsMaster"):
+                tube_master_by_key[(r["Family"], r["Color"],
+                                      r["LengthMM"])] = r["SKU"]
+
+    # Lookup: which products have BillOfMaterial=True in master data
+    bom_flag_by_sku = {
+        p["SKU"]: (str(p.get("BillOfMaterial")).lower() == "true")
+        for _, p in products.iterrows()
+    }
+
+    # Which SKUs have a CIN7-assigned supplier (from product.Suppliers)?
+    # A SKU with an explicit supplier is clearly intended to be bought.
+    has_cin7_supplier = set(cin7_supplier_local.keys())
+
+    def _global_is_master(sku: str) -> bool:
+        """A SKU is a MASTER (orderable) if there's evidence it's bought
+        from a supplier, AND it's not explicitly marked as assembled-from.
+        Detection priority:
+          1. Supplier assigned in CIN7 → likely master (can still be
+             overridden by explicit Assemble-from rule — see #2)
+          2. Rule says 'Assemble from X' → non-master (wins over #1;
+             e.g. MP variants can have a supplier but the rule tells us
+             they're assembled, not bought)
+          3. Rule says 'Purchased full length' → master
+          4. BillOfMaterial=True or appears in BOMs as assembly → non-master
+          5. Default → master (no evidence of assembly)
+        """
+        rule = rule_by_sku.get(sku, {})
+        # 2: Explicit Assemble-from always wins
+        if rule.get("SourceFraction") is not None:
+            return False
+        # 3: Explicit Purchased full length
+        if rule.get("IsMaster"):
+            return True
+        # 4: BOM flag or BOM-has-components
+        if bom_flag_by_sku.get(sku):
+            return False
+        if sku in bom_components_by_asm:
+            return False
+        # 1: Supplier assigned (without any Assemble-from / BOM evidence)
+        if sku in has_cin7_supplier:
+            return True
+        # 5: default — orderable
+        return True
+
+    def _find_master_for_assembly(sku: str) -> Optional[tuple]:
+        """Return (master_sku, qty_per_unit) or None.
+        Tries BOM data first, then tube family+color+length lookup.
+        """
+        # Method A: BOM data (authoritative)
+        comps = bom_components_by_asm.get(sku)
+        if comps:
+            # Pick the first component as primary master
+            # (products typically have a main component; others are
+            # accessories like screws)
+            return comps[0]
+        # Method B: tube fallback
+        if not tube_df.empty:
+            r = tube_df[tube_df["SKU"] == sku]
+            if not r.empty:
+                row = r.iloc[0]
+                fam = row["Family"]
+                color = row["Color"]
+                slen = row["SourceLengthMM"]
+                if slen is not None:
+                    k = (fam, color, slen)
+                    master = tube_master_by_key.get(k)
+                    if not master:
+                        succ = family_migration_rules.get(fam)
+                        if succ:
+                            master = tube_master_by_key.get(
+                                (succ, color, slen))
+                    if master:
+                        frac = row.get("SourceFraction") or 1.0
+                        return (master, frac)
+        # Method C: sourcing rule source_length matches a real master SKU
+        # (naive substitution — works for tubes where source is a master)
+        rule = rule_by_sku.get(sku, {})
+        if (rule.get("SourceFraction") is not None
+                and rule.get("SourceLengthMM")):
+            parts = str(sku).split("-")
+            if len(parts) > 1:
+                slen_mm = rule["SourceLengthMM"]
+                # Try multiple length-string formats
+                candidates = []
+                if slen_mm >= 1000 and slen_mm % 1000 == 0:
+                    candidates.append(str(slen_mm // 1000))
+                else:
+                    candidates.append(str(slen_mm))
+                candidates.append(f"{slen_mm:04d}")
+                for len_str in candidates:
+                    candidate = "-".join(parts[:-1] + [len_str])
+                    if (products["SKU"] == candidate).any():
+                        return (candidate, rule["SourceFraction"])
+
+        # Method D: family-prefix sibling master lookup (for channels
+        # and similar SKUs where rule source_length is an intermediate
+        # cut size, not a purchasable master length).
+        # Take SKU's prefix (everything except last segment), find
+        # sibling SKUs with IsMaster=True, pick the longest, and
+        # compute consumption as own_physical_length / master_length.
+        parts = str(sku).split("-")
+        if len(parts) >= 2:
+            prefix = "-".join(parts[:-1]) + "-"
+            own_len_mm = _parse_length(parts[-1])
+            if own_len_mm and own_len_mm > 0:
+                # Find sibling masters
+                sibling_masters = []
+                for _, cand in products.iterrows():
+                    cand_sku = str(cand.get("SKU") or "")
+                    if not cand_sku.startswith(prefix):
+                        continue
+                    if cand_sku == sku:
+                        continue
+                    cand_rule = rule_by_sku.get(cand_sku, {})
+                    if not cand_rule.get("IsMaster"):
+                        continue
+                    cand_parts = cand_sku.split("-")
+                    cand_len_mm = _parse_length(cand_parts[-1])
+                    if cand_len_mm and cand_len_mm > 0:
+                        sibling_masters.append(
+                            (cand_sku, cand_len_mm))
+                if sibling_masters:
+                    # Pick the one with smallest length >= own_len
+                    # (best-fit); fall back to largest if none fits
+                    exact_fit = [m for m in sibling_masters
+                                  if m[1] >= own_len_mm]
+                    if exact_fit:
+                        chosen = min(exact_fit, key=lambda x: x[1])
+                    else:
+                        chosen = max(sibling_masters,
+                                      key=lambda x: x[1])
+                    master_sku, master_len = chosen
+                    # Consumption per unit = own_len / master_len
+                    qty_per = own_len_mm / master_len
+                    return (master_sku, qty_per)
+        return None
+
+    # Now compute rollup across ALL non-master products.
+    # For multi-component kits (LEDKIT etc.), distribute demand to
+    # EVERY component in the BOM proportionally — not just the first.
+    def _find_all_masters_for_assembly(sku: str):
+        """Return list of (master_sku, qty_per). Multi-component for
+        BOM kits; single-component for cuts."""
+        # Method A: ALL BOM components (each gets its own share)
+        comps = bom_components_by_asm.get(sku)
+        if comps:
+            return [(c, q) for c, q in comps if c and q]
+        # Fallback to single-master methods (B, C, D)
+        single = _find_master_for_assembly(sku)
+        return [single] if single else []
+
+    for _, p in products.iterrows():
+        sku = p["SKU"]
+        # Always roll up if the SKU has a BOM, even if _global_is_master
+        # returns True. Reason: the BOM is authoritative — if it says
+        # "this SKU is built from component X", the demand should
+        # cascade to X regardless of other classification heuristics
+        # (e.g. AdditionalAttribute1 saying "Purchased full length"
+        # by mistake, or supplier-assigned giving a misleading hint).
+        # This was the bug behind LED-WLNW-40K-IP20-100M showing
+        # zero rolled-up demand from its per-foot child.
+        has_bom = sku in bom_components_by_asm
+        if not has_bom and _global_is_master(sku):
+            continue
+        # Non-master (or has BOM): find ALL its masters and roll up demand
+        targets = _find_all_masters_for_assembly(sku)
+        if not targets:
+            continue
+        own_units = float(vel.loc[vel["SKU"] == sku, "units_12mo"].sum())
+        own_units_90d = float(
+            vel.loc[vel["SKU"] == sku, "units_90d"].sum())
+        # Migration-aware adjustment to own_units before rolling up:
+        #   migration_in : this SKU is a SUCCESSOR — receives demand
+        #                  from retired predecessors. Critical for
+        #                  successor MP variants (e.g. SIERRA38-W-MP-2
+        #                  inheriting from SMOKIES/CASCADE-W-MP-2),
+        #                  otherwise the inherited demand is added to
+        #                  migration_in then immediately zeroed when
+        #                  the MP variant is treated as non-master in
+        #                  _effective_units, never reaching the bare
+        #                  tube via tube_rollup_in.
+        #   migration_out: this SKU is RETIRING — its demand has been
+        #                  redirected to its successor. Replaces the
+        #                  prior buggy "own_units *= share" branch
+        #                  (which multiplied instead of subtracting).
+        # 90d intentionally skips migration: long-term successor
+        # signals shouldn't distort recent-activity dormancy detection.
+        own_units = max(0.0,
+                         own_units
+                         + float(migration_inflow.get(sku, 0))
+                         - float(migration_outflow.get(sku, 0)))
+        if own_units == 0 and own_units_90d == 0:
+            continue
+        # Roll up to EACH master independently
+        for target in targets:
+            if not target:
+                continue
+            master_sku, qty_per = target
+            if not master_sku or not qty_per:
+                continue
+            consumption = own_units * qty_per
+            consumption_90d = own_units_90d * qty_per
+            master_rollup_inflow[master_sku] = (
+                master_rollup_inflow.get(master_sku, 0) + consumption
+            )
+            master_rollup_inflow_90d[master_sku] = (
+                master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
+            )
+            master_rollup_notes.setdefault(master_sku, []).append(
+                f"{sku}: {own_units:.0f} × {qty_per:g} = {consumption:.1f}"
+            )
+
+    # 5da. LED-STRIP rollup (pattern-based; BOMs rarely populated).
+    # For each strip family base (e.g. LEDIRIS6000-180), find the
+    # largest-length variant and treat it as the bulk master. Roll up
+    # cut/roll sales by (their length in metres × units sold).
+    # Intermediate rolls with direct purchase history stay as
+    # alternate masters (don't roll them up).
+    strip_rollup_notes: dict = {}
+    strip_rollup_inflow: dict = {}
+    strip_rollup_inflow_90d: dict = {}
+    strip_non_master_skus: set = set()
+    strip_master_skus: set = set()
+    # Track each strip master's roll length in metres — used to flag
+    # bulk masters (≥50m) where the engine can suggest fractional
+    # reorder qtys. e.g. 0.40 of a 100m roll instead of rounding up
+    # to a full 100m roll when only 40m is needed.
+    bulk_master_lengths: dict = {}
+
+    # Build base-family index: {base: [(sku, length_m, name, purchased_bool)]}
+    strip_family_index: dict = {}
+    for _, p in products.iterrows():
+        sku_s = str(p.get("SKU"))
+        if not _is_strip_sku(sku_s, p.get("Name", "")):
+            continue
+        parse = _parse_strip_base(sku_s)
+        if not parse:
+            continue
+        base, length_m = parse
+        # Was this SKU directly purchased in our PO history?
+        purchased = sku_s in sup_by_sku_local
+        strip_family_index.setdefault(base, []).append(
+            (sku_s, length_m, p.get("Name", ""), purchased))
+
+    # For each family, pick bulk master + decide rollup targets
+    for base, members in strip_family_index.items():
+        if len(members) < 2:
+            continue  # nothing to roll up
+        # Largest-length variant = primary bulk master
+        sorted_members = sorted(members, key=lambda x: -x[1])
+        bulk_sku, bulk_len, bulk_name, bulk_purchased = sorted_members[0]
+        strip_master_skus.add(bulk_sku)
+        bulk_master_lengths[bulk_sku] = float(bulk_len or 0)
+        if bulk_len <= 0:
+            continue
+        # Additional masters: any intermediate with direct PO history
+        alternate_masters = set()
+        for sku_m, length_m, _, purchased in sorted_members[1:]:
+            if purchased and length_m >= 1.0:
+                alternate_masters.add(sku_m)
+                strip_master_skus.add(sku_m)
+                bulk_master_lengths[sku_m] = float(length_m or 0)
+
+        # Roll up each non-master's sales. CRITICAL: convert consumption
+        # from METRES to the master's UNIT count. 1 × 100m roll = 1 unit
+        # in CIN7, NOT 100 units. If we keep it in metres we inflate
+        # target stock by 100×.
+        for sku_m, length_m, nm, purchased in sorted_members:
+            if sku_m == bulk_sku:
+                continue
+            if sku_m in alternate_masters:
+                continue
+            own_units = float(vel.loc[vel["SKU"] == sku_m,
+                                       "units_12mo"].sum())
+            own_units_90d = float(vel.loc[vel["SKU"] == sku_m,
+                                           "units_90d"].sum())
+            if (own_units == 0 and own_units_90d == 0) or length_m == 0:
+                strip_non_master_skus.add(sku_m)
+                continue
+            consumption_m = own_units * length_m
+            consumption_m_90d = own_units_90d * length_m
+            # Convert metres → master rolls
+            consumption_in_master_units = consumption_m / bulk_len
+            consumption_in_master_units_90d = consumption_m_90d / bulk_len
+            strip_rollup_inflow[bulk_sku] = (
+                strip_rollup_inflow.get(bulk_sku, 0)
+                + consumption_in_master_units
+            )
+            strip_rollup_inflow_90d[bulk_sku] = (
+                strip_rollup_inflow_90d.get(bulk_sku, 0)
+                + consumption_in_master_units_90d
+            )
+            strip_rollup_notes.setdefault(bulk_sku, []).append(
+                f"{sku_m}: {own_units:.0f} × {length_m:g}m "
+                f"= {consumption_m:.1f}m = "
+                f"{consumption_in_master_units:.2f} × {bulk_len:g}m rolls"
+            )
+            strip_non_master_skus.add(sku_m)
+
+    # Merge strip rollup into the master_rollup_inflow tracked above
+    for master_sku, consumption in strip_rollup_inflow.items():
+        master_rollup_inflow[master_sku] = (
+            master_rollup_inflow.get(master_sku, 0) + consumption
+        )
+        notes = strip_rollup_notes.get(master_sku, [])
+        if notes:
+            existing = master_rollup_notes.setdefault(master_sku, [])
+            existing.extend(notes)
+
+    # Same merge for the 90d parallel rollup
+    for master_sku, consumption_90d in strip_rollup_inflow_90d.items():
+        master_rollup_inflow_90d[master_sku] = (
+            master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
+        )
+
+    df["tube_rollup_in"] = df["SKU"].apply(
+        lambda s: float(master_rollup_inflow.get(s, 0))).fillna(0)
+    df["tube_rollup_in_90d"] = df["SKU"].apply(
+        lambda s: float(master_rollup_inflow_90d.get(s, 0))).fillna(0)
+    df["tube_rollup_notes"] = df["SKU"].apply(
+        lambda s: "; ".join(master_rollup_notes.get(s, []))[:500])
+
+    # Bulk-master length + fractional-eligibility flag.
+    # is_bulk_master = strip master with ≥50m roll length. These SKUs
+    # are eligible for fractional reorder qtys (e.g. 0.40 × 100m roll
+    # instead of rounding up to a full roll). The threshold of 50m
+    # keeps small-roll masters (5m, 10m) on integer ordering since
+    # partial purchases on those are unusual.
+    #
+    # Two detection passes:
+    # (1) Strip-family parser (above) — catches masters whose family
+    #     members share a clean prefix (e.g. all LEDIRIS6000-* live
+    #     in the same family).
+    # (2) SKU-suffix fallback (below) — catches masters like
+    #     LED-WLNW-40K-IP20-100M whose per-foot child uses a
+    #     different middle segment (LED-WLNW-40K-16-IP20-0305) so
+    #     prefix matching fails. Any SKU ending in "-NNNm" or
+    #     "-NNNM" with N >= 50 is treated as a bulk master.
+    import re as _re_bulk
+    _bulk_suffix_pat = _re_bulk.compile(r"-(\d+)[Mm]$")
+    for _s in df["SKU"]:
+        _s_str = str(_s)
+        if bulk_master_lengths.get(_s_str, 0) > 0:
+            continue  # already detected via strip-family parser
+        _m = _bulk_suffix_pat.search(_s_str)
+        if not _m:
+            continue
+        _n = int(_m.group(1))
+        if _n >= 50:
+            bulk_master_lengths[_s_str] = float(_n)
+
+    df["bulk_length_m"] = df["SKU"].apply(
+        lambda s: float(bulk_master_lengths.get(str(s), 0)))
+    df["is_bulk_master"] = df["bulk_length_m"] >= 50.0
+
+    # 5e. IsMaster flag on df. A SKU is non-master if:
+    #  - flagged by _global_is_master as non-master, OR
+    #  - is a strip derivative (rolled up to bulk master above)
+    def _final_is_non_master(sku: str) -> bool:
+        if sku in strip_master_skus:
+            return False  # explicitly a strip master (bulk or alternate)
+        if sku in strip_non_master_skus:
+            return True   # strip derivative, rolled up
+        return not _global_is_master(sku)
+
+    df["is_non_master_tube"] = df["SKU"].apply(_final_is_non_master)
+
+    # Effective units_12mo for reorder math:
+    # - Non-master tubes → 0 (their demand is rolled up into the master)
+    # - Retiring SKUs → units_12mo - migrated_out (what stays with them)
+    # - Otherwise → units_12mo + migrated_in + tube_rollup_in
+    def _effective_units(row):
+        if row["is_non_master_tube"]:
+            return 0.0
+        base = float(row["units_12mo"])
+        return (base
+                - float(row["migrated_out"])
+                + float(row["migrated_in"])
+                + float(row["tube_rollup_in"]))
+
+    df["effective_units_12mo"] = df.apply(_effective_units, axis=1)
+
+    # --- Recency-aware effective demand (last 90 days) ---------------
+    # effective_units_90d mirrors effective_units_12mo but only sums
+    # the last 90 days of activity. We deliberately skip migration on
+    # the 90d view (mig_in / mig_out are typically tied to long-term
+    # successor decisions; recent activity is what matters here).
+    # Used to detect dormant SKUs whose 12mo number is dominated by
+    # stale demand that has since dried up.
+    def _effective_units_90d(row):
+        if row["is_non_master_tube"]:
+            return 0.0
+        base90 = float(row.get("units_90d") or 0)
+        rollup90 = float(row.get("tube_rollup_in_90d") or 0)
+        return base90 + rollup90
+
+    df["effective_units_90d"] = df.apply(_effective_units_90d, axis=1)
+
+    # Dormancy detection (two-tier):
+    #   Tier 1: Hard dormant — effective_units_90d == 0 AND
+    #           effective_units_12mo > 0. The family had history but
+    #           hasn't sold a single unit in 90 days. Always flag.
+    #   Tier 2: Soft dormant — recent 90d rate is < 20% of 12mo rate
+    #           AND 12mo rate is meaningful (>0.05/day). Catches
+    #           "demand fell off a cliff" while not over-flagging
+    #           genuinely low-volume but still-active SKUs.
+    # The hard tier replaces the previous 0.05 threshold floor — that
+    # threshold was preventing legitimate stale-demand SKUs (no sales
+    # since 2023, e.g. LEDIRIS6000-180-100) from being flagged.
+    def _is_dormant(row):
+        eff_12mo = float(row.get("effective_units_12mo") or 0)
+        eff_90d = float(row.get("effective_units_90d") or 0)
+        if eff_12mo <= 0:
+            return False
+        # Tier 1: ~zero 90d activity. The threshold is expressed in
+        # PHYSICAL UNITS so master rolls and leaf SKUs are compared
+        # consistently:
+        #   - Bulk master (e.g. 100m roll): less than 5m of physical
+        #     strip flow in 90 days = dormant. 0.001 master rolls
+        #     × 100m = 0.1m → dormant. 0.546 × 100m = 54.6m → active.
+        #   - Leaf SKU (e.g. per-foot cut): less than 1 unit in 90
+        #     days = dormant.
+        # This replaces a strict <=0 check that missed near-zero
+        # rolled-up activity from per-foot children.
+        is_bulk = bool(row.get("is_bulk_master", False))
+        bulk_len = float(row.get("bulk_length_m", 0) or 0)
+        if is_bulk and bulk_len > 0:
+            if (eff_90d * bulk_len) < 5.0:
+                return True
+        else:
+            if eff_90d < 1.0:
+                return True
+        rate_12mo_daily = eff_12mo / 365.0
+        rate_90d_daily = eff_90d / 90.0
+        # Tier 2: recent rate dropped > 80% vs 12mo. Catches the
+        # "demand fell off a cliff" case for SKUs whose 12mo rate
+        # is meaningful (>0.05/day = 18 units/year).
+        if rate_12mo_daily < 0.05:
+            return False
+        return rate_90d_daily < (0.20 * rate_12mo_daily)
+
+    df["is_dormant"] = df.apply(_is_dormant, axis=1)
+
+    # 6. Length for air-eligibility (parse from SKU's last numeric part)
+    def _length_of(sku: str) -> Optional[int]:
+        if not sku: return None
+        for part in reversed(str(sku).split("-")):
+            p = _parse_length(part) if 'parse_length' in globals() else None
+            if p is None:
+                try:
+                    n = float(part)
+                    if n <= 0: continue
+                    p = int(round(n*1000)) if n < 20 else int(round(n))
+                except ValueError:
+                    continue
+            if p is not None and 50 < p < 5000:
+                return p
+        return None
+    df["LengthMM"] = df["SKU"].apply(_length_of)
+
+    # 7. Monthly sales trend per SKU (12m + 24m buckets)
+    # Build monthly series so we can render sparklines in the table.
+    today_ts = pd.Timestamp(datetime.now().date())
+    from collections import defaultdict as _dd
+    monthly_12 = _dd(lambda: [0.0] * 12)
+    monthly_24 = _dd(lambda: [0.0] * 24)
+    for _, r in sl.iterrows():
+        d = r["InvoiceDate"]
+        if pd.isna(d):
+            continue
+        months_ago = (today_ts - d).days / 30.437
+        q = float(r["Quantity"] or 0)
+        sku_r = r["SKU"]
+        if 0 <= months_ago < 12:
+            b12 = 11 - int(months_ago)
+            monthly_12[sku_r][b12] += q
+        if 0 <= months_ago < 24:
+            b24 = 23 - int(months_ago)
+            monthly_24[sku_r][b24] += q
+
+    # --- Migration rollup of monthly buckets ---------------------------
+    # For every migration record (retiring → successor), add the
+    # retiring SKU's 12mo / 24mo monthly buckets × share_pct to the
+    # successor's buckets. Without this, "Last 6 months" and "12mo
+    # trend" columns on a successor (e.g. LED-SIERRA38-W-MP-2390)
+    # show only its OWN sales (post-migration), invisible to the
+    # historical demand from CASCADE/SMOKIES MP variants that the
+    # engine actually counts. After this step, sparklines and
+    # last-6-month numbers reflect the FULL lineage.
+    # Runs BEFORE the BOM rollup below so successor-MP variants
+    # propagate their inflated buckets up to the bare tube via BOM.
+    try:
+        _all_migs_buckets = [dict(m) for m in db.all_migrations()]
+    except Exception:
+        _all_migs_buckets = []
+    for _m in _all_migs_buckets:
+        _ret = str(_m.get("retiring_sku") or "")
+        _succ = str(_m.get("successor_sku") or "")
+        if not _ret or not _succ:
+            continue
+        _share = float(_m.get("share_pct") or 100) / 100.0
+        if _share <= 0:
+            continue
+        if _ret in monthly_12:
+            for i in range(12):
+                monthly_12[_succ][i] += monthly_12[_ret][i] * _share
+        if _ret in monthly_24:
+            for i in range(24):
+                monthly_24[_succ][i] += monthly_24[_ret][i] * _share
+
+    # --- Roll up children's monthly buckets onto master SKUs -----------
+    # Without this, "Last 6 months" and "12mo trend" sparkline columns
+    # show ONLY direct master sales — and for cut-source masters
+    # (100m/5m rolls) those are usually zero because customers don't
+    # buy whole rolls; demand is the per-foot variants. This pass
+    # adds each child's monthly bucket × BOM ratio to its master's
+    # monthly bucket, so the master's trend reflects family-wide
+    # demand expressed in master-roll equivalents (matches the
+    # demand-breakdown chart's normalisation).
+    # NB: combined with the migration rollup above, children that
+    # are successors will already have their predecessor history
+    # baked in — so the BOM rollup carries that all the way to the
+    # bare tube master.
+    for master_sku, ch_list in BOM_CHILDREN.items():
+        for ch in ch_list:
+            ch_sku = ch.get("AssemblySKU")
+            ratio = float(ch.get("Quantity") or 0)
+            if not ch_sku or ratio <= 0:
+                continue
+            # Use sku_r presence — only roll up if the child has any sales
+            if ch_sku in monthly_12:
+                for i in range(12):
+                    monthly_12[master_sku][i] += (
+                        monthly_12[ch_sku][i] * ratio)
+            if ch_sku in monthly_24:
+                for i in range(24):
+                    monthly_24[master_sku][i] += (
+                        monthly_24[ch_sku][i] * ratio)
+
+    # --- Migration + BOM rollup of 45d / prior-45d / 90d units ---------
+    # Same pattern as the monthly buckets above, but for the
+    # short-window aggregates the buyer sees in the Ordering grid:
+    # `45d units`, `momentum` (45d / prior-45d), `customers_45d`,
+    # `90d units`. Without rolling these up, a successor bare tube
+    # shows 0 in those columns even when its MP-variant children
+    # (and their predecessors) sold real volume in the last 45 days.
+    u45_dict = dict(zip(
+        df["SKU"].astype(str),
+        pd.to_numeric(df["units_45d"], errors="coerce").fillna(0)))
+    uprior_dict = dict(zip(
+        df["SKU"].astype(str),
+        pd.to_numeric(df["units_prior_45d"], errors="coerce").fillna(0)))
+    u90_dict = dict(zip(
+        df["SKU"].astype(str),
+        pd.to_numeric(df["units_90d"], errors="coerce").fillna(0)))
+
+    # Migration rollup — same logic as for monthly buckets.
+    # 90d intentionally skips migration to keep dormancy detection
+    # focused on RECENT activity (predecessors are by definition
+    # not active anymore).
+    for _m in _all_migs_buckets:
+        _ret = str(_m.get("retiring_sku") or "")
+        _succ = str(_m.get("successor_sku") or "")
+        if not _ret or not _succ:
+            continue
+        _share = float(_m.get("share_pct") or 100) / 100.0
+        if _share <= 0:
+            continue
+        if _ret in u45_dict:
+            u45_dict[_succ] = u45_dict.get(_succ, 0) + u45_dict[_ret] * _share
+        if _ret in uprior_dict:
+            uprior_dict[_succ] = uprior_dict.get(_succ, 0) + uprior_dict[_ret] * _share
+
+    # BOM rollup — child × ratio added to master.
+    for master_sku, ch_list in BOM_CHILDREN.items():
+        for ch in ch_list:
+            ch_sku = ch.get("AssemblySKU")
+            ratio = float(ch.get("Quantity") or 0)
+            if not ch_sku or ratio <= 0:
+                continue
+            if ch_sku in u45_dict:
+                u45_dict[master_sku] = u45_dict.get(master_sku, 0) + u45_dict[ch_sku] * ratio
+            if ch_sku in uprior_dict:
+                uprior_dict[master_sku] = uprior_dict.get(master_sku, 0) + uprior_dict[ch_sku] * ratio
+            if ch_sku in u90_dict:
+                u90_dict[master_sku] = u90_dict.get(master_sku, 0) + u90_dict[ch_sku] * ratio
+
+    # Write back. Replace the raw values so the Ordering grid columns
+    # (`units_45d`, `momentum`, `units_90d`) reflect the full lineage
+    # consistent with `effective_units_12mo`.
+    df["units_45d"] = df["SKU"].astype(str).map(u45_dict).fillna(0)
+    df["units_prior_45d"] = df["SKU"].astype(str).map(uprior_dict).fillna(0)
+    df["units_90d"] = df["SKU"].astype(str).map(u90_dict).fillna(0)
+    # Recompute momentum from the rolled-up values.
+    df["momentum"] = df.apply(
+        lambda r: (float(r["units_45d"]) / max(float(r["units_prior_45d"]), 1.0)
+                    if float(r["units_prior_45d"]) > 0
+                    else (1.5 if float(r["units_45d"]) > 0 else 1.0)),
+        axis=1)
+
+    # --- Migration + BOM rollup of customer-level metrics ---------------
+    # customers_45d, top_cust_pct, top_2_cust_pct, non_top_avg_units,
+    # top_cust_name, and top_cust_units_12mo are all derived from per-
+    # customer sale-line aggregations. Until now they used ONLY direct
+    # sales of the SKU — leaving 0 customers_45d on bare-tube masters
+    # whose volume actually flows through MP children + predecessors.
+    # This pass rebuilds them from rolled-up customer-qty maps.
+    _cust_qty_45d: dict = {}    # {sku: {customer_id: qty}}
+    _cust_qty_12mo: dict = {}
+    _cust_names: dict = {}      # {sku: {customer_id: customer_name}}
+    for _, _r in sl.iterrows():
+        _s = str(_r.get("SKU") or "")
+        _cid = str(_r.get("CustomerID") or "")
+        if not _s or not _cid:
+            continue
+        _q = float(_r.get("Quantity") or 0)
+        _d = _r.get("InvoiceDate")
+        if pd.isna(_d):
+            continue
+        if _d >= cutoff_12mo if False else _d >= today_ts - pd.Timedelta(days=window_days):
+            _cust_qty_12mo.setdefault(_s, {})
+            _cust_qty_12mo[_s][_cid] = _cust_qty_12mo[_s].get(_cid, 0) + _q
+        if _d >= cutoff_recent:
+            _cust_qty_45d.setdefault(_s, {})
+            _cust_qty_45d[_s][_cid] = _cust_qty_45d[_s].get(_cid, 0) + _q
+        _cn = str(_r.get("Customer") or "")
+        if _cn:
+            _cust_names.setdefault(_s, {})[_cid] = _cn
+
+    # Migration rollup
+    for _m in _all_migs_buckets:
+        _ret = str(_m.get("retiring_sku") or "")
+        _succ = str(_m.get("successor_sku") or "")
+        if not _ret or not _succ:
+            continue
+        _share = float(_m.get("share_pct") or 100) / 100.0
+        if _share <= 0:
+            continue
+        for _src_map in (_cust_qty_45d, _cust_qty_12mo):
+            if _ret in _src_map:
+                _dest = _src_map.setdefault(_succ, {})
+                for _cid, _q in _src_map[_ret].items():
+                    _dest[_cid] = _dest.get(_cid, 0) + _q * _share
+        # Carry customer names from predecessor where successor doesn't
+        # already know the name
+        if _ret in _cust_names:
+            _dest_names = _cust_names.setdefault(_succ, {})
+            for _cid, _nm in _cust_names[_ret].items():
+                _dest_names.setdefault(_cid, _nm)
+
+    # BOM rollup
+    for _master, _ch_list in BOM_CHILDREN.items():
+        for _ch in _ch_list:
+            _ch_sku = _ch.get("AssemblySKU")
+            _ratio = float(_ch.get("Quantity") or 0)
+            if not _ch_sku or _ratio <= 0:
+                continue
+            for _src_map in (_cust_qty_45d, _cust_qty_12mo):
+                if _ch_sku in _src_map:
+                    _dest = _src_map.setdefault(_master, {})
+                    for _cid, _q in _src_map[_ch_sku].items():
+                        _dest[_cid] = _dest.get(_cid, 0) + _q * _ratio
+            if _ch_sku in _cust_names:
+                _dest_names = _cust_names.setdefault(_master, {})
+                for _cid, _nm in _cust_names[_ch_sku].items():
+                    _dest_names.setdefault(_cid, _nm)
+
+    # Recompute customer-derived columns from the rolled-up maps
+    _new_cust_count: dict = {}
+    _new_top_pct: dict = {}
+    _new_top_2_pct: dict = {}
+    _new_non_top_avg: dict = {}
+    _new_top_name: dict = {}
+    _new_top_12mo: dict = {}
+    for _s in df["SKU"].astype(str):
+        _45 = _cust_qty_45d.get(_s, {})
+        _12 = _cust_qty_12mo.get(_s, {})
+        _names = _cust_names.get(_s, {})
+        if _45:
+            _new_cust_count[_s] = len(_45)
+            _sorted = sorted(_45.items(), key=lambda x: -x[1])
+            _total = sum(_45.values())
+            if _total > 0:
+                _top_qty = _sorted[0][1]
+                _top_cid = _sorted[0][0]
+                _new_top_pct[_s] = _top_qty / _total
+                if len(_sorted) >= 2:
+                    _new_top_2_pct[_s] = (
+                        _top_qty + _sorted[1][1]) / _total
+                else:
+                    _new_top_2_pct[_s] = _new_top_pct[_s]
+                _non_top_qty = _total - _top_qty
+                _non_top_n = max(len(_sorted) - 1, 0)
+                _new_non_top_avg[_s] = (
+                    _non_top_qty / _non_top_n
+                    if _non_top_n > 0 else 0.0)
+                _new_top_name[_s] = _names.get(_top_cid, "")
+                # Top customer's 12mo total (from 12mo map for SAME cid)
+                _new_top_12mo[_s] = float(_12.get(_top_cid, 0))
+
+    # Write back — overwrite the raw values with rolled-up versions
+    df["customers_45d"] = (
+        df["SKU"].astype(str).map(_new_cust_count).fillna(0).astype(int))
+    df["top_cust_pct"] = (
+        df["SKU"].astype(str).map(_new_top_pct).fillna(0))
+    df["top_2_cust_pct"] = (
+        df["SKU"].astype(str).map(_new_top_2_pct).fillna(0))
+    df["non_top_avg_units"] = (
+        df["SKU"].astype(str).map(_new_non_top_avg).fillna(0))
+    df["top_cust_name"] = (
+        df["SKU"].astype(str).map(_new_top_name).fillna(""))
+    df["top_cust_units_12mo"] = (
+        df["SKU"].astype(str).map(_new_top_12mo).fillna(0))
+
+    df["trend_12m"] = df["SKU"].apply(
+        lambda s: list(monthly_12.get(s, [0.0] * 12)))
+    df["trend_24m"] = df["SKU"].apply(
+        lambda s: list(monthly_24.get(s, [0.0] * 24)))
+    # Last 6 months total (sum of most recent 6 monthly buckets)
+    df["last_6mo"] = df["trend_12m"].apply(
+        lambda buckets: float(sum(buckets[-6:])) if buckets else 0.0)
+    # Last 6 months as a readable "oldest … newest" sequence.
+    # Show 1 decimal place when values include rolled-up fractional
+    # contributions (e.g. master rolls absorbing per-foot demand —
+    # 100 cuts × 0.0035 ratio = 0.35 rolls). For SKUs whose values
+    # are all whole numbers (typical leaf products), keep the
+    # cleaner integer format the buyer is used to.
+    def _fmt_6mo_series(buckets):
+        if not buckets:
+            return ""
+        last6 = buckets[-6:]
+        if any(abs(v - round(v)) > 0.05 for v in last6):
+            return "  ".join(f"{v:.1f}" for v in last6)
+        return "  ".join(f"{int(round(v))}" for v in last6)
+    df["last_6mo_series"] = df["trend_12m"].apply(_fmt_6mo_series)
+
+    # 8. Hybrid ABC uses EFFECTIVE units (post-migration, post-rollup) so
+    # Sierra masters with migrated Smokies demand get proper A/B/C class.
+    df["annual_value"] = df["effective_units_12mo"] * df["AverageCost"]
+    # Percentile rank (0-1), higher = more valuable / more units
+    df["_val_rank"] = df["annual_value"].rank(pct=True)
+    df["_qty_rank"] = df["units_12mo"].rank(pct=True)
+    df["_blend"] = 0.6 * df["_val_rank"] + 0.4 * df["_qty_rank"]
+
+    # Sort by blend desc, compute cumulative annual_value share
+    sorted_df = df.sort_values("_blend", ascending=False).copy()
+    total_value = sorted_df["annual_value"].sum()
+    if total_value > 0:
+        sorted_df["cum_value_pct"] = (
+            sorted_df["annual_value"].cumsum() / total_value
+        )
+        def _class(p):
+            if p <= 0.70: return "A"
+            if p <= 0.90: return "B"
+            return "C"
+        sorted_df["ABC"] = sorted_df["cum_value_pct"].apply(_class)
+    else:
+        sorted_df["ABC"] = "—"
+    df = df.merge(sorted_df[["SKU", "ABC"]], on="SKU", how="left")
+
+    # Class-aware dormancy refinement (now that ABC is known).
+    # The base _is_dormant was conservative — flagged only items
+    # with effectively zero recent activity. C-class SKUs need a
+    # higher bar: they're low-priority by definition, so only
+    # genuinely meaningful 90d demand justifies keeping them
+    # active. Thresholds in physical units (metres for bulk
+    # masters, units for leaves):
+    #   A-class:  5m / 1 unit  (current — keep active easily)
+    #   B-class: 10m / 2 units
+    #   C-class: 25m / 5 units (high bar — slow-movers go dormant)
+    # This means an item with 9m of 90d strip flow (e.g., 2-3 ft of
+    # per-foot cuts/month) is "active" for an A-class SKU but
+    # "dormant" for a C-class SKU — letting attrition run down
+    # slow-moving inventory automatically.
+    def _refine_dormancy_by_class(row):
+        if bool(row.get("is_dormant", False)):
+            return True  # already flagged by base rules
+        abc = str(row.get("ABC") or "C")
+        eff_90d = float(row.get("effective_units_90d") or 0)
+        is_bulk = bool(row.get("is_bulk_master", False))
+        bulk_len = float(row.get("bulk_length_m", 0) or 0)
+        if is_bulk and bulk_len > 0:
+            threshold_m = {"A": 5.0, "B": 10.0,
+                            "C": 25.0}.get(abc, 10.0)
+            if (eff_90d * bulk_len) < threshold_m:
+                return True
+        else:
+            threshold_u = {"A": 1.0, "B": 2.0,
+                            "C": 5.0}.get(abc, 2.0)
+            if eff_90d < threshold_u:
+                return True
+        return False
+
+    df["is_dormant"] = df.apply(_refine_dormancy_by_class, axis=1)
+
+    # 9. Daily demand, DoC — use EFFECTIVE units (direct + migrated +
+    # tube rollup) so Sierra masters reflect Smokies/Cascade migration
+    # and their MP/cut variant consumption.
+    df["avg_daily"] = df["effective_units_12mo"] / max(window_days, 1)
+
+    # --- Trend-aware avg_daily adjustment -------------------------
+    # Override avg_daily based on detected demand patterns:
+    #   💤 Dormant → demand has fallen off a cliff (90d rate <20% of
+    #                12mo rate). Use the 90d rate (≈ 0) to avoid
+    #                ordering against stale historical demand. Takes
+    #                precedence — if a SKU is dormant, it doesn't
+    #                matter what trend_flag says.
+    #   📈 Trend   → use last-45d velocity — this catches
+    #                acceleration fast so the engine builds stock
+    #                before the next PO cycle.
+    #   🎯 Project → subtract the top customer's 12mo units from
+    #                effective demand (that customer isn't part of
+    #                the sustaining baseline), then re-derive daily.
+    def _adjust_avg_daily(r):
+        base = r["avg_daily"]
+        flag = r.get("trend_flag", "Stable")
+        if pd.isna(flag):
+            flag = "Stable"
+        def _safe(v, default=0.0):
+            try:
+                v = float(v)
+                return default if pd.isna(v) else v
+            except (ValueError, TypeError):
+                return default
+        # Dormancy override — highest priority. If the family hasn't
+        # moved in 90 days, use the 90d rate (which will be ≈0)
+        # regardless of how much 12mo history the SKU has.
+        if bool(r.get("is_dormant", False)):
+            # Hard-zero for dormant: any positive avg_daily would
+            # produce a small positive target_stock, which then
+            # snaps up to 10m via the bulk-master 10m floor →
+            # spurious 0.10 suggestions for items the engine has
+            # explicitly classified as dormant. Returning 0 ensures
+            # target_stock = 0 → shortfall = 0 → reorder = 0.
+            return 0.0
+        if flag == "📈 Trend":
+            u45 = _safe(r.get("units_45d"))
+            if u45 > 0:
+                # last-45d daily velocity (units per day)
+                return (u45 / 45.0)
+        if flag == "🎯 Project":
+            eff = _safe(r.get("effective_units_12mo"))
+            # Subtract top customer's 12mo contribution
+            top_u = _safe(r.get("top_cust_units_12mo"))
+            corrected = max(0.0, eff - top_u)
+            return corrected / max(window_days, 1)
+        return base
+
+    df["avg_daily_base"] = df["avg_daily"]
+    df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)
+
+    # Promote is_dormant into trend_flag display so the buyer sees
+    # 💤 Dormant in the PO editor's Trend column. We override Stable
+    # only — preserve any existing acceleration/project/decline flag
+    # if one was already set (those signals took priority before
+    # dormancy was added; keeping that contract avoids surprises).
+    def _promote_dormant_flag(r):
+        cur = r.get("trend_flag", "Stable")
+        if pd.isna(cur):
+            cur = "Stable"
+        if bool(r.get("is_dormant", False)) and cur == "Stable":
+            return "💤 Dormant"
+        return cur
+
+    df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)
+    df["DoC_days"] = df.apply(
+        lambda r: (r["OnHand"] / r["avg_daily"])
+        if r["avg_daily"] > 0 else None, axis=1)
+
+    # 9b. Cost fields kept separate:
+    #
+    #   FixedCost  — supplier's agreed PO price (strict; used for
+    #                PO line value calc — what the PO will actually
+    #                cost us).
+    #   AverageCost — CIN7's weighted landed cost (historical, drifts
+    #                with every purchase). Keep for reference /
+    #                valuation fallback but NOT the primary.
+    #
+    # Line value on a PO = Order qty × FixedCost (not AverageCost).
+    # When FixedCost is missing on a SKU, we fall back to AverageCost
+    # and flag clearly.
+    df["FixedCost"] = df["SKU"].apply(
+        lambda s: float(cin7_cost_local.get(s, 0))
+    )
+    df["POCostBasis"] = df.apply(
+        lambda r: ("FixedCost (supplier)" if r["FixedCost"] > 0
+                   else ("AverageCost (fallback)"
+                         if float(r["AverageCost"] or 0) > 0
+                         else "No cost on file")),
+        axis=1,
+    )
+    # Effective PO cost — prefers FixedCost, falls back if missing
+    df["POCost"] = df.apply(
+        lambda r: (r["FixedCost"] if r["FixedCost"] > 0
+                   else float(r["AverageCost"] or 0)), axis=1)
+
+    return df
+
 
 if page == "Overview":
     st.header(":bar_chart: Overview")
@@ -6665,1422 +8112,9 @@ engine shows every input and how it got to the suggestion.
     # elsewhere in app.py no longer triggers a recompute. Cuts dev
     # iteration time by ~80%. ttl extended from 5min to 1h since the
     # underlying data only refreshes via the daily sync.
-    @st.cache_data(
-        persist="disk",
-        show_spinner="Computing ABC engine…")
-    def _abc_engine(products: pd.DataFrame,
-                    stock: pd.DataFrame,
-                    sale_lines: pd.DataFrame,
-                    purchase_lines: pd.DataFrame,
-                    window_days: int = 365) -> pd.DataFrame:
-        """Compute per-SKU ABC, velocity, target, reorder for Stock items.
-        Uses hybrid ABC: 60% value + 40% qty percentile rank."""
-        # 1. Filter to Stock items only (already done by global filter)
-        prods = products[["SKU", "Name", "Type", "Category", "Brand",
-                          "Status", "AverageCost",
-                          "MinimumBeforeReorder", "ReorderQuantity",
-                          "AdditionalAttribute1", "BillOfMaterial",
-                          "BOMType"]].copy()
-        prods = prods[prods["Type"] == "Stock"]
-        # Dedupe on SKU so downstream .map() operations don't hit
-        # pandas Arrow-backend InvalidIndexError on duplicate indices.
-        prods = prods.drop_duplicates(subset=["SKU"])
-        # Also normalise SKU to plain strings (not Arrow StringArray)
-        prods["SKU"] = prods["SKU"].astype(str)
-        prods["AverageCost"] = _to_num(prods["AverageCost"]).fillna(0)
-
-        # 2. 12-month velocity per SKU — filter by InvoiceDate >= today-window
-        # EXCLUDE CREDITED lines so returned/refunded units don't inflate
-        # demand. A sale that was fully returned should net to zero
-        # contribution — CIN7's Status = 'CREDITED' marks invoices that
-        # were later credited (returned).
-        sl = sale_lines.copy()
-        sl["InvoiceDate"] = _to_date(sl["InvoiceDate"]).dt.tz_localize(None)
-        cutoff = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=window_days)
-        sl = sl[sl["InvoiceDate"] >= cutoff].dropna(subset=["InvoiceDate"])
-        # Exclude credited / voided / cancelled to reflect NET demand
-        if "Status" in sl.columns:
-            excluded_statuses = ("CREDITED", "VOIDED", "CANCELLED")
-            sl = sl[~sl["Status"].astype(str).str.upper()
-                                   .isin(excluded_statuses)]
-        sl["Quantity"] = _to_num(sl["Quantity"]).fillna(0)
-        sl["Total"] = _to_num(sl["Total"]).fillna(0)
-        vel = (sl.groupby("SKU")
-                 .agg(units_12mo=("Quantity", "sum"),
-                      rev_12mo=("Total", "sum"),
-                      last_sold=("InvoiceDate", "max"),
-                      first_sold=("InvoiceDate", "min"))
-                 .reset_index())
-
-        # --- Trend vs. project detection (45-day window) --------------
-        # For each SKU, compute:
-        #   units_45d       — units sold in last 45 days
-        #   units_prior_45d — units sold in days 45-90 ago (prior period)
-        #   customers_45d   — distinct customers in last 45d
-        #   top_cust_pct    — % of 45d volume from the single biggest buyer
-        #   top_cust_name   — who that buyer is
-        #   top_cust_units_12mo — how much THIS customer bought this SKU
-        #                         over the full 12mo (used for project
-        #                         baseline-correction)
-        #   momentum        — units_45d / max(units_prior_45d, 1)
-        #   trend_flag      — Stable / 📈 Trend / 🎯 Project / 🔀 Mixed / 📉 Decline
-        #
-        # 45 days catches spikes faster than 90 days; the trade-off is a
-        # noisier signal on low-volume SKUs (hence the 3-unit low-volume
-        # guard below, down from 5 when this was a 90d window).
-        today_ts = pd.Timestamp(datetime.now().date())
-        cutoff_recent = today_ts - pd.Timedelta(days=45)
-        cutoff_prior = today_ts - pd.Timedelta(days=90)
-        cutoff_90 = today_ts - pd.Timedelta(days=90)
-        sl_recent = sl[sl["InvoiceDate"] >= cutoff_recent]
-        sl_prior = sl[(sl["InvoiceDate"] >= cutoff_prior)
-                       & (sl["InvoiceDate"] < cutoff_recent)]
-        sl_90d = sl[sl["InvoiceDate"] >= cutoff_90]
-
-        u45 = sl_recent.groupby("SKU")["Quantity"].sum().rename("units_45d")
-        uprior = sl_prior.groupby("SKU")["Quantity"].sum().rename(
-            "units_prior_45d")
-        c45 = sl_recent.groupby("SKU")["CustomerID"].nunique().rename(
-            "customers_45d")
-        # 90-day units — used for dormancy detection. A SKU with strong
-        # 12mo history but zero 90d activity is treated as dormant; the
-        # engine uses the 90d rate (≈0) instead of the inflated 12mo rate
-        # to avoid suggesting reorders against demand that's stopped.
-        u90 = sl_90d.groupby("SKU")["Quantity"].sum().rename("units_90d")
-
-        # Top customer(s) per SKU in 45d:
-        #   top_cust_pct       — share going to the single biggest buyer
-        #   top_2_cust_pct     — share going to top 2 combined (concentration
-        #                        check; 2 customers taking >70% is still
-        #                        project-like even if there are 6+ others)
-        #   non_top_avg_units  — avg units per non-top customer (measures
-        #                        whether the "many customers" actually
-        #                        buy meaningful quantities)
-        #   top_cust_name      — the top buyer's name (for transparency)
-        #   top_cust_units_12mo — top buyer's full 12mo contribution on
-        #                        this SKU (for project baseline correction)
-        top_info = []
-        for sku, g in sl_recent.groupby("SKU"):
-            if g.empty:
-                continue
-            cust_tot = g.groupby("CustomerID").agg(
-                qty=("Quantity", "sum"),
-                name=("Customer", "first"),
-            ).sort_values("qty", ascending=False)
-            if cust_tot.empty:
-                continue
-            total = float(g["Quantity"].sum())
-            if total <= 0:
-                continue
-            top_qty = float(cust_tot.iloc[0]["qty"])
-            top_name = cust_tot.iloc[0]["name"]
-            top_cid = cust_tot.index[0]
-            share1 = top_qty / total
-            share2 = share1
-            if len(cust_tot) >= 2:
-                share2 = (top_qty + float(cust_tot.iloc[1]["qty"])) / total
-            # Non-top: average units per customer excluding the biggest
-            non_top_qty = total - top_qty
-            non_top_n = max(len(cust_tot) - 1, 0)
-            non_top_avg = (non_top_qty / non_top_n) if non_top_n > 0 else 0.0
-            cust_12mo = float(
-                sl[(sl["SKU"] == sku) & (sl["CustomerID"] == top_cid)
-                    ]["Quantity"].sum())
-            top_info.append({
-                "SKU": sku,
-                "top_cust_pct": share1,
-                "top_2_cust_pct": share2,
-                "non_top_avg_units": non_top_avg,
-                "top_cust_name": str(top_name)[:50] if top_name else "",
-                "top_cust_units_12mo": cust_12mo,
-            })
-        top_df = (pd.DataFrame(top_info)
-                    if top_info else pd.DataFrame(
-                      columns=["SKU", "top_cust_pct", "top_2_cust_pct",
-                                "non_top_avg_units",
-                                "top_cust_name",
-                                "top_cust_units_12mo"]))
-
-        vel = vel.merge(u45, on="SKU", how="left")
-        vel = vel.merge(uprior, on="SKU", how="left")
-        vel = vel.merge(c45, on="SKU", how="left")
-        vel = vel.merge(u90, on="SKU", how="left")
-        vel = vel.merge(top_df, on="SKU", how="left")
-        vel["units_45d"] = vel["units_45d"].fillna(0)
-        vel["units_prior_45d"] = vel["units_prior_45d"].fillna(0)
-        vel["units_90d"] = vel["units_90d"].fillna(0)
-        vel["customers_45d"] = vel["customers_45d"].fillna(0).astype(int)
-        vel["top_cust_pct"] = vel["top_cust_pct"].fillna(0)
-        vel["top_cust_units_12mo"] = vel["top_cust_units_12mo"].fillna(0)
-        vel["top_cust_name"] = vel["top_cust_name"].fillna("")
-        # momentum (avoid div-by-zero)
-        vel["momentum"] = vel.apply(
-            lambda r: (r["units_45d"] / max(r["units_prior_45d"], 1.0)
-                         if r["units_prior_45d"] > 0
-                         else (float("inf")
-                                if r["units_45d"] > 0 else 1.0)),
-            axis=1,
-        )
-
-        # Classify — tightened rules per buyer feedback:
-        #   📈 Trend  requires ALL of:
-        #     - momentum > 1.5
-        #     - 4+ distinct customers in 45d
-        #     - top customer < 40%  (was 60%)
-        #     - non-top customers avg ≥ 2 units each (real spread, not noise)
-        #   🎯 Project triggers if ANY of:
-        #     - ≤ 2 customers
-        #     - top customer ≥ 50%  (was 70%)
-        #     - top 2 customers ≥ 70% combined (new — catches "8 customers
-        #       but 2 took most of it")
-        #   🔀 Mixed = spike but neither pure trend nor pure project.
-        def _trend_flag(r):
-            u45v = float(r["units_45d"])
-            uprv = float(r["units_prior_45d"])
-            mom = r["momentum"]
-            # Low-volume guard — not enough signal to classify at 45d
-            if u45v < 3:
-                return "Stable"
-            # Decline
-            if uprv > 0 and mom < 0.5:
-                return "📉 Decline"
-            # Spike — decompose
-            if mom > 1.5:
-                n_cust = int(r["customers_45d"])
-                top_share = float(r["top_cust_pct"])
-                top_2_share = float(r.get("top_2_cust_pct", top_share))
-                non_top_avg = float(r.get("non_top_avg_units", 0))
-                # Project-like concentrations (ANY of these)
-                if n_cust <= 2:
-                    return "🎯 Project"
-                if top_share >= 0.50:
-                    return "🎯 Project"
-                if top_2_share >= 0.70:
-                    return "🎯 Project"
-                # Real trend (ALL of these)
-                if (n_cust >= 4
-                        and top_share < 0.40
-                        and non_top_avg >= 2.0):
-                    return "📈 Trend"
-                return "🔀 Mixed"
-            return "Stable"
-
-        vel["trend_flag"] = vel.apply(_trend_flag, axis=1)
-
-        # 3. Stock — include Allocated AND CIN7's StockOnHand (FIFO $ value)
-        if not stock.empty:
-            st_df = stock.copy()
-            st_df["OnHand"] = _to_num(st_df["OnHand"]).fillna(0)
-            st_df["Available"] = _to_num(st_df["Available"]).fillna(0)
-            st_df["OnOrder"] = _to_num(st_df["OnOrder"]).fillna(0)
-            if "Allocated" in st_df.columns:
-                st_df["Allocated"] = _to_num(st_df["Allocated"]).fillna(0)
-            else:
-                st_df["Allocated"] = 0
-            # CIN7's authoritative FIFO stock value per SKU per location
-            if "StockOnHand" in st_df.columns:
-                st_df["StockOnHand"] = _to_num(
-                    st_df["StockOnHand"]).fillna(0)
-            else:
-                st_df["StockOnHand"] = 0
-            st_agg = (st_df.groupby("SKU")
-                       .agg(OnHand=("OnHand", "sum"),
-                            Allocated=("Allocated", "sum"),
-                            Available=("Available", "sum"),
-                            OnOrder=("OnOrder", "sum"),
-                            StockOnHand=("StockOnHand", "sum"))
-                       .reset_index())
-        else:
-            st_agg = pd.DataFrame(columns=["SKU", "OnHand", "Allocated",
-                                             "Available", "OnOrder",
-                                             "StockOnHand"])
-
-        # 3b. Unfulfilled sale demand per SKU — backorders + open ordered
-        # Not yet shipped; eats into future stock position.
-        # Excludes ESTIMATING (pre-quote) and PICKING/PICKED/PACKING (those
-        # are typically already in Allocated, so double-counting to be
-        # avoided).
-        UNFULFILLED_STATUSES = ("BACKORDERED", "ORDERED", "ORDERING")
-        unfulfilled_by_sku = {}
-        if "Status" in sale_lines.columns:
-            unful_lines = sale_lines[sale_lines["Status"]
-                                       .astype(str).str.upper()
-                                       .isin(UNFULFILLED_STATUSES)].copy()
-            unful_lines["Quantity"] = _to_num(
-                unful_lines["Quantity"]).fillna(0)
-            ug = unful_lines.groupby("SKU")["Quantity"].sum()
-            unfulfilled_by_sku = ug.to_dict()
-
-        # 3c. Apply unfulfilled-order lookup to the main frame later
-        # (defer until df is built).
-
-        # 4. Supplier per SKU using 4-tier resolution:
-        # override > CIN7 native Suppliers > PO history > family default > unassigned
-        sku_overrides_local = db.all_sku_supplier_overrides()
-        fam_assignments_local = {r["family"]: r["supplier_name"]
-                                  for r in db.all_family_suppliers()}
-
-        # CIN7 native supplier from product.Suppliers. Key is 'SupplierName'.
-        # Also capture FixedCost and Lead time from ProductSupplierOptions.
-        cin7_supplier_local: dict = {}
-        cin7_cost_local: dict = {}
-        cin7_lead_local: dict = {}
-        cin7_currency_local: dict = {}
-        for _, p in products.iterrows():
-            sups_raw = p.get("Suppliers")
-            if not sups_raw or sups_raw in ("[]", "None", None):
-                continue
-            sups = sups_raw
-            if isinstance(sups, str):
-                try:
-                    sups = json.loads(sups)
-                except (ValueError, TypeError):
-                    continue
-            if not isinstance(sups, list) or not sups:
-                continue
-            primary = next(
-                (s for s in sups if isinstance(s, dict) and s.get("SupplierName")),
-                None,
-            )
-            if not primary:
-                continue
-            sku = p["SKU"]
-            cin7_supplier_local[sku] = primary["SupplierName"]
-            fc = primary.get("FixedCost") or primary.get("Cost") or primary.get("PurchaseCost")
-            if fc and float(fc) > 0:
-                cin7_cost_local[sku] = float(fc)
-            if primary.get("Currency"):
-                cin7_currency_local[sku] = primary["Currency"]
-            opts = primary.get("ProductSupplierOptions") or []
-            if isinstance(opts, list):
-                for opt in opts:
-                    if isinstance(opt, dict):
-                        lead = opt.get("Lead")
-                        if lead and int(lead) > 0:
-                            cin7_lead_local[sku] = int(lead)
-                            break
-
-        sup_by_sku_local: dict = {}
-        if not purchase_lines.empty:
-            pl = purchase_lines.copy()
-            pl["Total"] = _to_num(pl["Total"]).fillna(0)
-            sup_group = (pl.groupby(["SKU", "Supplier"])["Total"]
-                           .sum().reset_index())
-            for sku, grp in sup_group.groupby("SKU"):
-                sup_by_sku_local[sku] = grp.sort_values(
-                    "Total", ascending=False)["Supplier"].iloc[0]
-
-        def _resolve_sup(sku: str, category: str) -> str:
-            if sku in sku_overrides_local:
-                return sku_overrides_local[sku]
-            if sku in cin7_supplier_local:
-                return cin7_supplier_local[sku]
-            if sku in sup_by_sku_local:
-                return sup_by_sku_local[sku]
-            return "(unassigned)"
-
-        # 5. Merge everything
-        df = prods.merge(vel, on="SKU", how="left")
-        df = df.merge(st_agg, on="SKU", how="left")
-        for c in ["units_12mo", "rev_12mo", "OnHand", "Allocated",
-                  "Available", "OnOrder", "StockOnHand",
-                  # Trend-detection fields — NaN for products with no sales
-                  # in the recent window. Must be numeric-0 for downstream
-                  # int() casts in _compute_target_and_reorder.
-                  "units_45d", "units_prior_45d", "units_90d",
-                  "customers_45d",
-                  "top_cust_pct", "top_2_cust_pct", "non_top_avg_units",
-                  "top_cust_units_12mo", "momentum"]:
-            if c not in df.columns:
-                df[c] = 0
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        # trend_flag and top_cust_name are strings — default to empty/Stable.
-        if "trend_flag" not in df.columns:
-            df["trend_flag"] = "Stable"
-        df["trend_flag"] = df["trend_flag"].fillna("Stable")
-        if "top_cust_name" not in df.columns:
-            df["top_cust_name"] = ""
-        df["top_cust_name"] = df["top_cust_name"].fillna("")
-
-        # Unfulfilled open orders per SKU
-        df["unfulfilled"] = df["SKU"].apply(
-            lambda s: float(unfulfilled_by_sku.get(s, 0))).fillna(0)
-
-        df["Supplier"] = df["SKU"].apply(lambda s: _resolve_sup(s, ""))
-
-        # 5b. Apply MIGRATION demand — retiring SKUs' sales roll into successors
-        # (same logic used on LED Tubes page). Saved mappings take priority;
-        # auto-proposed Sierra successors fill in the rest.
-        saved_migrations = {m["retiring_sku"]: dict(m)
-                             for m in db.all_migrations()}
-
-        # Parse tubes so we can compute auto-proposed successors AND rollup
-        # cut/MP consumption onto masters.
-        tube_records = []
-        for _, p in products.iterrows():
-            rec = _parse_tube_sku(p.get("SKU"), p.get("Name", ""))
-            if rec:
-                rule = parse_sourcing_rule(p.get("AdditionalAttribute1"))
-                rec["RuleCode"] = rule["RuleCode"]
-                rec["IsMaster"] = rule["IsMaster"]
-                rec["SourceFraction"] = rule["SourceFraction"]
-                rec["SourceLengthMM"] = rule["SourceLengthMM"]
-                tube_records.append(rec)
-        tube_df = pd.DataFrame(tube_records) if tube_records else pd.DataFrame()
-
-        # Auto-detect retiring → successor family rules (from LED Tubes logic)
-        tube_fams = (tube_df["Family"].unique().tolist()
-                      if not tube_df.empty else [])
-        family_migration_rules = {}
-        for fam in tube_fams:
-            if fam.startswith("SMOKIES") and fam[7:].isdigit():
-                cand = f"SIERRA{fam[7:]}"
-                if cand in tube_fams:
-                    family_migration_rules[fam] = cand
-            elif fam.startswith("CASCADE") and fam[7:].isdigit():
-                cand = f"SIERRA{fam[7:]}"
-                if cand in tube_fams:
-                    family_migration_rules[fam] = cand
-
-        def _auto_successor_for(row) -> Optional[str]:
-            fam = row.get("Family")
-            succ_fam = family_migration_rules.get(fam)
-            if not succ_fam:
-                return None
-            color = row.get("Color")
-            has_mp = row.get("HasMP")
-            length_mm = row.get("LengthMM")
-            if length_mm is None:
-                return None
-            if length_mm >= 1000 and length_mm % 1000 == 0:
-                len_str = str(length_mm // 1000)
-            elif length_mm >= 1000:
-                len_str = str(length_mm)
-            else:
-                len_str = f"{length_mm:04d}"
-            mp_part = "-MP" if has_mp else ""
-            cand = f"LED-{succ_fam}-{color}{mp_part}-{len_str}"
-            if (products["SKU"] == cand).any():
-                return cand
-            return None
-
-        # 5c. Compute EFFECTIVE demand per SKU = direct + migrated_in
-        # Also track where migrated demand came from (for transparency).
-        migration_notes: dict = {s: [] for s in df["SKU"]}
-        migration_inflow: dict = {s: 0.0 for s in df["SKU"]}
-        migration_outflow: dict = {s: 0.0 for s in df["SKU"]}  # retiring SKUs
-
-        # Track which retiring SKUs we've already credited so we don't
-        # double-count if a SKU is both a tube AND has an IP-imported
-        # migration record.
-        handled_retiring: set = set()
-
-        if not tube_df.empty:
-            # For every retiring tube SKU that has sales, compute share and
-            # add to the successor's inflow.
-            retiring_fams = list(family_migration_rules.keys())
-            retiring_tubes = tube_df[tube_df["Family"].isin(retiring_fams)]
-            for _, r in retiring_tubes.iterrows():
-                retiring_sku = r["SKU"]
-                # Successor from saved mapping OR auto-proposal
-                saved = saved_migrations.get(retiring_sku, {})
-                successor = (saved.get("successor_sku")
-                              or _auto_successor_for(r))
-                if not successor:
-                    continue
-                share = float(saved.get("share_pct", 100.0)) / 100.0
-                units_here = float(vel.loc[vel["SKU"] == retiring_sku,
-                                            "units_12mo"].sum())
-                if units_here == 0 or share <= 0:
-                    continue
-                migrated_units = units_here * share
-
-                # Successor gets the migrated units
-                if successor in migration_inflow:
-                    migration_inflow[successor] += migrated_units
-                    migration_notes.setdefault(successor, []).append(
-                        f"{retiring_sku}: +{migrated_units:.0f} units")
-
-                # Retiring SKU shrinks by that share
-                if retiring_sku in migration_outflow:
-                    migration_outflow[retiring_sku] += migrated_units
-
-                handled_retiring.add(retiring_sku)
-
-        # === Generalised migration application (non-tube) =================
-        # Applies ANY db.set_migration() entry — not just tube-family
-        # ones. This is what makes the 71 IP-imported migrations
-        # (LED-XRD, LED-V3000, LED-AL-SL7, LEDEXTA42, etc.) actually
-        # affect successor reorder math.
-        #
-        # Same math as the tube loop: retiring SKU's 12mo units × share
-        # → added to successor's inflow, subtracted from retiring's
-        # outflow. Skips entries already handled by the tube loop above
-        # to avoid double-counting.
-        for retiring_sku, saved in saved_migrations.items():
-            if retiring_sku in handled_retiring:
-                continue
-            successor = saved.get("successor_sku")
-            if not successor or successor not in migration_inflow:
-                # Successor SKU isn't in the engine's product set —
-                # could be discontinued itself or filtered out. Skip
-                # gracefully.
-                continue
-            share = float(saved.get("share_pct", 100.0)) / 100.0
-            if share <= 0:
-                continue
-            units_match = vel.loc[vel["SKU"] == retiring_sku, "units_12mo"]
-            if units_match.empty:
-                continue
-            units_here = float(units_match.sum())
-            if units_here == 0:
-                continue
-            migrated_units = units_here * share
-
-            migration_inflow[successor] += migrated_units
-            migration_notes.setdefault(successor, []).append(
-                f"{retiring_sku}: +{migrated_units:.0f} units")
-            if retiring_sku in migration_outflow:
-                migration_outflow[retiring_sku] += migrated_units
-            handled_retiring.add(retiring_sku)
-
-        df["migrated_in"] = df["SKU"].apply(
-            lambda s: float(migration_inflow.get(s, 0))).fillna(0)
-        df["migrated_out"] = df["SKU"].apply(
-            lambda s: float(migration_outflow.get(s, 0))).fillna(0)
-        df["migrated_from"] = df["SKU"].apply(
-            lambda s: "; ".join(migration_notes.get(s, []))[:200])
-
-        # 5d. GLOBAL IsMaster flag + rollup for EVERY product with a
-        # sourcing rule — not just tubes. Covers B2060020-2390, other cut
-        # SKUs with Assemble-from rules, and BOM-based assemblies.
-        # Rule priority: parsed AdditionalAttribute1 → BOM lookup → default.
-        master_rollup_notes: dict = {}
-        master_rollup_inflow: dict = {}
-        # Parallel 90d rollup tracking — used for dormancy detection on
-        # masters whose own 90d sales are zero but whose children's 90d
-        # sales tell us whether the family still has active demand.
-        master_rollup_inflow_90d: dict = {}
-
-        # Index: SKU -> sourcing rule dict
-        rule_by_sku: dict = {}
-        for _, p in products.iterrows():
-            rule_by_sku[p["SKU"]] = parse_sourcing_rule(
-                p.get("AdditionalAttribute1"))
-
-        # Index: AssemblySKU -> list of (ComponentSKU, Quantity) from BOMs
-        bom_components_by_asm: dict = {}
-        if not boms.empty:
-            for _, b in boms.iterrows():
-                asm = b.get("AssemblySKU")
-                comp = b.get("ComponentSKU")
-                qty = b.get("Quantity")
-                if asm and comp and pd.notna(qty):
-                    bom_components_by_asm.setdefault(asm, []).append(
-                        (comp, float(qty)))
-
-        # Build tube family+color+length master lookup (fallback for tubes)
-        tube_master_by_key: dict = {}
-        if not tube_df.empty:
-            for _, r in tube_df.iterrows():
-                if r.get("IsMaster"):
-                    tube_master_by_key[(r["Family"], r["Color"],
-                                          r["LengthMM"])] = r["SKU"]
-
-        # Lookup: which products have BillOfMaterial=True in master data
-        bom_flag_by_sku = {
-            p["SKU"]: (str(p.get("BillOfMaterial")).lower() == "true")
-            for _, p in products.iterrows()
-        }
-
-        # Which SKUs have a CIN7-assigned supplier (from product.Suppliers)?
-        # A SKU with an explicit supplier is clearly intended to be bought.
-        has_cin7_supplier = set(cin7_supplier_local.keys())
-
-        def _global_is_master(sku: str) -> bool:
-            """A SKU is a MASTER (orderable) if there's evidence it's bought
-            from a supplier, AND it's not explicitly marked as assembled-from.
-            Detection priority:
-              1. Supplier assigned in CIN7 → likely master (can still be
-                 overridden by explicit Assemble-from rule — see #2)
-              2. Rule says 'Assemble from X' → non-master (wins over #1;
-                 e.g. MP variants can have a supplier but the rule tells us
-                 they're assembled, not bought)
-              3. Rule says 'Purchased full length' → master
-              4. BillOfMaterial=True or appears in BOMs as assembly → non-master
-              5. Default → master (no evidence of assembly)
-            """
-            rule = rule_by_sku.get(sku, {})
-            # 2: Explicit Assemble-from always wins
-            if rule.get("SourceFraction") is not None:
-                return False
-            # 3: Explicit Purchased full length
-            if rule.get("IsMaster"):
-                return True
-            # 4: BOM flag or BOM-has-components
-            if bom_flag_by_sku.get(sku):
-                return False
-            if sku in bom_components_by_asm:
-                return False
-            # 1: Supplier assigned (without any Assemble-from / BOM evidence)
-            if sku in has_cin7_supplier:
-                return True
-            # 5: default — orderable
-            return True
-
-        def _find_master_for_assembly(sku: str) -> Optional[tuple]:
-            """Return (master_sku, qty_per_unit) or None.
-            Tries BOM data first, then tube family+color+length lookup.
-            """
-            # Method A: BOM data (authoritative)
-            comps = bom_components_by_asm.get(sku)
-            if comps:
-                # Pick the first component as primary master
-                # (products typically have a main component; others are
-                # accessories like screws)
-                return comps[0]
-            # Method B: tube fallback
-            if not tube_df.empty:
-                r = tube_df[tube_df["SKU"] == sku]
-                if not r.empty:
-                    row = r.iloc[0]
-                    fam = row["Family"]
-                    color = row["Color"]
-                    slen = row["SourceLengthMM"]
-                    if slen is not None:
-                        k = (fam, color, slen)
-                        master = tube_master_by_key.get(k)
-                        if not master:
-                            succ = family_migration_rules.get(fam)
-                            if succ:
-                                master = tube_master_by_key.get(
-                                    (succ, color, slen))
-                        if master:
-                            frac = row.get("SourceFraction") or 1.0
-                            return (master, frac)
-            # Method C: sourcing rule source_length matches a real master SKU
-            # (naive substitution — works for tubes where source is a master)
-            rule = rule_by_sku.get(sku, {})
-            if (rule.get("SourceFraction") is not None
-                    and rule.get("SourceLengthMM")):
-                parts = str(sku).split("-")
-                if len(parts) > 1:
-                    slen_mm = rule["SourceLengthMM"]
-                    # Try multiple length-string formats
-                    candidates = []
-                    if slen_mm >= 1000 and slen_mm % 1000 == 0:
-                        candidates.append(str(slen_mm // 1000))
-                    else:
-                        candidates.append(str(slen_mm))
-                    candidates.append(f"{slen_mm:04d}")
-                    for len_str in candidates:
-                        candidate = "-".join(parts[:-1] + [len_str])
-                        if (products["SKU"] == candidate).any():
-                            return (candidate, rule["SourceFraction"])
-
-            # Method D: family-prefix sibling master lookup (for channels
-            # and similar SKUs where rule source_length is an intermediate
-            # cut size, not a purchasable master length).
-            # Take SKU's prefix (everything except last segment), find
-            # sibling SKUs with IsMaster=True, pick the longest, and
-            # compute consumption as own_physical_length / master_length.
-            parts = str(sku).split("-")
-            if len(parts) >= 2:
-                prefix = "-".join(parts[:-1]) + "-"
-                own_len_mm = _parse_length(parts[-1])
-                if own_len_mm and own_len_mm > 0:
-                    # Find sibling masters
-                    sibling_masters = []
-                    for _, cand in products.iterrows():
-                        cand_sku = str(cand.get("SKU") or "")
-                        if not cand_sku.startswith(prefix):
-                            continue
-                        if cand_sku == sku:
-                            continue
-                        cand_rule = rule_by_sku.get(cand_sku, {})
-                        if not cand_rule.get("IsMaster"):
-                            continue
-                        cand_parts = cand_sku.split("-")
-                        cand_len_mm = _parse_length(cand_parts[-1])
-                        if cand_len_mm and cand_len_mm > 0:
-                            sibling_masters.append(
-                                (cand_sku, cand_len_mm))
-                    if sibling_masters:
-                        # Pick the one with smallest length >= own_len
-                        # (best-fit); fall back to largest if none fits
-                        exact_fit = [m for m in sibling_masters
-                                      if m[1] >= own_len_mm]
-                        if exact_fit:
-                            chosen = min(exact_fit, key=lambda x: x[1])
-                        else:
-                            chosen = max(sibling_masters,
-                                          key=lambda x: x[1])
-                        master_sku, master_len = chosen
-                        # Consumption per unit = own_len / master_len
-                        qty_per = own_len_mm / master_len
-                        return (master_sku, qty_per)
-            return None
-
-        # Now compute rollup across ALL non-master products.
-        # For multi-component kits (LEDKIT etc.), distribute demand to
-        # EVERY component in the BOM proportionally — not just the first.
-        def _find_all_masters_for_assembly(sku: str):
-            """Return list of (master_sku, qty_per). Multi-component for
-            BOM kits; single-component for cuts."""
-            # Method A: ALL BOM components (each gets its own share)
-            comps = bom_components_by_asm.get(sku)
-            if comps:
-                return [(c, q) for c, q in comps if c and q]
-            # Fallback to single-master methods (B, C, D)
-            single = _find_master_for_assembly(sku)
-            return [single] if single else []
-
-        for _, p in products.iterrows():
-            sku = p["SKU"]
-            # Always roll up if the SKU has a BOM, even if _global_is_master
-            # returns True. Reason: the BOM is authoritative — if it says
-            # "this SKU is built from component X", the demand should
-            # cascade to X regardless of other classification heuristics
-            # (e.g. AdditionalAttribute1 saying "Purchased full length"
-            # by mistake, or supplier-assigned giving a misleading hint).
-            # This was the bug behind LED-WLNW-40K-IP20-100M showing
-            # zero rolled-up demand from its per-foot child.
-            has_bom = sku in bom_components_by_asm
-            if not has_bom and _global_is_master(sku):
-                continue
-            # Non-master (or has BOM): find ALL its masters and roll up demand
-            targets = _find_all_masters_for_assembly(sku)
-            if not targets:
-                continue
-            own_units = float(vel.loc[vel["SKU"] == sku, "units_12mo"].sum())
-            own_units_90d = float(
-                vel.loc[vel["SKU"] == sku, "units_90d"].sum())
-            # Migration-aware adjustment to own_units before rolling up:
-            #   migration_in : this SKU is a SUCCESSOR — receives demand
-            #                  from retired predecessors. Critical for
-            #                  successor MP variants (e.g. SIERRA38-W-MP-2
-            #                  inheriting from SMOKIES/CASCADE-W-MP-2),
-            #                  otherwise the inherited demand is added to
-            #                  migration_in then immediately zeroed when
-            #                  the MP variant is treated as non-master in
-            #                  _effective_units, never reaching the bare
-            #                  tube via tube_rollup_in.
-            #   migration_out: this SKU is RETIRING — its demand has been
-            #                  redirected to its successor. Replaces the
-            #                  prior buggy "own_units *= share" branch
-            #                  (which multiplied instead of subtracting).
-            # 90d intentionally skips migration: long-term successor
-            # signals shouldn't distort recent-activity dormancy detection.
-            own_units = max(0.0,
-                             own_units
-                             + float(migration_inflow.get(sku, 0))
-                             - float(migration_outflow.get(sku, 0)))
-            if own_units == 0 and own_units_90d == 0:
-                continue
-            # Roll up to EACH master independently
-            for target in targets:
-                if not target:
-                    continue
-                master_sku, qty_per = target
-                if not master_sku or not qty_per:
-                    continue
-                consumption = own_units * qty_per
-                consumption_90d = own_units_90d * qty_per
-                master_rollup_inflow[master_sku] = (
-                    master_rollup_inflow.get(master_sku, 0) + consumption
-                )
-                master_rollup_inflow_90d[master_sku] = (
-                    master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
-                )
-                master_rollup_notes.setdefault(master_sku, []).append(
-                    f"{sku}: {own_units:.0f} × {qty_per:g} = {consumption:.1f}"
-                )
-
-        # 5da. LED-STRIP rollup (pattern-based; BOMs rarely populated).
-        # For each strip family base (e.g. LEDIRIS6000-180), find the
-        # largest-length variant and treat it as the bulk master. Roll up
-        # cut/roll sales by (their length in metres × units sold).
-        # Intermediate rolls with direct purchase history stay as
-        # alternate masters (don't roll them up).
-        strip_rollup_notes: dict = {}
-        strip_rollup_inflow: dict = {}
-        strip_rollup_inflow_90d: dict = {}
-        strip_non_master_skus: set = set()
-        strip_master_skus: set = set()
-        # Track each strip master's roll length in metres — used to flag
-        # bulk masters (≥50m) where the engine can suggest fractional
-        # reorder qtys. e.g. 0.40 of a 100m roll instead of rounding up
-        # to a full 100m roll when only 40m is needed.
-        bulk_master_lengths: dict = {}
-
-        # Build base-family index: {base: [(sku, length_m, name, purchased_bool)]}
-        strip_family_index: dict = {}
-        for _, p in products.iterrows():
-            sku_s = str(p.get("SKU"))
-            if not _is_strip_sku(sku_s, p.get("Name", "")):
-                continue
-            parse = _parse_strip_base(sku_s)
-            if not parse:
-                continue
-            base, length_m = parse
-            # Was this SKU directly purchased in our PO history?
-            purchased = sku_s in sup_by_sku_local
-            strip_family_index.setdefault(base, []).append(
-                (sku_s, length_m, p.get("Name", ""), purchased))
-
-        # For each family, pick bulk master + decide rollup targets
-        for base, members in strip_family_index.items():
-            if len(members) < 2:
-                continue  # nothing to roll up
-            # Largest-length variant = primary bulk master
-            sorted_members = sorted(members, key=lambda x: -x[1])
-            bulk_sku, bulk_len, bulk_name, bulk_purchased = sorted_members[0]
-            strip_master_skus.add(bulk_sku)
-            bulk_master_lengths[bulk_sku] = float(bulk_len or 0)
-            if bulk_len <= 0:
-                continue
-            # Additional masters: any intermediate with direct PO history
-            alternate_masters = set()
-            for sku_m, length_m, _, purchased in sorted_members[1:]:
-                if purchased and length_m >= 1.0:
-                    alternate_masters.add(sku_m)
-                    strip_master_skus.add(sku_m)
-                    bulk_master_lengths[sku_m] = float(length_m or 0)
-
-            # Roll up each non-master's sales. CRITICAL: convert consumption
-            # from METRES to the master's UNIT count. 1 × 100m roll = 1 unit
-            # in CIN7, NOT 100 units. If we keep it in metres we inflate
-            # target stock by 100×.
-            for sku_m, length_m, nm, purchased in sorted_members:
-                if sku_m == bulk_sku:
-                    continue
-                if sku_m in alternate_masters:
-                    continue
-                own_units = float(vel.loc[vel["SKU"] == sku_m,
-                                           "units_12mo"].sum())
-                own_units_90d = float(vel.loc[vel["SKU"] == sku_m,
-                                               "units_90d"].sum())
-                if (own_units == 0 and own_units_90d == 0) or length_m == 0:
-                    strip_non_master_skus.add(sku_m)
-                    continue
-                consumption_m = own_units * length_m
-                consumption_m_90d = own_units_90d * length_m
-                # Convert metres → master rolls
-                consumption_in_master_units = consumption_m / bulk_len
-                consumption_in_master_units_90d = consumption_m_90d / bulk_len
-                strip_rollup_inflow[bulk_sku] = (
-                    strip_rollup_inflow.get(bulk_sku, 0)
-                    + consumption_in_master_units
-                )
-                strip_rollup_inflow_90d[bulk_sku] = (
-                    strip_rollup_inflow_90d.get(bulk_sku, 0)
-                    + consumption_in_master_units_90d
-                )
-                strip_rollup_notes.setdefault(bulk_sku, []).append(
-                    f"{sku_m}: {own_units:.0f} × {length_m:g}m "
-                    f"= {consumption_m:.1f}m = "
-                    f"{consumption_in_master_units:.2f} × {bulk_len:g}m rolls"
-                )
-                strip_non_master_skus.add(sku_m)
-
-        # Merge strip rollup into the master_rollup_inflow tracked above
-        for master_sku, consumption in strip_rollup_inflow.items():
-            master_rollup_inflow[master_sku] = (
-                master_rollup_inflow.get(master_sku, 0) + consumption
-            )
-            notes = strip_rollup_notes.get(master_sku, [])
-            if notes:
-                existing = master_rollup_notes.setdefault(master_sku, [])
-                existing.extend(notes)
-
-        # Same merge for the 90d parallel rollup
-        for master_sku, consumption_90d in strip_rollup_inflow_90d.items():
-            master_rollup_inflow_90d[master_sku] = (
-                master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
-            )
-
-        df["tube_rollup_in"] = df["SKU"].apply(
-            lambda s: float(master_rollup_inflow.get(s, 0))).fillna(0)
-        df["tube_rollup_in_90d"] = df["SKU"].apply(
-            lambda s: float(master_rollup_inflow_90d.get(s, 0))).fillna(0)
-        df["tube_rollup_notes"] = df["SKU"].apply(
-            lambda s: "; ".join(master_rollup_notes.get(s, []))[:500])
-
-        # Bulk-master length + fractional-eligibility flag.
-        # is_bulk_master = strip master with ≥50m roll length. These SKUs
-        # are eligible for fractional reorder qtys (e.g. 0.40 × 100m roll
-        # instead of rounding up to a full roll). The threshold of 50m
-        # keeps small-roll masters (5m, 10m) on integer ordering since
-        # partial purchases on those are unusual.
-        #
-        # Two detection passes:
-        # (1) Strip-family parser (above) — catches masters whose family
-        #     members share a clean prefix (e.g. all LEDIRIS6000-* live
-        #     in the same family).
-        # (2) SKU-suffix fallback (below) — catches masters like
-        #     LED-WLNW-40K-IP20-100M whose per-foot child uses a
-        #     different middle segment (LED-WLNW-40K-16-IP20-0305) so
-        #     prefix matching fails. Any SKU ending in "-NNNm" or
-        #     "-NNNM" with N >= 50 is treated as a bulk master.
-        import re as _re_bulk
-        _bulk_suffix_pat = _re_bulk.compile(r"-(\d+)[Mm]$")
-        for _s in df["SKU"]:
-            _s_str = str(_s)
-            if bulk_master_lengths.get(_s_str, 0) > 0:
-                continue  # already detected via strip-family parser
-            _m = _bulk_suffix_pat.search(_s_str)
-            if not _m:
-                continue
-            _n = int(_m.group(1))
-            if _n >= 50:
-                bulk_master_lengths[_s_str] = float(_n)
-
-        df["bulk_length_m"] = df["SKU"].apply(
-            lambda s: float(bulk_master_lengths.get(str(s), 0)))
-        df["is_bulk_master"] = df["bulk_length_m"] >= 50.0
-
-        # 5e. IsMaster flag on df. A SKU is non-master if:
-        #  - flagged by _global_is_master as non-master, OR
-        #  - is a strip derivative (rolled up to bulk master above)
-        def _final_is_non_master(sku: str) -> bool:
-            if sku in strip_master_skus:
-                return False  # explicitly a strip master (bulk or alternate)
-            if sku in strip_non_master_skus:
-                return True   # strip derivative, rolled up
-            return not _global_is_master(sku)
-
-        df["is_non_master_tube"] = df["SKU"].apply(_final_is_non_master)
-
-        # Effective units_12mo for reorder math:
-        # - Non-master tubes → 0 (their demand is rolled up into the master)
-        # - Retiring SKUs → units_12mo - migrated_out (what stays with them)
-        # - Otherwise → units_12mo + migrated_in + tube_rollup_in
-        def _effective_units(row):
-            if row["is_non_master_tube"]:
-                return 0.0
-            base = float(row["units_12mo"])
-            return (base
-                    - float(row["migrated_out"])
-                    + float(row["migrated_in"])
-                    + float(row["tube_rollup_in"]))
-
-        df["effective_units_12mo"] = df.apply(_effective_units, axis=1)
-
-        # --- Recency-aware effective demand (last 90 days) ---------------
-        # effective_units_90d mirrors effective_units_12mo but only sums
-        # the last 90 days of activity. We deliberately skip migration on
-        # the 90d view (mig_in / mig_out are typically tied to long-term
-        # successor decisions; recent activity is what matters here).
-        # Used to detect dormant SKUs whose 12mo number is dominated by
-        # stale demand that has since dried up.
-        def _effective_units_90d(row):
-            if row["is_non_master_tube"]:
-                return 0.0
-            base90 = float(row.get("units_90d") or 0)
-            rollup90 = float(row.get("tube_rollup_in_90d") or 0)
-            return base90 + rollup90
-
-        df["effective_units_90d"] = df.apply(_effective_units_90d, axis=1)
-
-        # Dormancy detection (two-tier):
-        #   Tier 1: Hard dormant — effective_units_90d == 0 AND
-        #           effective_units_12mo > 0. The family had history but
-        #           hasn't sold a single unit in 90 days. Always flag.
-        #   Tier 2: Soft dormant — recent 90d rate is < 20% of 12mo rate
-        #           AND 12mo rate is meaningful (>0.05/day). Catches
-        #           "demand fell off a cliff" while not over-flagging
-        #           genuinely low-volume but still-active SKUs.
-        # The hard tier replaces the previous 0.05 threshold floor — that
-        # threshold was preventing legitimate stale-demand SKUs (no sales
-        # since 2023, e.g. LEDIRIS6000-180-100) from being flagged.
-        def _is_dormant(row):
-            eff_12mo = float(row.get("effective_units_12mo") or 0)
-            eff_90d = float(row.get("effective_units_90d") or 0)
-            if eff_12mo <= 0:
-                return False
-            # Tier 1: ~zero 90d activity. The threshold is expressed in
-            # PHYSICAL UNITS so master rolls and leaf SKUs are compared
-            # consistently:
-            #   - Bulk master (e.g. 100m roll): less than 5m of physical
-            #     strip flow in 90 days = dormant. 0.001 master rolls
-            #     × 100m = 0.1m → dormant. 0.546 × 100m = 54.6m → active.
-            #   - Leaf SKU (e.g. per-foot cut): less than 1 unit in 90
-            #     days = dormant.
-            # This replaces a strict <=0 check that missed near-zero
-            # rolled-up activity from per-foot children.
-            is_bulk = bool(row.get("is_bulk_master", False))
-            bulk_len = float(row.get("bulk_length_m", 0) or 0)
-            if is_bulk and bulk_len > 0:
-                if (eff_90d * bulk_len) < 5.0:
-                    return True
-            else:
-                if eff_90d < 1.0:
-                    return True
-            rate_12mo_daily = eff_12mo / 365.0
-            rate_90d_daily = eff_90d / 90.0
-            # Tier 2: recent rate dropped > 80% vs 12mo. Catches the
-            # "demand fell off a cliff" case for SKUs whose 12mo rate
-            # is meaningful (>0.05/day = 18 units/year).
-            if rate_12mo_daily < 0.05:
-                return False
-            return rate_90d_daily < (0.20 * rate_12mo_daily)
-
-        df["is_dormant"] = df.apply(_is_dormant, axis=1)
-
-        # 6. Length for air-eligibility (parse from SKU's last numeric part)
-        def _length_of(sku: str) -> Optional[int]:
-            if not sku: return None
-            for part in reversed(str(sku).split("-")):
-                p = _parse_length(part) if 'parse_length' in globals() else None
-                if p is None:
-                    try:
-                        n = float(part)
-                        if n <= 0: continue
-                        p = int(round(n*1000)) if n < 20 else int(round(n))
-                    except ValueError:
-                        continue
-                if p is not None and 50 < p < 5000:
-                    return p
-            return None
-        df["LengthMM"] = df["SKU"].apply(_length_of)
-
-        # 7. Monthly sales trend per SKU (12m + 24m buckets)
-        # Build monthly series so we can render sparklines in the table.
-        today_ts = pd.Timestamp(datetime.now().date())
-        from collections import defaultdict as _dd
-        monthly_12 = _dd(lambda: [0.0] * 12)
-        monthly_24 = _dd(lambda: [0.0] * 24)
-        for _, r in sl.iterrows():
-            d = r["InvoiceDate"]
-            if pd.isna(d):
-                continue
-            months_ago = (today_ts - d).days / 30.437
-            q = float(r["Quantity"] or 0)
-            sku_r = r["SKU"]
-            if 0 <= months_ago < 12:
-                b12 = 11 - int(months_ago)
-                monthly_12[sku_r][b12] += q
-            if 0 <= months_ago < 24:
-                b24 = 23 - int(months_ago)
-                monthly_24[sku_r][b24] += q
-
-        # --- Migration rollup of monthly buckets ---------------------------
-        # For every migration record (retiring → successor), add the
-        # retiring SKU's 12mo / 24mo monthly buckets × share_pct to the
-        # successor's buckets. Without this, "Last 6 months" and "12mo
-        # trend" columns on a successor (e.g. LED-SIERRA38-W-MP-2390)
-        # show only its OWN sales (post-migration), invisible to the
-        # historical demand from CASCADE/SMOKIES MP variants that the
-        # engine actually counts. After this step, sparklines and
-        # last-6-month numbers reflect the FULL lineage.
-        # Runs BEFORE the BOM rollup below so successor-MP variants
-        # propagate their inflated buckets up to the bare tube via BOM.
-        try:
-            _all_migs_buckets = [dict(m) for m in db.all_migrations()]
-        except Exception:
-            _all_migs_buckets = []
-        for _m in _all_migs_buckets:
-            _ret = str(_m.get("retiring_sku") or "")
-            _succ = str(_m.get("successor_sku") or "")
-            if not _ret or not _succ:
-                continue
-            _share = float(_m.get("share_pct") or 100) / 100.0
-            if _share <= 0:
-                continue
-            if _ret in monthly_12:
-                for i in range(12):
-                    monthly_12[_succ][i] += monthly_12[_ret][i] * _share
-            if _ret in monthly_24:
-                for i in range(24):
-                    monthly_24[_succ][i] += monthly_24[_ret][i] * _share
-
-        # --- Roll up children's monthly buckets onto master SKUs -----------
-        # Without this, "Last 6 months" and "12mo trend" sparkline columns
-        # show ONLY direct master sales — and for cut-source masters
-        # (100m/5m rolls) those are usually zero because customers don't
-        # buy whole rolls; demand is the per-foot variants. This pass
-        # adds each child's monthly bucket × BOM ratio to its master's
-        # monthly bucket, so the master's trend reflects family-wide
-        # demand expressed in master-roll equivalents (matches the
-        # demand-breakdown chart's normalisation).
-        # NB: combined with the migration rollup above, children that
-        # are successors will already have their predecessor history
-        # baked in — so the BOM rollup carries that all the way to the
-        # bare tube master.
-        for master_sku, ch_list in BOM_CHILDREN.items():
-            for ch in ch_list:
-                ch_sku = ch.get("AssemblySKU")
-                ratio = float(ch.get("Quantity") or 0)
-                if not ch_sku or ratio <= 0:
-                    continue
-                # Use sku_r presence — only roll up if the child has any sales
-                if ch_sku in monthly_12:
-                    for i in range(12):
-                        monthly_12[master_sku][i] += (
-                            monthly_12[ch_sku][i] * ratio)
-                if ch_sku in monthly_24:
-                    for i in range(24):
-                        monthly_24[master_sku][i] += (
-                            monthly_24[ch_sku][i] * ratio)
-
-        # --- Migration + BOM rollup of 45d / prior-45d / 90d units ---------
-        # Same pattern as the monthly buckets above, but for the
-        # short-window aggregates the buyer sees in the Ordering grid:
-        # `45d units`, `momentum` (45d / prior-45d), `customers_45d`,
-        # `90d units`. Without rolling these up, a successor bare tube
-        # shows 0 in those columns even when its MP-variant children
-        # (and their predecessors) sold real volume in the last 45 days.
-        u45_dict = dict(zip(
-            df["SKU"].astype(str),
-            pd.to_numeric(df["units_45d"], errors="coerce").fillna(0)))
-        uprior_dict = dict(zip(
-            df["SKU"].astype(str),
-            pd.to_numeric(df["units_prior_45d"], errors="coerce").fillna(0)))
-        u90_dict = dict(zip(
-            df["SKU"].astype(str),
-            pd.to_numeric(df["units_90d"], errors="coerce").fillna(0)))
-
-        # Migration rollup — same logic as for monthly buckets.
-        # 90d intentionally skips migration to keep dormancy detection
-        # focused on RECENT activity (predecessors are by definition
-        # not active anymore).
-        for _m in _all_migs_buckets:
-            _ret = str(_m.get("retiring_sku") or "")
-            _succ = str(_m.get("successor_sku") or "")
-            if not _ret or not _succ:
-                continue
-            _share = float(_m.get("share_pct") or 100) / 100.0
-            if _share <= 0:
-                continue
-            if _ret in u45_dict:
-                u45_dict[_succ] = u45_dict.get(_succ, 0) + u45_dict[_ret] * _share
-            if _ret in uprior_dict:
-                uprior_dict[_succ] = uprior_dict.get(_succ, 0) + uprior_dict[_ret] * _share
-
-        # BOM rollup — child × ratio added to master.
-        for master_sku, ch_list in BOM_CHILDREN.items():
-            for ch in ch_list:
-                ch_sku = ch.get("AssemblySKU")
-                ratio = float(ch.get("Quantity") or 0)
-                if not ch_sku or ratio <= 0:
-                    continue
-                if ch_sku in u45_dict:
-                    u45_dict[master_sku] = u45_dict.get(master_sku, 0) + u45_dict[ch_sku] * ratio
-                if ch_sku in uprior_dict:
-                    uprior_dict[master_sku] = uprior_dict.get(master_sku, 0) + uprior_dict[ch_sku] * ratio
-                if ch_sku in u90_dict:
-                    u90_dict[master_sku] = u90_dict.get(master_sku, 0) + u90_dict[ch_sku] * ratio
-
-        # Write back. Replace the raw values so the Ordering grid columns
-        # (`units_45d`, `momentum`, `units_90d`) reflect the full lineage
-        # consistent with `effective_units_12mo`.
-        df["units_45d"] = df["SKU"].astype(str).map(u45_dict).fillna(0)
-        df["units_prior_45d"] = df["SKU"].astype(str).map(uprior_dict).fillna(0)
-        df["units_90d"] = df["SKU"].astype(str).map(u90_dict).fillna(0)
-        # Recompute momentum from the rolled-up values.
-        df["momentum"] = df.apply(
-            lambda r: (float(r["units_45d"]) / max(float(r["units_prior_45d"]), 1.0)
-                        if float(r["units_prior_45d"]) > 0
-                        else (1.5 if float(r["units_45d"]) > 0 else 1.0)),
-            axis=1)
-
-        # --- Migration + BOM rollup of customer-level metrics ---------------
-        # customers_45d, top_cust_pct, top_2_cust_pct, non_top_avg_units,
-        # top_cust_name, and top_cust_units_12mo are all derived from per-
-        # customer sale-line aggregations. Until now they used ONLY direct
-        # sales of the SKU — leaving 0 customers_45d on bare-tube masters
-        # whose volume actually flows through MP children + predecessors.
-        # This pass rebuilds them from rolled-up customer-qty maps.
-        _cust_qty_45d: dict = {}    # {sku: {customer_id: qty}}
-        _cust_qty_12mo: dict = {}
-        _cust_names: dict = {}      # {sku: {customer_id: customer_name}}
-        for _, _r in sl.iterrows():
-            _s = str(_r.get("SKU") or "")
-            _cid = str(_r.get("CustomerID") or "")
-            if not _s or not _cid:
-                continue
-            _q = float(_r.get("Quantity") or 0)
-            _d = _r.get("InvoiceDate")
-            if pd.isna(_d):
-                continue
-            if _d >= cutoff_12mo if False else _d >= today_ts - pd.Timedelta(days=window_days):
-                _cust_qty_12mo.setdefault(_s, {})
-                _cust_qty_12mo[_s][_cid] = _cust_qty_12mo[_s].get(_cid, 0) + _q
-            if _d >= cutoff_recent:
-                _cust_qty_45d.setdefault(_s, {})
-                _cust_qty_45d[_s][_cid] = _cust_qty_45d[_s].get(_cid, 0) + _q
-            _cn = str(_r.get("Customer") or "")
-            if _cn:
-                _cust_names.setdefault(_s, {})[_cid] = _cn
-
-        # Migration rollup
-        for _m in _all_migs_buckets:
-            _ret = str(_m.get("retiring_sku") or "")
-            _succ = str(_m.get("successor_sku") or "")
-            if not _ret or not _succ:
-                continue
-            _share = float(_m.get("share_pct") or 100) / 100.0
-            if _share <= 0:
-                continue
-            for _src_map in (_cust_qty_45d, _cust_qty_12mo):
-                if _ret in _src_map:
-                    _dest = _src_map.setdefault(_succ, {})
-                    for _cid, _q in _src_map[_ret].items():
-                        _dest[_cid] = _dest.get(_cid, 0) + _q * _share
-            # Carry customer names from predecessor where successor doesn't
-            # already know the name
-            if _ret in _cust_names:
-                _dest_names = _cust_names.setdefault(_succ, {})
-                for _cid, _nm in _cust_names[_ret].items():
-                    _dest_names.setdefault(_cid, _nm)
-
-        # BOM rollup
-        for _master, _ch_list in BOM_CHILDREN.items():
-            for _ch in _ch_list:
-                _ch_sku = _ch.get("AssemblySKU")
-                _ratio = float(_ch.get("Quantity") or 0)
-                if not _ch_sku or _ratio <= 0:
-                    continue
-                for _src_map in (_cust_qty_45d, _cust_qty_12mo):
-                    if _ch_sku in _src_map:
-                        _dest = _src_map.setdefault(_master, {})
-                        for _cid, _q in _src_map[_ch_sku].items():
-                            _dest[_cid] = _dest.get(_cid, 0) + _q * _ratio
-                if _ch_sku in _cust_names:
-                    _dest_names = _cust_names.setdefault(_master, {})
-                    for _cid, _nm in _cust_names[_ch_sku].items():
-                        _dest_names.setdefault(_cid, _nm)
-
-        # Recompute customer-derived columns from the rolled-up maps
-        _new_cust_count: dict = {}
-        _new_top_pct: dict = {}
-        _new_top_2_pct: dict = {}
-        _new_non_top_avg: dict = {}
-        _new_top_name: dict = {}
-        _new_top_12mo: dict = {}
-        for _s in df["SKU"].astype(str):
-            _45 = _cust_qty_45d.get(_s, {})
-            _12 = _cust_qty_12mo.get(_s, {})
-            _names = _cust_names.get(_s, {})
-            if _45:
-                _new_cust_count[_s] = len(_45)
-                _sorted = sorted(_45.items(), key=lambda x: -x[1])
-                _total = sum(_45.values())
-                if _total > 0:
-                    _top_qty = _sorted[0][1]
-                    _top_cid = _sorted[0][0]
-                    _new_top_pct[_s] = _top_qty / _total
-                    if len(_sorted) >= 2:
-                        _new_top_2_pct[_s] = (
-                            _top_qty + _sorted[1][1]) / _total
-                    else:
-                        _new_top_2_pct[_s] = _new_top_pct[_s]
-                    _non_top_qty = _total - _top_qty
-                    _non_top_n = max(len(_sorted) - 1, 0)
-                    _new_non_top_avg[_s] = (
-                        _non_top_qty / _non_top_n
-                        if _non_top_n > 0 else 0.0)
-                    _new_top_name[_s] = _names.get(_top_cid, "")
-                    # Top customer's 12mo total (from 12mo map for SAME cid)
-                    _new_top_12mo[_s] = float(_12.get(_top_cid, 0))
-
-        # Write back — overwrite the raw values with rolled-up versions
-        df["customers_45d"] = (
-            df["SKU"].astype(str).map(_new_cust_count).fillna(0).astype(int))
-        df["top_cust_pct"] = (
-            df["SKU"].astype(str).map(_new_top_pct).fillna(0))
-        df["top_2_cust_pct"] = (
-            df["SKU"].astype(str).map(_new_top_2_pct).fillna(0))
-        df["non_top_avg_units"] = (
-            df["SKU"].astype(str).map(_new_non_top_avg).fillna(0))
-        df["top_cust_name"] = (
-            df["SKU"].astype(str).map(_new_top_name).fillna(""))
-        df["top_cust_units_12mo"] = (
-            df["SKU"].astype(str).map(_new_top_12mo).fillna(0))
-
-        df["trend_12m"] = df["SKU"].apply(
-            lambda s: list(monthly_12.get(s, [0.0] * 12)))
-        df["trend_24m"] = df["SKU"].apply(
-            lambda s: list(monthly_24.get(s, [0.0] * 24)))
-        # Last 6 months total (sum of most recent 6 monthly buckets)
-        df["last_6mo"] = df["trend_12m"].apply(
-            lambda buckets: float(sum(buckets[-6:])) if buckets else 0.0)
-        # Last 6 months as a readable "oldest … newest" sequence.
-        # Show 1 decimal place when values include rolled-up fractional
-        # contributions (e.g. master rolls absorbing per-foot demand —
-        # 100 cuts × 0.0035 ratio = 0.35 rolls). For SKUs whose values
-        # are all whole numbers (typical leaf products), keep the
-        # cleaner integer format the buyer is used to.
-        def _fmt_6mo_series(buckets):
-            if not buckets:
-                return ""
-            last6 = buckets[-6:]
-            if any(abs(v - round(v)) > 0.05 for v in last6):
-                return "  ".join(f"{v:.1f}" for v in last6)
-            return "  ".join(f"{int(round(v))}" for v in last6)
-        df["last_6mo_series"] = df["trend_12m"].apply(_fmt_6mo_series)
-
-        # 8. Hybrid ABC uses EFFECTIVE units (post-migration, post-rollup) so
-        # Sierra masters with migrated Smokies demand get proper A/B/C class.
-        df["annual_value"] = df["effective_units_12mo"] * df["AverageCost"]
-        # Percentile rank (0-1), higher = more valuable / more units
-        df["_val_rank"] = df["annual_value"].rank(pct=True)
-        df["_qty_rank"] = df["units_12mo"].rank(pct=True)
-        df["_blend"] = 0.6 * df["_val_rank"] + 0.4 * df["_qty_rank"]
-
-        # Sort by blend desc, compute cumulative annual_value share
-        sorted_df = df.sort_values("_blend", ascending=False).copy()
-        total_value = sorted_df["annual_value"].sum()
-        if total_value > 0:
-            sorted_df["cum_value_pct"] = (
-                sorted_df["annual_value"].cumsum() / total_value
-            )
-            def _class(p):
-                if p <= 0.70: return "A"
-                if p <= 0.90: return "B"
-                return "C"
-            sorted_df["ABC"] = sorted_df["cum_value_pct"].apply(_class)
-        else:
-            sorted_df["ABC"] = "—"
-        df = df.merge(sorted_df[["SKU", "ABC"]], on="SKU", how="left")
-
-        # Class-aware dormancy refinement (now that ABC is known).
-        # The base _is_dormant was conservative — flagged only items
-        # with effectively zero recent activity. C-class SKUs need a
-        # higher bar: they're low-priority by definition, so only
-        # genuinely meaningful 90d demand justifies keeping them
-        # active. Thresholds in physical units (metres for bulk
-        # masters, units for leaves):
-        #   A-class:  5m / 1 unit  (current — keep active easily)
-        #   B-class: 10m / 2 units
-        #   C-class: 25m / 5 units (high bar — slow-movers go dormant)
-        # This means an item with 9m of 90d strip flow (e.g., 2-3 ft of
-        # per-foot cuts/month) is "active" for an A-class SKU but
-        # "dormant" for a C-class SKU — letting attrition run down
-        # slow-moving inventory automatically.
-        def _refine_dormancy_by_class(row):
-            if bool(row.get("is_dormant", False)):
-                return True  # already flagged by base rules
-            abc = str(row.get("ABC") or "C")
-            eff_90d = float(row.get("effective_units_90d") or 0)
-            is_bulk = bool(row.get("is_bulk_master", False))
-            bulk_len = float(row.get("bulk_length_m", 0) or 0)
-            if is_bulk and bulk_len > 0:
-                threshold_m = {"A": 5.0, "B": 10.0,
-                                "C": 25.0}.get(abc, 10.0)
-                if (eff_90d * bulk_len) < threshold_m:
-                    return True
-            else:
-                threshold_u = {"A": 1.0, "B": 2.0,
-                                "C": 5.0}.get(abc, 2.0)
-                if eff_90d < threshold_u:
-                    return True
-            return False
-
-        df["is_dormant"] = df.apply(_refine_dormancy_by_class, axis=1)
-
-        # 9. Daily demand, DoC — use EFFECTIVE units (direct + migrated +
-        # tube rollup) so Sierra masters reflect Smokies/Cascade migration
-        # and their MP/cut variant consumption.
-        df["avg_daily"] = df["effective_units_12mo"] / max(window_days, 1)
-
-        # --- Trend-aware avg_daily adjustment -------------------------
-        # Override avg_daily based on detected demand patterns:
-        #   💤 Dormant → demand has fallen off a cliff (90d rate <20% of
-        #                12mo rate). Use the 90d rate (≈ 0) to avoid
-        #                ordering against stale historical demand. Takes
-        #                precedence — if a SKU is dormant, it doesn't
-        #                matter what trend_flag says.
-        #   📈 Trend   → use last-45d velocity — this catches
-        #                acceleration fast so the engine builds stock
-        #                before the next PO cycle.
-        #   🎯 Project → subtract the top customer's 12mo units from
-        #                effective demand (that customer isn't part of
-        #                the sustaining baseline), then re-derive daily.
-        def _adjust_avg_daily(r):
-            base = r["avg_daily"]
-            flag = r.get("trend_flag", "Stable")
-            if pd.isna(flag):
-                flag = "Stable"
-            def _safe(v, default=0.0):
-                try:
-                    v = float(v)
-                    return default if pd.isna(v) else v
-                except (ValueError, TypeError):
-                    return default
-            # Dormancy override — highest priority. If the family hasn't
-            # moved in 90 days, use the 90d rate (which will be ≈0)
-            # regardless of how much 12mo history the SKU has.
-            if bool(r.get("is_dormant", False)):
-                # Hard-zero for dormant: any positive avg_daily would
-                # produce a small positive target_stock, which then
-                # snaps up to 10m via the bulk-master 10m floor →
-                # spurious 0.10 suggestions for items the engine has
-                # explicitly classified as dormant. Returning 0 ensures
-                # target_stock = 0 → shortfall = 0 → reorder = 0.
-                return 0.0
-            if flag == "📈 Trend":
-                u45 = _safe(r.get("units_45d"))
-                if u45 > 0:
-                    # last-45d daily velocity (units per day)
-                    return (u45 / 45.0)
-            if flag == "🎯 Project":
-                eff = _safe(r.get("effective_units_12mo"))
-                # Subtract top customer's 12mo contribution
-                top_u = _safe(r.get("top_cust_units_12mo"))
-                corrected = max(0.0, eff - top_u)
-                return corrected / max(window_days, 1)
-            return base
-
-        df["avg_daily_base"] = df["avg_daily"]
-        df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)
-
-        # Promote is_dormant into trend_flag display so the buyer sees
-        # 💤 Dormant in the PO editor's Trend column. We override Stable
-        # only — preserve any existing acceleration/project/decline flag
-        # if one was already set (those signals took priority before
-        # dormancy was added; keeping that contract avoids surprises).
-        def _promote_dormant_flag(r):
-            cur = r.get("trend_flag", "Stable")
-            if pd.isna(cur):
-                cur = "Stable"
-            if bool(r.get("is_dormant", False)) and cur == "Stable":
-                return "💤 Dormant"
-            return cur
-
-        df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)
-        df["DoC_days"] = df.apply(
-            lambda r: (r["OnHand"] / r["avg_daily"])
-            if r["avg_daily"] > 0 else None, axis=1)
-
-        # 9b. Cost fields kept separate:
-        #
-        #   FixedCost  — supplier's agreed PO price (strict; used for
-        #                PO line value calc — what the PO will actually
-        #                cost us).
-        #   AverageCost — CIN7's weighted landed cost (historical, drifts
-        #                with every purchase). Keep for reference /
-        #                valuation fallback but NOT the primary.
-        #
-        # Line value on a PO = Order qty × FixedCost (not AverageCost).
-        # When FixedCost is missing on a SKU, we fall back to AverageCost
-        # and flag clearly.
-        df["FixedCost"] = df["SKU"].apply(
-            lambda s: float(cin7_cost_local.get(s, 0))
-        )
-        df["POCostBasis"] = df.apply(
-            lambda r: ("FixedCost (supplier)" if r["FixedCost"] > 0
-                       else ("AverageCost (fallback)"
-                             if float(r["AverageCost"] or 0) > 0
-                             else "No cost on file")),
-            axis=1,
-        )
-        # Effective PO cost — prefers FixedCost, falls back if missing
-        df["POCost"] = df.apply(
-            lambda r: (r["FixedCost"] if r["FixedCost"] > 0
-                       else float(r["AverageCost"] or 0)), axis=1)
-
-        return df
+    # v2.67.32 - _abc_engine moved to module scope so the AI Assistant
+    # page can call it too. The early-exit guard above still gates this
+    # page on having products + sale_lines.
 
     engine_df = _abc_engine(products, stock, sale_lines, purchase_lines)
 
@@ -14432,14 +14466,41 @@ elif page == "AI Assistant":
             f"indexed.) Run `python shopify_sync.py` to refresh."
         )
 
-    # Build a lightweight inventory view for the AI tools. The full
-    # ABC engine is currently scoped to the Ordering page block, so
-    # we don't have engine_df here. Instead we compose a simpler
-    # SKU-level frame from products + stock — enough for search,
-    # SKU lookup, and migration chain queries. Tools that need the
-    # full engine (ABC class, Classification etc.) will see those
-    # columns missing and gracefully degrade.
-    if not products.empty:
+    # v2.67.32 — call the same _abc_engine as the Ordering page so
+    # the AI tools get the FULL engine_df (with is_non_master_tube,
+    # trend_flag, is_dormant, excess_units, ABC, etc.). Hoisted to
+    # module scope above so this page has access. With
+    # @st.cache_data(persist='disk') the engine result is reused
+    # across pages — no recomputation if inputs haven't changed.
+    # Falls back to a lightweight stock-only view if products or
+    # sale_lines are missing.
+    if not products.empty and not sale_lines.empty:
+        try:
+            engine_df = _abc_engine(
+                products, stock, sale_lines, purchase_lines)
+        except Exception as _engine_err:  # noqa: BLE001
+            # If the engine fails for any reason, fall back to the
+            # lightweight view so search/SKU-lookup tools still work.
+            st.warning(
+                f"Full ABC engine failed ({_engine_err}); falling "
+                "back to lightweight inventory view. Slow-mover / "
+                "trend signals will be missing — visit the Ordering "
+                "page to check the engine.")
+            engine_df = products.copy()
+            engine_df["SKU"] = engine_df["SKU"].astype(str)
+            if not stock.empty and "SKU" in stock.columns:
+                _stock_view = stock[["SKU"]].copy()
+                _stock_view["SKU"] = _stock_view["SKU"].astype(str)
+                for _col in ("OnHand", "Available"):
+                    if _col in stock.columns:
+                        _stock_view[_col] = pd.to_numeric(
+                            stock[_col], errors="coerce")
+                engine_df = engine_df.merge(
+                    _stock_view, on="SKU", how="left")
+            if "AdditionalAttribute1" in engine_df.columns:
+                engine_df["Family"] = engine_df["AdditionalAttribute1"]
+    elif not products.empty:
+        # No sale_lines — can't run full engine. Lightweight only.
         engine_df = products.copy()
         engine_df["SKU"] = engine_df["SKU"].astype(str)
         if not stock.empty and "SKU" in stock.columns:
@@ -14451,7 +14512,6 @@ elif page == "AI Assistant":
                         stock[_col], errors="coerce")
             engine_df = engine_df.merge(
                 _stock_view, on="SKU", how="left")
-        # Family lives in AdditionalAttribute1 in CIN7 conventions.
         if "AdditionalAttribute1" in engine_df.columns:
             engine_df["Family"] = engine_df["AdditionalAttribute1"]
     else:
