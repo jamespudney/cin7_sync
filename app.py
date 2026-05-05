@@ -228,14 +228,33 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.34 — Profile/channel queries auto-"
-                "exclude mounting-bracket / fixing-kit "
-                "accessories. Same problem we solved for strips: "
-                "'what slow-moving profiles do we have' was "
-                "returning 6 mounting brackets and 4 actual "
-                "profiles — accessories share descriptive words "
-                "with the profile housing they fit. Now filtered.")
+    st.caption("🟢 v2.67.35 — Two new features. (1) AI tools "
+                "now know warehouse Bin location for every SKU "
+                "(answers 'where do we keep X?'). (2) Dormancy "
+                "provenance: SKUs that have ever been flagged "
+                "slow-moving get a ❗ prefix in the Ordering "
+                "page Status column + an auto-note 'WAS slow-"
+                "moving — verify demand before reordering'. "
+                "Auto-lifts after 90d sustained recovery; buyer "
+                "can manually dismiss.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.35** — Bin location now flows through to "
+            "the AI assistant (merged from stock_on_hand into "
+            "engine_df after the cached engine returns). Plus "
+            "dormancy provenance: new sku_dormancy_log table "
+            "tracks every is_dormant=True observation, and the "
+            "Ordering page renders ❗ + auto-note for SKUs that "
+            "were once slow movers. The note explains: 'Sales "
+            "is actively pushing this — verify demand is real "
+            "before reordering. Warning auto-lifts after 90d "
+            "sustained activity.' This guards against the "
+            "stock-reduction fly-wheel from accidentally re-"
+            "ordering items that are only moving because we're "
+            "actively clearing them. Manual dismissals persist "
+            "across re-dormancy (buyer's intent overrides "
+            "automatic re-flagging)."
+        )
         st.caption(
             "**v2.67.34** — Profile/channel auto-exclude list. "
             "Mirrors the v2.67.28 strip-accessory exclude. "
@@ -4772,6 +4791,42 @@ def _abc_engine(products: pd.DataFrame,
         lambda r: (r["FixedCost"] if r["FixedCost"] > 0
                    else float(r["AverageCost"] or 0)), axis=1)
 
+    # v2.67.36 — record dormancy provenance. Write today's
+    # is_dormant snapshot to the sku_dormancy_log table so the
+    # Ordering page can flag "once-slow" SKUs even after they
+    # recover. This runs only on engine recompute (cache miss),
+    # which happens daily after the sync — perfect cadence for
+    # this signal. We classify recovery as "is_dormant=False AND
+    # has recent demand" so a SKU with zero sales doesn't
+    # accidentally trigger the recovery clock.
+    try:
+        _dormant_skus = set(
+            df.loc[df["is_dormant"].fillna(False)
+                    .astype(bool), "SKU"].astype(str).tolist())
+        _onhand_col = (df["OnHand"].fillna(0)
+                        if "OnHand" in df.columns
+                        else pd.Series(0, index=df.index))
+        _eff45_col = (df["effective_units_45d"].fillna(0)
+                        if "effective_units_45d" in df.columns
+                        else (df["units_45d"].fillna(0)
+                              if "units_45d" in df.columns
+                              else pd.Series(0, index=df.index)))
+        _recovered_mask = (
+            (~df["is_dormant"].fillna(False).astype(bool))
+            & (_eff45_col > 0)
+            & (_onhand_col > 0)
+        )
+        _recovered_skus = set(
+            df.loc[_recovered_mask, "SKU"].astype(str).tolist())
+        if _dormant_skus or _recovered_skus:
+            db.record_dormancy_snapshot(
+                _dormant_skus, _recovered_skus)
+    except Exception:  # noqa: BLE001
+        # Provenance write must never break the engine. Failures
+        # here just mean we skip this snapshot — the next engine
+        # recompute will catch up.
+        pass
+
     return df
 
 
@@ -8150,6 +8205,13 @@ engine shows every input and how it got to the suggestion.
     # --- Buyer exclusions + inline notes (loaded once per render) -------
     excluded_skus = db.all_do_not_reorder_skus()
     latest_notes_map = db.latest_note_per_sku()
+    # v2.67.36 — dormancy provenance lookup. Returns {sku: info}
+    # for every SKU that has an active "once-slow" warning. The
+    # engine writes to this on every recompute; here we just read.
+    try:
+        dormancy_warnings_map = db.get_dormancy_warnings()
+    except Exception:  # noqa: BLE001
+        dormancy_warnings_map = {}
 
     # --- Effective dropship set — combined from 4 sources -----------
     # Priority / merging logic (documented in RULES.md §5.4):
@@ -8663,21 +8725,32 @@ engine shows every input and how it got to the suggestion.
     # Status — must use EFFECTIVE units (direct + migrated + rollup),
     # otherwise masters with rolled-up demand (e.g. Sierra65-W-2, strip
     # bulk rolls) get wrongly flagged as Dead Stock.
+    # v2.67.36 — prepend "❗" to the Status when the SKU has an
+    # active once-slow dormancy warning. This is the buyer's cue
+    # to verify whether reorder demand is sales-driven (we just
+    # surfaced it as slow stock and are clearing it) vs genuine
+    # market recovery. The warning auto-lifts after 90d sustained
+    # activity or via manual dismiss.
     def _status(r):
         eff = float(r.get("effective_units_12mo",
                             r.get("units_12mo", 0)) or 0)
         onhand = float(r.get("OnHand") or 0)
+        sku_str = str(r.get("SKU") or "")
+        once_slow = sku_str in dormancy_warnings_map
         if eff == 0 and onhand == 0:
-            return "⚪ No demand, no stock"
-        if eff == 0 and onhand > 0:
-            return "💀 Dead stock"
-        if onhand < (r.get("avg_daily") or 0) * (r.get("lead_time_days") or 0):
-            return "🔴 Reorder now"
-        if onhand < (r.get("target_stock") or 0):
-            return "🟠 Reorder soon"
-        if onhand > (r.get("target_stock") or 0) * 1.5:
-            return "🔵 Overstocked"
-        return "🟢 On target"
+            base = "⚪ No demand, no stock"
+        elif eff == 0 and onhand > 0:
+            base = "💀 Dead stock"
+        elif onhand < (r.get("avg_daily") or 0) * (
+                r.get("lead_time_days") or 0):
+            base = "🔴 Reorder now"
+        elif onhand < (r.get("target_stock") or 0):
+            base = "🟠 Reorder soon"
+        elif onhand > (r.get("target_stock") or 0) * 1.5:
+            base = "🔵 Overstocked"
+        else:
+            base = "🟢 On target"
+        return f"❗ {base}" if once_slow else base
     engine_df["Status"] = engine_df.apply(_status, axis=1)
 
     # --- Top-of-page stock optimisation headline -----------------------
@@ -10082,9 +10155,40 @@ engine shows every input and how it got to the suggestion.
     _work["Source"] = "Auto"
     # Note = latest saved note body for this SKU (blank if none). Editable
     # in-grid; saved to notes table on "Save edits" below.
-    _work["Note"] = _work["SKU"].astype(str).apply(
-        lambda s: latest_notes_map.get(s, "")
-    )
+    # v2.67.36 — prepend a dormancy-provenance warning when the SKU
+    # was once a slow mover. Format: "⚠️ Was slow (last flagged
+    # YYYY-MM-DD). Verify demand is real before reordering. | <buyer
+    # note>". The system-generated prefix is non-editable from the
+    # buyer's perspective (it'll re-appear on the next page render
+    # since it comes from sku_dormancy_log, not the notes table) —
+    # buyers can lift it via the dismiss button, not by deleting
+    # from the Note column.
+    def _build_note(sku_s: str) -> str:
+        manual = latest_notes_map.get(sku_s, "") or ""
+        warning_info = dormancy_warnings_map.get(sku_s)
+        if not warning_info:
+            return manual
+        last_flagged = (
+            str(warning_info.get("last_seen_dormant_at") or "")[:10])
+        recovered = warning_info.get("recovered_at")
+        if recovered:
+            recovered_short = str(recovered)[:10]
+            prefix = (
+                f"⚠️ WAS slow-moving (flagged "
+                f"{last_flagged}, started recovering "
+                f"{recovered_short}). Sales is actively pushing "
+                f"this — verify demand is genuine before reordering. "
+                f"Warning auto-lifts after 90d sustained activity."
+            )
+        else:
+            prefix = (
+                f"⚠️ WAS slow-moving (flagged "
+                f"{last_flagged}). Sales is actively pushing "
+                f"this — verify demand is genuine before reordering. "
+                f"Warning auto-lifts after 90d sustained activity."
+            )
+        return f"{prefix} | {manual}" if manual else prefix
+    _work["Note"] = _work["SKU"].astype(str).apply(_build_note)
     # Exclude? always False in this view — excluded SKUs are already
     # filtered out above. Ticking here + saving moves a row to the
     # "Archived" section.
@@ -14507,6 +14611,24 @@ elif page == "AI Assistant":
         try:
             engine_df = _abc_engine(
                 products, stock, sale_lines, purchase_lines)
+            # v2.67.35 — merge Bin (warehouse shelf location) from
+            # stock_on_hand. Engine doesn't include Bin natively
+            # because it's not a velocity-relevant signal, but
+            # buyers/sales staff often ask "where do we keep X" so
+            # the AI needs it. Take the first non-empty Bin per
+            # SKU (a SKU can be in multiple bins — first one is a
+            # reasonable default for a single-line answer).
+            if not stock.empty and "Bin" in stock.columns:
+                _bin_view = stock[["SKU", "Bin"]].copy()
+                _bin_view["SKU"] = _bin_view["SKU"].astype(str)
+                _bin_view["Bin"] = _bin_view["Bin"].fillna("").astype(str)
+                _bin_view = _bin_view[_bin_view["Bin"].str.strip() != ""]
+                _bin_view = _bin_view.drop_duplicates(subset=["SKU"])
+                engine_df = engine_df.copy()  # don't mutate cache
+                if "Bin" in engine_df.columns:
+                    engine_df = engine_df.drop(columns=["Bin"])
+                engine_df = engine_df.merge(
+                    _bin_view, on="SKU", how="left")
         except Exception as _engine_err:  # noqa: BLE001
             # If the engine fails for any reason, fall back to the
             # lightweight view so search/SKU-lookup tools still work.

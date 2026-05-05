@@ -523,6 +523,32 @@ CREATE INDEX IF NOT EXISTS ix_demand_signals_outcome
 CREATE INDEX IF NOT EXISTS ix_demand_signals_review
     ON demand_signals(needs_review)
     WHERE needs_review = 1;
+
+-- v2.67.36 — Dormancy provenance log. Tracks SKUs that have been
+-- flagged is_dormant=True at any engine run, so that when a salesman
+-- successfully sells one (because the AI surfaced it as slow stock),
+-- the buyer gets a "!" warning before reordering. The warning auto-
+-- lifts after sustained recovery (90 days of post-dormancy active
+-- demand) or buyer manual dismiss. Critical for the discounting/
+-- promotion fly-wheel: we don't want sales-driven recoveries to
+-- inflate reorder targets and re-stock items we're trying to
+-- liquidate.
+CREATE TABLE IF NOT EXISTS sku_dormancy_log (
+    sku                     TEXT PRIMARY KEY,
+    first_seen_dormant_at   TIMESTAMP,        -- earliest is_dormant=True observation
+    last_seen_dormant_at    TIMESTAMP,        -- most recent is_dormant=True observation
+    recovered_at            TIMESTAMP,        -- first observation post-dormancy
+                                                -- where is_dormant=False AND demand>0;
+                                                -- cleared if SKU goes dormant again
+    warning_lifted_at       TIMESTAMP,        -- NULL = warning still active
+    warning_lift_reason     TEXT,             -- 'auto_recovered_90d' | 'manual_dismiss'
+    warning_lifted_by       TEXT,             -- user_id who dismissed (manual)
+    last_engine_run_at      TIMESTAMP,        -- last time engine touched this row
+    created_at              TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS ix_dormancy_active
+    ON sku_dormancy_log(warning_lifted_at)
+    WHERE warning_lifted_at IS NULL;
 """
 
 
@@ -3714,3 +3740,195 @@ def last_demand_signal_reconcile_at() -> Optional[str]:
             "ORDER BY at DESC LIMIT 1"
         ).fetchone()
     return row["at"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# v2.67.36 — Dormancy provenance helpers.
+# ---------------------------------------------------------------------------
+# Track SKUs that have been flagged is_dormant=True so that when a
+# salesman successfully sells one (because the AI surfaced it as slow
+# stock), the buyer gets a "!" warning before reordering. The warning
+# auto-lifts after 90 days of sustained post-dormancy activity, or
+# can be manually dismissed.
+
+# How long sustained activity (post-dormancy) must persist before the
+# warning auto-lifts. Buyer can override via the dismiss button.
+DORMANCY_RECOVERY_LIFT_DAYS = 90
+
+
+def record_dormancy_snapshot(dormant_skus: set,
+                              recovered_skus: set,
+                              lift_after_days: int = DORMANCY_RECOVERY_LIFT_DAYS
+                              ) -> dict:
+    """v2.67.36 — write today's dormancy state into sku_dormancy_log.
+
+    Called once per ABC engine recompute (which happens daily after
+    the sync). Three flows:
+
+      1. SKU is dormant NOW → upsert with last_seen_dormant_at=now,
+         clear recovered_at (we're back to dormant), and set
+         first_seen_dormant_at if this is the first observation.
+
+      2. SKU was dormant before AND is now active+selling → set
+         recovered_at if not yet set, and check whether it's been
+         active long enough to auto-lift the warning.
+
+      3. SKUs we don't see this run stay as-is. The warning persists
+         indefinitely until lifted.
+
+    Args:
+        dormant_skus: set of SKU strings where is_dormant=True now.
+        recovered_skus: set of SKU strings where is_dormant=False AND
+            recent demand > 0 (i.e. genuinely active again).
+
+    Returns a small summary dict {dormant_seen, recoveries_started,
+    auto_lifted} for logging.
+    """
+    summary = {
+        "dormant_seen": 0,
+        "recoveries_started": 0,
+        "auto_lifted": 0,
+    }
+    if not dormant_skus and not recovered_skus:
+        return summary
+    with connect() as c:
+        # 1. Dormant SKUs — upsert "still / newly" dormant.
+        for sku in dormant_skus:
+            sku = str(sku).strip()
+            if not sku:
+                continue
+            c.execute(
+                """
+                INSERT INTO sku_dormancy_log
+                    (sku, first_seen_dormant_at, last_seen_dormant_at,
+                     recovered_at, last_engine_run_at)
+                VALUES
+                    (?, datetime('now'), datetime('now'),
+                     NULL, datetime('now'))
+                ON CONFLICT(sku) DO UPDATE SET
+                    last_seen_dormant_at = datetime('now'),
+                    recovered_at = NULL,
+                    last_engine_run_at = datetime('now'),
+                    -- Re-dormancy clears any prior auto-lift so the
+                    -- warning re-engages. Manual dismissals stay
+                    -- (buyer's intent persists across re-dormancy).
+                    warning_lifted_at = CASE
+                        WHEN warning_lift_reason = 'manual_dismiss'
+                        THEN warning_lifted_at
+                        ELSE NULL
+                    END,
+                    warning_lift_reason = CASE
+                        WHEN warning_lift_reason = 'manual_dismiss'
+                        THEN warning_lift_reason
+                        ELSE NULL
+                    END
+                """,
+                (sku,),
+            )
+            summary["dormant_seen"] += 1
+        # 2. Recovered SKUs — record first sign of recovery and
+        #    auto-lift if recovery is sustained.
+        for sku in recovered_skus:
+            sku = str(sku).strip()
+            if not sku:
+                continue
+            # Set recovered_at if a prior dormancy exists and we
+            # haven't yet recorded recovery. Use cursor explicitly
+            # so we can read .rowcount (Connection has no rowcount).
+            cur = c.execute(
+                """
+                UPDATE sku_dormancy_log
+                   SET recovered_at = COALESCE(recovered_at,
+                                                datetime('now')),
+                       last_engine_run_at = datetime('now')
+                 WHERE sku = ?
+                   AND last_seen_dormant_at IS NOT NULL
+                """,
+                (sku,),
+            )
+            if cur.rowcount > 0:
+                row = c.execute(
+                    "SELECT recovered_at, last_seen_dormant_at, "
+                    "       warning_lifted_at "
+                    "  FROM sku_dormancy_log WHERE sku = ?",
+                    (sku,),
+                ).fetchone()
+                if row and row["recovered_at"] and not row[
+                        "warning_lifted_at"]:
+                    # Auto-lift if the recovery has held for the
+                    # threshold AND last_seen_dormant_at is older
+                    # than the recovery (i.e. no re-dormancy).
+                    auto_cur = c.execute(
+                        """
+                        UPDATE sku_dormancy_log
+                           SET warning_lifted_at = datetime('now'),
+                               warning_lift_reason = 'auto_recovered_'
+                                                  || ?
+                                                  || 'd'
+                         WHERE sku = ?
+                           AND warning_lifted_at IS NULL
+                           AND recovered_at IS NOT NULL
+                           AND last_seen_dormant_at < recovered_at
+                           AND julianday('now')
+                                 - julianday(recovered_at)
+                               >= ?
+                        """,
+                        (int(lift_after_days), sku,
+                         int(lift_after_days)),
+                    )
+                    if auto_cur.rowcount > 0:
+                        summary["auto_lifted"] += 1
+                    else:
+                        summary["recoveries_started"] += 1
+    return summary
+
+
+def get_dormancy_warnings() -> dict:
+    """v2.67.36 — return {sku: warning_info} for SKUs with an active
+    once-slow warning. Used by the Ordering page to render a "!" in
+    the Status column and an auto-note next to the buyer's manual
+    notes."""
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT sku,
+                   first_seen_dormant_at,
+                   last_seen_dormant_at,
+                   recovered_at,
+                   last_engine_run_at
+              FROM sku_dormancy_log
+             WHERE warning_lifted_at IS NULL
+               AND last_seen_dormant_at IS NOT NULL
+            """,
+        ).fetchall()
+    out = {}
+    for r in rows:
+        out[r["sku"]] = {
+            "first_seen_dormant_at": r["first_seen_dormant_at"],
+            "last_seen_dormant_at": r["last_seen_dormant_at"],
+            "recovered_at": r["recovered_at"],
+            "last_engine_run_at": r["last_engine_run_at"],
+        }
+    return out
+
+
+def dismiss_dormancy_warning(sku: str, user_id: str = "",
+                                reason: str = "manual_dismiss") -> None:
+    """v2.67.36 — buyer override. Clears the once-slow warning so
+    the SKU stops getting flagged in the Ordering page. The reason
+    distinguishes manual dismissals from auto-lifts; manual ones
+    persist across re-dormancy (a buyer's deliberate decision)."""
+    sku = str(sku).strip()
+    if not sku:
+        return
+    with connect() as c:
+        c.execute(
+            """
+            UPDATE sku_dormancy_log
+               SET warning_lifted_at = datetime('now'),
+                   warning_lift_reason = ?,
+                   warning_lifted_by = ?
+             WHERE sku = ?
+            """,
+            (reason, user_id or "", sku),
+        )
