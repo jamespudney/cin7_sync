@@ -228,15 +228,29 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.28 — Stop accessory-junk from eating "
-                "limit slots in stock-listing answers. "
-                "search_products_by_text now auto-unions strip-"
-                "accessory excludes (drivers/connectors/dimmers/"
-                "etc.) for any 'strip' query. System prompt "
-                "tightened: limit=200 mandatory for stock "
-                "questions, AI must verify every known warm-white "
-                "family is in the result before answering.")
+    st.caption("🟢 v2.67.29 — parents_only=true is now the "
+                "DEFAULT in search_products_by_text (no longer "
+                "depends on the AI remembering to pass it). "
+                "Slow/dead/excess flags are now MANDATORY in "
+                "answer format — every is_dormant row must be "
+                "prefixed with ⚠️ SLOW, every dead-stock row "
+                "with 🔴 DEAD, every excess row with 📦 EXCESS.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.29** — Two failure modes locked down. "
+            "(1) parents_only default flipped to True at the "
+            "search_products_by_text layer — the AI was "
+            "inconsistently passing this arg, so child SKUs "
+            "(LEDIRIS3000-60-0305 etc.) kept slipping through. "
+            "Making it the default eliminates that variable. "
+            "(2) Answer format rule made HARD: every row with "
+            "is_dormant=true must be prefixed with ⚠️ SLOW; "
+            "OnHand>0 with zero 12mo demand gets 🔴 DEAD; "
+            "excess_units>0 gets 📦 EXCESS; non-Stable "
+            "trend_flag appended. The whole point of the app "
+            "is shrinking stock holding — the AI was hiding the "
+            "very signal that drives that decision."
+        )
         st.caption(
             "**v2.67.28** — Coverage discipline for stock "
             "answers. White Iris / White Lily / Cardinal Flower "
@@ -15196,6 +15210,34 @@ elif page == "AI Assistant":
                 # The Ordering page's ABC engine is the source of
                 # truth for slow/dead/excess intelligence; we just
                 # surface its columns to the AI.
+                # v2.67.29 — make slow-mover surfacing a HARD
+                # format requirement, not a soft suggestion. The
+                # buyer/sales staff use these flags to decide what
+                # to push, so missing them is a critical failure.
+                "**MANDATORY ANSWER FORMAT (v2.67.29) — every "
+                "product row in a stock answer MUST include "
+                "trend_flag and slow/dead/excess flags from the "
+                "engine columns:**\n"
+                "  - If `is_dormant` is true → prefix with "
+                "`⚠️ SLOW —`\n"
+                "  - If `OnHand`>0 AND `effective_units_12mo`==0 "
+                "→ prefix with `🔴 DEAD —`\n"
+                "  - If `excess_units`>0 → prefix with "
+                "`📦 EXCESS —`\n"
+                "  - If `trend_flag` is non-Stable → append the "
+                "trend_flag (e.g. ` 📉 Decline` or ` 🎯 Project`)\n"
+                "Required format example:\n"
+                "  `⚠️ SLOW — LED-31.171-6 — Elite Gold 2400K "
+                "15W/m 6m — **0.07 on hand** — ABC=C — 📉 "
+                "Decline`\n"
+                "  `LEDIRIS2700-120-100M — White Iris 2700K "
+                "120LEDs/m 100m — **1.02 on hand** — ABC=B`\n"
+                "Do NOT just list SKUs and qty — that hides the "
+                "stock-reduction signal which is the whole point "
+                "of this app. If a row in the result has "
+                "is_dormant=true and you don't flag it, the "
+                "answer is wrong. Sales staff scan for the "
+                "⚠️ / 🔴 / 📦 markers to spot what to push.\n\n"
                 "**Engine signals — the ABC analytics intelligence "
                 "the app already produces (v2.67.27):** every "
                 "search_products / search_products_by_text row "

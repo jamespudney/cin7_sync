@@ -1659,17 +1659,18 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if family and "Family" in df.columns:
         df = df[df["Family"].astype(str).str.upper() == family]
 
-    # v2.67.23 — parents_only at search-level was too aggressive: it
-    # shrank cin7_matched_skus so much that find_products' Shopify
-    # scoring loop saw `sp_skus_passing` empty for almost every hit,
-    # and every family fell into the "found in Shopify; stock data
-    # not available" fallback branch. The fix is to keep this layer
-    # wide (no parents_only filter here by default) and let
-    # find_products apply the filter AT EMISSION TIME, where it can
-    # skip child SKUs without breaking the family-coverage signal.
-    # Default reverted to False; pass True explicitly only when the
-    # caller wants the search itself narrowed (rare).
-    parents_only = bool(args.get("parents_only", False))
+    # v2.67.29 — default flipped back to True. v2.67.23 set it to
+    # False to fix find_products' Shopify scoring loop, but
+    # find_products now explicitly passes parents_only=False to
+    # search_products_by_text (handling the filter at emission
+    # time). Direct callers of search_products_by_text — including
+    # the AI assistant — should get parents-only by default so
+    # child SKUs (per-foot cuts, BOM derivatives) are hidden
+    # automatically. The AI was inconsistently passing this arg,
+    # so making it the default eliminates that as a source of
+    # failure. Pass parents_only=false explicitly when you actually
+    # want every variant.
+    parents_only = bool(args.get("parents_only", True))
     if parents_only and "is_non_master_tube" in df.columns:
         df = df[~df["is_non_master_tube"].fillna(False)]
 
