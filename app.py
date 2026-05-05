@@ -228,13 +228,28 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.33 — On-the-fly feedback. Type a "
-                "one-line correction under any AI answer and it "
-                "becomes a standing rule the assistant follows on "
-                "every future question. Active corrections are "
-                "shown in a 🧠 panel above the chat input; archive "
-                "any that are no longer wanted.")
+    st.caption("🟢 v2.67.34 — Profile/channel queries auto-"
+                "exclude mounting-bracket / fixing-kit "
+                "accessories. Same problem we solved for strips: "
+                "'what slow-moving profiles do we have' was "
+                "returning 6 mounting brackets and 4 actual "
+                "profiles — accessories share descriptive words "
+                "with the profile housing they fit. Now filtered.")
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.34** — Profile/channel auto-exclude list. "
+            "Mirrors the v2.67.28 strip-accessory exclude. "
+            "search_products_by_text now detects 'profile', "
+            "'channel', or 'extrusion' in the query and auto-"
+            "unions a _DEFAULT_EXCLUDES_FOR_PROFILES list "
+            "(mounting bracket, fixing kit, end cap, LED strip, "
+            "driver, connector, etc.) so the user sees the "
+            "actual profile extrusions, not the brackets that "
+            "mount them. Strip-vs-profile detection is "
+            "mutually exclusive — a query is one or the other. "
+            "Bare 'mount'/'mounting' is preserved so legit "
+            "names like 'Surface Mount Profile' aren't dropped."
+        )
         st.caption(
             "**v2.67.33** — Feedback fly-wheel. Replaced the "
             "👍/👎 buttons + separate Feedback page with an "
@@ -15511,6 +15526,29 @@ elif page == "AI Assistant":
                 "dead / decline items are PRIORITY to sell — "
                 "shrinking stock holding is the strategic driver "
                 "of this whole app.\n\n"
+                # v2.67.34 — profile/channel auto-exclude. The
+                # search_products_by_text tool now auto-unions a
+                # _DEFAULT_EXCLUDES_FOR_PROFILES list when the query
+                # contains 'profile', 'channel', or 'extrusion'.
+                # The AI should still pass an explicit exclude_types
+                # for profile queries as a safety net (mirrors the
+                # strip behaviour).
+                "**Profile / channel routing (v2.67.34):** when "
+                "the user asks about LED 'profiles' / 'channels' / "
+                "'extrusions' (the aluminum housing that the LED "
+                "strip slots into), they want the EXTRUSION "
+                "ITSELF — not mounting brackets, fixing kits, "
+                "end caps, or the LED strip that sits inside it. "
+                "Pass exclude_types=['mounting bracket', "
+                "'mounting kit', 'fixing kit', 'end cap', "
+                "'led strip', 'driver', 'connector'] for these "
+                "queries (the tool also auto-unions a "
+                "comprehensive default list when query contains "
+                "'profile' / 'channel' / 'extrusion'). Do NOT "
+                "exclude bare 'mount' or 'mounting' because "
+                "legitimate profiles often have names like "
+                "'Surface Mount Profile' or 'Suspended Mount "
+                "Profile'.\n\n"
                 "**Title-abbreviation reality (v2.67):** CIN7 "
                 "product titles abbreviate freely. 'Ultra Wm', "
                 "'Wm', or 'Warm' may appear instead of 'warm white' "

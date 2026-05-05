@@ -1595,10 +1595,27 @@ def search_products_by_text(engine_df: pd.DataFrame,
     # symptom was: ai assistant called search_products_by_text with
     # limit=50, accessories ate ~25 slots, and major families like
     # White Iris / White Lily fell off the bottom of the result.
-    if "strip" in query:
+    #
+    # v2.67.34 — same treatment for profile/channel/extrusion
+    # queries. "What slow-moving profiles do we have" was returning
+    # mounting brackets and fixing kits because those rows contain
+    # "profile" in their descriptions; the user wants the profile
+    # extrusions themselves. Strip and profile excludes are
+    # mutually exclusive (a query is one or the other), so we pick
+    # which list to apply based on which keyword fires.
+    _qlower = query.lower() if isinstance(query, str) else ""
+    if "strip" in _qlower:
         from product_search import _DEFAULT_EXCLUDES_FOR_STRIPS
         _existing_lower = set(exclude_types)
         for _default in _DEFAULT_EXCLUDES_FOR_STRIPS:
+            if _default.lower() not in _existing_lower:
+                exclude_types.append(_default.lower())
+                _existing_lower.add(_default.lower())
+    elif any(_kw in _qlower for _kw in
+              ("profile", "channel", "extrusion")):
+        from product_search import _DEFAULT_EXCLUDES_FOR_PROFILES
+        _existing_lower = set(exclude_types)
+        for _default in _DEFAULT_EXCLUDES_FOR_PROFILES:
             if _default.lower() not in _existing_lower:
                 exclude_types.append(_default.lower())
                 _existing_lower.add(_default.lower())

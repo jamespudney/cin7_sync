@@ -718,6 +718,35 @@ _DEFAULT_EXCLUDES_FOR_STRIPS = (
     "service", "transformer",
 )
 
+# v2.67.34 — Default exclude list when the caller asks about
+# profiles / channels / extrusions. Same problem the strip filter
+# solves, inverted: a "what slow-moving profiles do we have" query
+# was pulling in mounting brackets, fixing kits, and end caps —
+# accessories of profiles that share descriptive words. The user
+# wants the profile extrusions themselves, not what mounts them.
+#
+# Note we DO NOT exclude single-word "mount" or "mounting" because
+# legitimate profile names contain "Surface Mount" / "Recessed
+# Mount" / "Suspended Mount" indicating the profile's installation
+# style. We exclude the longer phrases ("mounting bracket",
+# "mounting kit") and explicit accessory terms.
+_DEFAULT_EXCLUDES_FOR_PROFILES = (
+    # Mounting / fixing accessories
+    "mounting bracket", "mounting kit", "mounting clip",
+    "fixing kit", "fixing clip", "wall bracket",
+    "ceiling bracket", "end cap", "endcap",
+    "spring clip",
+    # LED-strip-related (the user is asking about the housing,
+    # not the strip itself)
+    "led strip", "led tape", "strip light",
+    # Power / electronics (not the profile)
+    "driver", "dimmer", "controller", "power supply",
+    "transformer", "psu", "amplifier", "repeater",
+    "extension cable",
+    # Generic accessory rows
+    "service", "accessory",
+)
+
 
 def find_products(engine_df: pd.DataFrame,
                    sale_lines_df: pd.DataFrame,
