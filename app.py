@@ -228,10 +228,34 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.17 — Density-aware bucket diversification "
-                "so 180-density variants surface alongside 120/60.")
+    st.caption("🟢 v2.67.19 — get_sales_totals now accepts "
+                "start_date/end_date for arbitrary historical "
+                "ranges (April 2026, Q1 2026, etc.).")
     with st.expander("Recent versions", expanded=False):
         st.caption(
+            "**v2.67.19** — get_sales_totals gained "
+            "`start_date` / `end_date` params (ISO YYYY-MM-DD, "
+            "inclusive). Previously the tool only accepted a "
+            "fixed `period` enum (today / mtd / last_30_days / "
+            "ytd / last_year etc.), so questions like 'how did "
+            "April do?' or 'Q1 2026 revenue' forced Claude to "
+            "either guess via group_by='month' inference or "
+            "admit the limitation. Now custom ranges are first-"
+            "class — Claude passes the explicit dates and the "
+            "tool does header-revenue + line-item-units + "
+            "order-count aggregation exactly as for the pre-"
+            "defined periods. Schema's `required` was relaxed "
+            "(period no longer mandatory). Dates win over period "
+            "if both are passed; malformed dates return a clear "
+            "error rather than mis-aggregating.\n\n"
+            "**v2.67.18** — Cap raised from 2 to 3 SKUs per "
+            "(family, kelvin) bucket in pass 1, paired with "
+            "v2.67.17's density-aware diversification. Each kelvin "
+            "now emits 3 distinct-density variants — for Iris "
+            "2700K: LEDIRIS2700-120-0305 (120 LED/m), "
+            "LEDIRIS2700-180-0305 (180 LED/m), and "
+            "LEDIRIS2700-60-0305 (60 LED/m). Total Iris pass-1 "
+            "emissions: 9 (3 densities × 3 warm kelvins).\n\n"
             "**v2.67.17** — Within each (family, kelvin) bucket, "
             "reorder SKUs to interleave by first varying segment. "
             "v2.67.16's pass-1 cap=2 was emitting two same-density "
@@ -14590,7 +14614,10 @@ elif page == "AI Assistant":
                 "any period ('total sales this month', 'last 90 days "
                 "revenue', 'monthly trend for the last 6 months'). "
                 "Uses order-level data so the revenue figure matches "
-                "CIN7's dashboard (includes shipping + tax).\n"
+                "CIN7's dashboard (includes shipping + tax). For "
+                "arbitrary historical ranges ('April 2026', 'Q1 "
+                "2026', 'Mar 15 to Apr 30') pass start_date + "
+                "end_date as ISO YYYY-MM-DD instead of period.\n"
                 "- get_recent_signals / get_top_inquired_products / "
                 "get_rising_demand / get_demand_score — DEMAND "
                 "SIGNAL tools. Use these for proactive questions: "

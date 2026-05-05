@@ -206,10 +206,14 @@ TOOL_SCHEMAS: list[dict] = [
             "per-SKU. Use when the user asks about company-wide sales: "
             "'what have our sales been this month?', 'how much did we "
             "sell last week?', 'monthly revenue for the last 6 months', "
-            "'compare this month to last month'. Returns revenue (from "
+            "'compare this month to last month', 'how did April do?', "
+            "'Q1 2026 revenue'. Returns revenue (from "
             "order headers, includes shipping & tax — matches CIN7's "
             "Revenue tile), unit count (from line items), and order "
-            "count for the requested period and granularity."
+            "count for the requested range and granularity. "
+            "Pass EITHER `period` (pre-defined) OR `start_date` + "
+            "`end_date` (arbitrary historical range, ISO YYYY-MM-DD). "
+            "If both are given, the explicit dates win."
         ),
         "input_schema": {
             "type": "object",
@@ -222,7 +226,24 @@ TOOL_SCHEMAS: list[dict] = [
                               "ytd", "last_year"],
                     "description": "Pre-defined period. Use 'mtd' "
                                    "for month-to-date, 'ytd' for year-"
-                                   "to-date.",
+                                   "to-date. Omit when passing "
+                                   "start_date/end_date.",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start of custom range, "
+                                   "ISO YYYY-MM-DD (inclusive). "
+                                   "Examples: April 2026 → "
+                                   "'2026-04-01'; Q1 2026 → "
+                                   "'2026-01-01'. Pair with end_date.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End of custom range, "
+                                   "ISO YYYY-MM-DD (inclusive). "
+                                   "Examples: April 2026 → "
+                                   "'2026-04-30'; Q1 2026 → "
+                                   "'2026-03-31'. Pair with start_date.",
                 },
                 "group_by": {
                     "type": "string",
@@ -233,7 +254,7 @@ TOOL_SCHEMAS: list[dict] = [
                                    "month etc.",
                 },
             },
-            "required": ["period"],
+            "required": [],
         },
     },
     {
@@ -967,32 +988,55 @@ def get_sales_totals(engine_df: pd.DataFrame,
     cache populated by the page on first call. To keep the dispatch
     signature uniform, we use the module-level _SALES_FULL hook below.
     """
-    period = (args.get("period") or "mtd").strip().lower()
+    raw_period = args.get("period")
+    raw_start = (args.get("start_date") or "").strip()
+    raw_end = (args.get("end_date") or "").strip()
     group_by = (args.get("group_by") or "none").strip().lower()
 
     today = pd.Timestamp.now().normalize()
-    if period == "today":
-        start, end = today, today
-    elif period == "yesterday":
-        start = end = today - pd.Timedelta(days=1)
-    elif period == "mtd":
-        start, end = today.replace(day=1), today
-    elif period == "last_7_days":
-        start, end = today - pd.Timedelta(days=7), today
-    elif period == "last_30_days":
-        start, end = today - pd.Timedelta(days=30), today
-    elif period == "last_90_days":
-        start, end = today - pd.Timedelta(days=90), today
-    elif period == "last_365_days":
-        start, end = today - pd.Timedelta(days=365), today
-    elif period == "ytd":
-        start = pd.Timestamp(year=today.year, month=1, day=1)
-        end = today
-    elif period == "last_year":
-        start = pd.Timestamp(year=today.year - 1, month=1, day=1)
-        end = pd.Timestamp(year=today.year - 1, month=12, day=31)
+
+    # v2.67.19 — custom date range branch. If start_date/end_date are
+    # provided, use those (they win over period). This makes arbitrary
+    # historical ranges like 'April 2026' or 'Q1 2026' first-class
+    # without forcing Claude into the breakdown-inference workaround.
+    if raw_start or raw_end:
+        if not (raw_start and raw_end):
+            return {"error": "start_date and end_date must both be "
+                              "provided (ISO YYYY-MM-DD)."}
+        try:
+            start = pd.Timestamp(raw_start).normalize()
+            end = pd.Timestamp(raw_end).normalize()
+        except (ValueError, TypeError) as exc:
+            return {"error": f"Could not parse start_date/end_date "
+                             f"({exc}). Expect ISO YYYY-MM-DD."}
+        if start > end:
+            return {"error": f"start_date {raw_start!r} is after "
+                             f"end_date {raw_end!r}."}
+        period = f"custom ({raw_start} to {raw_end})"
     else:
-        return {"error": f"Unknown period {period!r}"}
+        period = (raw_period or "mtd").strip().lower()
+        if period == "today":
+            start, end = today, today
+        elif period == "yesterday":
+            start = end = today - pd.Timedelta(days=1)
+        elif period == "mtd":
+            start, end = today.replace(day=1), today
+        elif period == "last_7_days":
+            start, end = today - pd.Timedelta(days=7), today
+        elif period == "last_30_days":
+            start, end = today - pd.Timedelta(days=30), today
+        elif period == "last_90_days":
+            start, end = today - pd.Timedelta(days=90), today
+        elif period == "last_365_days":
+            start, end = today - pd.Timedelta(days=365), today
+        elif period == "ytd":
+            start = pd.Timestamp(year=today.year, month=1, day=1)
+            end = today
+        elif period == "last_year":
+            start = pd.Timestamp(year=today.year - 1, month=1, day=1)
+            end = pd.Timestamp(year=today.year - 1, month=12, day=31)
+        else:
+            return {"error": f"Unknown period {period!r}"}
 
     # Headers (revenue) — order-level, includes shipping/tax.
     rev_total = 0.0
