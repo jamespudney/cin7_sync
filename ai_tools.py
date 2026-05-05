@@ -1606,20 +1606,17 @@ def search_products_by_text(engine_df: pd.DataFrame,
     if family and "Family" in df.columns:
         df = df[df["Family"].astype(str).str.upper() == family]
 
-    # v2.67.22 — parents_only filter. Reuses the Ordering page's
-    # `is_non_master_tube` column on engine_df, which is computed by
-    # `_final_is_non_master()` (app.py) using the same authoritative
-    # rules: BOM child detection, sourcing-rule SourceFraction, and
-    # supplier-assignment heuristics. When True (the default for
-    # broad-discovery questions), we drop child SKUs that are derived
-    # from a parent — e.g. per-foot LEDIRIS2700-120-0305 is hidden in
-    # favor of the supplier-orderable parent LEDIRIS2700-120-100M.
-    # The buyer crew uses these answers to decide what to reorder /
-    # promote / discontinue, and child SKUs duplicate the same parent
-    # product visually — surfacing both clutters the answer and
-    # crowds out other families. Default True; pass False explicitly
-    # to see all variants.
-    parents_only = bool(args.get("parents_only", True))
+    # v2.67.23 — parents_only at search-level was too aggressive: it
+    # shrank cin7_matched_skus so much that find_products' Shopify
+    # scoring loop saw `sp_skus_passing` empty for almost every hit,
+    # and every family fell into the "found in Shopify; stock data
+    # not available" fallback branch. The fix is to keep this layer
+    # wide (no parents_only filter here by default) and let
+    # find_products apply the filter AT EMISSION TIME, where it can
+    # skip child SKUs without breaking the family-coverage signal.
+    # Default reverted to False; pass True explicitly only when the
+    # caller wants the search itself narrowed (rare).
+    parents_only = bool(args.get("parents_only", False))
     if parents_only and "is_non_master_tube" in df.columns:
         df = df[~df["is_non_master_tube"].fillna(False)]
 
@@ -1642,11 +1639,17 @@ def search_products_by_text(engine_df: pd.DataFrame,
     # (is_dormant, effective_units_12mo, excess_units, OnHand) so the
     # post-process below can compute slow/dead/active flags even when
     # engine_df doesn't have a literal `Classification` column.
+    # v2.67.23 — also include `trend_flag` (Stable / 📈 Trend / 🎯
+    # Project / 🔀 Mixed / 📉 Decline). The Ordering page uses this
+    # as a sales-staff rating: a 🎯 Project SKU has concentrated
+    # demand from 1-2 buyers, a 📉 Decline SKU has falling momentum.
+    # Sales staff want this rating inline so they can prioritise
+    # selling slow movers / declining stock.
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
         "OnHand", "TargetStock", "ReorderSuggested",
         "is_dormant", "effective_units_12mo", "excess_units",
-        "is_non_master_tube",
+        "is_non_master_tube", "trend_flag",
     ] if c in df.columns]
     df = df.head(limit)[cols_we_want] if cols_we_want else df.head(limit)
     rows = [_serialise_row(r) for r in df.to_dict(orient="records")]

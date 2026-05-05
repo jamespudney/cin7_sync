@@ -981,11 +981,15 @@ def find_products(engine_df: pd.DataFrame,
                 "fields": ["title", "name", "description", "tags",
                             "product_type", "category"],
                 "in_stock_only": in_stock_only,
-                # v2.67.22 — forward parents_only so child SKUs are
-                # excluded from cin7_matched_skus. Without this, the
-                # Shopify-side scoring loop would still find child
-                # SKUs in sp.skus and emit them.
-                "parents_only": parents_only,
+                # v2.67.23 — keep cin7_rows wide (do NOT filter
+                # children at search level). v2.67.22 had this set
+                # to True which shrank cin7_matched_skus so much
+                # that find_products' Shopify scoring loop saw
+                # empty sp_skus_passing for every hit and emitted
+                # only Shopify-only fallback rows. parents_only is
+                # now applied at emission time below where it can
+                # skip child SKUs without breaking family coverage.
+                "parents_only": False,
                 # v2.67.11 — bumped 200 → 1000. With 200 we were
                 # getting only the alphabetically/CSV-first 200
                 # warm-white-matching CIN7 rows; LED-31.* and
@@ -1081,6 +1085,17 @@ def find_products(engine_df: pd.DataFrame,
         if sku in seen_skus:
             return
         cin7_row = cin7_rows_by_sku.get(sku, {})
+        # v2.67.23 — parents_only filter at emission time. Skip child
+        # SKUs (per-foot cuts, BOM derivatives, fractional sources)
+        # so the answer matches the Ordering page's PO-suggestion
+        # logic. Filter applied here (not at search level) so that
+        # the Shopify scoring loop's family-coverage signal stays
+        # accurate — children still count for "this family has
+        # passing variants" but they don't get emitted as separate
+        # rows. v2.67.22 had this filter at search level which broke
+        # family coverage entirely; v2.67.23 moves it here.
+        if parents_only and cin7_row.get("is_non_master_tube"):
+            return
         onhand_raw = (cin7_row.get("OnHand")
                        if "OnHand" in cin7_row
                        else cin7_by_sku.get(sku, {}).get("OnHand"))
@@ -1101,6 +1116,8 @@ def find_products(engine_df: pd.DataFrame,
         # candidates inline. Classification is derived in
         # search_products_by_text via _ensure_classification_column,
         # so cin7_row already has the field.
+        # v2.67.23 — also propagate trend_flag (Stable / 📈 Trend /
+        # 🎯 Project / 🔀 Mixed / 📉 Decline) for sales staff rating.
         out.append({
             "sku": sku,
             "name": (cin7_row.get("Name")
@@ -1114,6 +1131,7 @@ def find_products(engine_df: pd.DataFrame,
             "stock": onhand_v,
             "stock_status": stock_status_v,
             "classification": cin7_row.get("Classification"),
+            "trend_flag": cin7_row.get("trend_flag"),
             "matched_in": fields_hit,
             "score": round(score, 2),
             "note": None,
@@ -1197,6 +1215,13 @@ def find_products(engine_df: pd.DataFrame,
     # passing SKUs by kelvin (parsed from CIN7 Name) and emit one SKU
     # per kelvin bucket, capped at _PER_FAMILY_PASS_1 distinct kelvin
     # temperatures per family.
+    # v2.67.23 — helper to detect child SKUs at emission time. Reads
+    # is_non_master_tube from cin7_rows_by_sku (which now flows
+    # through search_products_by_text result rows). Centralising this
+    # so pass-1, pass-2, and CIN7-only fallback share the same check.
+    def _is_child_sku(sku: str) -> bool:
+        return bool(cin7_rows_by_sku.get(sku, {}).get("is_non_master_tube"))
+
     for score, fields_hit, sp in shopify_hits:
         # v2.67.20 — pass-1 stops at pass_1_budget (not limit) so the
         # remaining slots are reserved for pass-2 density depth.
@@ -1237,6 +1262,22 @@ def find_products(engine_df: pd.DataFrame,
             # SKUs from different densities/form-factors instead
             # of two same-density variants, surfacing the variety
             # users expect to see in a single answer.
+            #
+            # v2.67.23 — drop child SKUs from each bucket BEFORE
+            # diversification + emission when parents_only=True,
+            # so per-foot cuts (LEDIRIS2700-120-0305) and other
+            # BOM derivatives don't eat pass-1 emission slots.
+            # This is the right layer for the filter: by the time
+            # we get here, family-coverage signal (sp_skus_passing
+            # non-empty) has already been preserved upstream, so
+            # trimming the bucket only affects which specific SKU
+            # gets emitted — not whether the family appears at all.
+            if parents_only:
+                for k in list(sku_by_kelvin.keys()):
+                    sku_by_kelvin[k] = [s for s in sku_by_kelvin[k]
+                                          if not _is_child_sku(s)]
+                    if not sku_by_kelvin[k]:
+                        del sku_by_kelvin[k]
             for k in sku_by_kelvin:
                 sku_by_kelvin[k] = _diversify_skus(sku_by_kelvin[k])
 
@@ -1381,6 +1422,10 @@ def find_products(engine_df: pd.DataFrame,
         bucket_order: list[tuple[str, str]] = []
         for entry in deferred:
             score, fields_hit, sp, sku = entry
+            # v2.67.23 — drop child SKUs from pass-2 deferred queue
+            # when parents_only=True. Same reasoning as pass-1.
+            if parents_only and _is_child_sku(sku):
+                continue
             family_key = sp.family or f"_handle_{sp.handle}"
             name = str(cin7_rows_by_sku.get(sku, {}).get("Name") or "")
             m = re.search(r"\b(\d{4})\s*[Kk]\b", name)
@@ -1425,6 +1470,11 @@ def find_products(engine_df: pd.DataFrame,
         for r in cin7_rows:
             sku = str(r.get("SKU") or "").strip()
             if not sku or sku in seen_skus or sku in shopify_sku_set:
+                continue
+            # v2.67.23 — skip child SKUs in CIN7-only fallback when
+            # parents_only=True (the column flows through search_
+            # products_by_text result rows; see cols_we_want).
+            if parents_only and r.get("is_non_master_tube"):
                 continue
             name = str(r.get("Name") or "")
             family = detect_family(name)
@@ -1476,7 +1526,10 @@ def find_products(engine_df: pd.DataFrame,
                 "stock_status": stock_status,
                 # v2.67.22 — propagate Classification from cin7 row
                 # so slow/dead/excess flags surface in the answer.
+                # v2.67.23 — also propagate trend_flag for sales
+                # rating.
                 "classification": r.get("Classification"),
+                "trend_flag": r.get("trend_flag"),
                 "matched_in": ["cin7-text-search"],
                 "score": float(r.get("score") or 0.0),
                 "note": None,
