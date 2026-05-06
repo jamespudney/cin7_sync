@@ -29,6 +29,13 @@ REM 2026-05-05 even though OnOrder=190 in stock-on-hand. 30 days
 REM matches the EU/Asia supplier lead-time floor.
 python cin7_sync.py purchaselines --days 30 >> output\daily_sync.log 2>&1
 
+REM v2.67.54 — ShipStation 7-day catch-up. Skipped automatically by
+REM the script when SHIPSTATION_API_KEY/SECRET env vars aren't set,
+REM so leaving this enabled before keys are configured is harmless.
+REM First-time backfill (5y of history) is a manual one-time:
+REM   python shipstation_sync.py full --days 1825
+python shipstation_sync.py recent --days 7 >> output\daily_sync.log 2>&1
+
 REM v2.67.36 — warm the ABC engine cache after the sync so the next
 REM user that opens the dashboard gets an instant page load instead
 REM of waiting 30-60s for the engine to recompute. Best-effort; a

@@ -89,5 +89,20 @@ else
     echo "[$(stamp)] shopify_sync skipped (env vars not set)" >> "$LOG"
 fi
 
+# v2.67.54 — ShipStation sync. Recent (7-day) catch-up keeps the
+# rolling shipments_last_7d_*.csv up to date so the AI's
+# get_shipping_details tool sees yesterday's labels and the Monthly
+# Metrics shipping-cost row stays current. Skipped automatically if
+# SHIPSTATION_API_KEY / SHIPSTATION_API_SECRET aren't set. Note:
+# first-time backfill (5y of history) needs to be run manually:
+#   python shipstation_sync.py full --days 1825
+if [ -n "${SHIPSTATION_API_KEY:-}" ] && [ -n "${SHIPSTATION_API_SECRET:-}" ]; then
+    echo "[$(stamp)] shipstation_sync recent --days 7" >> "$LOG"
+    python shipstation_sync.py recent --days 7 >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] shipstation_sync FAILED (continuing)" >> "$LOG"
+else
+    echo "[$(stamp)] shipstation_sync skipped (env vars not set)" >> "$LOG"
+fi
+
 echo "[$(stamp)] daily_sync.sh done" >> "$LOG"
 echo "" >> "$LOG"

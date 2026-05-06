@@ -698,6 +698,76 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        # v2.67.54 — ShipStation lookup. Lets the AI answer
+        # "where's order SO-12345 / tracking 1Z123...", "what
+        # carrier did we use", "what's the shipping cost on this
+        # sale". Reads the local shipments CSV pulled by
+        # shipstation_sync.py.
+        "name": "get_shipping_details",
+        "description": (
+            "Look up ShipStation shipments by order number, "
+            "tracking number, customer name, or date range. "
+            "Returns shipment cost, carrier, service, tracking "
+            "number, ship-to address, weight, dimensions, item "
+            "list, and any customer / internal notes. Use this "
+            "when the user asks 'where is order SO-12345', "
+            "'what's the tracking for INV-9981', 'who shipped "
+            "this for Acme yesterday', 'what carriers did we "
+            "use last week', 'what was the freight on this "
+            "sale'. Returns matched=0 with a note when "
+            "ShipStation isn't configured (env vars not set) "
+            "or the order isn't in the local sync window."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_number": {
+                    "type": "string",
+                    "description": (
+                        "Sale order number to look up "
+                        "(SO-12345 or just 12345; case-"
+                        "insensitive).")
+                },
+                "tracking_number": {
+                    "type": "string",
+                    "description": (
+                        "Tracking number to look up.")
+                },
+                "customer": {
+                    "type": "string",
+                    "description": (
+                        "Customer name substring. Combine with "
+                        "date_from / date_to to scope.")
+                },
+                "carrier_code": {
+                    "type": "string",
+                    "description": (
+                        "Filter by carrier (ups / fedex / "
+                        "usps / dhl_express). Useful for "
+                        "carrier-mix questions.")
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive "
+                        "lower bound on shipDate.")
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive "
+                        "upper bound on shipDate.")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max shipments to return (cap 50, "
+                        "default 25).")
+                },
+            },
+        },
+    },
+    {
         # v2.67.51 — stock-adjustment lookup. The local sync currently
         # captures HEADERS only (TaskID, EffectiveDate, StocktakeNumber,
         # Status, Account, Reference). Line-level detail (which SKUs
@@ -1431,6 +1501,8 @@ _PURCHASE_LINES_HOLDER: dict = {"df": None}
 _PURCHASE_HEADERS_HOLDER: dict = {"df": None}
 _SALE_LINES_LONGEST_HOLDER: dict = {"df": None}
 _STOCK_ADJUSTMENTS_HOLDER: dict = {"df": None}
+# v2.67.54 — ShipStation shipments holder.
+_SHIPMENTS_HOLDER: dict = {"df": None}
 
 
 def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
@@ -1467,6 +1539,13 @@ def set_stock_adjustments(stock_adjustments_df: pd.DataFrame) -> None:
     get_stock_adjustment. CIN7's adjustment endpoint only returns
     headers in the bulk pull; per-line detail isn't synced today."""
     _STOCK_ADJUSTMENTS_HOLDER["df"] = stock_adjustments_df
+
+
+def set_shipments(shipments_df: pd.DataFrame) -> None:
+    """v2.67.54 — stash the merged ShipStation shipments DataFrame
+    so get_shipping_details can scan without re-loading the CSV per
+    tool call."""
+    _SHIPMENTS_HOLDER["df"] = shipments_df
 
 
 def _signal_row_to_dict(row) -> dict:
@@ -2896,6 +2975,162 @@ def get_stock_adjustment(engine_df: pd.DataFrame,
     }
 
 
+def get_shipping_details(engine_df: pd.DataFrame,
+                           sale_lines_df: pd.DataFrame,
+                           args: dict) -> dict:
+    """v2.67.54 — ShipStation lookup. Reads the local shipments
+    DataFrame (merged longest-window pattern) and returns matching
+    shipment records.
+
+    Filter precedence: tracking_number > order_number > carrier +
+    customer + date range. The first specific filter wins because
+    the user usually knows ONE of those identifiers, and falling
+    through to broad filters when a specific one is set produces
+    confusing 'multiple shipments matched' answers."""
+    order_number = (args.get("order_number") or "").strip()
+    tracking_number = (args.get("tracking_number") or "").strip()
+    customer_filter = (args.get("customer") or "").strip().upper()
+    carrier_filter = (args.get("carrier_code") or "").strip().lower()
+    date_from = (args.get("date_from") or "").strip()
+    date_to = (args.get("date_to") or "").strip()
+    limit = max(1, min(int(args.get("limit", 25) or 25), 50))
+
+    df = _SHIPMENTS_HOLDER.get("df")
+    if df is None or df.empty:
+        return {
+            "error": ("ShipStation shipments not loaded. Either the "
+                      "ShipStation env vars (SHIPSTATION_API_KEY + "
+                      "SHIPSTATION_API_SECRET) aren't configured, "
+                      "or the shipstation_sync hasn't run yet. The "
+                      "first sync can take 30-60 minutes for a "
+                      "5-year backfill; subsequent syncs are "
+                      "incremental."),
+        }
+
+    if not (order_number or tracking_number or customer_filter
+            or carrier_filter or date_from or date_to):
+        return {
+            "error": ("Specify at least one filter: order_number, "
+                      "tracking_number, customer, carrier_code, "
+                      "OR a date range. Empty filter would dump "
+                      "thousands of shipments."),
+        }
+
+    work = df.copy()
+
+    # Tracking number is most specific — try it first.
+    if tracking_number and "TrackingNumber" in work.columns:
+        work = work[work["TrackingNumber"].astype(str).str.upper()
+                     == tracking_number.upper()]
+    # Order number — same prefix-strip pattern used elsewhere.
+    elif order_number and "OrderNumber" in work.columns:
+        norm = order_number.upper().lstrip("SO-").lstrip("SO")
+        col = (work["OrderNumber"].astype(str).str.upper()
+                .str.replace("SO-", "", regex=False)
+                .str.replace("SO", "", regex=False))
+        work = work[col == norm]
+    else:
+        if customer_filter and "CustomerName" in work.columns:
+            work = work[work["CustomerName"].astype(str).str.upper()
+                         .str.contains(customer_filter, na=False)]
+        if carrier_filter and "CarrierCode" in work.columns:
+            work = work[work["CarrierCode"].astype(str).str.lower()
+                         == carrier_filter]
+        if date_from and "ShipDate" in work.columns:
+            try:
+                cutoff = pd.Timestamp(date_from)
+                parsed = pd.to_datetime(work["ShipDate"], errors="coerce")
+                work = work[parsed >= cutoff]
+            except Exception:
+                pass
+        if date_to and "ShipDate" in work.columns:
+            try:
+                cutoff = pd.Timestamp(date_to) + pd.Timedelta(days=1)
+                parsed = pd.to_datetime(work["ShipDate"], errors="coerce")
+                work = work[parsed < cutoff]
+            except Exception:
+                pass
+
+    if work.empty:
+        return {
+            "matched": 0,
+            "filters": {
+                "order_number": order_number or None,
+                "tracking_number": tracking_number or None,
+                "customer": customer_filter or None,
+                "carrier_code": carrier_filter or None,
+                "date_from": date_from or None,
+                "date_to": date_to or None,
+            },
+            "note": ("No shipments match. Either the order hasn't "
+                     "shipped yet (ShipStation only records "
+                     "shipments AFTER carrier label is created), "
+                     "or it's outside the local sync window. The "
+                     "AI should tell the user to check ShipStation "
+                     "directly OR wait for the next sync."),
+        }
+
+    # Sort newest first.
+    if "ShipDate" in work.columns:
+        work = work.assign(_d=pd.to_datetime(
+            work["ShipDate"], errors="coerce"))
+        work = work.sort_values("_d", ascending=False).drop(columns="_d")
+
+    out = []
+    for _, r in work.head(limit).iterrows():
+        out.append(_serialise_row({
+            "shipment_id": r.get("ShipmentID"),
+            "order_number": r.get("OrderNumber"),
+            "customer": r.get("CustomerName"),
+            "ship_date": (str(r.get("ShipDate"))
+                            if pd.notna(r.get("ShipDate"))
+                            else None),
+            "voided": bool(r.get("Voided"))
+                       if pd.notna(r.get("Voided")) else False,
+            "tracking_number": r.get("TrackingNumber"),
+            "carrier": r.get("CarrierCode"),
+            "service": r.get("ServiceCode"),
+            "shipment_cost": (
+                float(r.get("ShipmentCost"))
+                if pd.notna(r.get("ShipmentCost")) else None),
+            "insurance_cost": (
+                float(r.get("InsuranceCost"))
+                if pd.notna(r.get("InsuranceCost")) else None),
+            "ship_to_city": r.get("ShipToCity"),
+            "ship_to_state": r.get("ShipToState"),
+            "ship_to_country": r.get("ShipToCountry"),
+            "ship_to_postal": r.get("ShipToPostal"),
+            "weight_value": r.get("WeightValue"),
+            "weight_units": r.get("WeightUnits"),
+            "item_count": r.get("ItemCount"),
+            "item_summary": r.get("ItemSummary"),
+            "customer_notes": (
+                str(r.get("CustomerNotes")).strip()
+                if pd.notna(r.get("CustomerNotes"))
+                and str(r.get("CustomerNotes")).strip()
+                else None),
+            "internal_notes": (
+                str(r.get("InternalNotes")).strip()
+                if pd.notna(r.get("InternalNotes"))
+                and str(r.get("InternalNotes")).strip()
+                else None),
+        }))
+
+    return {
+        "matched": len(out),
+        "limit_applied": limit,
+        "shipments": out,
+        "note": (
+            "Show the user: ship_date · order_number · customer · "
+            "carrier+service · tracking_number · shipment_cost. "
+            "Voided shipments are flagged voided=true — surface "
+            "that as 'VOIDED' so users don't think it shipped. "
+            "If customer_notes / internal_notes are non-null, "
+            "include them — the warehouse / sales rep typed them "
+            "for a reason."),
+    }
+
+
 def get_compatible_accessories(engine_df: pd.DataFrame,
                                  sale_lines_df: pd.DataFrame,
                                  args: dict) -> dict:
@@ -3352,6 +3587,8 @@ TOOL_HANDLERS = {
     "get_purchase_order": get_purchase_order,
     "get_sale_order": get_sale_order,
     "get_stock_adjustment": get_stock_adjustment,
+    # v2.67.54 — ShipStation lookup.
+    "get_shipping_details": get_shipping_details,
     "get_compatible_accessories": get_compatible_accessories,
     # v2.66.6: get_relevant_slow_stock UNREGISTERED. Slow-stock
     # promotion was breaking product-list queries. Function stays in

@@ -21,4 +21,14 @@ if [ "$RC" -eq 0 ]; then
 else
   echo "[$(stamp)] nearsync exited rc=$RC" >> "$LOG"
 fi
+
+# v2.67.54 — ShipStation 1-day catch-up. Picks up shipments
+# created since the last run so the AI can answer "where's my
+# shipment" questions within 15 minutes of the carrier label
+# creation. No-ops when env vars aren't set; failure here doesn't
+# affect the CIN7 nearsync exit code (we already captured RC).
+echo "[$(stamp)] shipstation_sync recent --days 1" >> "$LOG"
+python shipstation_sync.py recent --days 1 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] shipstation_sync FAILED (continuing)" >> "$LOG"
+
 exit "$RC"

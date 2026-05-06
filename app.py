@@ -296,6 +296,27 @@ into. `get_sale_order` surfaces all of them:
 - **CustomerReference** — customer's own PO# referencing this
   sale.
 
+#### ShipStation integration (v2.67.54)
+ShipStation shipment data feeds two places:
+- **AI Assistant** — `get_shipping_details(order_number /
+  tracking_number / customer + date)` returns ship date, carrier,
+  service, tracking number, ship-to address, shipment cost,
+  weight, item summary, customer/internal notes. Voided shipments
+  are flagged explicitly.
+- **Monthly Metrics** — the "Shipping Cost" row in the Margins
+  block aggregates `shipmentCost` per month (excluding voided
+  shipments). Pre-ShipStation months show 0; post-integration
+  months show real freight spend.
+
+Setup:
+1. Set `SHIPSTATION_API_KEY` + `SHIPSTATION_API_SECRET` in env.
+2. One-time backfill: `python shipstation_sync.py full --days
+   1825` (5 years; 30-60 minutes for a busy account).
+3. NearSync (1-day) and Daily Sync (7-day) catch-ups run
+   automatically once env vars are set. NearSync keeps
+   shipments visible to the AI within 15 minutes of label
+   creation.
+
 #### Transaction lookup (v2.67.51)
 The AI Assistant can pull up specific CIN7 documents on demand.
 Three tools, picked by what kind of number the user mentions:
@@ -705,15 +726,16 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.53 — Slow-stock value reconciled. "
-                "Overview said $290,872, Slow Movers page said "
-                "$232,153, monthly snapshot said something else "
-                "again — three code paths, three filters, two "
-                "different value columns. New "
-                "_compute_slow_stock_holding() helper is the single "
-                "source: parents/standalones, OnHand>0, engine "
-                "OnHandValue. All three tiles now call it. The "
-                "discrepancy disappears.")
+    st.caption("🟢 v2.67.54 — ShipStation integration. New AI "
+                "tool `get_shipping_details(order_number / "
+                "tracking / customer + date)` answers "
+                "shipping-status questions. Monthly Metrics' "
+                "'Shipping Cost' row finally has data (was a "
+                "placeholder since launch). NearSync picks up new "
+                "shipments within 15 min of label creation; "
+                "first-time backfill is `python shipstation_sync.py "
+                "full --days 1825` after setting "
+                "SHIPSTATION_API_KEY+SECRET.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -751,6 +773,58 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.54** — ShipStation integration. The "
+            "Monthly Metrics 'Shipping Cost' row has been a "
+            "placeholder since launch; staff also wanted AI "
+            "lookup of shipping details by order / tracking / "
+            "customer.\n\n"
+            "Built `shipstation_sync.py` (parallel to "
+            "`cin7_sync.py` and `shopify_sync.py`):\n"
+            "- ShipStation v1 API client with Basic auth + "
+            "rate-limit-aware pagination (honours "
+            "X-Rate-Limit-Remaining/-Reset headers; sleeps for "
+            "the reset rather than burning a fixed delay).\n"
+            "- `recent --days N` mode for rolling window "
+            "(NearSync 1d, Daily 7d).\n"
+            "- `full --days 1825` mode for one-time 5-year "
+            "backfill.\n"
+            "- Output: `shipments_full.csv` (backfill base) + "
+            "`shipments_last_<N>d_*.csv` (rolling-window "
+            "patches). Same merge pattern as "
+            "`purchase_lines_*` — `_load_longest_shipments()` "
+            "picks the widest base and layers newer files on "
+            "top, deduped by ShipmentID.\n\n"
+            "AI side:\n"
+            "- New `get_shipping_details` tool: filters by "
+            "order_number / tracking_number / customer / "
+            "carrier_code / date range. Returns ship_date, "
+            "carrier, service, tracking, cost, ship-to "
+            "address, weight, item_summary, customer/internal "
+            "notes. Voided shipments flagged explicitly.\n"
+            "- `_SHIPMENTS_HOLDER` + `set_shipments()` setter "
+            "wired into AI page boot. Tool gracefully reports "
+            "'not loaded' when env vars missing.\n"
+            "- System prompt SHIPPING-LOOKUP routing rule "
+            "covers 'where's order X', 'tracking on Y', "
+            "'who shipped Z', etc.\n\n"
+            "Monthly Metrics:\n"
+            "- Shipping Cost row now aggregates "
+            "`ShipmentCost` from the merged shipments DF, "
+            "grouped by ShipDate month, voided shipments "
+            "excluded. Label flips between '(ShipStation)' "
+            "(live) and '(ShipStation pending — set "
+            "SHIPSTATION_API_KEY+SECRET)' (not configured).\n\n"
+            "Sync schedule:\n"
+            "- NearSync (15-min): `recent --days 1`.\n"
+            "- Daily (7am): `recent --days 7` catch-up.\n"
+            "- Both gate on env vars; no-op when missing.\n\n"
+            "Setup steps to enable: (1) add "
+            "SHIPSTATION_API_KEY + SHIPSTATION_API_SECRET to "
+            ".env / Render env. (2) Run `python "
+            "shipstation_sync.py full --days 1825` once. "
+            "(3) NearSync + Daily Sync take over."
+        )
         st.caption(
             "**v2.67.53** — Slow-stock value reconciliation. "
             "User reported a $58k discrepancy: the Overview's "
@@ -2488,6 +2562,11 @@ purchase_headers = load("purchases_last_30d")
 purchase_lines = load("purchase_lines_last_90d")  # rebound below
 sale_lines_3d = load("sale_lines_last_3d")
 sale_lines_30d = load("sale_lines_last_30d")
+# v2.67.54 — ShipStation shipments. Module-level placeholder; the
+# real merged DataFrame is built below after _load_longest_shipments
+# is defined. Loader gracefully returns an empty frame if shipping
+# isn't configured / the first sync hasn't run.
+shipments = pd.DataFrame()
 
 # Why this pattern: persist="disk" caches don't support ttl. To get
 # auto-invalidation on fresh data, the cache key must change when the
@@ -2661,6 +2740,67 @@ def _load_longest_purchase_lines() -> pd.DataFrame:
         _dir_fingerprint("purchase_lines_last_*d_*.csv"))
 
 
+# v2.67.54 — ShipStation shipments loader. Same merge pattern as
+# the purchase / sale loaders: full backfill (`shipments_full.csv`)
+# acts as the base, rolling-window files (`shipments_last_<N>d_*.csv`)
+# layer newer rows on top. ShipmentID is the dedup key — every
+# shipment has a unique ID and re-sync of the same shipment gives
+# the same ID back, so 'last update wins' produces the right
+# row. The cache invalidates whenever any file in the pattern
+# changes, mirroring `_dir_fingerprint` for the others.
+@st.cache_data(persist="disk",
+                show_spinner="Loading shipping history…")
+def _load_longest_shipments_cached(fingerprint: tuple) -> pd.DataFrame:
+    files = []
+    full_path = OUTPUT_DIR / "shipments_full.csv"
+    if full_path.exists():
+        files.append(("full", full_path.stat().st_mtime, full_path))
+    import re as _re
+    for p in OUTPUT_DIR.glob("shipments_last_*d_*.csv"):
+        m = _re.match(r"shipments_last_(\d+)d_", p.name)
+        if m:
+            files.append((int(m.group(1)), p.stat().st_mtime, p))
+    if not files:
+        # Empty schema so consumers don't crash on column access.
+        return pd.DataFrame(columns=[
+            "ShipmentID", "OrderNumber", "ShipDate", "ShipmentCost",
+            "TrackingNumber", "CarrierCode", "ServiceCode",
+            "CustomerName", "Voided"])
+    # Sort: 'full' (the backfill) first as base; then by descending
+    # window width; then by descending mtime. Each subsequent file
+    # is concat'd on top.
+    def _sort_key(item):
+        days, mtime, _p = item
+        if days == "full":
+            return (-10**9, -mtime)
+        return (-days, -mtime)
+    files.sort(key=_sort_key)
+    base = pd.DataFrame()
+    base_mtime = 0.0
+    for _days, mtime, p in files:
+        try:
+            chunk = pd.read_csv(p, low_memory=False)
+        except Exception:
+            continue
+        if base.empty:
+            base = chunk
+            base_mtime = mtime
+            continue
+        # Only merge in newer files (older snapshots would just
+        # reintroduce stale rows the dedup might keep).
+        if mtime <= base_mtime:
+            continue
+        base = pd.concat([base, chunk], ignore_index=True)
+    if "ShipmentID" in base.columns:
+        base = base.drop_duplicates(subset=["ShipmentID"], keep="last")
+    return base.reset_index(drop=True)
+
+
+def _load_longest_shipments() -> pd.DataFrame:
+    return _load_longest_shipments_cached(
+        _dir_fingerprint("shipments_*.csv"))
+
+
 # Order-level (header) sales for revenue calculations that need to
 # match CIN7's dashboard. The line-level `sale_lines.Total` excludes
 # shipping; `sales_full.InvoiceAmount` includes shipping + tax which
@@ -2677,6 +2817,12 @@ sales_full = _load_longest_sales()
 # get_incoming_stock tool sees recent POs (e.g. PO-7109 reported
 # missing on 2026-05-05). Same pattern as sales_full above.
 purchase_lines = _load_longest_purchase_lines()
+
+# v2.67.54 — bind shipments to the longest-window merged loader.
+# Returns an empty DataFrame (with sentinel columns) when no files
+# exist yet, so downstream code doesn't have to special-case the
+# pre-ShipStation-rollout state.
+shipments = _load_longest_shipments()
 
 
 stock_adjustments = load("stock_adjustments_last_30d")
@@ -13831,8 +13977,39 @@ elif page == "Monthly Metrics":
         _row("Margins", "Shipping Charged",
              _per_month(lambda m: float(
                  ship_charged_per_month.get(m, 0) or 0)))
-        _row("Margins", "Shipping Cost (ShipStation pending)",
-             _per_month(lambda m: 0.0))
+        # v2.67.54 — populate Shipping Cost row from ShipStation
+        # when configured. Aggregates ShipmentCost by month-of-
+        # ShipDate, skipping voided shipments. Returns 0 for months
+        # without data so the row still renders for pre-ShipStation
+        # months. Label reflects whether the integration is live.
+        _ship_cost_per_month = {}
+        try:
+            if (not shipments.empty
+                    and "ShipDate" in shipments.columns
+                    and "ShipmentCost" in shipments.columns):
+                _sc_df = shipments.copy()
+                if "Voided" in _sc_df.columns:
+                    _sc_df = _sc_df[
+                        ~_sc_df["Voided"].fillna(False).astype(bool)]
+                _sc_df["_dt"] = pd.to_datetime(
+                    _sc_df["ShipDate"], errors="coerce", utc=True)
+                _sc_df = _sc_df.dropna(subset=["_dt"])
+                _sc_df["_month"] = (_sc_df["_dt"].dt.tz_convert(None)
+                                                  .dt.strftime("%Y-%m"))
+                _sc_df["_cost"] = pd.to_numeric(
+                    _sc_df["ShipmentCost"], errors="coerce").fillna(0)
+                _ship_cost_per_month = (
+                    _sc_df.groupby("_month")["_cost"].sum().to_dict())
+        except Exception:
+            _ship_cost_per_month = {}
+        _ship_cost_label = (
+            "Shipping Cost (ShipStation)"
+            if _ship_cost_per_month
+            else "Shipping Cost (ShipStation pending — set "
+                 "SHIPSTATION_API_KEY+SECRET)")
+        _row("Margins", _ship_cost_label,
+             _per_month(lambda m: float(
+                 _ship_cost_per_month.get(m, 0) or 0)))
         _row("Margins", "Line Contribution Margin",
              _per_month(lambda m: _get(sales_per_month, m)
                                    - _get(cogs_per_month, m)))
@@ -14102,7 +14279,14 @@ elif page == "Monthly Metrics":
                 "last 30 days. **The weekend sync pulls 5 years of sales "
                 "headers** — Monday's Shipping Charged figures will match "
                 "your Easy Insight report across the full 14 months.\n"
-                "- **Shipping Cost** is 0 until ShipStation is plugged in.\n"
+                "- **Shipping Cost** — populated from ShipStation "
+                "(v2.67.54) when SHIPSTATION_API_KEY + "
+                "SHIPSTATION_API_SECRET are set in env. "
+                "Aggregates ShipStation's `shipmentCost` field by "
+                "month-of-shipDate, excluding voided shipments. "
+                "Pre-ShipStation months show 0; backfill the "
+                "history with `python shipstation_sync.py full "
+                "--days 1825` once.\n"
                 "- **Average Inventory Value** is reconstructed by walking "
                 "backward from the current stock snapshot: "
                 "`end_inv(M) = end_inv(M+1) + COGS(M+1) − purchases(M+1)`. "
@@ -16020,6 +16204,13 @@ elif page == "AI Assistant":
         ai_tools.set_stock_adjustments(stock_adjustments)
     except Exception:
         pass
+    try:
+        # v2.67.54 — ShipStation shipments. If shipments is empty
+        # (env vars not set OR first sync hasn't run), the tool
+        # returns a friendly 'not loaded' message instead of crashing.
+        ai_tools.set_shipments(shipments)
+    except Exception:
+        pass
 
     # Lay out the page. Left column: chat input + transcript. Right:
     # a "what can I ask" cheatsheet so users know where to start.
@@ -16840,6 +17031,29 @@ elif page == "AI Assistant":
                 "get_purchase_order. If context is customer / "
                 "invoice, default to get_sale_order. If you're "
                 "genuinely unsure, ASK.\n"
+                # v2.67.54 — ShipStation routing.
+                "  - **SHIPPING-LOOKUP question (v2.67.54)**: "
+                "when the user asks 'where's order X', 'what's "
+                "the tracking on Y', 'who shipped Z', 'what "
+                "carrier did we use', 'how much did this ship "
+                "cost', 'has X gone out yet', 'where is the "
+                "shipment for <customer>' → CALL "
+                "`get_shipping_details` with order_number / "
+                "tracking_number / customer + date range. "
+                "Returns ship_date, tracking_number, carrier, "
+                "service, shipment_cost, ship_to_city/state, "
+                "weight, item_summary, customer_notes, "
+                "internal_notes. Surface tracking_number "
+                "verbatim — staff want to copy/paste it. If "
+                "shipment_cost is set, mention it. If voided "
+                "is true, say 'VOIDED' explicitly. If the tool "
+                "errors with 'shipments not loaded', tell the "
+                "user the ShipStation integration isn't "
+                "configured yet (env vars not set OR first "
+                "backfill hasn't run). Don't guess shipping "
+                "info from the sale order — get_sale_order "
+                "doesn't have tracking; get_shipping_details "
+                "does.\n"
                 "  - **STOCK question** — they want to know what "
                 "we have on the shelf right now, qty available, "
                 "what's running low, what's slow-moving, what to "
