@@ -365,15 +365,12 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.38 — Slow-mover stock-reduction "
-                "workspace. Overview gets a 4-tile slow-stock "
-                "panel (SKUs flagged, value on shelf, cleared "
-                "this month, revenue this month). New dedicated "
-                "🪫 Slow Movers page with pie chart by family + "
-                "sortable detail table + manual dismiss. New "
-                "weekly_slow_movers_email.py script sends a "
-                "Friday digest with top-20 slow movers + "
-                "newcomers + progress.")
+    st.caption("🟢 v2.67.39 — Hotfix: Slow Movers page was "
+                "raising KeyError 'Family' because engine_df has "
+                "no literal Family column (CIN7 stores family in "
+                "AdditionalAttribute1). Page now derives Family "
+                "from AdditionalAttribute1 with a '(no family)' "
+                "fallback so it renders cleanly.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -409,6 +406,17 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.39** — Slow Movers page hotfix. The pie "
+            "chart's groupby was reading `_slow_df['Family']` "
+            "directly, but the lifted `_abc_engine` doesn't "
+            "produce a `Family` column on engine_df — CIN7 "
+            "carries family info in `AdditionalAttribute1`. "
+            "Page now resolves Family with: literal Family "
+            "column → AdditionalAttribute1 → '(no family)' "
+            "fallback. Detail table also uses the resolved "
+            "Family series so it renders end-to-end."
+        )
         st.caption(
             "**v2.67.38** — Slow-mover stock-reduction "
             "workspace. Three things bundled. (1) Overview gets "
@@ -16401,16 +16409,28 @@ elif page == "Slow Movers":
     # --- Pie chart by family ------------------------------------------
     st.divider()
     st.subheader("Where is the slow stock concentrated?")
+    # v2.67.39 — engine_df has no literal `Family` column; CIN7's
+    # family lives in AdditionalAttribute1. Build a Family series
+    # from whichever source is present and fall back to "(no family)"
+    # so the page still renders cleanly when neither is set.
+    if "Family" in _slow_df.columns:
+        _family_series = _slow_df["Family"].fillna("(no family)")
+    elif "AdditionalAttribute1" in _slow_df.columns:
+        _family_series = (_slow_df["AdditionalAttribute1"]
+                            .fillna("(no family)")
+                            .replace("", "(no family)"))
+    else:
+        _family_series = pd.Series(
+            ["(no family)"] * len(_slow_df), index=_slow_df.index)
+    _slow_df = _slow_df.assign(_family=_family_series)
     _by_family = (_slow_df
                    .assign(_v=_slow_df.get("OnHandValue",
                                             pd.Series(dtype=float))
                             .fillna(0))
-                   .groupby(_slow_df["Family"].fillna("(no family)"),
-                              dropna=False)
+                   .groupby("_family", dropna=False)
                    .agg(SKU_count=("SKU", "count"),
                           Value_at_risk=("_v", "sum"))
                    .reset_index()
-                   .rename(columns={"index": "Family"})
                    .sort_values("Value_at_risk", ascending=False))
     _by_family.columns = ["Family", "SKU_count", "Value_at_risk"]
     _pc1, _pc2 = st.columns([1, 1])
@@ -16450,6 +16470,11 @@ elif page == "Slow Movers":
         "(e.g. you've already discounted, returned to supplier, "
         "or accepted the SKU as long-tail strategic stock).")
 
+    # v2.67.39 — include the resolved _family column (built above)
+    # under a friendly "Family" header. Engine_df doesn't carry a
+    # native Family column; we materialised it from
+    # AdditionalAttribute1 with a sensible fallback.
+    _slow_df = _slow_df.rename(columns={"_family": "Family"})
     _detail_cols = [c for c in (
         "SKU", "Name", "Family", "ABC", "trend_flag",
         "OnHand", "OnHandValue", "effective_units_12mo",
