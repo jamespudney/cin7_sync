@@ -564,6 +564,186 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        # v2.67.51 — open-ended PO lookup. get_incoming_stock filters
+        # to OPEN POs and matches by SKU/family; this tool fetches the
+        # full PO by number regardless of status (DRAFT, ORDERED,
+        # PARTIAL, INVOICED, RECEIVED, CLOSED, VOIDED) so the user can
+        # answer questions like 'what was on PO-7109?' or 'did we
+        # receive PO-7042 yet?'.
+        "name": "get_purchase_order",
+        "description": (
+            "Look up a specific CIN7 purchase order by number "
+            "(e.g. PO-7109) and return its header + every line "
+            "item, including SKU / Name / Quantity / Price / "
+            "supplier / status / required-by date / Comments / "
+            "Shipping notes. Use this when the user asks about a "
+            "SPECIFIC PO ('what's on PO-7109', 'what did we order "
+            "from Topmet on April 28', 'show me purchase 7042'). "
+            "Returns `matched`=0 with a note if the PO isn't in "
+            "the local sync window — the sync currently covers the "
+            "last ~30 days for line detail. The widest available "
+            "window is used automatically."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number": {
+                    "type": "string",
+                    "description": (
+                        "PO number, with or without the 'PO-' "
+                        "prefix. Case-insensitive. Either po_number "
+                        "or supplier+date_from is required.")
+                },
+                "supplier": {
+                    "type": "string",
+                    "description": (
+                        "Optional supplier name substring filter. "
+                        "Used together with date_from when the user "
+                        "doesn't have the PO number.")
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "Optional ISO date (YYYY-MM-DD). Returns "
+                        "POs raised on/after this date. Pair with "
+                        "supplier when the user is browsing.")
+                },
+                "include_received": {
+                    "type": "boolean",
+                    "description": (
+                        "Include fully-received / closed POs. "
+                        "Default true (this tool is for full lookup, "
+                        "unlike get_incoming_stock which is for "
+                        "open-only).")
+                },
+            },
+        },
+    },
+    {
+        # v2.67.51 — sale-order lookup. Mirrors get_purchase_order on
+        # the sales side. Reads the sale_lines DataFrames the page
+        # already merges (sale_lines_3d / sale_lines_30d / longest).
+        "name": "get_sale_order",
+        "description": (
+            "Look up a specific CIN7 sale order by number / invoice "
+            "and return its header + every line item including SKU, "
+            "Name, Quantity, Price, Total, Customer, Order date, "
+            "Status. Use this when the user asks about a SPECIFIC "
+            "sale ('what did Acme buy on SO-12345', 'show me sale "
+            "INV-9981', 'who ordered LED-V3060001-2 last week'). "
+            "Searches by order_number, invoice_number, OR by customer "
+            "name + date range when the user doesn't have a number. "
+            "Returns `matched`=0 with a note if the sale isn't in "
+            "the local sync window (line detail covers the last 30 "
+            "days; the widest available window is used)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_number": {
+                    "type": "string",
+                    "description": (
+                        "Sale order number (e.g. SO-12345 or "
+                        "12345). Case-insensitive.")
+                },
+                "invoice_number": {
+                    "type": "string",
+                    "description": (
+                        "Invoice number (e.g. INV-9981).")
+                },
+                "customer": {
+                    "type": "string",
+                    "description": (
+                        "Customer name substring. Combine with "
+                        "date_from / date_to to scope when no "
+                        "number is known.")
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive lower "
+                        "bound on order_date.")
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive upper "
+                        "bound on order_date.")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max sales to return (cap 25, default 10). "
+                        "Each sale's full line list is included.")
+                },
+            },
+        },
+    },
+    {
+        # v2.67.51 — stock-adjustment lookup. The local sync currently
+        # captures HEADERS only (TaskID, EffectiveDate, StocktakeNumber,
+        # Status, Account, Reference). Line-level detail (which SKUs
+        # were adjusted, by how much) requires a per-task detail call
+        # which we don't sync yet. The tool returns whatever we have
+        # locally + a note flagging the limitation so the AI doesn't
+        # claim it sees line-level data.
+        "name": "get_stock_adjustment",
+        "description": (
+            "Look up a specific CIN7 stock adjustment / stocktake "
+            "by number (e.g. ST-12345) or list adjustments matching "
+            "a date range / reference. Returns header detail "
+            "(EffectiveDate, Status, Account, Reference). NOTE: "
+            "line-level detail (per-SKU before/after qty) is NOT "
+            "currently in the local sync — the tool tells the user "
+            "to view the adjustment in CIN7 directly for line "
+            "detail. Use this for 'show me ST-2034', 'what "
+            "adjustments did we run last week', 'find the "
+            "stocktake for warehouse 500'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stocktake_number": {
+                    "type": "string",
+                    "description": (
+                        "Stocktake / adjustment number (e.g. "
+                        "ST-12345). Case-insensitive.")
+                },
+                "reference_substring": {
+                    "type": "string",
+                    "description": (
+                        "Substring match against Reference field "
+                        "(used for 'sales order 7103', 'cycle "
+                        "count', etc.).")
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive lower "
+                        "bound on EffectiveDate.")
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive upper "
+                        "bound on EffectiveDate.")
+                },
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "Filter by Status (COMPLETED, VOIDED, "
+                        "DRAFT). Default: all.")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max adjustments to return (cap 50, "
+                        "default 25).")
+                },
+            },
+        },
+    },
+    {
         "name": "search_products_by_text",
         "description": (
             "PRIMARY STOCK-LISTING TOOL (v2.67.25). Use this for "
@@ -818,7 +998,10 @@ TOOL_SCHEMAS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 def _serialise_row(row: dict) -> dict:
-    """Make a row JSON-friendly: convert NaN/None, dates to strings."""
+    """Make a row JSON-friendly: convert NaN/None, dates to strings.
+    v2.67.51 — list/dict values pass through unchanged so nested
+    structures (e.g. a PO record with `lines: [...]` already
+    serialised) don't get collapsed to `str(v)`."""
     out = {}
     for k, v in row.items():
         if v is None:
@@ -831,6 +1014,13 @@ def _serialise_row(row: dict) -> dict:
         elif isinstance(v, (pd.Timestamp, )):
             out[k] = v.strftime("%Y-%m-%d") if not pd.isna(v) else None
         elif isinstance(v, (int, str, bool)):
+            out[k] = v
+        elif isinstance(v, (list, tuple, dict)):
+            # Pass nested structures through. They were either built
+            # by the caller as JSON-safe primitives, or they're a
+            # list of already-serialised dicts (the get_purchase_order
+            # / get_sale_order pattern: per-line dicts stored under
+            # `lines`).
             out[k] = v
         else:
             out[k] = str(v)
@@ -1215,6 +1405,14 @@ def get_sales_totals(engine_df: pd.DataFrame,
 # every tool call sees the same headers without repeatedly loading.
 _SALES_FULL_HOLDER: dict = {"df": None}
 _PURCHASE_LINES_HOLDER: dict = {"df": None}
+# v2.67.51 — additional holders for the new transaction-lookup tools.
+# Purchase headers carry InvoiceAmount, RequiredBy, Status, etc. that
+# aren't on the line rows. Sale lines (longest window) drive
+# get_sale_order's line listing. Stock-adjustment headers feed
+# get_stock_adjustment.
+_PURCHASE_HEADERS_HOLDER: dict = {"df": None}
+_SALE_LINES_LONGEST_HOLDER: dict = {"df": None}
+_STOCK_ADJUSTMENTS_HOLDER: dict = {"df": None}
 
 
 def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
@@ -1226,9 +1424,31 @@ def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
 
 def set_purchase_lines(purchase_lines_df: pd.DataFrame) -> None:
     """Called by the Streamlit AI Assistant page on load. Stashes the
-    purchase_lines_last_90d DataFrame so get_incoming_stock can scan
-    open POs without re-loading the CSV per tool call."""
+    purchase-lines DataFrame (longest available window post-v2.67.51)
+    so get_incoming_stock + get_purchase_order can scan POs without
+    re-loading the CSV per tool call."""
     _PURCHASE_LINES_HOLDER["df"] = purchase_lines_df
+
+
+def set_purchase_headers(purchase_headers_df: pd.DataFrame) -> None:
+    """v2.67.51 — stash purchase headers for get_purchase_order so it
+    can return supplier-level metadata (InvoiceAmount, BaseCurrency,
+    SupplierCurrency, RequiredBy) that the line CSV doesn't carry."""
+    _PURCHASE_HEADERS_HOLDER["df"] = purchase_headers_df
+
+
+def set_sale_lines_longest(sale_lines_df: pd.DataFrame) -> None:
+    """v2.67.51 — stash the merged longest-window sale-lines DataFrame
+    so get_sale_order can return full line detail per sale without
+    each tool call having to merge windows itself."""
+    _SALE_LINES_LONGEST_HOLDER["df"] = sale_lines_df
+
+
+def set_stock_adjustments(stock_adjustments_df: pd.DataFrame) -> None:
+    """v2.67.51 — stash stock-adjustment headers for
+    get_stock_adjustment. CIN7's adjustment endpoint only returns
+    headers in the bulk pull; per-line detail isn't synced today."""
+    _STOCK_ADJUSTMENTS_HOLDER["df"] = stock_adjustments_df
 
 
 def _signal_row_to_dict(row) -> dict:
@@ -2013,10 +2233,51 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         df = df[sku_match | name_match]
 
     if df.empty:
+        # v2.67.51 — cross-check engine_df.OnOrder before declaring
+        # "nothing on order". The CIN7 stock-on-hand row carries an
+        # OnOrder field that aggregates ALL outstanding PO lines for
+        # the SKU regardless of when the PO was raised. The
+        # purchase_lines DataFrame only carries lines from whatever
+        # window we last synced (default 30d as of v2.67.51). Stale
+        # sync windows produced false-negative answers ("no open POs
+        # for LED-V3060001-2") even when OnOrder=190 said otherwise.
+        # If the discrepancy shows up, surface it explicitly so the
+        # AI tells the user "stock record says X on order but the
+        # line detail isn't in our local sync window — admin should
+        # run a wider sync".
+        gap_hint = None
+        try:
+            if engine_df is not None and not engine_df.empty and sku:
+                _eng = engine_df
+                if "SKU" in _eng.columns:
+                    _row = _eng[
+                        _eng["SKU"].astype(str).str.upper()
+                        == sku.upper()]
+                    if not _row.empty and "OnOrder" in _row.columns:
+                        _on_order = pd.to_numeric(
+                            _row.iloc[0].get("OnOrder"),
+                            errors="coerce")
+                        if pd.notna(_on_order) and _on_order > 0:
+                            gap_hint = (
+                                f"DATA GAP: CIN7 stock record shows "
+                                f"{int(_on_order)} units on order for "
+                                f"{sku}, but no matching open PO line "
+                                f"is in our local sync window. The PO "
+                                f"may have been raised before the "
+                                f"current purchase-lines window "
+                                f"(daily sync = 30d). Tell the user "
+                                f"to either look up the PO directly "
+                                f"in CIN7 OR ask an admin to widen "
+                                f"the sync window. Do not say 'no PO "
+                                f"exists' — say 'the local sync "
+                                f"doesn't cover the PO'.")
+        except Exception:
+            pass
         return {
             "matched": 0,
             "subject": sku or family,
             "date_field_used": date_col,
+            "data_gap": gap_hint,
             "note": ("No open / incomplete purchase orders match. "
                       "Either the SKU has nothing on order, or all "
                       "matching POs are already received / closed / "
@@ -2069,6 +2330,479 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         "note": (
             f"Showing first {limit} of potentially many open POs."
             if len(out_rows) == limit else None),
+    }
+
+
+# ---------------------------------------------------------------------------
+# v2.67.51 — transaction lookup tools.
+#
+# Why three separate tools instead of one generic "get_transaction":
+#   - Each transaction type lives in its own CSV with a different
+#     column shape (purchase headers vs sale lines vs stock-adjustment
+#     headers). A unified tool would have to either return a wildly
+#     polymorphic shape OR collapse the data — both lose information
+#     the AI needs to answer the user's actual question.
+#   - The user's question vocabulary is naturally different per type
+#     ("what's on PO-X" vs "what did Acme buy" vs "show me the
+#     stocktake"). Distinct schemas let Claude pick the right tool
+#     instead of guessing flags.
+#   - get_purchase_order overlaps but doesn't replace get_incoming_stock
+#     — get_incoming_stock filters to OPEN POs and matches by SKU;
+#     get_purchase_order is a full lookup including received/closed,
+#     keyed on PO number.
+# ---------------------------------------------------------------------------
+
+
+def _normalise_po_number(raw: str) -> str:
+    """Strip optional 'PO-' prefix and uppercase. PO-7109 → 7109."""
+    s = (raw or "").strip().upper()
+    if s.startswith("PO-"):
+        s = s[3:]
+    elif s.startswith("PO"):
+        s = s[2:].lstrip("-")
+    return s
+
+
+def get_purchase_order(engine_df: pd.DataFrame,
+                        sale_lines_df: pd.DataFrame,
+                        args: dict) -> dict:
+    """Look up a CIN7 purchase order by number and return header +
+    every line item. v2.67.51 — built to answer 'what's on PO-7109',
+    'show me the Topmet order from April', etc.
+
+    Strategy: match purchase_lines first (it's where SKU detail
+    lives), then enrich the header summary from purchase_headers if
+    that DataFrame is also loaded. Status filtering is OFF by default
+    — this is a full lookup tool, distinct from get_incoming_stock."""
+    po_raw = (args.get("po_number") or "").strip()
+    supplier_filter = (args.get("supplier") or "").strip().upper()
+    date_from = (args.get("date_from") or "").strip()
+    include_received = bool(args.get("include_received", True))
+
+    purchase_lines = _PURCHASE_LINES_HOLDER.get("df")
+    purchase_headers = _PURCHASE_HEADERS_HOLDER.get("df")
+
+    if purchase_lines is None or purchase_lines.empty:
+        return {
+            "error": ("Purchase lines not loaded for this session. "
+                      "An admin needs to call "
+                      "ai_tools.set_purchase_lines() at AI page boot."),
+        }
+
+    if not po_raw and not supplier_filter and not date_from:
+        return {
+            "error": ("Specify either po_number, OR supplier + "
+                      "date_from. With no filter the tool would "
+                      "return every PO in the sync window."),
+        }
+
+    df = purchase_lines.copy()
+
+    # PO number match (with or without PO- prefix). The line CSV
+    # carries OrderNumber as the PO identifier.
+    if po_raw and "OrderNumber" in df.columns:
+        po_norm = _normalise_po_number(po_raw)
+        order_norm = (df["OrderNumber"].astype(str).str.upper()
+                      .str.replace("PO-", "", regex=False)
+                      .str.replace("PO", "", regex=False)
+                      .str.lstrip("-"))
+        df = df[order_norm == po_norm]
+
+    # Supplier substring filter.
+    if supplier_filter and "Supplier" in df.columns:
+        df = df[df["Supplier"].astype(str).str.upper()
+                .str.contains(supplier_filter, na=False)]
+
+    # date_from filter.
+    if date_from:
+        date_cols = [c for c in ("OrderDate", "InvoiceDate", "RequiredBy")
+                     if c in df.columns]
+        if date_cols:
+            primary = date_cols[0]
+            try:
+                cutoff = pd.Timestamp(date_from)
+                parsed = pd.to_datetime(df[primary], errors="coerce")
+                df = df[parsed >= cutoff]
+            except Exception:
+                pass
+
+    # Optional "open only" filter (default OFF — this tool is for
+    # full lookup, unlike get_incoming_stock).
+    if not include_received and "Status" in df.columns:
+        closed_keywords = ("RECEIVED", "CLOSED", "COMPLETED",
+                            "CANCELLED", "VOIDED")
+        status_u = df["Status"].fillna("").astype(str).str.upper()
+        df = df[~status_u.apply(
+            lambda s: any(k in s for k in closed_keywords))]
+
+    if df.empty:
+        return {
+            "matched": 0,
+            "po_number": po_raw or None,
+            "supplier_filter": supplier_filter or None,
+            "date_from": date_from or None,
+            "note": ("No purchase order matches the filter in the "
+                     "local sync window. The line-detail sync covers "
+                     "the last ~30 days as of v2.67.51 (longer if a "
+                     "manual full-sync was run more recently). If "
+                     "the user mentioned an older PO, tell them the "
+                     "data isn't in this snapshot — they should look "
+                     "it up in CIN7 directly OR an admin can run a "
+                     "wider sync window."),
+        }
+
+    # Group by PO so each unique PO becomes one record with its
+    # full line list. Most queries match exactly one PO; a supplier
+    # / date browse may return several.
+    pos_out = []
+    if "OrderNumber" in df.columns:
+        po_groups = df.groupby("OrderNumber", sort=False)
+    else:
+        po_groups = [(None, df)]
+
+    for po_num, gdf in po_groups:
+        # Header fields — same per group, take the first row.
+        head_row = gdf.iloc[0]
+        # Optional enrichment from purchase_headers (richer header
+        # data than the line CSV holds).
+        invoice_amount = None
+        invoice_date = None
+        order_status = None
+        if (purchase_headers is not None
+                and not purchase_headers.empty
+                and "OrderNumber" in purchase_headers.columns):
+            hdr_match = purchase_headers[
+                purchase_headers["OrderNumber"].astype(str).str.upper()
+                == str(po_num or "").upper()]
+            if not hdr_match.empty:
+                hdr = hdr_match.iloc[0]
+                invoice_amount = hdr.get("InvoiceAmount")
+                invoice_date = hdr.get("InvoiceDate")
+                order_status = hdr.get("OrderStatus")
+
+        line_rows = []
+        for _, lr in gdf.iterrows():
+            line_rows.append(_serialise_row({
+                "sku": lr.get("SKU"),
+                "name": lr.get("Name"),
+                "quantity": lr.get("Quantity"),
+                "price": lr.get("Price"),
+                "tax": lr.get("Tax"),
+                "discount": lr.get("Discount"),
+                "total": lr.get("Total"),
+                "uom": lr.get("UOM"),
+            }))
+
+        po_record = {
+            "po_number": po_num,
+            "supplier": head_row.get("Supplier"),
+            "order_date": str(head_row.get("OrderDate"))
+                if pd.notna(head_row.get("OrderDate")) else None,
+            "invoice_date": (
+                str(invoice_date)
+                if invoice_date is not None
+                and pd.notna(invoice_date)
+                else (str(head_row.get("InvoiceDate"))
+                      if "InvoiceDate" in gdf.columns
+                      and pd.notna(head_row.get("InvoiceDate"))
+                      else None)),
+            "required_by": (
+                str(head_row.get("RequiredBy"))
+                if "RequiredBy" in gdf.columns
+                and pd.notna(head_row.get("RequiredBy"))
+                else None),
+            "status": head_row.get("Status"),
+            "order_status": order_status,
+            "invoice_amount": (
+                float(invoice_amount)
+                if invoice_amount is not None
+                and pd.notna(invoice_amount)
+                else None),
+            "comments": (
+                str(head_row.get("Comments")).strip()
+                if "Comments" in gdf.columns
+                and pd.notna(head_row.get("Comments"))
+                and str(head_row.get("Comments")).strip()
+                else None),
+            "shipping_notes": (
+                str(head_row.get("ShippingNotes")).strip()
+                if "ShippingNotes" in gdf.columns
+                and pd.notna(head_row.get("ShippingNotes"))
+                and str(head_row.get("ShippingNotes")).strip()
+                else None),
+            "line_count": len(line_rows),
+            "lines": line_rows,
+        }
+        pos_out.append(_serialise_row(po_record))
+
+    return {
+        "matched": len(pos_out),
+        "po_number": po_raw or None,
+        "purchase_orders": pos_out,
+        "note": (
+            "When showing the user, lead with PO number + supplier "
+            "+ status, then list each line as `<qty> × <SKU> – "
+            "<Name> @ <price>`. If `comments` or `shipping_notes` "
+            "are set, surface them — they're the buyer's freight "
+            "notes."),
+    }
+
+
+def get_sale_order(engine_df: pd.DataFrame,
+                    sale_lines_df: pd.DataFrame,
+                    args: dict) -> dict:
+    """Look up a specific sale order by number / invoice / customer +
+    date range. v2.67.51 — answers 'what did Acme buy on SO-12345',
+    'show me sale INV-9981', 'who ordered LED-V3060001-2 last week'.
+
+    Reads from _SALE_LINES_LONGEST_HOLDER (set at page boot to the
+    merged longest-window sale-lines DataFrame), falling back to
+    sale_lines_df arg if the holder wasn't populated."""
+    order_number = (args.get("order_number") or "").strip()
+    invoice_number = (args.get("invoice_number") or "").strip()
+    customer_filter = (args.get("customer") or "").strip().upper()
+    date_from = (args.get("date_from") or "").strip()
+    date_to = (args.get("date_to") or "").strip()
+    limit = max(1, min(int(args.get("limit", 10) or 10), 25))
+
+    sl = _SALE_LINES_LONGEST_HOLDER.get("df")
+    if sl is None or sl.empty:
+        sl = sale_lines_df
+    if sl is None or sl.empty:
+        return {
+            "error": ("Sale lines not available. An admin needs to "
+                      "call ai_tools.set_sale_lines_longest() at AI "
+                      "page boot, or the local sync hasn't run."),
+        }
+
+    if not (order_number or invoice_number or customer_filter
+            or date_from or date_to):
+        return {
+            "error": ("Specify at least one filter: order_number, "
+                      "invoice_number, customer, OR a date range. "
+                      "An empty filter would dump every sale line."),
+        }
+
+    df = sl.copy()
+
+    if order_number and "OrderNumber" in df.columns:
+        order_norm = order_number.upper().lstrip("SO-").lstrip("SO")
+        col = (df["OrderNumber"].astype(str).str.upper()
+               .str.replace("SO-", "", regex=False)
+               .str.replace("SO", "", regex=False))
+        df = df[col == order_norm]
+
+    if invoice_number and "InvoiceNumber" in df.columns:
+        inv_norm = invoice_number.upper()
+        df = df[df["InvoiceNumber"].astype(str).str.upper() == inv_norm]
+
+    if customer_filter and "Customer" in df.columns:
+        df = df[df["Customer"].astype(str).str.upper()
+                .str.contains(customer_filter, na=False)]
+
+    if date_from and "OrderDate" in df.columns:
+        try:
+            cutoff = pd.Timestamp(date_from)
+            parsed = pd.to_datetime(df["OrderDate"], errors="coerce")
+            df = df[parsed >= cutoff]
+        except Exception:
+            pass
+
+    if date_to and "OrderDate" in df.columns:
+        try:
+            cutoff = pd.Timestamp(date_to) + pd.Timedelta(days=1)
+            parsed = pd.to_datetime(df["OrderDate"], errors="coerce")
+            df = df[parsed < cutoff]
+        except Exception:
+            pass
+
+    if df.empty:
+        return {
+            "matched": 0,
+            "filters": {
+                "order_number": order_number or None,
+                "invoice_number": invoice_number or None,
+                "customer": customer_filter or None,
+                "date_from": date_from or None,
+                "date_to": date_to or None,
+            },
+            "note": ("No sale matches in the local sync window. "
+                     "Sale-line detail covers the last ~30 days "
+                     "(longer if a manual full sync ran more "
+                     "recently). For older sales, the user should "
+                     "check CIN7 directly."),
+        }
+
+    # Group by sale (SaleID preferred — order_number can be reused
+    # across credit notes / amendments).
+    group_col = ("SaleID" if "SaleID" in df.columns
+                 else "OrderNumber" if "OrderNumber" in df.columns
+                 else None)
+    if group_col is None:
+        return {"error": "No SaleID / OrderNumber column on sale_lines."}
+
+    grouped = list(df.groupby(group_col, sort=False))
+    grouped = grouped[:limit]
+
+    sales_out = []
+    for sale_id, gdf in grouped:
+        head = gdf.iloc[0]
+        lines = []
+        line_total = 0.0
+        for _, lr in gdf.iterrows():
+            qty = pd.to_numeric(lr.get("Quantity"), errors="coerce")
+            total = pd.to_numeric(lr.get("Total"), errors="coerce")
+            if pd.notna(total):
+                line_total += float(total)
+            lines.append(_serialise_row({
+                "sku": lr.get("SKU"),
+                "name": lr.get("Name"),
+                "quantity": (float(qty) if pd.notna(qty) else None),
+                "price": lr.get("Price"),
+                "discount": lr.get("Discount"),
+                "tax": lr.get("Tax"),
+                "total": (float(total) if pd.notna(total) else None),
+                "uom": lr.get("UOM"),
+            }))
+
+        sales_out.append(_serialise_row({
+            "sale_id": sale_id,
+            "order_number": head.get("OrderNumber"),
+            "invoice_number": head.get("InvoiceNumber"),
+            "order_date": (str(head.get("OrderDate"))
+                            if pd.notna(head.get("OrderDate"))
+                            else None),
+            "invoice_date": (str(head.get("InvoiceDate"))
+                              if "InvoiceDate" in gdf.columns
+                              and pd.notna(head.get("InvoiceDate"))
+                              else None),
+            "status": head.get("Status"),
+            "sale_type": head.get("SaleType"),
+            "source_channel": head.get("SourceChannel"),
+            "customer": head.get("Customer"),
+            "line_count": len(lines),
+            "line_total": round(line_total, 2),
+            "lines": lines,
+        }))
+
+    return {
+        "matched": len(sales_out),
+        "limit_applied": limit,
+        "sales": sales_out,
+        "note": (
+            "Show the user: order number + customer + date + status, "
+            "then each line as `<qty> × <SKU> – <Name> @ <price> = "
+            "$<total>`. line_total is the sum of line `Total` values "
+            "(excludes header-level shipping / tax adjustments)."),
+    }
+
+
+def get_stock_adjustment(engine_df: pd.DataFrame,
+                          sale_lines_df: pd.DataFrame,
+                          args: dict) -> dict:
+    """Look up CIN7 stock adjustments / stocktakes. v2.67.51 — answers
+    'show me ST-2034', 'what adjustments ran last week', 'find the
+    cycle count for warehouse 500'.
+
+    LIMITATION: the local sync only captures adjustment HEADERS
+    (TaskID, EffectiveDate, StocktakeNumber, Status, Account,
+    Reference). Per-line SKU detail (which SKUs were adjusted and by
+    how much) requires a per-task detail call we don't sync today.
+    The tool surfaces what we have + tells the AI to direct the user
+    to CIN7 for line detail."""
+    stocktake_number = (args.get("stocktake_number") or "").strip()
+    ref_substring = (args.get("reference_substring") or "").strip().upper()
+    date_from = (args.get("date_from") or "").strip()
+    date_to = (args.get("date_to") or "").strip()
+    status = (args.get("status") or "").strip().upper()
+    limit = max(1, min(int(args.get("limit", 25) or 25), 50))
+
+    adj = _STOCK_ADJUSTMENTS_HOLDER.get("df")
+    if adj is None or adj.empty:
+        return {
+            "error": ("Stock adjustments not loaded for this "
+                      "session. An admin needs to call "
+                      "ai_tools.set_stock_adjustments() at AI page "
+                      "boot."),
+        }
+
+    df = adj.copy()
+
+    if stocktake_number and "StocktakeNumber" in df.columns:
+        st_norm = stocktake_number.upper()
+        df = df[df["StocktakeNumber"].astype(str).str.upper() == st_norm]
+
+    if ref_substring and "Reference" in df.columns:
+        df = df[df["Reference"].astype(str).str.upper()
+                .str.contains(ref_substring, na=False)]
+
+    if status and "Status" in df.columns:
+        df = df[df["Status"].astype(str).str.upper() == status]
+
+    if date_from and "EffectiveDate" in df.columns:
+        try:
+            cutoff = pd.Timestamp(date_from)
+            parsed = pd.to_datetime(df["EffectiveDate"], errors="coerce")
+            df = df[parsed >= cutoff]
+        except Exception:
+            pass
+
+    if date_to and "EffectiveDate" in df.columns:
+        try:
+            cutoff = pd.Timestamp(date_to) + pd.Timedelta(days=1)
+            parsed = pd.to_datetime(df["EffectiveDate"], errors="coerce")
+            df = df[parsed < cutoff]
+        except Exception:
+            pass
+
+    if df.empty:
+        return {
+            "matched": 0,
+            "filters": {
+                "stocktake_number": stocktake_number or None,
+                "reference_substring": ref_substring or None,
+                "status": status or None,
+                "date_from": date_from or None,
+                "date_to": date_to or None,
+            },
+            "note": ("No stock adjustments match. The local sync "
+                     "covers the last 30 days; older adjustments "
+                     "won't be in this snapshot."),
+        }
+
+    # Sort newest first.
+    if "EffectiveDate" in df.columns:
+        df = df.assign(_d=pd.to_datetime(
+            df["EffectiveDate"], errors="coerce"))
+        df = df.sort_values("_d", ascending=False).drop(columns="_d")
+
+    out_rows = []
+    for _, r in df.head(limit).iterrows():
+        out_rows.append(_serialise_row({
+            "task_id": r.get("TaskID"),
+            "stocktake_number": r.get("StocktakeNumber"),
+            "effective_date": (str(r.get("EffectiveDate"))
+                                if pd.notna(r.get("EffectiveDate"))
+                                else None),
+            "status": r.get("Status"),
+            "account": r.get("Account"),
+            "reference": (str(r.get("Reference")).strip()
+                           if pd.notna(r.get("Reference"))
+                           and str(r.get("Reference")).strip()
+                           else None),
+        }))
+
+    return {
+        "matched": len(out_rows),
+        "limit_applied": limit,
+        "adjustments": out_rows,
+        "line_detail_available": False,
+        "note": (
+            "IMPORTANT: per-SKU line detail (which SKUs were "
+            "adjusted by how much) is NOT in our local sync. Tell "
+            "the user the header data shown here, then point them "
+            "to CIN7 → Inventory → Stock adjustments → "
+            "<StocktakeNumber> for the line breakdown."),
     }
 
 
@@ -2524,6 +3258,10 @@ TOOL_HANDLERS = {
     "find_products": find_products,
     "find_similar_products": find_similar_products,
     "get_incoming_stock": get_incoming_stock,
+    # v2.67.51 — transaction-lookup tools.
+    "get_purchase_order": get_purchase_order,
+    "get_sale_order": get_sale_order,
+    "get_stock_adjustment": get_stock_adjustment,
     "get_compatible_accessories": get_compatible_accessories,
     # v2.66.6: get_relevant_slow_stock UNREGISTERED. Slow-stock
     # promotion was breaking product-list queries. Function stays in

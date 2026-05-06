@@ -272,6 +272,37 @@ Two buyer-curated freight signals on every PO line:
   Shenzhen 2026-04-12, in customs".
 Both flow through `get_incoming_stock` so AI shipment-status
 answers report freight mode + progress, not just Required-By.
+
+#### Transaction lookup (v2.67.51)
+The AI Assistant can pull up specific CIN7 documents on demand.
+Three tools, picked by what kind of number the user mentions:
+- **`get_purchase_order(po_number=PO-XXXX)`** — full PO lookup.
+  Returns supplier, every line item (SKU / qty / price), Status,
+  Required-By, Comments + Shipping notes. Includes received /
+  closed POs (unlike `get_incoming_stock` which is open-only).
+- **`get_sale_order(order_number / invoice_number / customer +
+  date_from)`** — full sale lookup. Returns customer, every line
+  item, line_total. Useful for "what did Acme buy on SO-12345"
+  or "who ordered LED-V3060001-2 last week".
+- **`get_stock_adjustment(stocktake_number / date_from)`** —
+  adjustment header lookup. Returns EffectiveDate / Status /
+  Reference. Per-SKU line detail is NOT in the local sync;
+  the AI tells the user to view the line breakdown in CIN7.
+
+#### Local sync windows (v2.67.51)
+The AI's transaction tools read from local CSVs the daily sync
+drops:
+- **Purchase lines** — 30-day rolling window (bumped from 7d in
+  v2.67.51 after PO-7109 was missed). The widest available window
+  file is used as the base, with newer 1-day files merged on top.
+- **Sale lines** — 30-day rolling window (bumped from 3d in
+  v2.67.43). Plus the 1825-day longest-history file when present.
+- **Stock adjustments** — 30-day window, headers only (no per-SKU
+  line detail in the bulk endpoint).
+- **Stock-on-hand `OnOrder` field** — the canonical PO total,
+  refreshed every NearSync (15-min). When `get_incoming_stock`
+  returns no PO lines but `OnOrder>0`, the tool flags this as a
+  data gap rather than claiming "no PO exists".
 """
 
 
@@ -588,14 +619,18 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.50 — Hotfix: Slow Movers detail "
-                "table was raising ValueError on duplicate "
-                "Category columns. Engine_df already carries "
-                "Category from products; v2.67.47's _category → "
-                "Category rename then created a second "
-                "Category column → pyarrow couldn't serialise. "
-                "Fixed by overwriting Category in place "
-                "instead of renaming.")
+    st.caption("🟢 v2.67.51 — Transaction lookup + PO sync fix. "
+                "Adds three AI tools (get_purchase_order, "
+                "get_sale_order, get_stock_adjustment) so staff "
+                "can ask 'what's on PO-7109' / 'what did Acme buy "
+                "on SO-12345' / 'show me ST-2034'. Also fixes the "
+                "PO-7109 visibility bug — daily sync now refreshes "
+                "purchase lines on a 30-day window (was 7d), and "
+                "the AI's purchase-lines holder uses the longest-"
+                "window merged loader so 1d top-ups patch a stale "
+                "90d base. New OnOrder data-gap hint stops false "
+                "'no PO exists' answers when the line is outside "
+                "the sync window.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -631,6 +666,53 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.51** — Transaction lookup tools + PO-7109 "
+            "visibility fix. User reported the AI couldn't find "
+            "PO-7109 / LED-V3060001-2 even though OnOrder=190 "
+            "in stock-on-hand. Root cause: the AI was reading "
+            "`purchase_lines_last_90d_*.csv` directly, which is "
+            "only refreshed by manual full-syncs (the daily "
+            "sync was running `purchaselines --days 7`, so the "
+            "90d file was 14 days stale and PO-7109 — raised "
+            "less than 14 days ago — was invisible). Three "
+            "fixes shipped together:\n\n"
+            "(1) **Sync window bump.** `daily_sync.sh` and "
+            "`daily_sync.bat` now run "
+            "`cin7_sync.py purchaselines --days 30` daily. "
+            "Parallels the v2.67.43 sales-window bump. The "
+            "Windows .bat previously didn't run purchaselines "
+            "at all — added.\n\n"
+            "(2) **Longest-window holder.** `purchase_lines` is "
+            "now bound to `_load_longest_purchase_lines()` "
+            "instead of `load('purchase_lines_last_90d')`. "
+            "Same merge pattern as `sales_full`: pick the "
+            "widest window file as base, layer newer 1d/3d/30d "
+            "files on top. Now even if the 90d window goes "
+            "stale, recent 1d files patch it.\n\n"
+            "(3) **OnOrder data-gap hint.** "
+            "`get_incoming_stock` cross-checks "
+            "`engine_df.OnOrder` when matched=0; if OnOrder>0 "
+            "the response includes a `data_gap` field telling "
+            "the AI to say 'CIN7 record shows X on order but "
+            "the PO line isn't in our local sync window' "
+            "rather than 'no PO exists'.\n\n"
+            "Also added three new AI tools per user request "
+            "('look up any transaction'): "
+            "`get_purchase_order(po_number)` for full PO "
+            "lookup including received/closed; "
+            "`get_sale_order(order_number / invoice_number / "
+            "customer+date)` for sale-side lookup; "
+            "`get_stock_adjustment(stocktake_number / "
+            "date_range)` for adjustment headers (line detail "
+            "isn't synced — tool tells the AI to point users "
+            "at CIN7 directly for the per-SKU breakdown). "
+            "System prompt updated with TRANSACTION-LOOKUP "
+            "routing rules covering each number style "
+            "(PO-XXXX / SO-XXXX / INV-XXXX / ST-XXXX). "
+            "Glossary documents the new tools and the local "
+            "sync windows."
+        )
         st.caption(
             "**v2.67.50** — Slow Movers detail-table hotfix. "
             "v2.67.47's `_category → Category` rename created "
@@ -2240,7 +2322,15 @@ customers_file = _latest_file("customers")
 suppliers = load("suppliers")
 sales_headers = load("sales_last_30d")
 purchase_headers = load("purchases_last_30d")
-purchase_lines = load("purchase_lines_last_90d")
+# v2.67.51 — `purchase_lines` reassigned below, AFTER the longest-window
+# loader is defined. We previously did `load("purchase_lines_last_90d")`
+# directly here, but the 90-day file is only refreshed by a manual full-
+# sync; the daily/near sync drops 1d and 7d files. So `_last_90d` could
+# be 14+ days stale (we observed PO-7109 missing because it landed
+# inside the 14-day gap between the Apr 21 snapshot and today). The
+# real assignment lives next to `sales_full = _load_longest_sales()`
+# which uses the identical merge pattern for sale headers.
+purchase_lines = load("purchase_lines_last_90d")  # rebound below
 sale_lines_3d = load("sale_lines_last_3d")
 sale_lines_30d = load("sale_lines_last_30d")
 
@@ -2423,6 +2513,15 @@ def _load_longest_purchase_lines() -> pd.DataFrame:
 # - sale_lines for unit counts, velocity, customer rollup, ABC engine
 # - sales_full for revenue $ that the user can reconcile to CIN7
 sales_full = _load_longest_sales()
+
+# v2.67.51 — rebind `purchase_lines` to use the merged longest-window
+# loader. The original `load("purchase_lines_last_90d")` above could be
+# 14+ days stale because only a manual full sync refreshes the 90d
+# window; the daily/near sync only emits 1d / 7d files. Merge them on
+# top of whatever the widest window is so the AI Assistant's
+# get_incoming_stock tool sees recent POs (e.g. PO-7109 reported
+# missing on 2026-05-05). Same pattern as sales_full above.
+purchase_lines = _load_longest_purchase_lines()
 
 
 stock_adjustments = load("stock_adjustments_last_30d")
@@ -15741,6 +15840,27 @@ elif page == "AI Assistant":
         # if the DF never made it through.
         pass
 
+    # v2.67.51 — additional holders for the new transaction-lookup
+    # tools. Each setter is wrapped individually so a failure in one
+    # doesn't prevent the others from registering.
+    try:
+        ai_tools.set_purchase_headers(purchase_headers)
+    except Exception:
+        pass
+    try:
+        # `sale_lines` (module-level) is already the merged longest-
+        # window sale-lines DataFrame — _load_longest_sale_lines()
+        # picks the widest window file as base and merges newer 1d /
+        # 30d files on top. Hand it directly to the tool module so
+        # get_sale_order has full historical coverage.
+        ai_tools.set_sale_lines_longest(sale_lines)
+    except Exception:
+        pass
+    try:
+        ai_tools.set_stock_adjustments(stock_adjustments)
+    except Exception:
+        pass
+
     # Lay out the page. Left column: chat input + transcript. Right:
     # a "what can I ask" cheatsheet so users know where to start.
     main_col, side_col = st.columns([3, 1])
@@ -16496,7 +16616,54 @@ elif page == "AI Assistant":
                 "(✈/🚢 freight mode) and `shipping_notes` "
                 "(📍 progress detail) when present — they're "
                 "the most current human-curated signal about "
-                "the shipment status.\n"
+                "the shipment status. **If get_incoming_stock "
+                "returns matched=0 with a `data_gap` field set "
+                "(v2.67.51), DO NOT tell the user 'no PO "
+                "exists' — the data_gap means CIN7's stock "
+                "record shows units on order but the PO line "
+                "isn't in our local sync window. Tell the user "
+                "exactly that, and suggest checking CIN7 "
+                "directly OR asking an admin to widen the sync "
+                "window.**\n"
+                # v2.67.51 — transaction-lookup routing. Distinct from
+                # SHIPMENT-TIMING because the user is asking about a
+                # SPECIFIC transaction (PO/sale/adjustment) by number,
+                # not "what's incoming for SKU X".
+                "  - **TRANSACTION-LOOKUP question (v2.67.51)**: "
+                "when the user asks about a specific document by "
+                "number — 'what's on PO-7109', 'show me purchase "
+                "7042', 'who's the supplier on PO-7109', 'what "
+                "did Acme buy on SO-12345', 'show me sale INV-"
+                "9981', 'what was on stocktake ST-2034', 'what "
+                "adjustments did we run last week' — pick the "
+                "matching tool:\n"
+                "      • PO numbers (`PO-XXXX` or `purchase "
+                "XXXX`) → `get_purchase_order` with "
+                "po_number=`PO-XXXX`. Returns header + every "
+                "line. If matched=0, the PO isn't in the local "
+                "sync window — tell the user and suggest CIN7 "
+                "lookup. NOTE: get_purchase_order INCLUDES "
+                "received/closed POs by default; "
+                "get_incoming_stock is OPEN-only.\n"
+                "      • Sale numbers (`SO-XXXX`, `INV-XXXX`, "
+                "or 'what did <customer> buy') → "
+                "`get_sale_order` with order_number / "
+                "invoice_number / customer + date_from/date_to. "
+                "Returns header + every line + line_total.\n"
+                "      • Stocktake / adjustment numbers (`ST-"
+                "XXXX`) or 'what adjustments ran' → "
+                "`get_stock_adjustment` with stocktake_number "
+                "or date_from/date_to. NOTE: only header data "
+                "is locally synced — line-level SKU detail "
+                "isn't available, so always tell the user to "
+                "view the adjustment in CIN7 → Inventory → "
+                "Stock adjustments for the per-SKU breakdown.\n"
+                "      • If the user gives a number with no "
+                "prefix ('what's on 7109') and the context is "
+                "supplier / freight, default to "
+                "get_purchase_order. If context is customer / "
+                "invoice, default to get_sale_order. If you're "
+                "genuinely unsure, ASK.\n"
                 "  - **STOCK question** — they want to know what "
                 "we have on the shelf right now, qty available, "
                 "what's running low, what's slow-moving, what to "

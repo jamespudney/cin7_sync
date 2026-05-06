@@ -51,9 +51,16 @@ echo "[$(stamp)] cin7_sync salelines --days 30" >> "$LOG"
 python cin7_sync.py salelines --days 30 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync salelines FAILED (continuing)" >> "$LOG"
 
-# Purchase lines feed FixedCost audit and supplier-pricing audits.
-echo "[$(stamp)] cin7_sync purchaselines --days 7" >> "$LOG"
-python cin7_sync.py purchaselines --days 7 >> "$LOG" 2>&1 || \
+# Purchase lines feed FixedCost audit, supplier-pricing audits, AND
+# the AI Assistant's get_incoming_stock + get_purchase_order tools.
+# v2.67.51 — bumped from 7 to 30 days. With a 7-day window, any PO
+# created more than a week ago that wasn't received yet would be
+# invisible to the AI (reported as "no open PO matches") because the
+# widest-window file we hold became stale between manual full syncs.
+# Lead times from EU / Asia suppliers run 4-8 weeks, so 30d is the
+# right floor. Same parallel as the sales-window bump in v2.67.43.
+echo "[$(stamp)] cin7_sync purchaselines --days 30" >> "$LOG"
+python cin7_sync.py purchaselines --days 30 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync purchaselines FAILED (continuing)" >> "$LOG"
 
 echo "[$(stamp)] sync_sku_renames" >> "$LOG"
