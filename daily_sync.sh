@@ -85,6 +85,13 @@ if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
     echo "[$(stamp)] shopify_sync" >> "$LOG"
     python shopify_sync.py >> "$LOG" 2>&1 || \
       echo "[$(stamp)] shopify_sync FAILED (continuing)" >> "$LOG"
+    # v2.67.55 — Shopify ORDER pull for conversion attribution.
+    # Distinct from the content sync above (products / collections /
+    # pages); writes to OUTPUT_DIR/shopify_orders_last_7d_*.csv. The
+    # AI's get_shopify_order tool reads the merged file.
+    echo "[$(stamp)] shopify_sync --orders-recent 7" >> "$LOG"
+    python shopify_sync.py --orders-recent 7 >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] shopify_orders_recent FAILED (continuing)" >> "$LOG"
 else
     echo "[$(stamp)] shopify_sync skipped (env vars not set)" >> "$LOG"
 fi

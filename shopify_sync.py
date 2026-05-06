@@ -426,6 +426,226 @@ def write_article_md(article: dict, blog_handle: str,
 # ---------------------------------------------------------------------------
 # Main sync entry
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v2.67.55 — Shopify order sync. Distinct from the markdown content
+# sync above: orders are time-series transactional data, written as
+# CSVs to OUTPUT_DIR (the same location cin7_sync.py writes), so the
+# Streamlit app's existing _dir_fingerprint cache pattern picks them
+# up. Why we need this even though CIN7 already pulls Shopify orders
+# (via SourceChannel='Shopify' on /sale): CIN7 keeps the financial
+# data but DROPS the conversion attribution fields. landing_site,
+# referring_site, source_name, browser_ip, customer_locale,
+# note_attributes — all useful for "how did we get this conversion"
+# answers — only exist on the Shopify order. So we mirror them
+# locally next to the CIN7 sale data.
+# ---------------------------------------------------------------------------
+
+import csv as _csv  # avoid namespace clash with module-level uses
+import json as _json
+from datetime import datetime as _dt
+from datetime import timedelta as _td
+
+# Where shopify_orders_*.csv files live. Same OUTPUT_DIR (output/) as
+# cin7_sync uses, so the merge-loader patterns in app.py find them.
+from data_paths import OUTPUT_DIR as _CIN7_OUTPUT_DIR
+
+
+def _flatten_shopify_order(o: dict) -> dict:
+    """Flatten a Shopify Admin API order row into the column shape
+    we want in CSV. Conversion-attribution fields are first-class:
+
+      - source_name  Shopify's own "where did this order come from"
+                     classification (web, shopify_draft_order,
+                     pos, mobile_app, ...).
+      - landing_site URL of the FIRST page the customer hit on the
+                     storefront.
+      - referring_site Where the customer was BEFORE landing
+                     (google.com, instagram.com, t.co, etc.) —
+                     this is the gold for attribution.
+      - browser_ip   Sometimes useful for fraud / location guess.
+      - customer_locale Language the customer browsed in.
+      - note_attributes Custom key/value pairs Shopify themes /
+                     apps stash on the order (UTM params often go
+                     here when the storefront is set up for it).
+      - tags         Free-text classification, often used for
+                     'wholesale', 'priority', 'b2b'.
+      - discount_codes Coupon / promo codes redeemed.
+
+    Customer journey (multi-touch attribution) is on a separate
+    GraphQL endpoint — out of scope for v1; we leave a placeholder
+    column for it."""
+    if not isinstance(o, dict):
+        return {}
+    cust = o.get("customer") or {}
+    if not isinstance(cust, dict):
+        cust = {}
+    line_items = o.get("line_items") or []
+    li_summary = ""
+    if isinstance(line_items, list) and line_items:
+        parts = []
+        for li in line_items:
+            if not isinstance(li, dict):
+                continue
+            qty = li.get("quantity")
+            sku = li.get("sku") or ""
+            title = (li.get("title") or "")[:60]
+            parts.append(f"{qty}× {sku} ({title})")
+        li_summary = "; ".join(parts)
+    note_attrs_raw = o.get("note_attributes") or []
+    if isinstance(note_attrs_raw, list):
+        # Render as compact "key=value; key=value" so the CSV is
+        # human-readable and the AI can scan it with a single
+        # substring check rather than parsing JSON.
+        note_attrs = "; ".join(
+            f"{(a.get('name') or '').strip()}={(a.get('value') or '').strip()}"
+            for a in note_attrs_raw if isinstance(a, dict))
+    else:
+        note_attrs = ""
+    discount_codes_raw = o.get("discount_codes") or []
+    if isinstance(discount_codes_raw, list):
+        discount_codes = "; ".join(
+            (dc.get("code") or "").strip()
+            for dc in discount_codes_raw if isinstance(dc, dict))
+    else:
+        discount_codes = ""
+    return {
+        "ShopifyOrderID": o.get("id"),
+        "Name": o.get("name"),                    # e.g. #1234
+        "OrderNumber": o.get("order_number"),     # e.g. 1234
+        "ConfirmationNumber": o.get("confirmation_number"),
+        "CreatedAt": o.get("created_at"),
+        "UpdatedAt": o.get("updated_at"),
+        "ProcessedAt": o.get("processed_at"),
+        "ClosedAt": o.get("closed_at"),
+        "CancelledAt": o.get("cancelled_at"),
+        "FinancialStatus": o.get("financial_status"),
+        "FulfillmentStatus": o.get("fulfillment_status"),
+        "TotalPrice": o.get("total_price"),
+        "Subtotal": o.get("subtotal_price"),
+        "TotalTax": o.get("total_tax"),
+        "TotalDiscounts": o.get("total_discounts"),
+        "TotalShipping": (
+            (o.get("total_shipping_price_set") or {})
+            .get("shop_money", {}).get("amount")
+            if isinstance(o.get("total_shipping_price_set"), dict)
+            else None),
+        "Currency": o.get("currency"),
+        "PresentmentCurrency": o.get("presentment_currency"),
+        "Email": o.get("email") or cust.get("email"),
+        "CustomerID": cust.get("id"),
+        "CustomerFirstName": cust.get("first_name"),
+        "CustomerLastName": cust.get("last_name"),
+        "CustomerOrdersCount": cust.get("orders_count"),
+        "CustomerTotalSpent": cust.get("total_spent"),
+        "CustomerTags": cust.get("tags"),
+        "Tags": o.get("tags"),
+        "Note": o.get("note"),
+        # CONVERSION ATTRIBUTION — the bits CIN7 doesn't carry.
+        "SourceName": o.get("source_name"),
+        "LandingSite": o.get("landing_site"),
+        "LandingSiteRef": o.get("landing_site_ref"),
+        "ReferringSite": o.get("referring_site"),
+        "BrowserIP": o.get("browser_ip"),
+        "CustomerLocale": o.get("customer_locale"),
+        "NoteAttributes": note_attrs,             # compact "k=v;k=v"
+        "DiscountCodes": discount_codes,
+        "AppID": o.get("app_id"),
+        "Test": o.get("test"),
+        "ItemCount": (len(line_items)
+                       if isinstance(line_items, list) else 0),
+        "ItemSummary": li_summary,
+        # Placeholder for v2 GraphQL customer-journey backfill.
+        "CustomerJourneySource": None,
+    }
+
+
+def _write_orders_csv(name: str, rows: list) -> Path:
+    """Same CSV-writer pattern shipstation_sync uses. Drops a
+    timestamped file in cin7_sync's OUTPUT_DIR so the merge loader
+    auto-picks it up."""
+    ts = _dt.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    out_path = _CIN7_OUTPUT_DIR / f"{name}_{ts}.csv"
+    _CIN7_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        with out_path.open("w", encoding="utf-8", newline="") as f:
+            f.write("ShopifyOrderID,Name,OrderNumber,CreatedAt,"
+                     "TotalPrice\n")
+        log.info("Wrote empty %s (0 orders)", out_path.name)
+        return out_path
+    fieldnames = list(rows[0].keys())
+    seen = set(fieldnames)
+    for r in rows[1:]:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames,
+                                   extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    log.info("Wrote %s (%d orders)", out_path.name, len(rows))
+    return out_path
+
+
+def sync_orders_recent(client: ShopifyClient, days: int) -> Path:
+    """Pull Shopify orders updated in the last N days. Used by
+    NearSync (1d) and Daily Sync (7d)."""
+    since = (_dt.utcnow() - _td(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    log.info("Pulling Shopify orders updated_at >= %s ...", since)
+    rows_raw = client.paginate(
+        "orders.json", "orders",
+        params={"updated_at_min": since,
+                "status": "any",
+                "limit": 250})
+    rows = [_flatten_shopify_order(o) for o in rows_raw]
+    return _write_orders_csv(f"shopify_orders_last_{days}d", rows)
+
+
+def sync_orders_full(client: ShopifyClient, days: int = 1825) -> Path:
+    """One-time full backfill (default ~5y). Same backup-then-rewrite
+    pattern as shipstation_sync's `full` mode. Slow on busy stores
+    — Shopify's 2/sec sustained rate caps progress to ~7,000 orders
+    per hour. Plan accordingly."""
+    since = (_dt.utcnow() - _td(days=days)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    log.info("FULL Shopify-orders backfill since %s ...", since)
+    rows_raw = client.paginate(
+        "orders.json", "orders",
+        params={"updated_at_min": since,
+                "status": "any",
+                "limit": 250})
+    rows = [_flatten_shopify_order(o) for o in rows_raw]
+    out_path = _CIN7_OUTPUT_DIR / "shopify_orders_full.csv"
+    if out_path.exists():
+        backup = out_path.with_suffix(
+            f".bak.{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
+        out_path.rename(backup)
+        log.info("Backed up previous shopify_orders_full.csv to %s",
+                   backup.name)
+    if not rows:
+        with out_path.open("w", encoding="utf-8", newline="") as f:
+            f.write("ShopifyOrderID,Name,OrderNumber,CreatedAt\n")
+        return out_path
+    fieldnames = list(rows[0].keys())
+    seen = set(fieldnames)
+    for r in rows[1:]:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames,
+                                   extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+    log.info("Wrote %s (%d orders)", out_path.name, len(rows))
+    return out_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Sync Shopify content to local AI knowledge base")
@@ -444,6 +664,16 @@ def main() -> int:
         "--skip-policies", action="store_true")
     parser.add_argument(
         "--skip-menus", action="store_true")
+    # v2.67.55 — order pull modes. Distinct from the content sync
+    # so callers can run "orders only" from NearSync.
+    parser.add_argument(
+        "--orders-recent", type=int, metavar="DAYS",
+        help="Pull only Shopify orders from the last N days "
+              "(skips products/collections/pages/etc).")
+    parser.add_argument(
+        "--orders-full", type=int, metavar="DAYS",
+        help="Full Shopify-orders backfill (default 1825 days). "
+              "Skips other content.")
     args = parser.parse_args()
 
     load_dotenv()
@@ -455,6 +685,16 @@ def main() -> int:
         return 1
 
     client = ShopifyClient(domain, token)
+
+    # v2.67.55 — order-only modes short-circuit. Leaves the
+    # content sync untouched when caller only wants orders.
+    if args.orders_recent is not None:
+        sync_orders_recent(client, args.orders_recent)
+        return 0
+    if args.orders_full is not None:
+        sync_orders_full(client, args.orders_full)
+        return 0
+
     _ensure_dirs()
 
     log.info("Connected to %s", domain)

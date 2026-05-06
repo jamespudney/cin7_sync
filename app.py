@@ -296,6 +296,30 @@ into. `get_sale_order` surfaces all of them:
 - **CustomerReference** — customer's own PO# referencing this
   sale.
 
+#### Shopify order tracing (v2.67.55)
+CIN7 records sales from the Shopify channel with
+SourceChannel='Shopify' but doesn't carry the Shopify-side
+conversion fields. shopify_sync.py now mirrors them locally so
+the AI's `get_shopify_order` tool can answer "how did we get
+this conversion" questions:
+
+- **source_name** — Shopify's classification: web / pos /
+  shopify_draft_order / mobile_app / etc.
+- **landing_site** — URL of the FIRST page the customer hit on
+  the storefront.
+- **referring_site** — where the customer was BEFORE landing
+  (google.com, instagram.com, t.co, etc.). The most useful
+  field for marketing attribution.
+- **note_attributes** — custom key=value pairs Shopify themes
+  / apps stash on the order. UTM params often go here.
+- **discount_codes** — coupons / promo codes redeemed.
+- **customer_orders_count** + **customer_total_spent** — quick
+  returning-customer flag.
+
+When the AI sees `get_sale_order` return SourceChannel=Shopify,
+it proactively follows up with `get_shopify_order` for the
+joined view rather than "I have CIN7 data, check Shopify yourself".
+
 #### ShipStation integration (v2.67.54)
 ShipStation shipment data feeds two places:
 - **AI Assistant** — `get_shipping_details(order_number /
@@ -726,16 +750,20 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.54 — ShipStation integration. New AI "
-                "tool `get_shipping_details(order_number / "
-                "tracking / customer + date)` answers "
-                "shipping-status questions. Monthly Metrics' "
-                "'Shipping Cost' row finally has data (was a "
-                "placeholder since launch). NearSync picks up new "
-                "shipments within 15 min of label creation; "
-                "first-time backfill is `python shipstation_sync.py "
-                "full --days 1825` after setting "
-                "SHIPSTATION_API_KEY+SECRET.")
+    st.caption("🟢 v2.67.55 — Shopify order tracing for "
+                "conversion attribution. CIN7 records sales with "
+                "SourceChannel='Shopify' but doesn't carry the "
+                "Shopify-side fields (landing_site, "
+                "referring_site, source_name, UTM params). New AI "
+                "tool `get_shopify_order` mirrors them locally so "
+                "staff can ask 'how did we get this conversion' / "
+                "'what coupon did they use' / 'is this a "
+                "returning customer'. When `get_sale_order` "
+                "returns SourceChannel=Shopify the AI proactively "
+                "follows up with `get_shopify_order` for the "
+                "joined view. Setup: SHOPIFY_DOMAIN + "
+                "SHOPIFY_ACCESS_TOKEN env vars + one-time "
+                "`python shopify_sync.py --orders-full 1825`.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -773,6 +801,61 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.55** — Shopify order tracing for conversion "
+            "attribution. User asked: 'can you trace shopify "
+            "orders in cin7 and glean more information when "
+            "required... example if a user asks how did we get "
+            "this conversion, then ai knows to trace back an "
+            "order to amazon or shopify and give conversion "
+            "details'.\n\n"
+            "Problem: CIN7 stores Shopify sales with "
+            "SourceChannel='Shopify' but DROPS the conversion-"
+            "attribution fields. landing_site, referring_site, "
+            "source_name, customer_locale, note_attributes (UTM "
+            "params), discount_codes, browser_ip — all useful for "
+            "'how did we get this conversion' answers — only live "
+            "on the Shopify order itself.\n\n"
+            "Built into the existing shopify_sync.py:\n"
+            "- New `_flatten_shopify_order` extracts the conversion-"
+            "attribution columns alongside the financial fields.\n"
+            "- `sync_orders_recent(days)` for rolling-window pulls "
+            "(NearSync 1d, Daily 7d).\n"
+            "- `sync_orders_full(days=1825)` for one-time 5y "
+            "backfill.\n"
+            "- Output: `shopify_orders_full.csv` (backfill base) + "
+            "`shopify_orders_last_<N>d_*.csv` (rolling patches), "
+            "merged via `_load_longest_shopify_orders()` (same "
+            "pattern as shipments).\n\n"
+            "AI side:\n"
+            "- New `get_shopify_order(order_name / email / "
+            "customer + date)` tool. Returns total_price, "
+            "financial_status, fulfillment_status, customer "
+            "details, **plus** the headline conversion fields: "
+            "source_name, landing_site, referring_site, "
+            "customer_locale, note_attributes (UTM key=value "
+            "pairs), discount_codes, customer_orders_count, "
+            "customer_total_spent.\n"
+            "- System prompt CONVERSION-ATTRIBUTION routing rule: "
+            "when the user asks attribution-flavoured questions "
+            "AND the sale is Shopify-channel, AI calls the tool. "
+            "Pattern: when get_sale_order returns "
+            "SourceChannel=Shopify, AI proactively follows up "
+            "with get_shopify_order for the joined view "
+            "(rather than 'I have CIN7 data, you check Shopify').\n\n"
+            "Sync schedule:\n"
+            "- NearSync: `shopify_sync.py --orders-recent 1`\n"
+            "- Daily Sync: `shopify_sync.py --orders-recent 7`\n"
+            "- Both gated on existing SHOPIFY_DOMAIN + "
+            "SHOPIFY_ACCESS_TOKEN env vars; no-op when missing.\n\n"
+            "Future enhancement: customer_journey GraphQL endpoint "
+            "for multi-touch attribution (placeholder column "
+            "`CustomerJourneySource` already in the schema). "
+            "Amazon-side conversion data isn't currently in scope "
+            "— Amazon's Selling Partner API has equivalents "
+            "(referring_url, traffic_source) but a separate "
+            "client. Flagged for v2.67.56+ if/when needed."
+        )
         st.caption(
             "**v2.67.54** — ShipStation integration. The "
             "Monthly Metrics 'Shipping Cost' row has been a "
@@ -2567,6 +2650,9 @@ sale_lines_30d = load("sale_lines_last_30d")
 # is defined. Loader gracefully returns an empty frame if shipping
 # isn't configured / the first sync hasn't run.
 shipments = pd.DataFrame()
+# v2.67.55 — Shopify orders for conversion attribution. Same
+# placeholder pattern.
+shopify_orders = pd.DataFrame()
 
 # Why this pattern: persist="disk" caches don't support ttl. To get
 # auto-invalidation on fresh data, the cache key must change when the
@@ -2801,6 +2887,60 @@ def _load_longest_shipments() -> pd.DataFrame:
         _dir_fingerprint("shipments_*.csv"))
 
 
+# v2.67.55 — Shopify orders loader. Same backfill+rolling-window
+# merge pattern as shipments. Backfill = `shopify_orders_full.csv`,
+# rolling window = `shopify_orders_last_<N>d_*.csv`. Dedup by
+# ShopifyOrderID, last-write wins (Shopify's `updated_at` filter
+# means an updated order shows up again with newer data).
+@st.cache_data(persist="disk",
+                show_spinner="Loading Shopify orders…")
+def _load_longest_shopify_orders_cached(fingerprint: tuple) -> pd.DataFrame:
+    files = []
+    full_path = OUTPUT_DIR / "shopify_orders_full.csv"
+    if full_path.exists():
+        files.append(("full", full_path.stat().st_mtime, full_path))
+    import re as _re
+    for p in OUTPUT_DIR.glob("shopify_orders_last_*d_*.csv"):
+        m = _re.match(r"shopify_orders_last_(\d+)d_", p.name)
+        if m:
+            files.append((int(m.group(1)), p.stat().st_mtime, p))
+    if not files:
+        return pd.DataFrame(columns=[
+            "ShopifyOrderID", "Name", "OrderNumber", "CreatedAt",
+            "TotalPrice", "SourceName", "LandingSite",
+            "ReferringSite", "Email", "ItemSummary"])
+
+    def _sort_key(item):
+        days, mtime, _p = item
+        if days == "full":
+            return (-10**9, -mtime)
+        return (-days, -mtime)
+    files.sort(key=_sort_key)
+    base = pd.DataFrame()
+    base_mtime = 0.0
+    for _days, mtime, p in files:
+        try:
+            chunk = pd.read_csv(p, low_memory=False)
+        except Exception:
+            continue
+        if base.empty:
+            base = chunk
+            base_mtime = mtime
+            continue
+        if mtime <= base_mtime:
+            continue
+        base = pd.concat([base, chunk], ignore_index=True)
+    if "ShopifyOrderID" in base.columns:
+        base = base.drop_duplicates(subset=["ShopifyOrderID"],
+                                       keep="last")
+    return base.reset_index(drop=True)
+
+
+def _load_longest_shopify_orders() -> pd.DataFrame:
+    return _load_longest_shopify_orders_cached(
+        _dir_fingerprint("shopify_orders_*.csv"))
+
+
 # Order-level (header) sales for revenue calculations that need to
 # match CIN7's dashboard. The line-level `sale_lines.Total` excludes
 # shipping; `sales_full.InvoiceAmount` includes shipping + tax which
@@ -2823,6 +2963,13 @@ purchase_lines = _load_longest_purchase_lines()
 # exist yet, so downstream code doesn't have to special-case the
 # pre-ShipStation-rollout state.
 shipments = _load_longest_shipments()
+
+# v2.67.55 — bind Shopify orders the same way. Holds conversion
+# attribution that CIN7 doesn't carry (landing_site, referring_site,
+# source_name, note_attributes, discount_codes). The AI's
+# get_shopify_order tool reads this to answer "how did we get
+# this conversion" / "what was the traffic source for SO-12345".
+shopify_orders = _load_longest_shopify_orders()
 
 
 stock_adjustments = load("stock_adjustments_last_30d")
@@ -16211,6 +16358,11 @@ elif page == "AI Assistant":
         ai_tools.set_shipments(shipments)
     except Exception:
         pass
+    try:
+        # v2.67.55 — Shopify orders for conversion attribution.
+        ai_tools.set_shopify_orders(shopify_orders)
+    except Exception:
+        pass
 
     # Lay out the page. Left column: chat input + transcript. Right:
     # a "what can I ask" cheatsheet so users know where to start.
@@ -17031,6 +17183,34 @@ elif page == "AI Assistant":
                 "get_purchase_order. If context is customer / "
                 "invoice, default to get_sale_order. If you're "
                 "genuinely unsure, ASK.\n"
+                # v2.67.55 — Shopify-conversion attribution routing.
+                # Used when staff ask 'how did we get this conversion'
+                # or want UTM / referrer / discount-code data on a
+                # specific Shopify-channel sale.
+                "  - **CONVERSION-ATTRIBUTION question "
+                "(v2.67.55)**: when the user asks 'how did we "
+                "get this conversion', 'what was the traffic "
+                "source', 'where did this customer come from', "
+                "'what coupon did they use', 'what UTM was on "
+                "this order', 'is this a returning customer' "
+                "AND the sale's SourceChannel is 'Shopify' (or "
+                "the user is referencing a Shopify-style order "
+                "name like #1234) → CALL `get_shopify_order` "
+                "with order_name (with or without #), email, "
+                "or customer + date_from. Returns source_name, "
+                "landing_site, referring_site, customer_locale, "
+                "note_attributes (UTM params), discount_codes, "
+                "customer_orders_count, customer_total_spent. "
+                "**Pattern: if you've already called "
+                "get_sale_order and the result has "
+                "source_channel='Shopify', proactively call "
+                "get_shopify_order with that sale's "
+                "order_number — the user usually wants the "
+                "joined view, not a 'I have CIN7 data, check "
+                "Shopify yourself' response.** If the tool "
+                "errors with 'not loaded', tell the user the "
+                "Shopify-orders sync isn't configured / "
+                "hasn't run.\n"
                 # v2.67.54 — ShipStation routing.
                 "  - **SHIPPING-LOOKUP question (v2.67.54)**: "
                 "when the user asks 'where's order X', 'what's "

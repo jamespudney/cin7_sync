@@ -31,4 +31,13 @@ echo "[$(stamp)] shipstation_sync recent --days 1" >> "$LOG"
 python shipstation_sync.py recent --days 1 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] shipstation_sync FAILED (continuing)" >> "$LOG"
 
+# v2.67.55 — Shopify orders 1-day catch-up for conversion-
+# attribution AI answers. Same gating pattern; same no-fail
+# semantics (we already captured the CIN7 RC above).
+if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
+    echo "[$(stamp)] shopify_sync --orders-recent 1" >> "$LOG"
+    python shopify_sync.py --orders-recent 1 >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] shopify_orders FAILED (continuing)" >> "$LOG"
+fi
+
 exit "$RC"

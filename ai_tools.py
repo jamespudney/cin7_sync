@@ -768,6 +768,78 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        # v2.67.55 — Shopify order trace for conversion attribution.
+        # CIN7 keeps the financial data on /sale (SourceChannel,
+        # Customer, Total, lines) but DROPS the conversion fields
+        # (landing_site, referring_site, source_name, UTM params in
+        # note_attributes, discount codes redeemed). Those only live
+        # on the Shopify order itself. This tool joins the two so
+        # the AI can answer 'how did we get this conversion'.
+        "name": "get_shopify_order",
+        "description": (
+            "Look up a Shopify order's conversion attribution and "
+            "metadata: source_name (web / pos / shopify_draft / "
+            "mobile_app), landing_site (first page hit), "
+            "referring_site (where they came from — google, "
+            "instagram, t.co, etc.), customer_locale, "
+            "note_attributes (UTM params + custom theme keys), "
+            "discount_codes redeemed, customer history (orders "
+            "count, total spent, tags). Use when a CIN7 sale has "
+            "SourceChannel='Shopify' AND the user asks 'how did we "
+            "get this conversion', 'what was the traffic source', "
+            "'what coupon did they use', 'is this a returning "
+            "customer'. The AI Assistant should automatically "
+            "follow up with this tool when asked attribution-flavoured "
+            "questions about a Shopify-channel sale. Match by order "
+            "Name (#1234), order_number (1234), email, or "
+            "customer_name + date range. Returns matched=0 if the "
+            "order isn't in the local sync window OR the integration "
+            "isn't configured."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_name": {
+                    "type": "string",
+                    "description": (
+                        "Shopify order name with or without # "
+                        "(e.g. '#1234' or '1234'). The same "
+                        "number CIN7 stores in OrderNumber for "
+                        "Shopify-channel sales.")
+                },
+                "email": {
+                    "type": "string",
+                    "description": (
+                        "Customer email — exact match.")
+                },
+                "customer": {
+                    "type": "string",
+                    "description": (
+                        "Customer name substring. Combine with "
+                        "date_from / date_to.")
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive lower "
+                        "bound on created_at.")
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Inclusive upper "
+                        "bound on created_at.")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max orders to return (cap 25, default "
+                        "10).")
+                },
+            },
+        },
+    },
+    {
         # v2.67.51 — stock-adjustment lookup. The local sync currently
         # captures HEADERS only (TaskID, EffectiveDate, StocktakeNumber,
         # Status, Account, Reference). Line-level detail (which SKUs
@@ -1503,6 +1575,9 @@ _SALE_LINES_LONGEST_HOLDER: dict = {"df": None}
 _STOCK_ADJUSTMENTS_HOLDER: dict = {"df": None}
 # v2.67.54 — ShipStation shipments holder.
 _SHIPMENTS_HOLDER: dict = {"df": None}
+# v2.67.55 — Shopify orders holder for conversion-attribution
+# lookups.
+_SHOPIFY_ORDERS_HOLDER: dict = {"df": None}
 
 
 def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
@@ -1546,6 +1621,13 @@ def set_shipments(shipments_df: pd.DataFrame) -> None:
     so get_shipping_details can scan without re-loading the CSV per
     tool call."""
     _SHIPMENTS_HOLDER["df"] = shipments_df
+
+
+def set_shopify_orders(shopify_orders_df: pd.DataFrame) -> None:
+    """v2.67.55 — stash the Shopify orders DataFrame so
+    get_shopify_order (and any future Shopify-side tool) can read it
+    without re-loading."""
+    _SHOPIFY_ORDERS_HOLDER["df"] = shopify_orders_df
 
 
 def _signal_row_to_dict(row) -> dict:
@@ -3131,6 +3213,198 @@ def get_shipping_details(engine_df: pd.DataFrame,
     }
 
 
+def get_shopify_order(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """v2.67.55 — fetch Shopify-side conversion attribution for a
+    sale that came through Shopify. CIN7's /sale endpoint records
+    SourceChannel='Shopify' but NOT the channel sub-attribution
+    (landing page, referrer, UTM, locale, discount codes). This
+    tool reads the Shopify Admin API mirror that shopify_sync.py
+    drops as `shopify_orders_full.csv` + rolling-window patches.
+
+    Filter precedence: order_name > email > customer + date.
+    Same first-specific-wins logic as get_shipping_details so the
+    answer doesn't accidentally widen when the user provided a
+    specific identifier."""
+    order_name = (args.get("order_name") or "").strip()
+    email = (args.get("email") or "").strip()
+    customer_filter = (args.get("customer") or "").strip().upper()
+    date_from = (args.get("date_from") or "").strip()
+    date_to = (args.get("date_to") or "").strip()
+    limit = max(1, min(int(args.get("limit", 10) or 10), 25))
+
+    df = _SHOPIFY_ORDERS_HOLDER.get("df")
+    if df is None or df.empty:
+        return {
+            "error": ("Shopify orders not loaded. Either the "
+                      "SHOPIFY_DOMAIN / SHOPIFY_ACCESS_TOKEN env "
+                      "vars aren't set, or the shopify-orders "
+                      "sync hasn't run yet. To enable: set the "
+                      "env vars, then run `python shopify_sync.py "
+                      "--orders-full 1825` once for backfill."),
+        }
+
+    if not (order_name or email or customer_filter or date_from
+            or date_to):
+        return {
+            "error": ("Specify at least one filter: order_name, "
+                      "email, customer, OR a date range. Empty "
+                      "filter would dump every Shopify order."),
+        }
+
+    work = df.copy()
+
+    if order_name:
+        # Match against both Name (#1234) and OrderNumber (1234).
+        norm = order_name.lstrip("#").strip()
+        candidates = []
+        if "OrderNumber" in work.columns:
+            candidates.append(
+                work["OrderNumber"].astype(str).str.lstrip("#") == norm)
+        if "Name" in work.columns:
+            candidates.append(
+                work["Name"].astype(str).str.lstrip("#") == norm)
+        if candidates:
+            mask = candidates[0]
+            for c in candidates[1:]:
+                mask = mask | c
+            work = work[mask]
+    elif email and "Email" in work.columns:
+        work = work[work["Email"].astype(str).str.lower()
+                     == email.lower()]
+    else:
+        if customer_filter:
+            cols = [c for c in
+                      ("CustomerFirstName", "CustomerLastName")
+                      if c in work.columns]
+            if cols:
+                full_name = work[cols[0]].fillna("").astype(str)
+                for c in cols[1:]:
+                    full_name = full_name + " " + work[c].fillna("").astype(str)
+                work = work[full_name.str.upper().str.contains(
+                    customer_filter, na=False)]
+        if date_from and "CreatedAt" in work.columns:
+            try:
+                cutoff = pd.Timestamp(date_from)
+                parsed = pd.to_datetime(work["CreatedAt"],
+                                            errors="coerce", utc=True)
+                # Drop tz to compare with naive cutoff.
+                parsed = parsed.dt.tz_convert(None)
+                work = work[parsed >= cutoff]
+            except Exception:
+                pass
+        if date_to and "CreatedAt" in work.columns:
+            try:
+                cutoff = pd.Timestamp(date_to) + pd.Timedelta(days=1)
+                parsed = pd.to_datetime(work["CreatedAt"],
+                                            errors="coerce", utc=True)
+                parsed = parsed.dt.tz_convert(None)
+                work = work[parsed < cutoff]
+            except Exception:
+                pass
+
+    if work.empty:
+        return {
+            "matched": 0,
+            "filters": {
+                "order_name": order_name or None,
+                "email": email or None,
+                "customer": customer_filter or None,
+                "date_from": date_from or None,
+                "date_to": date_to or None,
+            },
+            "note": ("No Shopify order matches in the local sync "
+                     "window. Either the order isn't from "
+                     "Shopify (CIN7 SourceChannel may say "
+                     "Shopify but the local mirror could be "
+                     "stale — check shopify_orders_full.csv "
+                     "freshness), or the filters are too "
+                     "narrow. The AI should tell the user what "
+                     "was searched and suggest a wider window "
+                     "or different identifier."),
+        }
+
+    # Newest first.
+    if "CreatedAt" in work.columns:
+        work = work.assign(_d=pd.to_datetime(
+            work["CreatedAt"], errors="coerce", utc=True))
+        work = work.sort_values("_d", ascending=False).drop(columns="_d")
+
+    out = []
+    for _, r in work.head(limit).iterrows():
+        def _txt(col):
+            if (col not in work.columns
+                    or not pd.notna(r.get(col))
+                    or not str(r.get(col)).strip()):
+                return None
+            return str(r.get(col)).strip()
+        out.append(_serialise_row({
+            "shopify_order_id": r.get("ShopifyOrderID"),
+            "name": r.get("Name"),
+            "order_number": r.get("OrderNumber"),
+            "created_at": _txt("CreatedAt"),
+            "processed_at": _txt("ProcessedAt"),
+            "financial_status": r.get("FinancialStatus"),
+            "fulfillment_status": r.get("FulfillmentStatus"),
+            "total_price": (
+                float(r.get("TotalPrice"))
+                if pd.notna(r.get("TotalPrice")) else None),
+            "subtotal": (
+                float(r.get("Subtotal"))
+                if pd.notna(r.get("Subtotal")) else None),
+            "total_tax": (
+                float(r.get("TotalTax"))
+                if pd.notna(r.get("TotalTax")) else None),
+            "total_shipping": (
+                float(r.get("TotalShipping"))
+                if pd.notna(r.get("TotalShipping")) else None),
+            "currency": r.get("Currency"),
+            "customer": (
+                f"{r.get('CustomerFirstName') or ''} "
+                f"{r.get('CustomerLastName') or ''}").strip()
+                or None,
+            "email": r.get("Email"),
+            "customer_orders_count": (
+                int(r.get("CustomerOrdersCount"))
+                if pd.notna(r.get("CustomerOrdersCount")) else None),
+            "customer_total_spent": (
+                float(r.get("CustomerTotalSpent"))
+                if pd.notna(r.get("CustomerTotalSpent")) else None),
+            "customer_tags": _txt("CustomerTags"),
+            "tags": _txt("Tags"),
+            "note": _txt("Note"),
+            # CONVERSION ATTRIBUTION — the headline use case.
+            "source_name": r.get("SourceName"),
+            "landing_site": _txt("LandingSite"),
+            "referring_site": _txt("ReferringSite"),
+            "customer_locale": r.get("CustomerLocale"),
+            "note_attributes": _txt("NoteAttributes"),
+            "discount_codes": _txt("DiscountCodes"),
+            "item_summary": _txt("ItemSummary"),
+        }))
+
+    return {
+        "matched": len(out),
+        "limit_applied": limit,
+        "orders": out,
+        "note": (
+            "Show the user: order_name + customer + date + "
+            "total_price as the headline. THEN surface "
+            "conversion-attribution fields: source_name (where "
+            "Shopify thinks it came from), referring_site (where "
+            "the customer was BEFORE Shopify — google, "
+            "instagram, etc.), landing_site (first storefront "
+            "page), discount_codes (coupon redeemed), and "
+            "note_attributes (UTM params + theme keys). "
+            "customer_orders_count >= 2 means returning "
+            "customer — flag that. If note_attributes contains "
+            "'utm_source' or 'utm_campaign' substrings, those "
+            "are the marketing-attribution params; surface "
+            "them."),
+    }
+
+
 def get_compatible_accessories(engine_df: pd.DataFrame,
                                  sale_lines_df: pd.DataFrame,
                                  args: dict) -> dict:
@@ -3589,6 +3863,8 @@ TOOL_HANDLERS = {
     "get_stock_adjustment": get_stock_adjustment,
     # v2.67.54 — ShipStation lookup.
     "get_shipping_details": get_shipping_details,
+    # v2.67.55 — Shopify conversion attribution.
+    "get_shopify_order": get_shopify_order,
     "get_compatible_accessories": get_compatible_accessories,
     # v2.66.6: get_relevant_slow_stock UNREGISTERED. Slow-stock
     # promotion was breaking product-list queries. Function stays in

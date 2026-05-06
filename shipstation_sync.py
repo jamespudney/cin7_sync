@@ -60,8 +60,22 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from data_paths import OUTPUT_DIR  # noqa: E402
 
 
-BASE_URL = os.environ.get("SHIPSTATION_BASE_URL",
-                            "https://ssapi.shipstation.com").rstrip("/")
+# v2.67.55+ — Two ShipStation APIs are supported. Auto-detect which
+# one to use based on env vars:
+#   v1 (legacy): HTTP Basic with SHIPSTATION_API_KEY + SHIPSTATION_API_SECRET.
+#                Base: https://ssapi.shipstation.com.
+#   v2 (newer):  Single token in `API-Key` header.
+#                Base: https://api.shipstation.com/v2.
+# v2's `/shipments` endpoint returns the same shape we want (with
+# slightly renamed fields) — we normalise to the v1 column set in
+# _flatten_shipment_v2 so the downstream CSV / AI tool layer doesn't
+# need to know which API the data came from.
+BASE_URL_V1 = os.environ.get("SHIPSTATION_BASE_URL",
+                                "https://ssapi.shipstation.com").rstrip("/")
+BASE_URL_V2 = os.environ.get("SHIPSTATION_V2_BASE_URL",
+                                "https://api.shipstation.com/v2").rstrip("/")
+# Backwards compat — old code references BASE_URL.
+BASE_URL = BASE_URL_V1
 DEFAULT_PAGE_SIZE = 500       # ShipStation max per page is 500
 DEFAULT_TIMEOUT = 30.0
 MAX_RETRIES = 5
@@ -76,23 +90,49 @@ log = logging.getLogger("shipstation_sync")
 # ---------------------------------------------------------------------------
 
 
-def _build_session(api_key: str, api_secret: str) -> requests.Session:
-    """Build a requests.Session preconfigured with Basic auth + JSON
-    headers. Why a session: keeps connection pooling alive across the
-    hundreds of paginated calls a backfill makes."""
-    if not api_key or not api_secret:
+def _build_session(api_key: str,
+                    api_secret: str = "",
+                    api_version: str = "auto") -> Tuple[
+                        requests.Session, str]:
+    """Build a requests.Session for whichever ShipStation API is
+    configured. Returns (session, version) where version is 'v1' or
+    'v2' so callers can route to the right endpoint paths.
+
+    Auto-detect rule: if api_secret is provided → v1 Basic auth
+    (SHIPSTATION_API_KEY + SHIPSTATION_API_SECRET). Otherwise → v2
+    API-Key header (SHIPSTATION_API_KEY only). Caller can force
+    via api_version='v1' or api_version='v2'.
+
+    Why two APIs: v1 (ssapi.shipstation.com) is the legacy
+    well-documented one, basic-auth, broad endpoint coverage. v2
+    (api.shipstation.com/v2) is ShipStation's newer API with a
+    single token. As of 2026, both are supported by ShipStation
+    but new accounts often only get v2 keys — hence auto-detect."""
+    if not api_key:
         raise RuntimeError(
-            "Missing ShipStation credentials. Set "
-            "SHIPSTATION_API_KEY and SHIPSTATION_API_SECRET in .env.")
+            "Missing SHIPSTATION_API_KEY. Set it in .env or Render "
+            "env vars. v1 also needs SHIPSTATION_API_SECRET; v2 "
+            "uses just the single API-Key.")
     s = requests.Session()
-    token = b64encode(f"{api_key}:{api_secret}".encode("utf-8")).decode("ascii")
-    s.headers.update({
-        "Authorization": f"Basic {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "cin7_sync-shipstation/2.67.54",
-    })
-    return s
+    if api_version == "auto":
+        api_version = "v1" if api_secret else "v2"
+    if api_version == "v1":
+        token = b64encode(
+            f"{api_key}:{api_secret}".encode("utf-8")).decode("ascii")
+        s.headers.update({
+            "Authorization": f"Basic {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "cin7_sync-shipstation/2.67.55",
+        })
+    else:  # v2
+        s.headers.update({
+            "API-Key": api_key,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "cin7_sync-shipstation/2.67.55",
+        })
+    return s, api_version
 
 
 def _respect_rate_limits(resp: requests.Response) -> None:
@@ -119,21 +159,31 @@ def _respect_rate_limits(resp: requests.Response) -> None:
 
 
 def _paginate_shipments(session: requests.Session,
-                         params: Dict[str, Any]
+                         params: Dict[str, Any],
+                         api_version: str = "v1"
                          ) -> Iterable[Dict[str, Any]]:
     """Yield every shipment matching the given query params. Handles
-    ShipStation's `page` + `pages` response shape. Retries on 429 /
-    5xx with exponential backoff."""
+    both v1 and v2 response shapes. Retries on 429 / 5xx with
+    exponential backoff.
+
+    v1 response shape: `{shipments: [...], total, page, pages}`.
+    v2 response shape: `{shipments: [...], links: {next: {href}},
+    total, page, pages}` (ShipStation v2 still includes page/pages
+    so we can use the same loop)."""
+    base = BASE_URL_V2 if api_version == "v2" else BASE_URL_V1
     page = 1
     while True:
         attempt = 0
         while True:
             attempt += 1
             try:
+                # v2 uses page_size (snake_case); v1 uses pageSize.
+                page_param = ("page_size"
+                              if api_version == "v2" else "pageSize")
                 resp = session.get(
-                    f"{BASE_URL}/shipments",
+                    f"{base}/shipments",
                     params={**params, "page": page,
-                            "pageSize": DEFAULT_PAGE_SIZE},
+                            page_param: DEFAULT_PAGE_SIZE},
                     timeout=DEFAULT_TIMEOUT)
             except requests.RequestException as exc:
                 if attempt >= MAX_RETRIES:
@@ -184,6 +234,218 @@ def _paginate_shipments(session: requests.Session,
 # ---------------------------------------------------------------------------
 # Row flattening
 # ---------------------------------------------------------------------------
+
+
+def _flatten_shipment_v2(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a ShipStation v2 /shipments response. v2 uses
+    snake_case + slightly different field names. We normalise to
+    the v1 column set so downstream consumers see a single shape.
+
+    Notable v2 quirks confirmed against the live API on 2026-05-06:
+      - shipment_number IS the CIN7 invoice number (e.g.
+        'INV-52959'). Critical join key. Maps to OrderNumber so
+        existing AI tool filters by order_number still work.
+      - shipping_paid is a {currency, amount} dict, not a scalar.
+        We extract amount.
+      - tracking_number lives on /labels, NOT /shipments. The
+        ENRICHMENT step in sync_recent/sync_full pulls /labels too
+        and merges tracking_number / tracking_url into the row by
+        shipment_id. _flatten_shipment_v2 returns a placeholder
+        None — _merge_label_data fills it in.
+      - customer_email is nested under ship_to.email (no top-level
+        customer_email field as in v1).
+      - shipment_status replaces v1's voided boolean; we map
+        'cancelled' → voided=True for downstream compatibility."""
+    if not isinstance(s, dict):
+        return {}
+    ship_to = s.get("ship_to") or {}
+    if not isinstance(ship_to, dict):
+        ship_to = {}
+    weight = s.get("total_weight") or s.get("weight") or {}
+    if not isinstance(weight, dict):
+        weight = {}
+    items = s.get("items") or s.get("shipment_items") or []
+    item_summary = ""
+    if isinstance(items, list) and items:
+        parts = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            qty = it.get("quantity")
+            sku = it.get("sku") or ""
+            name = (it.get("name") or "")[:60]
+            parts.append(f"{qty}× {sku} ({name})")
+        item_summary = "; ".join(parts)
+
+    # shipping_paid is a {currency, amount} dict in v2.
+    shipping_paid = s.get("shipping_paid") or {}
+    if not isinstance(shipping_paid, dict):
+        shipping_paid = {}
+    shipment_cost = shipping_paid.get("amount")
+    amount_paid = s.get("amount_paid") or {}
+    if not isinstance(amount_paid, dict):
+        amount_paid = {}
+    tax_paid = s.get("tax_paid") or {}
+    if not isinstance(tax_paid, dict):
+        tax_paid = {}
+
+    # Map v2 status to v1 voided boolean.
+    status = s.get("shipment_status") or ""
+    voided = status in ("cancelled", "voided")
+
+    return {
+        "ShipmentID": s.get("shipment_id"),
+        "OrderID": s.get("external_order_id"),
+        "OrderNumber": s.get("shipment_number"),  # INV-XXX = CIN7 invoice
+        "OrderKey": s.get("external_shipment_id"),
+        "UserID": s.get("assigned_user"),
+        "CustomerEmail": ship_to.get("email"),
+        "CustomerName": ship_to.get("name"),
+        "ShipDate": s.get("ship_date"),
+        "CreateDate": s.get("created_at"),
+        "VoidDate": (s.get("modified_at") if voided else None),
+        "Voided": voided,
+        "ShipmentStatus": status,            # v2-only column,
+                                                # AI tool surfaces it
+        "MarketplaceNotified": None,
+        "TrackingNumber": None,              # filled by label merge
+        "TrackingURL": None,                  # filled by label merge
+        "CarrierCode": s.get("carrier_id"),
+        "ServiceCode": s.get("service_code"),
+        "RequestedService": s.get("requested_shipment_service"),
+        "PackageCode": None,
+        "Confirmation": s.get("confirmation"),
+        "WarehouseID": s.get("warehouse_id"),
+        "StoreID": s.get("store_id"),
+        "ShipmentCost": shipment_cost,
+        "AmountPaid": amount_paid.get("amount"),
+        "TaxPaid": tax_paid.get("amount"),
+        "Currency": (shipping_paid.get("currency")
+                       or amount_paid.get("currency")),
+        "InsuranceCost": None,
+        "Notes": (s.get("internal_notes")
+                   or s.get("notes_from_buyer") or ""),
+        "InternalNotes": s.get("internal_notes"),
+        "CustomerNotes": s.get("notes_from_buyer"),
+        "GiftMessage": s.get("notes_for_gift"),
+        "ShipToCity": (ship_to.get("city_locality")
+                          or ship_to.get("city")),
+        "ShipToState": (ship_to.get("state_province")
+                          or ship_to.get("state")),
+        "ShipToPostal": ship_to.get("postal_code"),
+        "ShipToCountry": ship_to.get("country_code"),
+        "ShipToCompany": ship_to.get("company_name"),
+        "ShipToStreet1": ship_to.get("address_line1"),
+        "WeightValue": weight.get("value"),
+        "WeightUnits": weight.get("unit"),
+        "Zone": s.get("zone"),
+        "DimensionsLength": None,
+        "DimensionsWidth": None,
+        "DimensionsHeight": None,
+        "DimensionsUnits": None,
+        "ItemCount": len(items) if isinstance(items, list) else 0,
+        "ItemSummary": item_summary,
+    }
+
+
+def _fetch_labels_index(session: requests.Session,
+                          since_iso: str
+                          ) -> Dict[str, Dict[str, Any]]:
+    """Pull ShipStation v2 labels in the same date window and index
+    them by shipment_id. The shipments endpoint doesn't carry
+    tracking — it lives on labels. We fetch labels separately, then
+    merge into the shipment rows.
+
+    Why a separate fetch instead of per-shipment label calls: that
+    would be 2× the API hits. v2's /labels endpoint accepts the
+    same date filter and paginates the same way, so for ~equal
+    label-per-shipment ratio we save half the rate-limit budget.
+
+    Index value carries: tracking_number, tracking_url,
+    tracking_status, carrier_code, label_id, voided, batch_id."""
+    log.info("  Fetching labels for tracking-number enrichment...")
+    idx: Dict[str, Dict[str, Any]] = {}
+    # /labels has the same query shape as /shipments but a
+    # different result_key. Inline pagination — the shared
+    # paginator wouldn't help.
+    page = 1
+    while True:
+        try:
+            resp = session.get(
+                f"{BASE_URL_V2}/labels",
+                params={"created_at_start": since_iso,
+                          "page": page,
+                          "page_size": DEFAULT_PAGE_SIZE},
+                timeout=DEFAULT_TIMEOUT)
+        except requests.RequestException as exc:
+            log.warning("Label fetch network error %s — abandoning "
+                          "label enrichment for this run", exc)
+            return idx
+        if resp.status_code == 429:
+            wait = int(resp.headers.get("Retry-After", "60"))
+            log.warning("Label fetch 429 — sleeping %ss", wait)
+            time.sleep(wait)
+            continue
+        if not resp.ok:
+            log.warning("Label fetch %d on /labels: %s",
+                          resp.status_code, resp.text[:200])
+            return idx
+        _respect_rate_limits(resp)
+        payload = resp.json() or {}
+        labels = payload.get("labels") or []
+        for L in labels:
+            if not isinstance(L, dict):
+                continue
+            sid = L.get("shipment_id")
+            if not sid:
+                continue
+            # Skip voided labels — they have a tracking_number that's
+            # no longer valid; we want the active label per shipment.
+            if L.get("voided"):
+                continue
+            idx[sid] = {
+                "TrackingNumber": L.get("tracking_number"),
+                "TrackingURL": L.get("tracking_url"),
+                "TrackingStatus": L.get("tracking_status"),
+                "CarrierCode": L.get("carrier_code")
+                                 or L.get("carrier_id"),
+                "LabelID": L.get("label_id"),
+                "BatchID": L.get("batch_id"),
+            }
+        total_pages = payload.get("pages") or 1
+        log.info("    Labels page %d/%d (%d labels, %d indexed)",
+                   page, total_pages, len(labels), len(idx))
+        if page >= total_pages or not labels:
+            return idx
+        page += 1
+
+
+def _merge_label_data(shipment_row: Dict[str, Any],
+                        label_idx: Dict[str, Dict[str, Any]]
+                        ) -> Dict[str, Any]:
+    """Layer label fields onto a shipment row keyed by ShipmentID.
+    No-op when the shipment hasn't been labelled yet. Carrier code
+    from the label takes precedence over the shipment's carrier_id
+    (which is an internal SE-XXXX ID; the label gives the actual
+    carrier name like 'ups' / 'usps')."""
+    sid = shipment_row.get("ShipmentID")
+    if not sid:
+        return shipment_row
+    label = label_idx.get(sid)
+    if not label:
+        return shipment_row
+    out = dict(shipment_row)
+    if label.get("TrackingNumber"):
+        out["TrackingNumber"] = label["TrackingNumber"]
+    if label.get("TrackingURL"):
+        out["TrackingURL"] = label["TrackingURL"]
+    if label.get("CarrierCode"):
+        # Replace the SE-XXXX carrier_id with a friendly carrier
+        # code (ups/usps/fedex/dhl_express/etc).
+        out["CarrierCode"] = label["CarrierCode"]
+    out["TrackingStatus"] = label.get("TrackingStatus")
+    out["LabelID"] = label.get("LabelID")
+    return out
 
 
 def _flatten_shipment(s: Dict[str, Any]) -> Dict[str, Any]:
@@ -303,24 +565,47 @@ def _write_csv(name: str, rows: List[Dict[str, Any]]) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def sync_recent(session: requests.Session, days: int) -> Path:
+def _query_params(since_iso: str, api_version: str) -> Dict[str, Any]:
+    """Build the version-appropriate filter for /shipments. v1 uses
+    `createDateStart` + `includeShipmentItems`; v2 uses
+    `created_at_start` + items are returned by default."""
+    if api_version == "v2":
+        return {"created_at_start": since_iso}
+    return {"createDateStart": since_iso,
+            "includeShipmentItems": "true"}
+
+
+def sync_recent(session: requests.Session, days: int,
+                  api_version: str = "v1") -> Path:
     """Pull shipments with createDate within the last N days. This is
     what NearSync (--days 1) and Daily Sync (--days 7) call. The
     rolling-window file (shipments_last_<N>d_*.csv) is what
-    `_load_longest_shipments()` in app.py merges with the full dump."""
+    `_load_longest_shipments()` in app.py merges with the full dump.
+
+    v2 only: also pulls /labels in the same date window and merges
+    tracking_number / tracking_url / tracking_status onto each
+    shipment row. v1 has tracking on /shipments directly so no
+    enrichment step is needed there."""
     since_dt = datetime.now(timezone.utc) - timedelta(days=days)
     since_iso = since_dt.strftime("%Y-%m-%d %H:%M:%S")
-    log.info("Pulling ShipStation shipments since %s ...", since_iso)
+    log.info("Pulling ShipStation %s shipments since %s ...",
+              api_version.upper(), since_iso)
+    flatten = (_flatten_shipment_v2
+               if api_version == "v2" else _flatten_shipment)
     rows = []
     for s in _paginate_shipments(
             session,
-            {"createDateStart": since_iso,
-             "includeShipmentItems": "true"}):
-        rows.append(_flatten_shipment(s))
+            _query_params(since_iso, api_version),
+            api_version=api_version):
+        rows.append(flatten(s))
+    if api_version == "v2" and rows:
+        label_idx = _fetch_labels_index(session, since_iso)
+        rows = [_merge_label_data(r, label_idx) for r in rows]
     return _write_csv(f"shipments_last_{days}d", rows)
 
 
-def sync_full(session: requests.Session, days: int = 1825) -> Path:
+def sync_full(session: requests.Session, days: int = 1825,
+                api_version: str = "v1") -> Path:
     """Full backfill — pull every shipment in the last N days
     (default ~5 years). This is the 'big sync' the user mentioned;
     expect 30-60 minutes on a busy account. After this completes,
@@ -332,13 +617,20 @@ def sync_full(session: requests.Session, days: int = 1825) -> Path:
     on top via the longest-window loader pattern in app.py."""
     since_dt = datetime.now(timezone.utc) - timedelta(days=days)
     since_iso = since_dt.strftime("%Y-%m-%d %H:%M:%S")
-    log.info("FULL BACKFILL — shipments since %s ...", since_iso)
+    log.info("FULL %s BACKFILL — shipments since %s ...",
+              api_version.upper(), since_iso)
+    flatten = (_flatten_shipment_v2
+               if api_version == "v2" else _flatten_shipment)
     rows = []
     for s in _paginate_shipments(
             session,
-            {"createDateStart": since_iso,
-             "includeShipmentItems": "true"}):
-        rows.append(_flatten_shipment(s))
+            _query_params(since_iso, api_version),
+            api_version=api_version):
+        rows.append(flatten(s))
+    # v2 — enrich with tracking from /labels.
+    if api_version == "v2" and rows:
+        label_idx = _fetch_labels_index(session, since_iso)
+        rows = [_merge_label_data(r, label_idx) for r in rows]
     # Full file written without timestamp suffix so callers can find
     # it deterministically. Backup the previous one first.
     out_path = OUTPUT_DIR / "shipments_full.csv"
@@ -395,18 +687,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     api_key = os.environ.get("SHIPSTATION_API_KEY", "").strip()
     api_secret = os.environ.get("SHIPSTATION_API_SECRET", "").strip()
-    if not api_key or not api_secret:
-        log.warning("ShipStation env vars not set — skipping. Set "
-                      "SHIPSTATION_API_KEY + SHIPSTATION_API_SECRET "
-                      "to enable.")
+    if not api_key:
+        log.warning("ShipStation env var not set — skipping. Set "
+                      "SHIPSTATION_API_KEY (v2) or "
+                      "SHIPSTATION_API_KEY+SHIPSTATION_API_SECRET "
+                      "(v1 legacy) to enable.")
         return 0
 
-    session = _build_session(api_key, api_secret)
+    session, api_version = _build_session(api_key, api_secret)
+    log.info("Authenticated with ShipStation API %s", api_version.upper())
 
     if args.cmd == "recent":
-        sync_recent(session, args.days)
+        sync_recent(session, args.days, api_version=api_version)
     elif args.cmd == "full":
-        sync_full(session, args.days)
+        sync_full(session, args.days, api_version=api_version)
     return 0
 
 

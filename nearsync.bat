@@ -18,6 +18,12 @@ REM being created. The script no-ops if SHIPSTATION env vars
 REM aren't set — safe to leave enabled before keys are configured.
 python shipstation_sync.py recent --days 1 >> output\nearsync.log 2>&1
 
+REM v2.67.55 — Shopify orders 1-day catch-up. Mirrors Shopify-side
+REM order data (landing_site, referring_site, source_name, UTM
+REM params in note_attributes) so the AI can answer 'how did we
+REM get this conversion'. Errors logged but don't break the chain.
+python shopify_sync.py --orders-recent 1 >> output\nearsync.log 2>&1
+
 REM v2.67.36 — warm the engine cache after each near-sync. The
 REM 15-min cadence means the cache stays fresh throughout the
 REM workday, so any user opening the dashboard gets an instant
