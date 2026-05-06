@@ -52,6 +52,229 @@ from data_paths import OUTPUT_DIR  # noqa: E402
 # Branding is env-driven so the app can be re-skinned for other CIN7
 # customers without code changes. Defaults are the Wired4Signs values.
 # See SAAS_NOTES.md for the full list of company-specific touch points.
+
+# ===========================================================================
+# v2.67.49 — single-source glossary used by:
+#   - Ordering page expander (the original home of this content)
+#   - Slow Movers page expander (for cross-page consistency)
+#   - AI Assistant system prompt (so the AI can explain any term)
+# Edit HERE; consumers re-render on next page load.
+# ===========================================================================
+GLOSSARY_MARKDOWN = """
+#### ABC class
+Every SKU is ranked A / B / C on a hybrid score (60% of 12-month value
+rank + 40% of 12-month quantity rank):
+- **A** — top cumulative 70% of annual value. High-impact items, watch closely.
+- **B** — next 20%. Steady movers.
+- **C** — last 10%. Low-impact, review less frequently.
+
+#### Lead time (LT)
+How long from placing the PO to receiving the goods. Set per supplier
+in the Supplier configuration expander below. Air vs sea toggles use
+different LTs; the engine picks the faster one when the supplier offers
+air AND the item qualifies.
+
+#### Safety %
+A buffer added on top of lead-time demand to absorb variance (a big
+order, a bad month). Defaults per class: A=30%, B=20%, C=15%.
+
+#### Review days
+How long between buying reviews for this supplier. The engine adds
+`avg_daily × review_days` to target stock so you're covered between
+reviews. Default: A=14d, B=30d, C=45d. Longer review = more stock
+buffer, fewer POs. Shorter review = less capital tied up, more
+frequent ordering.
+
+#### Target stock — the reorder target
+**`target = (LT × avg_daily × (1 + safety%)) + (avg_daily × review_days)`**
+This is how much stock should be sitting on the shelf on a typical day
+to cover the lead time and the review period without stocking out.
+
+#### Suggested reorder (engine)
+**`max(0, target − (Available + OnOrder − unfulfilled))`**
+Only what you need to bring effective position back up to target.
+Already accounts for open POs (ORDERED / ORDERING) and backorders.
+
+#### OnHand / Allocated / Available
+- **OnHand** — physical units in the warehouse.
+- **Allocated** — reserved for existing customer orders.
+- **Available** — OnHand − Allocated.
+
+#### OnOrder
+Units already placed on open POs (status ORDERED or ORDERING). The
+engine subtracts these from what you need to reorder — you won't get
+a suggestion to buy something that's already on its way.
+
+#### Unfulfilled (backorders)
+Customer orders with status BACKORDERED / ORDERED / ORDERING — units
+customers are waiting on. Subtracted from effective position so the
+engine prioritises SKUs that owe customers.
+
+#### DoC (days of cover)
+**`OnHand / avg_daily`** — how many days the current stock will last
+at the 12-month average sales rate.
+
+#### Effective units (12mo)
+Direct sales + sales rolled up from child variants (MP variants, cuts,
+kit components) + sales migrated from retiring SKUs. Used for the
+reorder math, NOT the raw "units_12mo" figure.
+
+#### FixedCost / AverageCost / PO cost
+- **FixedCost** — the agreed supplier price on the SKU's supplier record
+  in CIN7. What you'll actually pay on the PO.
+- **AverageCost** — CIN7's weighted landed cost (drifts with every PO).
+- **PO cost** — FixedCost if set, otherwise AverageCost fallback.
+  Shown per row with a "Basis" column so you can see which one applied.
+
+#### MOV (minimum order value)
+Set per supplier (e.g. Blebox $250). The PO summary flags when the
+current draft is below MOV so you can consolidate.
+
+#### Freight mode
+Air or Sea. The engine defaults to air when the supplier offers it
+**and** the SKU's length fits in the supplier's air cutoff (e.g.
+Topmet UPS caps at 2200mm). Override per row in the grid; the reorder
+qty recalculates with the new lead time on next refresh.
+
+#### Status badges
+- 📦 **Dropship** — order-on-demand, we don't stock it.
+- Active, Deprecated, Discontinued — from CIN7's product status.
+
+#### Trend signal (📈 / 🎯 / 🔀 / 📉)
+A secondary check the engine runs to detect when the last-45-day sales
+pattern has diverged from the prior 45 days (days 45-90 ago). Uses
+four signals combined to avoid false-positives:
+
+- **📈 Trend** — ALL of these must be true: momentum >1.5, **4+ distinct
+  customers**, top customer **under 40%**, and non-top customers averaging
+  **at least 2 units each**. Real broad-based demand; engine switches to
+  last-45d velocity to keep up.
+- **🎯 Project** — ANY of these triggers: top customer **≥50%** of 45d
+  volume, top **2 customers combined ≥70%**, or fewer than 3 distinct
+  customers. Looks concentrated / one-off; engine subtracts top
+  customer's 12mo contribution before forecasting to avoid over-ordering.
+- **🔀 Mixed** — spike exists but fails both sets of rules. Watch
+  signal, no velocity override.
+- **📉 Decline** — units down 50%+ vs prior 45 days. Worth review.
+- **Stable** — everything else.
+
+**Why "top-2 combined" matters**: 8 customers with one buying 50% and
+a second buying 20% is still concentrated (top-2 = 70%). The tighter
+thresholds stop "many customers" from hiding real concentration.
+
+**Why "non-top avg units"**: a SKU with 8 customers where the top buyer
+took half leaves maybe 1-2 units each for the rest — that's not a trend,
+that's noise. The ≥2 units average rule makes sure there's substance
+beyond the big buyer.
+
+Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
+skip classification entirely — the signal is too noisy at that scale.
+
+The trend breakdown (who's buying, what %) shows in the transparency
+panel at the bottom when you drill into any flagged SKU.
+
+#### The 5 things driving reorder qty on any row
+1. **12mo effective demand** (direct + rollups)
+2. **Lead time** (longer = more stock)
+3. **Safety + review days** (more buffer = more stock)
+4. **What we already have** (OnHand, OnOrder, Available, Allocated)
+5. **What we owe customers** (unfulfilled backorders bring it up)
+
+For the full step-by-step math on any individual SKU, scroll to the
+**transparency panel** below the PO table and pick the SKU — the
+engine shows every input and how it got to the suggestion.
+
+#### Slow movers / dormancy (v2.67.36+)
+A SKU is **dormant** when its 90-day demand has dropped sharply
+versus its 12-month baseline (≈80% drop), AND it still has stock
+on hand. Computed by the engine on every recompute. Definitions:
+
+- `is_dormant` (bool) — engine output column. True = currently slow.
+- **Once-slow warning** — once a SKU has been flagged dormant, the
+  fact persists in `sku_dormancy_log` even after the engine
+  re-classifies it as active. The Ordering page renders ❗ in the
+  Status column and a `⚠️ WAS slow-moving` auto-prefix in the
+  Notes column. Auto-lifts after 90 days of sustained activity, or
+  the buyer can dismiss manually from the Slow Movers page.
+- **A-class grace (v2.67.48)** — A-class SKUs with positive 12mo
+  demand are EXEMPT from dormancy flagging. Reasoning: A-class is
+  by definition a steady-revenue mover; if the buyer over-bought
+  to secure better pricing, recent sales naturally drop while
+  stock is high — but the long-term pattern is unchanged. Flagging
+  these would discourage reordering of steady movers. The grace
+  applies in both `_is_dormant` (base rule) and
+  `_refine_dormancy_by_class` (class-aware refinement). The
+  Ordering page surfaces a 💼 note explaining the grace when an
+  A-class item's 90d activity is below threshold.
+
+#### Overstock / excess (v2.67.47+)
+- `excess_units` — units held beyond expected near-term demand.
+  Two implementations:
+  - **Naive (in `_abc_engine`)** — `max(0, OnHand - effective_units_12mo)`.
+    Always available, used by Slow Movers + Overview when Ordering
+    hasn't run in this session.
+  - **Precise (in Ordering page)** — `max(0, OnHand - target_stock)`
+    where target_stock factors supplier lead time, safety stock,
+    and review window. Overwrites the naive value on the cached
+    engine_df once the Ordering page runs.
+- `excess_value` — `excess_units × per-unit cost`. Cash that
+  could be freed up by clearing the overstock down to target.
+
+#### 🪫 REMNANT flag (v2.67.31)
+Bulk-roll parent SKUs with `OnHand < 1.0` (less than one full
+roll's worth). The engine's slow/dormant signals don't capture
+"we have 0.4 of a 100m roll left" because per-foot child sales
+roll up to the parent and keep its activity counter non-zero —
+but practically, a partial roll is stock-to-clear. The flag
+appears as a 🪫 prefix in the AI Assistant's stock-listing
+answers and gets called out in product-discovery rows. Different
+signal from slow-moving; both can apply to the same SKU.
+
+#### Stock-reduction fly-wheel signals
+Together these signals power the Slow Movers page, the Overview
+slow-mover panel, the weekly digest email, and the AI Assistant's
+stock-reduction answers:
+
+- ⚠️ **SLOW** — `is_dormant=True` and OnHand>0
+- 🔴 **DEAD** — OnHand>0 with zero 12mo effective demand
+- 📦 **EXCESS** — `excess_units > 0` (over target)
+- 🪫 **REMNANT** — bulk-roll parent with OnHand < 1.0
+- 💼 **A-class grace** — would have flagged but A-class trumps
+- ❗ **Once-slow warning** — was flagged in the past 90+ days,
+  warning still active
+
+#### Sales staff vs buyer signals
+The Slow Movers page is buyer-facing: it shows what to clear and
+lets you dismiss warnings. The AI Assistant is sales-facing: when
+sales staff ask "what warm white strips do we have?" the answer
+includes inline ⚠️/🔴/📦 flags so they know which items to
+push.
+
+#### parents_only filter (v2.67.22+)
+The AI Assistant's `find_products` and `search_products_by_text`
+tools default to `parents_only=true`, mirroring the Ordering
+page's PO-suggestion logic. Hides per-foot cuts and BOM
+derivatives in favor of the supplier-orderable parent
+(LEDIRIS2700-120-100M) so the answer matches what the buyer
+would actually order.
+
+#### Bin location
+Warehouse shelf location for each SKU, pulled from `stock_on_hand`
+and surfaced through the AI Assistant's `get_sku_details`. Answers
+"where do we keep X?".
+
+#### PO Comments + Shipping notes (v2.67.44)
+Two buyer-curated freight signals on every PO line:
+- **Comments** — top-level header free-text the buyer uses to
+  record airfreight/seafreight or one-line ETA notes.
+- **Shipping notes** — attribute under the "Vendor purchase"
+  attribute set, used for richer progress detail like "departed
+  Shenzhen 2026-04-12, in customs".
+Both flow through `get_incoming_stock` so AI shipment-status
+answers report freight mode + progress, not just Required-By.
+"""
+
+
 COMPANY_NAME = os.environ.get("COMPANY_NAME", "Wired4Signs USA")
 APP_TITLE = os.environ.get(
     "APP_TITLE", f"Cin7 Analytics — {COMPANY_NAME}")
@@ -365,16 +588,17 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.48 — A-class grace in dormancy "
-                "detection. A-class SKUs with positive 12mo "
-                "activity will no longer be flagged as slow "
-                "movers, even if 90d activity is low — they're "
-                "steady earners and a recent lull (often from "
-                "over-buying for pricing) shouldn't push the "
-                "buyer away from reordering. Ordering page also "
-                "gets a 💼 grace-applied note explaining the "
-                "behavior. Existing A-class log entries auto-"
-                "lift on the next engine recompute.")
+    st.caption("🟢 v2.67.49 — Single-source glossary. The "
+                "definitions panel from the Ordering page now "
+                "lives in one constant (`GLOSSARY_MARKDOWN`) and "
+                "is rendered on the Ordering page, on the Slow "
+                "Movers page, AND injected into the AI Assistant "
+                "system prompt — so adding a new concept like "
+                "A-class grace or 🪫 REMNANT documents itself "
+                "in every place at once. New entries cover "
+                "dormancy, A-class grace, overstock, REMNANT, "
+                "parents_only, Bin location, freight signals, "
+                "and the stock-reduction fly-wheel flags.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -410,6 +634,29 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.49** — Single-source glossary. The 'How "
+            "to read this page' panel was previously inline "
+            "markdown in the Ordering page only. User pointed "
+            "out that improvements like dormancy, A-class "
+            "grace, REMNANT, etc. weren't documented anywhere "
+            "the buyer or AI could reference, leading to "
+            "confusion about what the system was doing. "
+            "v2.67.49 extracts the content into a "
+            "module-level `GLOSSARY_MARKDOWN` constant, adds "
+            "new sections covering every concept shipped "
+            "since v2.67.20 (slow movers / dormancy / once-"
+            "slow warning / A-class grace / overstock / "
+            "REMNANT / fly-wheel flags / parents_only filter "
+            "/ Bin location / freight signals), renders it on "
+            "BOTH the Ordering page and the Slow Movers page, "
+            "AND injects it into the AI Assistant system "
+            "prompt as a knowledge appendix. So when a user "
+            "asks the AI 'what's A-class grace?' or 'why is "
+            "this REMNANT?', the AI quotes the canonical "
+            "definition. Future glossary edits automatically "
+            "propagate to every consumer."
+        )
         st.caption(
             "**v2.67.48** — A-class grace in dormancy detection. "
             "User reported A-class SKUs appearing in Slow Movers "
@@ -8900,130 +9147,11 @@ elif page == "Ordering":
         ":book: How to read this page — glossary & methodology",
         expanded=False,
     ):
-        st.markdown("""
-#### ABC class
-Every SKU is ranked A / B / C on a hybrid score (60% of 12-month value
-rank + 40% of 12-month quantity rank):
-- **A** — top cumulative 70% of annual value. High-impact items, watch closely.
-- **B** — next 20%. Steady movers.
-- **C** — last 10%. Low-impact, review less frequently.
-
-#### Lead time (LT)
-How long from placing the PO to receiving the goods. Set per supplier
-in the Supplier configuration expander below. Air vs sea toggles use
-different LTs; the engine picks the faster one when the supplier offers
-air AND the item qualifies.
-
-#### Safety %
-A buffer added on top of lead-time demand to absorb variance (a big
-order, a bad month). Defaults per class: A=30%, B=20%, C=15%.
-
-#### Review days
-How long between buying reviews for this supplier. The engine adds
-`avg_daily × review_days` to target stock so you're covered between
-reviews. Default: A=14d, B=30d, C=45d. Longer review = more stock
-buffer, fewer POs. Shorter review = less capital tied up, more
-frequent ordering.
-
-#### Target stock — the reorder target
-**`target = (LT × avg_daily × (1 + safety%)) + (avg_daily × review_days)`**
-This is how much stock should be sitting on the shelf on a typical day
-to cover the lead time and the review period without stocking out.
-
-#### Suggested reorder (engine)
-**`max(0, target − (Available + OnOrder − unfulfilled))`**
-Only what you need to bring effective position back up to target.
-Already accounts for open POs (ORDERED / ORDERING) and backorders.
-
-#### OnHand / Allocated / Available
-- **OnHand** — physical units in the warehouse.
-- **Allocated** — reserved for existing customer orders.
-- **Available** — OnHand − Allocated.
-
-#### OnOrder
-Units already placed on open POs (status ORDERED or ORDERING). The
-engine subtracts these from what you need to reorder — you won't get
-a suggestion to buy something that's already on its way.
-
-#### Unfulfilled (backorders)
-Customer orders with status BACKORDERED / ORDERED / ORDERING — units
-customers are waiting on. Subtracted from effective position so the
-engine prioritises SKUs that owe customers.
-
-#### DoC (days of cover)
-**`OnHand / avg_daily`** — how many days the current stock will last
-at the 12-month average sales rate.
-
-#### Effective units (12mo)
-Direct sales + sales rolled up from child variants (MP variants, cuts,
-kit components) + sales migrated from retiring SKUs. Used for the
-reorder math, NOT the raw "units_12mo" figure.
-
-#### FixedCost / AverageCost / PO cost
-- **FixedCost** — the agreed supplier price on the SKU's supplier record
-  in CIN7. What you'll actually pay on the PO.
-- **AverageCost** — CIN7's weighted landed cost (drifts with every PO).
-- **PO cost** — FixedCost if set, otherwise AverageCost fallback.
-  Shown per row with a "Basis" column so you can see which one applied.
-
-#### MOV (minimum order value)
-Set per supplier (e.g. Blebox $250). The PO summary flags when the
-current draft is below MOV so you can consolidate.
-
-#### Freight mode
-Air or Sea. The engine defaults to air when the supplier offers it
-**and** the SKU's length fits in the supplier's air cutoff (e.g.
-Topmet UPS caps at 2200mm). Override per row in the grid; the reorder
-qty recalculates with the new lead time on next refresh.
-
-#### Status badges
-- 📦 **Dropship** — order-on-demand, we don't stock it.
-- Active, Deprecated, Discontinued — from CIN7's product status.
-
-#### Trend signal (📈 / 🎯 / 🔀 / 📉)
-A secondary check the engine runs to detect when the last-45-day sales
-pattern has diverged from the prior 45 days (days 45-90 ago). Uses
-four signals combined to avoid false-positives:
-
-- **📈 Trend** — ALL of these must be true: momentum >1.5, **4+ distinct
-  customers**, top customer **under 40%**, and non-top customers averaging
-  **at least 2 units each**. Real broad-based demand; engine switches to
-  last-45d velocity to keep up.
-- **🎯 Project** — ANY of these triggers: top customer **≥50%** of 45d
-  volume, top **2 customers combined ≥70%**, or fewer than 3 distinct
-  customers. Looks concentrated / one-off; engine subtracts top
-  customer's 12mo contribution before forecasting to avoid over-ordering.
-- **🔀 Mixed** — spike exists but fails both sets of rules. Watch
-  signal, no velocity override.
-- **📉 Decline** — units down 50%+ vs prior 45 days. Worth review.
-- **Stable** — everything else.
-
-**Why "top-2 combined" matters**: 8 customers with one buying 50% and
-a second buying 20% is still concentrated (top-2 = 70%). The tighter
-thresholds stop "many customers" from hiding real concentration.
-
-**Why "non-top avg units"**: a SKU with 8 customers where the top buyer
-took half leaves maybe 1-2 units each for the rest — that's not a trend,
-that's noise. The ≥2 units average rule makes sure there's substance
-beyond the big buyer.
-
-Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
-skip classification entirely — the signal is too noisy at that scale.
-
-The trend breakdown (who's buying, what %) shows in the transparency
-panel at the bottom when you drill into any flagged SKU.
-
-#### The 5 things driving reorder qty on any row
-1. **12mo effective demand** (direct + rollups)
-2. **Lead time** (longer = more stock)
-3. **Safety + review days** (more buffer = more stock)
-4. **What we already have** (OnHand, OnOrder, Available, Allocated)
-5. **What we owe customers** (unfulfilled backorders bring it up)
-
-For the full step-by-step math on any individual SKU, scroll to the
-**transparency panel** below the PO table and pick the SKU — the
-engine shows every input and how it got to the suggestion.
-""")
+        # v2.67.49 — single-source glossary. Edit at the top of
+        # this file (see GLOSSARY_MARKDOWN). Same content also
+        # renders on the Slow Movers page expander and is
+        # injected into the AI Assistant system prompt.
+        st.markdown(GLOSSARY_MARKDOWN)
 
     if products.empty or sale_lines.empty:
         st.warning("Need products + 12-month sales to run ABC.")
@@ -16715,11 +16843,26 @@ elif page == "AI Assistant":
             # these AFTER the base prompt means they show up as recent
             # context Claude can use without overriding the core
             # behaviour rules.
+            # v2.67.49 — also append the glossary so the AI can answer
+            # term questions ("what's an A-class grace?", "what does
+            # REMNANT mean?", "explain dormancy") without hallucinating.
+            # Same content the Ordering and Slow Movers pages render.
+            _glossary_addendum = (
+                "\n\n=== GLOSSARY (shared with Ordering / Slow Movers "
+                "pages — single source of truth) ===\n"
+                "When the user asks about any term below, quote the "
+                "definition verbatim or summarise it. When you mention "
+                "a term in an answer, you can lean on the buyer's "
+                "prior exposure to it (these definitions are visible "
+                "on every relevant page).\n\n"
+                + GLOSSARY_MARKDOWN
+                + "\n=== END GLOSSARY ===\n")
             _system_prompt = (_system_prompt
                               + (_alias_addendum or "")
                               + (_similarity_addendum or "")
                               + (_accessory_addendum or "")
-                              + _corrections_addendum)
+                              + _corrections_addendum
+                              + _glossary_addendum)
 
             _tool_calls_log: list = []
             # Charts collected from tool results during this turn.
@@ -16957,6 +17100,15 @@ elif page == "Slow Movers":
         "returns — every dollar moved here is working capital "
         "freed up. Use the search box below to find any SKU and "
         "toggle its slow-mover flag manually.")
+
+    # v2.67.49 — same glossary as the Ordering page. The page-
+    # specific terms (dormancy, A-class grace, REMNANT, overstock,
+    # parents_only, etc.) are documented in one place and referenced
+    # from every page that exposes them.
+    with st.expander(
+            ":book: How to read this page — glossary & methodology",
+            expanded=False):
+        st.markdown(GLOSSARY_MARKDOWN)
 
     try:
         _warnings = db.get_dormancy_warnings()
