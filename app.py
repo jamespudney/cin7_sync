@@ -177,6 +177,100 @@ def _to_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True)
 
 
+def _compute_slow_mover_clearance(stock_df: pd.DataFrame,
+                                    sale_lines_df: pd.DataFrame,
+                                    products_df: pd.DataFrame,
+                                    dormancy_warnings: dict,
+                                    period_start,
+                                    period_end) -> dict:
+    """v2.67.38 — compute "value of slow stock cleared" over a date
+    window. Used by:
+      - Overview KPI tile (this month)
+      - Slow Movers page (this month / last 90d / etc)
+      - Weekly email script (last 7 days)
+
+    Definition: slow stock cleared = sum of (Quantity × cost) on
+    sale_lines for any SKU that has an active dormancy warning,
+    invoiced within [period_start, period_end].
+
+    Returns:
+      sku_count        — how many distinct slow SKUs sold in window
+      units_sold       — total units cleared
+      revenue          — sum(Total) on those sale lines
+      cost_value       — sum(Quantity × AverageCost) — the cost
+                          basis we cleared off the shelves; this is
+                          what relieves stock-holding cash
+      ai_attributed    — TODO. Reserved for when we wire a signal
+                          source distinguishing AI-driven sales.
+                          Currently None to make absence visible.
+
+    Notes on attribution: salespeople using the AI Assistant to
+    surface slow movers can't yet be cleanly tracked back to the
+    line items they sold. v2.67.39+ should add a signal — perhaps
+    tagging sales whose product was in a recent ai_audit_logs query
+    where the user clicked through, or per-rep attribution."""
+    if (sale_lines_df is None or sale_lines_df.empty
+            or "InvoiceDate" not in sale_lines_df.columns
+            or "SKU" not in sale_lines_df.columns):
+        return {
+            "sku_count": 0, "units_sold": 0.0,
+            "revenue": 0.0, "cost_value": 0.0,
+            "ai_attributed": None,
+        }
+    if not dormancy_warnings:
+        return {
+            "sku_count": 0, "units_sold": 0.0,
+            "revenue": 0.0, "cost_value": 0.0,
+            "ai_attributed": None,
+        }
+    slow_skus = set(dormancy_warnings.keys())
+    sl = sale_lines_df.copy()
+    sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
+    sl["SKU"] = sl["SKU"].astype(str)
+    in_window = sl[
+        (sl["SKU"].isin(slow_skus))
+        & (sl["InvoiceDate"] >= pd.Timestamp(period_start))
+        & (sl["InvoiceDate"] <= pd.Timestamp(period_end))
+    ]
+    # Status filter — VOIDED/CREDITED/CANCELLED don't count as cleared.
+    if "Status" in in_window.columns:
+        bad = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
+        in_window = in_window[
+            ~in_window["Status"].astype(str).str.upper().isin(bad)]
+    if in_window.empty:
+        return {
+            "sku_count": 0, "units_sold": 0.0,
+            "revenue": 0.0, "cost_value": 0.0,
+            "ai_attributed": None,
+        }
+    qty = _to_num(in_window["Quantity"]).fillna(0)
+    rev = (_to_num(in_window["Total"]).fillna(0)
+            if "Total" in in_window.columns
+            else pd.Series(0.0, index=in_window.index))
+    # Cost basis: prefer line-level AverageCost; fall back to product
+    # master AverageCost.
+    if "AverageCost" in in_window.columns:
+        line_cost = _to_num(in_window["AverageCost"]).fillna(0)
+    else:
+        line_cost = pd.Series(0.0, index=in_window.index)
+    if products_df is not None and not products_df.empty:
+        p_cost_map = (products_df.set_index("SKU")["AverageCost"]
+                       .apply(lambda v: float(v or 0))
+                       .to_dict()) if "AverageCost" in products_df.columns else {}
+        # Where line cost is 0 fall back to product master.
+        line_cost = line_cost.where(
+            line_cost > 0,
+            in_window["SKU"].map(lambda s: float(p_cost_map.get(s, 0))).fillna(0))
+    cost_value = float((qty * line_cost).sum())
+    return {
+        "sku_count": int(in_window["SKU"].nunique()),
+        "units_sold": float(qty.sum()),
+        "revenue": float(rev.sum()),
+        "cost_value": cost_value,
+        "ai_attributed": None,  # placeholder for v2.67.39+
+    }
+
+
 def _headline_stock_value(stock_df: pd.DataFrame,
                             products_df: Optional[pd.DataFrame] = None
                             ) -> float:
@@ -271,12 +365,15 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.37 — Stock value reconciliation. The "
-                "'Current stock value' tile in the Ordering "
-                "section now uses the same CIN7 StockOnHand sum "
-                "as the Overview tile and the Monthly Metrics "
-                "report — all three tie out to the cent. "
-                "Commissions reference matches what buyers see.")
+    st.caption("🟢 v2.67.38 — Slow-mover stock-reduction "
+                "workspace. Overview gets a 4-tile slow-stock "
+                "panel (SKUs flagged, value on shelf, cleared "
+                "this month, revenue this month). New dedicated "
+                "🪫 Slow Movers page with pie chart by family + "
+                "sortable detail table + manual dismiss. New "
+                "weekly_slow_movers_email.py script sends a "
+                "Friday digest with top-20 slow movers + "
+                "newcomers + progress.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -312,6 +409,30 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.38** — Slow-mover stock-reduction "
+            "workspace. Three things bundled. (1) Overview gets "
+            "a new 4-tile panel showing slow SKUs flagged, "
+            "value-on-shelf, value cleared month-to-date "
+            "(cost basis), and revenue cleared month-to-date. "
+            "AI-attributed clearance is reserved as a "
+            "placeholder until we wire a salesperson→AI-query→"
+            "sale signal source. (2) New dedicated 🪫 Slow "
+            "Movers page in the sidebar nav: header tiles "
+            "(SKU count / units / value / avg days dormant) + "
+            "pie chart of slow stock by family + sortable "
+            "detail table sorted by days_dormant descending + "
+            "manual dismiss control. (3) New "
+            "weekly_slow_movers_email.py script that sends a "
+            "Friday digest to a configurable recipient list — "
+            "top-20 slow movers by stock value + newcomers in "
+            "the past 7d + cleared cost basis + units + SKU "
+            "counts. HTML + plain-text body. Wired into Render "
+            "sync_loop.sh on Fridays (skips the rest of the "
+            "week). Local Windows users register via the new "
+            "schedule_weekly_email.bat. Silent no-op until "
+            "SLOW_MOVERS_EMAIL_TO env var is set."
+        )
         st.caption(
             "**v2.67.37** — Stock-value reconciliation across "
             "Overview / Ordering / Monthly Metrics. The three "
@@ -1465,6 +1586,7 @@ with st.sidebar:
             "AI Assistant",
             "AI Feedback",
             "Demand Signals",
+            "Slow Movers",  # v2.67.38 — dedicated stock-reduction page
             "My Profile",
             "Monthly Metrics",
             "Ordering",
@@ -5047,6 +5169,79 @@ if page == "Overview":
                help="Sum of line Total for all open POs.")
 
     st.divider()
+
+    # v2.67.38 — slow-mover stock-reduction panel. Surfaces what we
+    # cleared this month and what's still flagged dormant. The big
+    # strategic driver of this app is shrinking stock holding — give
+    # this its own visible block on the front page so the team sees
+    # it every day.
+    st.divider()
+    st.subheader("🪫 Slow-mover stock reduction")
+    try:
+        _dormancy_w = db.get_dormancy_warnings()
+    except Exception:  # noqa: BLE001
+        _dormancy_w = {}
+    _today = pd.Timestamp(datetime.now().date())
+    _mtd_start = _today.replace(day=1)
+    _mtd_clear = _compute_slow_mover_clearance(
+        stock, sale_lines, products, _dormancy_w,
+        _mtd_start, _today)
+    # Total slow-stock OnHand value from the engine (best estimate
+    # using its cost chain — the per-SKU OnHandValue column).
+    _slow_skus_set = set(_dormancy_w.keys())
+    _slow_holding_value = 0.0
+    _slow_units_held = 0.0
+    if (_slow_skus_set
+            and not stock.empty
+            and "SKU" in stock.columns):
+        _stock_view = stock.copy()
+        _stock_view["SKU"] = _stock_view["SKU"].astype(str)
+        _stock_slow = _stock_view[_stock_view["SKU"].isin(_slow_skus_set)]
+        if "StockOnHand" in _stock_slow.columns:
+            _slow_holding_value = float(
+                _to_num(_stock_slow["StockOnHand"]).fillna(0).sum())
+        if "OnHand" in _stock_slow.columns:
+            _slow_units_held = float(
+                _to_num(_stock_slow["OnHand"]).fillna(0).sum())
+    sm1, sm2, sm3, sm4 = st.columns(4)
+    sm1.metric(
+        "Slow stock — SKUs flagged",
+        _fmt_number(len(_dormancy_w)),
+        help=("SKUs in the dormancy log with an active warning. "
+              "Auto-lifts after 90 days sustained recovery; "
+              "buyer can manually dismiss any row."))
+    sm2.metric(
+        "Slow stock — value on shelf",
+        _fmt_money(_slow_holding_value),
+        help=("Sum of CIN7 StockOnHand for all currently-flagged "
+              "slow SKUs. This is working capital tied up in items "
+              "the engine has flagged as dormant."))
+    sm3.metric(
+        "Cleared this month — value",
+        _fmt_money(_mtd_clear["cost_value"]),
+        delta=(f"{_mtd_clear['units_sold']:.0f} units across "
+                f"{_mtd_clear['sku_count']} SKUs"),
+        help=("Cost basis of slow stock SOLD month-to-date "
+              "(quantity × cost). Sales of dormant SKUs liquidate "
+              "stuck inventory — every dollar here is cash freed "
+              "from the shelves."))
+    sm4.metric(
+        "Cleared this month — revenue",
+        _fmt_money(_mtd_clear["revenue"]),
+        help=("Top-line revenue from slow-stock sales this month. "
+              "Higher than the cost-basis tile to the left "
+              "(margin retained even on slow stock)."))
+    # Placeholder for AI-attribution — coming in v2.67.39+ when
+    # we wire a salesperson→AI-query→sale signal source.
+    st.caption(
+        "💡 _AI-attributed clearance (sales triggered by the AI "
+        "Assistant surfacing slow movers) — coming in v2.67.39+. "
+        "We need a signal source linking sales to AI queries; the "
+        "infrastructure (`sku_dormancy_log`, ai_audit_logs) is "
+        "already in place for it._  See the dedicated **Slow "
+        "Movers** page for the full SKU-level breakdown and "
+        "manual dismiss controls."
+    )
 
     # Stock positions
     if not stock.empty:
@@ -16106,6 +16301,203 @@ elif page == "AI Assistant":
 #
 # Edits go through db.update_demand_signal which writes a 'demand_signal.update'
 # row to audit_log per change, so the trail of who-changed-what stays intact.
+
+# ---------------------------------------------------------------------------
+# Page: Slow Movers (v2.67.38) — dedicated stock-reduction workspace.
+# Pie chart by family + sortable table with per-row dismiss + summary
+# stats. The strategic motivator of the whole app is shrinking stock
+# holding; this page makes that visible and actionable in one place.
+# ---------------------------------------------------------------------------
+
+elif page == "Slow Movers":
+    st.header("🪫 Slow Movers — stock-reduction workspace")
+    st.caption(
+        "Every SKU the ABC engine has flagged as dormant (90d "
+        "activity dropped vs 12mo baseline) with active stock on "
+        "hand. Clear these via promotions, AI-Assistant surfacing, "
+        "or supplier returns — every dollar moved here is working "
+        "capital freed up. Warnings auto-lift after 90 days "
+        "sustained recovery; you can manually dismiss any row.")
+
+    try:
+        _warnings = db.get_dormancy_warnings()
+    except Exception as _exc:  # noqa: BLE001
+        st.error(f"Could not load dormancy warnings: {_exc!r}")
+        _warnings = {}
+
+    if not _warnings:
+        st.info(
+            "No SKUs currently flagged as slow movers. Either the "
+            "engine hasn't had a chance to write its first snapshot "
+            "yet (visit the Ordering page or wait for the next "
+            "sync), or all flagged items have lifted their warnings.")
+        st.stop()
+
+    # --- Build the slow-mover table ----------------------------------
+    # Source: engine_df has all the engine signals. Merge in the
+    # dormancy timestamps so we can show "first/last flagged",
+    # "recovered" etc.
+    if 'engine_df' not in dir():
+        try:
+            engine_df = _abc_engine(
+                products, stock, sale_lines, purchase_lines)
+        except Exception as _exc:  # noqa: BLE001
+            st.error(
+                f"Could not run the ABC engine: {_exc!r}. "
+                "Visit the Ordering page first to populate the "
+                "engine cache.")
+            st.stop()
+
+    _slow_skus = set(_warnings.keys())
+    _slow_df = engine_df[engine_df["SKU"].astype(str).isin(_slow_skus)].copy()
+    if _slow_df.empty:
+        st.warning(
+            "Dormancy log has flagged SKUs but engine_df returned "
+            "no matching rows. The SKUs may have been deleted or "
+            "renamed since they were flagged.")
+        st.stop()
+
+    # Merge in dormancy metadata.
+    _slow_df["dormancy_first_seen"] = _slow_df["SKU"].map(
+        lambda s: (_warnings.get(str(s), {}).get(
+            "first_seen_dormant_at") or "")[:10])
+    _slow_df["dormancy_last_seen"] = _slow_df["SKU"].map(
+        lambda s: (_warnings.get(str(s), {}).get(
+            "last_seen_dormant_at") or "")[:10])
+    _slow_df["recovered_at"] = _slow_df["SKU"].map(
+        lambda s: (_warnings.get(str(s), {}).get(
+            "recovered_at") or "")[:10])
+
+    # Days since flagged (oldest first = most urgent to clear).
+    _today_ts = pd.Timestamp(datetime.now().date())
+    def _days_since(d_str: str) -> int:
+        try:
+            return int((_today_ts - pd.Timestamp(d_str)).days)
+        except Exception:  # noqa: BLE001
+            return 0
+    _slow_df["days_dormant"] = _slow_df["dormancy_first_seen"].apply(
+        _days_since)
+
+    # --- Summary header tiles ----------------------------------------
+    _total_skus = len(_slow_df)
+    _total_units = float(_slow_df.get("OnHand", pd.Series(dtype=float))
+                          .fillna(0).sum())
+    _total_value = float(_slow_df.get("OnHandValue", pd.Series(dtype=float))
+                          .fillna(0).sum())
+    _avg_days = (float(_slow_df["days_dormant"].mean())
+                  if not _slow_df.empty else 0.0)
+    _hc1, _hc2, _hc3, _hc4 = st.columns(4)
+    _hc1.metric("Slow SKUs", _fmt_number(_total_skus),
+                  help="Active warnings — auto-lifts after 90d recovery.")
+    _hc2.metric("Units on shelf", _fmt_number(_total_units))
+    _hc3.metric("Stock value tied up",
+                  _fmt_money(_total_value),
+                  help="Per-SKU cost-chain estimate (engine OnHandValue).")
+    _hc4.metric("Avg days dormant",
+                  f"{_avg_days:.0f}",
+                  help="Mean of (today - first_seen_dormant_at) across all "
+                       "flagged SKUs. Higher = more urgent to clear.")
+
+    # --- Pie chart by family ------------------------------------------
+    st.divider()
+    st.subheader("Where is the slow stock concentrated?")
+    _by_family = (_slow_df
+                   .assign(_v=_slow_df.get("OnHandValue",
+                                            pd.Series(dtype=float))
+                            .fillna(0))
+                   .groupby(_slow_df["Family"].fillna("(no family)"),
+                              dropna=False)
+                   .agg(SKU_count=("SKU", "count"),
+                          Value_at_risk=("_v", "sum"))
+                   .reset_index()
+                   .rename(columns={"index": "Family"})
+                   .sort_values("Value_at_risk", ascending=False))
+    _by_family.columns = ["Family", "SKU_count", "Value_at_risk"]
+    _pc1, _pc2 = st.columns([1, 1])
+    with _pc1:
+        if not _by_family.empty:
+            _fig = px.pie(
+                _by_family.head(15),
+                values="Value_at_risk",
+                names="Family",
+                title="Slow-stock value by family (top 15)",
+                hover_data=["SKU_count"],
+            )
+            _fig.update_traces(
+                textposition="inside",
+                textinfo="percent+label")
+            _fig.update_layout(
+                height=350, margin=dict(l=0, r=0, t=40, b=0),
+                showlegend=False)
+            st.plotly_chart(_fig, width="stretch")
+    with _pc2:
+        st.dataframe(
+            _by_family,
+            width="stretch", hide_index=True, height=350,
+            column_config={
+                "Value_at_risk": st.column_config.NumberColumn(
+                    format="$%.0f"),
+            },
+        )
+
+    # --- Sortable detail table ----------------------------------------
+    st.divider()
+    st.subheader("Detail — every flagged SKU")
+    st.caption(
+        "Sort by `days_dormant` (descending) to triage oldest "
+        "stuck stock first. Click **Dismiss** to lift a warning "
+        "manually if you've made a deliberate buyer decision "
+        "(e.g. you've already discounted, returned to supplier, "
+        "or accepted the SKU as long-tail strategic stock).")
+
+    _detail_cols = [c for c in (
+        "SKU", "Name", "Family", "ABC", "trend_flag",
+        "OnHand", "OnHandValue", "effective_units_12mo",
+        "dormancy_first_seen", "dormancy_last_seen",
+        "recovered_at", "days_dormant",
+    ) if c in _slow_df.columns]
+    _display_df = (_slow_df[_detail_cols]
+                    .sort_values("days_dormant", ascending=False))
+    st.dataframe(
+        _display_df,
+        width="stretch", hide_index=True, height=420,
+        column_config={
+            "OnHand": st.column_config.NumberColumn(format="%.2f"),
+            "OnHandValue": st.column_config.NumberColumn(
+                format="$%.0f"),
+            "effective_units_12mo": st.column_config.NumberColumn(
+                format="%.0f"),
+            "days_dormant": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    # --- Manual dismiss panel -----------------------------------------
+    st.divider()
+    st.subheader("Dismiss a warning manually")
+    st.caption(
+        "Manual dismiss is sticky — it persists across re-dormancy "
+        "(if the SKU goes dormant again later, the warning won't "
+        "re-engage). Use this for deliberate buyer decisions.")
+    _dismiss_options = [""] + sorted(_slow_df["SKU"].astype(str).tolist())
+    _to_dismiss = st.selectbox(
+        "SKU to dismiss",
+        _dismiss_options,
+        index=0,
+        help="Pick the SKU whose slow-mover warning you want to lift.")
+    if _to_dismiss and st.button(
+            f"Dismiss warning for {_to_dismiss}",
+            key=f"dismiss_{_to_dismiss}"):
+        try:
+            db.dismiss_dormancy_warning(
+                _to_dismiss,
+                user_id=current_user or "anonymous",
+                reason="manual_dismiss")
+            st.success(
+                f"Warning lifted for {_to_dismiss}. "
+                "Refreshing…")
+            st.rerun()
+        except Exception as _exc:  # noqa: BLE001
+            st.error(f"Could not dismiss: {_exc!r}")
 
 # ---------------------------------------------------------------------------
 # Page: My Profile — edit your own profile, admins can manage all (v2.66)

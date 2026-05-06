@@ -50,4 +50,18 @@ while true; do
     python warm_engine.py 2>&1 | tee -a "$LOG" || \
       echo "[$(stamp)] warm_engine.py exited with non-zero status" \
         | tee -a "$LOG"
+
+    # v2.67.38 — Friday weekly slow-mover digest email. Fires from
+    # the same loop instead of a separate Render cron service.
+    # Day-of-week check: %u returns 1=Mon ... 5=Fri ... 7=Sun.
+    # The loop only fires once per day (after the SYNC_HOUR_UTC
+    # daily_sync), so this gates exactly one send per Friday.
+    # Silent no-op if SLOW_MOVERS_EMAIL_TO env var isn't set.
+    if [ "$(date -u +%u)" = "5" ]; then
+        echo "[$(stamp)] Friday — sending weekly slow-mover digest" \
+          | tee -a "$LOG"
+        python weekly_slow_movers_email.py 2>&1 | tee -a "$LOG" || \
+          echo "[$(stamp)] weekly_slow_movers_email.py exited non-zero" \
+            | tee -a "$LOG"
+    fi
 done
