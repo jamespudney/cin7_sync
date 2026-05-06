@@ -365,13 +365,15 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.43 — Sales-invoiced reconciliation. "
-                "Daily sync now refreshes sales_last_30d.csv "
-                "every night (was only refreshed weekly). "
-                "Overview tile gets a freshness indicator: "
-                "green ✓ when the source CSV is <36h old, "
-                "red ⚠ otherwise. Closes the $200K gap "
-                "between our tile and CIN7's Revenue.")
+    st.caption("🟢 v2.67.44 — AI shipment queries now surface "
+                "the buyer's freight-mode notes (PO Comments — "
+                "air vs sea) and progress detail (Shipping notes "
+                "attribute on the Vendor purchase set — \"departed "
+                "Shenzhen 2026-04-12\"). Pulled into purchase_lines "
+                "via the daily sync; surfaced through "
+                "get_incoming_stock so questions like 'when's the "
+                "next shipment of LED-X?' now answer with the full "
+                "freight picture, not just Required-By.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -407,6 +409,26 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.44** — Buyer's freight signals on AI "
+            "shipment-status queries. The user's buyer logs "
+            "freight mode in the PO Comments field "
+            "(\"airfreight\" / \"seafreight\") and shipment "
+            "progress in a \"Shipping notes\" attribute on the "
+            "\"Vendor purchase\" attribute set (\"departed "
+            "Shenzhen 2026-04-12, in customs\"). Both got pulled "
+            "off the CIN7 sync into purchase_lines via a new "
+            "`_extract_po_freight_signals` helper that's "
+            "defensive against multiple shape variants. The "
+            "`get_incoming_stock` tool now returns both as "
+            "`comments` + `shipping_notes` per line, and the "
+            "tool description tells the AI to format them as "
+            "`✈/🚢 <comments> · 📍 <shipping_notes>` when "
+            "non-empty. AI answers like 'when is the next "
+            "shipment of LED-X coming?' now report the full "
+            "freight picture instead of just the Required-By "
+            "date."
+        )
         st.caption(
             "**v2.67.43** — Sales-invoiced reconciliation. "
             "User reported the Overview's 'Sales invoiced "

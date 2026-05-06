@@ -524,7 +524,19 @@ TOOL_SCHEMAS: list[dict] = [
             "on Y?'. Excludes received / closed / cancelled / "
             "voided POs and zero-quantity lines. If a line has no "
             "expected delivery date in CIN7, the tool returns "
-            "'not available' rather than guessing."
+            "'not available' rather than guessing. "
+            "**v2.67.44** — every line now also returns "
+            "`comments` (PO header free-text where the buyer "
+            "typically notes airfreight vs seafreight) and "
+            "`shipping_notes` (the 'Shipping notes' attribute under "
+            "the 'Vendor purchase' attribute set, where the buyer "
+            "logs progress like 'departed Shenzhen 2026-04-12, in "
+            "customs'). When a user asks about an incoming "
+            "shipment, INCLUDE both fields in the answer when "
+            "they're non-empty — they're the most current "
+            "human-curated signal about freight status. "
+            "Format: `<expected_date> · qty <N> from <Supplier> · "
+            "PO <number>  \\n  ✈/🚢 <comments> · 📍 <shipping_notes>`."
         ),
         "input_schema": {
             "type": "object",
@@ -2028,6 +2040,24 @@ def get_incoming_stock(engine_df: pd.DataFrame,
             "supplier": r.get("Supplier"),
             "po_number": r.get("OrderNumber"),
             "status": r.get("Status"),
+            # v2.67.44 — freight-signal fields. Buyer uses these
+            # to log shipment mode (air/sea) in `comments` and
+            # progress detail (e.g. "departed Shenzhen 2026-04-12,
+            # in customs") in `shipping_notes`. Surface both so
+            # AI shipment-status answers tell the staff what's
+            # actually happening with the freight, not just the
+            # required-by date.
+            "comments": (
+                str(r.get("Comments")).strip()
+                if "Comments" in df.columns and pd.notna(r.get("Comments"))
+                and str(r.get("Comments")).strip()
+                else None),
+            "shipping_notes": (
+                str(r.get("ShippingNotes")).strip()
+                if "ShippingNotes" in df.columns
+                and pd.notna(r.get("ShippingNotes"))
+                and str(r.get("ShippingNotes")).strip()
+                else None),
         }
         out_rows.append(_serialise_row(rec))
 

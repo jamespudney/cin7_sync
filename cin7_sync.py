@@ -643,6 +643,60 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
     return out
 
 
+def _extract_po_freight_signals(detail: Dict[str, Any],
+                                  header: Dict[str, Any]
+                                  ) -> Dict[str, Any]:
+    """v2.67.44 — pull two fields the buyer uses to signal shipment
+    progress on POs:
+      - Comments (top-level header field, e.g. "airfreight" /
+        "seafreight" / "ETA pushed back to Aug")
+      - Shipping notes — an additional attribute under the "Vendor
+        purchase" attribute set, where the buyer logs progress
+        details ("departed Shenzhen 2026-04-12, in customs")
+    Defensive extraction across possible CIN7 response shapes."""
+    comments = (
+        detail.get("Comments")
+        or detail.get("Comment")
+        or detail.get("InternalComments")
+        or header.get("Comments")
+        or header.get("Comment")
+        or "")
+    if not isinstance(comments, str):
+        comments = str(comments or "")
+    # Additional attributes: CIN7 may expose them as a list of
+    # {Name, Value} dicts, OR as flat AdditionalAttributeN fields.
+    shipping_notes = ""
+    attrs_list = (detail.get("AdditionalAttributes")
+                   or detail.get("AttributeSet")
+                   or header.get("AdditionalAttributes")
+                   or [])
+    if isinstance(attrs_list, list):
+        for a in attrs_list:
+            if not isinstance(a, dict):
+                continue
+            name = str(a.get("Name") or a.get("name") or "")
+            if name.lower().strip() == "shipping notes":
+                shipping_notes = str(a.get("Value")
+                                      or a.get("value") or "")
+                break
+    elif isinstance(attrs_list, dict):
+        for k, v in attrs_list.items():
+            if isinstance(k, str) and k.lower().strip() == "shipping notes":
+                shipping_notes = str(v or "")
+                break
+    # Flat-field fallback.
+    if not shipping_notes:
+        for k in ("ShippingNotes", "Shipping_Notes", "shipping_notes"):
+            v = detail.get(k) or header.get(k)
+            if v:
+                shipping_notes = str(v)
+                break
+    return {
+        "Comments": comments.strip() if comments else "",
+        "ShippingNotes": shipping_notes.strip() if shipping_notes else "",
+    }
+
+
 def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Pull order + invoice lines from a /purchase response."""
     pid = header.get("ID") or detail.get("ID")
@@ -652,6 +706,8 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
     order_date = header.get("OrderDate") or detail.get("OrderDate")
     required_by = header.get("RequiredBy") or detail.get("RequiredBy")
     status = header.get("Status") or detail.get("Status")
+    # v2.67.44 — pull buyer's freight-signal fields once per PO.
+    freight_signals = _extract_po_freight_signals(detail, header)
 
     out: List[Dict[str, Any]] = []
 
@@ -679,6 +735,10 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
             "Total": line.get("Total"),
             "UOM": line.get("UOM"),
             "Supplier SKU": line.get("SupplierSKU"),
+            # v2.67.44 — freight-signal fields on every line of the
+            # PO. Same value across lines from the same PO.
+            "Comments": freight_signals["Comments"],
+            "ShippingNotes": freight_signals["ShippingNotes"],
         })
 
     # Received qty from stock-received blocks, if present.
@@ -705,6 +765,11 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
                 "Quantity": line.get("ReceivedQuantity") or line.get("Quantity"),
                 "ReceivedDate": rec_date,
                 "UOM": line.get("UOM"),
+                # Freight signals carried through to received rows
+                # too so the AI can show progress notes that were
+                # captured on the original PO.
+                "Comments": freight_signals["Comments"],
+                "ShippingNotes": freight_signals["ShippingNotes"],
             })
 
     return out
