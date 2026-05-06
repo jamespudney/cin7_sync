@@ -365,15 +365,14 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.40 — Slow Movers page reworked. "
-                "Filters to parents/standalones with OnHand>0 by "
-                "default (children rolled-up to masters no longer "
-                "double-counted; zero-stock entries hidden). New "
-                "🔎 search box finds ANY SKU and lets you toggle "
-                "its slow-mover flag (Flag / Unflag buttons). "
-                "Engine fixed too: non-master tubes are no longer "
-                "flagged dormant since their demand is rolled up "
-                "to the bulk master.")
+    st.caption("🟢 v2.67.41 — Three small wins. (1) Engine "
+                "now session-cached: navigating between pages "
+                "is instant after the first compute. (2) Sidebar "
+                "shows a one-line description under each section "
+                "name. (3) Slow Movers pie chart groups by CIN7 "
+                "Category (LED Strip / Power Supplies / etc.) "
+                "instead of Family — high-level distribution "
+                "rather than SKU-series granularity.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -409,6 +408,29 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.41** — Three small wins shipped together. "
+            "(1) **Engine session cache**: `_abc_engine` is "
+            "@st.cache_data(persist='disk') but Streamlit's "
+            "deep DataFrame hashing was eating ~5-10s on every "
+            "page navigation against ~150K sale-line rows. New "
+            "`_get_engine_df()` helper stores the result in "
+            "`st.session_state` after the first call; "
+            "navigating between Overview / Ordering / Slow "
+            "Movers / AI Assistant is now instant. Cleared by "
+            "the Refresh button. (2) **Sidebar tooltips**: each "
+            "page name in the navigation now has a one-line "
+            "description below it (\"FixedCost Audit — Review "
+            "fixed-cost overrides applied to PO calculations\" "
+            "etc.) so new users know what each section is "
+            "about without clicking. (3) **Slow Movers pie**: "
+            "regrouped by CIN7 Category instead of Family — "
+            "shows high-level distribution (LED Strip vs Power "
+            "Supplies vs Channels) instead of SKU-series-level "
+            "(White Iris vs White Lily). Family detail "
+            "preserved in the detail table where granularity "
+            "matters."
+        )
         st.caption(
             "**v2.67.40** — Slow Movers page rework + engine "
             "fix. Three issues addressed.\n\n"
@@ -1647,6 +1669,33 @@ with st.sidebar:
             "Sales Recent",
             "Data Health",
     ]
+    # v2.67.41 — one-line per-page descriptions, rendered as
+    # captions under each radio option. Order MUST match
+    # `_page_options` exactly. Hover-style tooltip is achieved
+    # by rendering as visible captions (Streamlit's radio
+    # doesn't expose a per-option help= so this is the cleanest
+    # way to surface the same info).
+    _page_captions = [
+        "High-level KPIs: stock value, sales, slow movers, today vs YoY.",
+        "Natural-language Q&A grounded in live CIN7 + Shopify data.",
+        "Review past AI answers and team-logged corrections.",
+        "Track customer interest before it shows up in sales.",
+        "Stock-reduction workspace: dormant SKUs, value tied up, dismiss/flag.",
+        "Edit your profile; admins manage all users.",
+        "Month-over-month KPI report — commission reference.",
+        "ABC-driven reorder workbench with PO drafts.",
+        "Review fixed-cost overrides applied to PO calculations.",
+        "Single-SKU drill-down: stock, sales, BOM, pricing, history.",
+        "Pre-built kits, components, build candidates.",
+        "Tube families, MP variants, migration forecast.",
+        "Retiring → successor SKU mappings + impact.",
+        "Per-SKU supplier costs, freight modes, lead times.",
+        "Searchable stock view with FIFO values + flags.",
+        "Browse / search products with categories + statuses.",
+        "PO-side analytics: spend by supplier, lead-time variance.",
+        "Recent sales feed + filters.",
+        "Sync freshness, CSV row counts, data integrity flags.",
+    ]
     # v2.66: if the user has a default_page in their profile, jump
     # straight to it on first sign-in. We only honour it once per
     # session so the user can navigate freely afterwards.
@@ -1663,6 +1712,10 @@ with st.sidebar:
         _page_options,
         index=_start_idx,
         label_visibility="collapsed",
+        # v2.67.41 — captions surface each section's purpose so
+        # new users know what they're clicking into. Order matches
+        # _page_options exactly.
+        captions=_page_captions,
     )
 
     st.divider()
@@ -1685,6 +1738,11 @@ with st.sidebar:
                        "on the server. CIN7 itself is auto-synced nightly "
                        "at 02:00 UTC — you don't normally need this."):
         st.cache_data.clear()
+        # v2.67.41 — also drop the session-state engine cache so
+        # the next page render forces a fresh _abc_engine call
+        # against the freshly-loaded data.
+        if "_engine_df_cached" in st.session_state:
+            del st.session_state["_engine_df_cached"]
         st.rerun()
 
     # The rest of this block is the legacy 'Force sync from CIN7' that
@@ -5116,6 +5174,37 @@ def _abc_engine(products: pd.DataFrame,
         pass
 
     return df
+
+
+# v2.67.41 — session-state engine cache.
+# `_abc_engine` is @st.cache_data(persist="disk"), but Streamlit's
+# cache_data hashes its DataFrame inputs on every call. With ~150K
+# sale-line rows + 11K products, that hash takes seconds, AND
+# cache_data copies the result on each access. Both costs add up
+# enough that the user feels the spinner on every page navigation.
+#
+# Fix: cache the engine_df instance in st.session_state once per
+# user session. First page that needs it computes (or hits the
+# disk cache); subsequent navigations get an instant
+# session-state lookup. Cleared by the Refresh button below.
+def _get_engine_df() -> "pd.DataFrame":
+    """Session-cached accessor for the full ABC engine output.
+    Computes once per user session via the disk-cached _abc_engine,
+    then returns the same instance for every subsequent page that
+    needs it. Caller must NOT mutate the returned DataFrame in
+    ways that affect other pages — use .copy() before mutation if
+    in doubt. (Existing call sites add columns like target_stock
+    in-place; that's safe because every page would compute the
+    same values from the same cached engine_df.)"""
+    cached = st.session_state.get("_engine_df_cached")
+    if cached is not None:
+        return cached
+    if products.empty or sale_lines.empty:
+        return pd.DataFrame()
+    engine_df = _abc_engine(
+        products, stock, sale_lines, purchase_lines)
+    st.session_state["_engine_df_cached"] = engine_df
+    return engine_df
 
 
 if page == "Overview":
@@ -8552,7 +8641,11 @@ engine shows every input and how it got to the suggestion.
     # page can call it too. The early-exit guard above still gates this
     # page on having products + sale_lines.
 
-    engine_df = _abc_engine(products, stock, sale_lines, purchase_lines)
+    # v2.67.41 — go via the session-cached accessor so navigating
+    # away and back is instant. First page that needs the engine
+    # primes the session cache; subsequent pages reuse the same
+    # instance until the user clicks Refresh.
+    engine_df = _get_engine_df()
 
     # --- Buyer exclusions + inline notes (loaded once per render) -------
     excluded_skus = db.all_do_not_reorder_skus()
@@ -14974,8 +15067,8 @@ elif page == "AI Assistant":
     # sale_lines are missing.
     if not products.empty and not sale_lines.empty:
         try:
-            engine_df = _abc_engine(
-                products, stock, sale_lines, purchase_lines)
+            # v2.67.41 — session-cached engine accessor.
+            engine_df = _get_engine_df()
             # v2.67.35 — merge Bin (warehouse shelf location) from
             # stock_on_hand. Engine doesn't include Bin natively
             # because it's not a velocity-relevant signal, but
@@ -16386,10 +16479,10 @@ elif page == "Slow Movers":
 
     # We need engine_df for both the flagged-list view AND the
     # search-by-any-SKU view, so build it unconditionally.
+    # v2.67.41 — session-cached accessor; instant on page revisit.
     if 'engine_df' not in dir():
         try:
-            engine_df = _abc_engine(
-                products, stock, sale_lines, purchase_lines)
+            engine_df = _get_engine_df()
         except Exception as _exc:  # noqa: BLE001
             st.error(
                 f"Could not run the ABC engine: {_exc!r}. "
@@ -16586,23 +16679,42 @@ elif page == "Slow Movers":
             ["(no family)"] * len(_slow_df), index=_slow_df.index)
     _slow_df = _slow_df.assign(_family=_family_series)
 
-    # --- Pie chart by family -----------------------------------------
+    # --- Pie chart by Category ---------------------------------------
+    # v2.67.41 — group by CIN7 Category (high-level groupings like
+    # "LED Strip", "Power Supplies", "Channels") instead of Family
+    # (which is too granular — Family is the SKU series like White
+    # Iris / White Lily). Family detail still appears in the
+    # detail table below where granularity is useful. Falls back to
+    # AdditionalAttribute1 → "(no category)" when Category is
+    # missing on a row.
     st.divider()
     st.subheader("Where is the slow stock concentrated?")
-    _by_family = (_slow_df
-                   .assign(_v=_to_num(_slow_df.get(
-                                "OnHandValue",
-                                pd.Series(dtype=float))).fillna(0))
-                   .groupby("_family", dropna=False)
-                   .agg(SKU_count=("SKU", "count"),
-                          Value_at_risk=("_v", "sum"))
-                   .reset_index()
-                   .sort_values("Value_at_risk", ascending=False))
-    _by_family.columns = ["Family", "SKU_count", "Value_at_risk"]
+    if "Category" in _slow_df.columns:
+        _category_series = (_slow_df["Category"]
+                              .fillna("(no category)")
+                              .replace("", "(no category)"))
+    elif "AdditionalAttribute1" in _slow_df.columns:
+        _category_series = (_slow_df["AdditionalAttribute1"]
+                              .fillna("(no category)")
+                              .replace("", "(no category)"))
+    else:
+        _category_series = pd.Series(
+            ["(no category)"] * len(_slow_df), index=_slow_df.index)
+    _slow_df = _slow_df.assign(_category=_category_series)
+    _by_cat = (_slow_df
+                .assign(_v=_to_num(_slow_df.get(
+                            "OnHandValue",
+                            pd.Series(dtype=float))).fillna(0))
+                .groupby("_category", dropna=False)
+                .agg(SKU_count=("SKU", "count"),
+                       Value_at_risk=("_v", "sum"))
+                .reset_index()
+                .sort_values("Value_at_risk", ascending=False))
+    _by_cat.columns = ["Category", "SKU_count", "Value_at_risk"]
     # Guard: don't render the pie if all values are zero (would
     # produce an empty wheel).
-    if (_by_family.empty
-            or float(_by_family["Value_at_risk"].sum()) <= 0):
+    if (_by_cat.empty
+            or float(_by_cat["Value_at_risk"].sum()) <= 0):
         st.caption(
             "_Pie chart not rendered — no slow-stock value to "
             "segment after filtering._")
@@ -16610,10 +16722,10 @@ elif page == "Slow Movers":
         _pc1, _pc2 = st.columns([1, 1])
         with _pc1:
             _fig = px.pie(
-                _by_family.head(15),
+                _by_cat.head(15),
                 values="Value_at_risk",
-                names="Family",
-                title="Slow-stock value by family (top 15)",
+                names="Category",
+                title="Slow-stock value by category (top 15)",
                 hover_data=["SKU_count"],
             )
             _fig.update_traces(
@@ -16625,7 +16737,7 @@ elif page == "Slow Movers":
             st.plotly_chart(_fig, width="stretch")
         with _pc2:
             st.dataframe(
-                _by_family,
+                _by_cat,
                 width="stretch", hide_index=True, height=350,
                 column_config={
                     "Value_at_risk": st.column_config.NumberColumn(
