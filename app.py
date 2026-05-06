@@ -365,14 +365,12 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.46 — AI shipment-question routing fix. "
-                "'When does X arrive / when do we get more X' "
-                "now correctly routes to get_incoming_stock "
-                "even when the STOCK intent chip is set. Plus "
-                "a 'must produce text' backstop so the AI no "
-                "longer falls back to 'I couldn't answer that' "
-                "when tools return matched=0 — it now explains "
-                "what was searched and offers a follow-up.")
+    st.caption("🟢 v2.67.47 — Slow Movers detail table now "
+                "includes Category, Overstock qty, and Overstock "
+                "value columns. Naive baseline computed in "
+                "_abc_engine (OnHand minus 12mo demand); "
+                "Ordering-page values are more precise and will "
+                "overwrite once that page runs in your session.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -408,6 +406,23 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.47** — Slow Movers detail table gets two "
+            "new columns: **Overstock qty** (`excess_units`) "
+            "and **Overstock value** (`excess_value`). Naive "
+            "baseline computed inside `_abc_engine` as "
+            "max(0, OnHand − effective_units_12mo) × per-unit "
+            "cost — i.e. how many units we hold beyond a year's "
+            "demand and what the dollar value of that overhang "
+            "is. The Ordering page later overwrites these with "
+            "a more precise version that factors supplier lead "
+            "times, freight modes, safety stock, and review "
+            "windows — so visiting the Ordering page in your "
+            "session upgrades the same cached engine_df. "
+            "Resolved Category column now also appears in the "
+            "detail table (was previously only the pie's "
+            "group key)."
+        )
         st.caption(
             "**v2.67.46** — AI Assistant fixes for "
             "shipment-timing questions. User reported "
@@ -5294,6 +5309,38 @@ def _abc_engine(products: pd.DataFrame,
                               errors="coerce").fillna(0))
     else:
         df["OnHandValue"] = 0.0
+
+    # v2.67.47 — naive excess_units / excess_value baseline.
+    # The Ordering page later OVERWRITES these with a more precise
+    # version that factors supplier lead times, freight modes,
+    # safety stock, etc. (target_stock = LT × avg + safety + review).
+    # But that calculation depends on supplier configs loaded inside
+    # the Ordering page elif — Slow Movers + Overview can't access
+    # it. So we set a baseline here using a much simpler heuristic
+    # (OnHand minus 12mo effective demand) so excess columns are
+    # always populated. Once the user visits the Ordering page in
+    # the same session, the cached engine_df gets the precise
+    # versions on top — Slow Movers picks those up automatically.
+    _onh = pd.to_numeric(
+        df.get("OnHand", pd.Series(0.0, index=df.index)),
+        errors="coerce").fillna(0)
+    _eff_12mo = pd.to_numeric(
+        df.get("effective_units_12mo",
+                pd.Series(0.0, index=df.index)),
+        errors="coerce").fillna(0)
+    df["excess_units"] = (_onh - _eff_12mo).clip(lower=0)
+    # Per-unit cost from OnHandValue / OnHand when both are
+    # positive; otherwise fall back to AverageCost.
+    _ohv_for_cost = pd.to_numeric(
+        df.get("OnHandValue", pd.Series(0.0, index=df.index)),
+        errors="coerce").fillna(0)
+    _per_unit = (_ohv_for_cost / _onh.where(_onh > 0, 1)).where(
+        _onh > 0, 0)
+    _avgcost_fallback = pd.to_numeric(
+        df.get("AverageCost", pd.Series(0.0, index=df.index)),
+        errors="coerce").fillna(0)
+    _per_unit = _per_unit.where(_per_unit > 0, _avgcost_fallback)
+    df["excess_value"] = (df["excess_units"] * _per_unit).round(2)
 
     # v2.67.36 — record dormancy provenance. Write today's
     # is_dormant snapshot to the sku_dormancy_log table so the
@@ -17062,10 +17109,20 @@ elif page == "Slow Movers":
         "surfaces first. Use the search box above to dismiss any "
         "individual warning.")
 
-    _slow_df = _slow_df.rename(columns={"_family": "Family"})
+    # v2.67.47 — surface resolved Category as a column on the
+    # detail table (was rendering only as the pie's group key).
+    # Rename _category → Category for display. Also drops the
+    # stale rename of _family which v2.67.41 removed.
+    _slow_df = _slow_df.rename(columns={"_category": "Category"})
     _detail_cols = [c for c in (
-        "SKU", "Name", "Family", "ABC", "trend_flag",
-        "OnHand", "OnHandValue", "effective_units_12mo",
+        "SKU", "Name", "Category", "ABC", "trend_flag",
+        "OnHand", "OnHandValue",
+        # v2.67.47 — overstock qty + value columns. Naive baseline
+        # from _abc_engine (OnHand - effective_units_12mo); the
+        # Ordering page may overwrite with a more precise value
+        # in the same engine_df instance after that page runs.
+        "excess_units", "excess_value",
+        "effective_units_12mo",
         "dormancy_first_seen", "dormancy_last_seen",
         "recovered_at", "days_dormant",
     ) if c in _slow_df.columns]
@@ -17078,6 +17135,19 @@ elif page == "Slow Movers":
             "OnHand": st.column_config.NumberColumn(format="%.2f"),
             "OnHandValue": st.column_config.NumberColumn(
                 format="$%.0f"),
+            "excess_units": st.column_config.NumberColumn(
+                format="%.2f",
+                help=("Overstock qty — units beyond 12-month "
+                      "demand (naive). Precise version factoring "
+                      "supplier lead times appears once you've "
+                      "visited the Ordering page in this "
+                      "session.")),
+            "excess_value": st.column_config.NumberColumn(
+                format="$%.0f",
+                help=("Overstock dollar value (excess_units × "
+                      "per-unit cost). The cash you'd free up "
+                      "by clearing this SKU back down to 12mo "
+                      "demand.")),
             "effective_units_12mo": st.column_config.NumberColumn(
                 format="%.0f"),
             "days_dormant": st.column_config.NumberColumn(format="%d"),
