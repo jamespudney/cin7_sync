@@ -32,11 +32,23 @@ echo "[$(stamp)] cin7_sync quick --days 3" >> "$LOG"
 python cin7_sync.py quick --days 3 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync quick FAILED (continuing)" >> "$LOG"
 
+# v2.67.43 — refresh the 30-day sale-header window daily. The
+# Overview tile "Sales invoiced (last 30d)" reads sales_last_30d_*
+# directly. Without this refresh the file goes stale (we observed
+# a 13-day-stale file producing $323K vs CIN7's $520K — a $200K
+# gap that matters for sales-team commission visibility).
+echo "[$(stamp)] cin7_sync sales --days 30" >> "$LOG"
+python cin7_sync.py sales --days 30 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync sales --days 30 FAILED (continuing)" >> "$LOG"
+
 # Sale lines feed the ABC engine, customer rollups, velocity. The
 # `quick` sync above pulls sale headers but NOT line items. Without
 # this incremental pull, line-level data goes stale by ~1 day per day.
-echo "[$(stamp)] cin7_sync salelines --days 3" >> "$LOG"
-python cin7_sync.py salelines --days 3 >> "$LOG" 2>&1 || \
+# v2.67.43 — bumped the salelines window from 3 to 30 days too so
+# the line-level rollups behind the Monthly Metrics report stay
+# current within the same window the headline tile reports.
+echo "[$(stamp)] cin7_sync salelines --days 30" >> "$LOG"
+python cin7_sync.py salelines --days 30 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync salelines FAILED (continuing)" >> "$LOG"
 
 # Purchase lines feed FixedCost audit and supplier-pricing audits.

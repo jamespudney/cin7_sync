@@ -365,13 +365,13 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.42 — Slow-stock value-on-shelf tile "
-                "now shows month-over-month delta in green "
-                "(if dropped) or red (if increased) so progress "
-                "is visible at a glance. Snapshot table "
-                "populates daily from the engine recompute; "
-                "comparison appears as soon as we have a "
-                "snapshot from any day of the previous month.")
+    st.caption("🟢 v2.67.43 — Sales-invoiced reconciliation. "
+                "Daily sync now refreshes sales_last_30d.csv "
+                "every night (was only refreshed weekly). "
+                "Overview tile gets a freshness indicator: "
+                "green ✓ when the source CSV is <36h old, "
+                "red ⚠ otherwise. Closes the $200K gap "
+                "between our tile and CIN7's Revenue.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -407,6 +407,25 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.43** — Sales-invoiced reconciliation. "
+            "User reported the Overview's 'Sales invoiced "
+            "(last 30d)' showed $323K against CIN7's actual "
+            "$520K Revenue for the same window — a 38% "
+            "understatement. Root cause: `sales_last_30d_*.csv` "
+            "was 13 days stale (last written April 23 but the "
+            "user was checking on May 6). The Daily Sync only "
+            "refreshes 3-day windows via `cin7_sync.py quick "
+            "--days 3`; the 30-day file only got refreshed by "
+            "the weekend deep sync. Fix: daily_sync.sh and "
+            "daily_sync.bat now also run `cin7_sync.py sales "
+            "--days 30` and `salelines --days 30` so the "
+            "headline window stays fresh nightly. The tile gets "
+            "a freshness indicator: ✓ green when source CSV is "
+            "<36h old, ⚠ red otherwise so the user immediately "
+            "knows when the number is reliable. Pattern matches "
+            "v2.67.36's engine-cache-age caption."
+        )
         st.caption(
             "**v2.67.42** — Month-over-month delta on the "
             "Slow-stock value-on-shelf tile. New "
@@ -5340,6 +5359,39 @@ if page == "Overview":
              "'pre-tax ≈' line under it is the closest match to CIN7's "
              "Overview dashboard 'Revenue' metric (pre-tax).",
     )
+    # v2.67.43 — freshness indicator. If the underlying
+    # sales_last_30d_*.csv is more than ~36h old, the tile is
+    # undercounting and the user should know. Without this hint,
+    # users see a number that drifts from CIN7's dashboard with
+    # no explanation. Once daily_sync refreshes the 30d file each
+    # morning this caption disappears (or shows a young age).
+    try:
+        _sales_files = sorted(
+            OUTPUT_DIR.glob("sales_last_30d_*.csv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True)
+        if _sales_files:
+            _sales_age_h = (
+                (datetime.now().timestamp()
+                 - _sales_files[0].stat().st_mtime) / 3600.0)
+            if _sales_age_h > 36:
+                c2.markdown(
+                    f"<small style='color:#dc2626;'>"
+                    f"⚠ sales_last_30d.csv is "
+                    f"{_sales_age_h:.0f}h old — tile is "
+                    "undercounting recent sales. Daily sync "
+                    "should refresh this nightly (v2.67.43)."
+                    "</small>",
+                    unsafe_allow_html=True)
+            else:
+                c2.markdown(
+                    f"<small style='color:#16a34a;'>"
+                    f"✓ source refreshed "
+                    f"{_sales_age_h:.1f}h ago"
+                    "</small>",
+                    unsafe_allow_html=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Open POs — unique purchases with status 'ORDERED' / 'ORDERING'.
     # NOTE: purchase_lines is deduped on (PurchaseID, SKU, Quantity),
