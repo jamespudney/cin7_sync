@@ -3104,12 +3104,23 @@ def get_shipping_details(engine_df: pd.DataFrame,
     if tracking_number and "TrackingNumber" in work.columns:
         work = work[work["TrackingNumber"].astype(str).str.upper()
                      == tracking_number.upper()]
-    # Order number — same prefix-strip pattern used elsewhere.
+    # Order number. ShipStation v2's `shipment_number` field is
+    # the CIN7 invoice number (INV-XXXXX), so we strip both SO-
+    # and INV- prefixes to handle however the user typed it.
+    # v2.67.55+ — match against the same normalised column so
+    # 'INV-53141', '53141', 'inv-53141' all hit the same row.
     elif order_number and "OrderNumber" in work.columns:
-        norm = order_number.upper().lstrip("SO-").lstrip("SO")
+        norm = order_number.upper()
+        for pfx in ("SO-", "SO", "INV-", "INV"):
+            if norm.startswith(pfx):
+                norm = norm[len(pfx):].lstrip("-")
+                break
         col = (work["OrderNumber"].astype(str).str.upper()
                 .str.replace("SO-", "", regex=False)
-                .str.replace("SO", "", regex=False))
+                .str.replace("SO", "", regex=False)
+                .str.replace("INV-", "", regex=False)
+                .str.replace("INV", "", regex=False)
+                .str.lstrip("-"))
         work = work[col == norm]
     else:
         if customer_filter and "CustomerName" in work.columns:

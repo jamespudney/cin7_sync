@@ -368,19 +368,40 @@ def _fetch_labels_index(session: requests.Session,
     # /labels has the same query shape as /shipments but a
     # different result_key. Inline pagination — the shared
     # paginator wouldn't help.
+    # v2.67.55+ — /labels is materially slower than /shipments
+    # (observed 30s timeout on first attempt with page_size=500).
+    # Use a smaller page size + longer timeout + retries on
+    # network errors. 100 per page is the v2 default and we've
+    # seen it return reliably; 500 likely triggers a server-side
+    # query that exceeds the request budget.
+    LABELS_TIMEOUT = 90.0
+    LABELS_PAGE_SIZE = 100
+    LABELS_MAX_RETRIES = 3
     page = 1
     while True:
-        try:
-            resp = session.get(
-                f"{BASE_URL_V2}/labels",
-                params={"created_at_start": since_iso,
-                          "page": page,
-                          "page_size": DEFAULT_PAGE_SIZE},
-                timeout=DEFAULT_TIMEOUT)
-        except requests.RequestException as exc:
-            log.warning("Label fetch network error %s — abandoning "
-                          "label enrichment for this run", exc)
-            return idx
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = session.get(
+                    f"{BASE_URL_V2}/labels",
+                    params={"created_at_start": since_iso,
+                              "page": page,
+                              "page_size": LABELS_PAGE_SIZE},
+                    timeout=LABELS_TIMEOUT)
+                break
+            except requests.RequestException as exc:
+                if attempt >= LABELS_MAX_RETRIES:
+                    log.warning("Label fetch network error %s "
+                                  "after %d tries — abandoning label "
+                                  "enrichment for this run",
+                                  exc, attempt)
+                    return idx
+                wait = 2 ** attempt
+                log.warning("Label fetch attempt %d failed (%s) — "
+                              "retrying in %ds", attempt, exc, wait)
+                time.sleep(wait)
+                continue
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", "60"))
             log.warning("Label fetch 429 — sleeping %ss", wait)
