@@ -365,14 +365,13 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.41 — Three small wins. (1) Engine "
-                "now session-cached: navigating between pages "
-                "is instant after the first compute. (2) Sidebar "
-                "shows a one-line description under each section "
-                "name. (3) Slow Movers pie chart groups by CIN7 "
-                "Category (LED Strip / Power Supplies / etc.) "
-                "instead of Family — high-level distribution "
-                "rather than SKU-series granularity.")
+    st.caption("🟢 v2.67.42 — Slow-stock value-on-shelf tile "
+                "now shows month-over-month delta in green "
+                "(if dropped) or red (if increased) so progress "
+                "is visible at a glance. Snapshot table "
+                "populates daily from the engine recompute; "
+                "comparison appears as soon as we have a "
+                "snapshot from any day of the previous month.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -408,6 +407,21 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.42** — Month-over-month delta on the "
+            "Slow-stock value-on-shelf tile. New "
+            "`slow_mover_value_snapshots` table holds one row "
+            "per calendar date with skus_count + units_on_hand "
+            "+ value_on_shelf. The engine writes a fresh "
+            "snapshot on every recompute (last-write-wins per "
+            "day). The Overview tile reads the latest snapshot "
+            "from the previous calendar month and renders a "
+            "small caption below the dollar value: green ↓ "
+            "when the value dropped (we cleared slow stock), "
+            "red ↑ when it grew (we accumulated more). Until "
+            "we have a previous-month snapshot the caption "
+            "explains what to expect."
+        )
         st.caption(
             "**v2.67.41** — Three small wins shipped together. "
             "(1) **Engine session cache**: `_abc_engine` is "
@@ -5167,6 +5181,38 @@ def _abc_engine(products: pd.DataFrame,
         if _dormant_skus or _recovered_skus:
             db.record_dormancy_snapshot(
                 _dormant_skus, _recovered_skus)
+        # v2.67.42 — also snapshot the slow-stock VALUE on shelf
+        # so the Overview tile can render a month-over-month delta
+        # caption. Filter to in-stock + parents only to match the
+        # actionable definition the rest of the page uses.
+        try:
+            _value_snap_df = df.loc[
+                df["is_dormant"].fillna(False).astype(bool)
+                & (df.get("OnHand", pd.Series(0)).fillna(0) > 0)
+                & (~df.get("is_non_master_tube",
+                            pd.Series(False)).fillna(False))
+            ]
+            _v_skus_count = int(len(_value_snap_df))
+            _v_units = float(
+                _value_snap_df.get("OnHand",
+                                    pd.Series(dtype=float))
+                .fillna(0).sum())
+            # Use StockOnHand (CIN7 FIFO field) when available; fall
+            # back to OnHandValue. This mirrors what the Overview
+            # slow-mover tile displays so the snapshot ties to the
+            # tile we'll compare against.
+            if "StockOnHand" in _value_snap_df.columns:
+                _v_value = float(
+                    _value_snap_df["StockOnHand"].fillna(0).sum())
+            else:
+                _v_value = float(
+                    _value_snap_df.get("OnHandValue",
+                                        pd.Series(dtype=float))
+                    .fillna(0).sum())
+            db.record_slow_mover_value_snapshot(
+                _v_skus_count, _v_units, _v_value)
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
         # Provenance write must never break the engine. Failures
         # here just mean we skip this snapshot — the next engine
@@ -5358,12 +5404,55 @@ if page == "Overview":
         help=("SKUs in the dormancy log with an active warning. "
               "Auto-lifts after 90 days sustained recovery; "
               "buyer can manually dismiss any row."))
+    # v2.67.42 — month-over-month delta caption. Reads the latest
+    # snapshot from the previous calendar month and renders a small
+    # red caption under the value. Direction-aware colouring: a
+    # DROP is good news (less stock tied up) and renders green; an
+    # increase is bad and renders red.
+    try:
+        _prev_month = db.get_previous_month_slow_mover_value()
+    except Exception:  # noqa: BLE001
+        _prev_month = {}
     sm2.metric(
         "Slow stock — value on shelf",
         _fmt_money(_slow_holding_value),
         help=("Sum of CIN7 StockOnHand for all currently-flagged "
               "slow SKUs. This is working capital tied up in items "
-              "the engine has flagged as dormant."))
+              "the engine has flagged as dormant. The caption "
+              "below compares to the previous calendar month."))
+    if _prev_month and _prev_month.get("value_on_shelf") is not None:
+        _prev_v = float(_prev_month["value_on_shelf"] or 0)
+        _delta = _slow_holding_value - _prev_v
+        _prev_date = str(_prev_month.get("snapshot_date") or "")[:10]
+        if _prev_v > 0:
+            _pct = _delta / _prev_v * 100
+            _pct_str = f"{_pct:+.1f}%"
+        else:
+            _pct_str = "n/a"
+        # Direction: drop is GOOD (we cleared stock), rise is BAD.
+        if _delta < 0:
+            _arrow = "↓"
+            _colour = "#16a34a"  # green-600
+            _verb = "down vs prev month"
+        elif _delta > 0:
+            _arrow = "↑"
+            _colour = "#dc2626"  # red-600
+            _verb = "up vs prev month"
+        else:
+            _arrow = "→"
+            _colour = "#6b7280"  # grey-500
+            _verb = "unchanged vs prev month"
+        sm2.markdown(
+            f"<small style='color:{_colour};'>"
+            f"{_arrow} {_fmt_money(abs(_delta))} ({_pct_str}) "
+            f"{_verb} ({_prev_date}: {_fmt_money(_prev_v)})"
+            "</small>",
+            unsafe_allow_html=True)
+    else:
+        sm2.caption(
+            "_Previous-month comparison will appear once we have "
+            "a snapshot from last month (one snapshot per day "
+            "from the daily engine recompute)._")
     sm3.metric(
         "Cleared this month — value",
         _fmt_money(_mtd_clear["cost_value"]),

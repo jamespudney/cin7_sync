@@ -549,6 +549,19 @@ CREATE TABLE IF NOT EXISTS sku_dormancy_log (
 CREATE INDEX IF NOT EXISTS ix_dormancy_active
     ON sku_dormancy_log(warning_lifted_at)
     WHERE warning_lifted_at IS NULL;
+
+-- v2.67.42 — daily snapshot of slow-stock value on shelf. Used by
+-- the Overview tile + Slow Movers page to show month-over-month
+-- progress / regression. Snapshot key is the date so we get one
+-- row per day; engine recomputes during the day overwrite the
+-- same date's row (last-write-wins).
+CREATE TABLE IF NOT EXISTS slow_mover_value_snapshots (
+    snapshot_date         DATE PRIMARY KEY,
+    skus_count            INTEGER,
+    units_on_hand         REAL,
+    value_on_shelf        REAL,    -- StockOnHand sum across the day's slow SKUs
+    captured_at           TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -3910,6 +3923,64 @@ def get_dormancy_warnings() -> dict:
             "last_engine_run_at": r["last_engine_run_at"],
         }
     return out
+
+
+def record_slow_mover_value_snapshot(skus_count: int,
+                                        units_on_hand: float,
+                                        value_on_shelf: float
+                                        ) -> None:
+    """v2.67.42 — daily snapshot of slow-stock totals. Called from
+    the engine recompute right after dormancy log writes. One row
+    per calendar date — same-day re-runs overwrite the row so the
+    latest snapshot per day is kept (last-write-wins).
+
+    Used by the Overview tile to show month-over-month progress
+    (red caption with previous month's value) and by the Slow
+    Movers page header for the same purpose."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO slow_mover_value_snapshots
+                (snapshot_date, skus_count, units_on_hand,
+                 value_on_shelf, captured_at)
+            VALUES
+                (date('now'), ?, ?, ?, datetime('now'))
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                skus_count     = excluded.skus_count,
+                units_on_hand  = excluded.units_on_hand,
+                value_on_shelf = excluded.value_on_shelf,
+                captured_at    = excluded.captured_at
+            """,
+            (int(skus_count), float(units_on_hand),
+             float(value_on_shelf)),
+        )
+
+
+def get_previous_month_slow_mover_value() -> dict:
+    """v2.67.42 — returns the most-recent snapshot from any date
+    in the PREVIOUS calendar month, or {} if none. Used by the
+    Overview slow-stock tile to render a small comparison caption.
+
+    'Previous month' is defined as the calendar month preceding
+    today's calendar month. So on 2026-05-15 we look at the
+    latest snapshot dated between 2026-04-01 and 2026-04-30."""
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT snapshot_date, skus_count, units_on_hand,
+                   value_on_shelf
+              FROM slow_mover_value_snapshots
+             WHERE snapshot_date >=
+                   date('now', 'start of month', '-1 month')
+               AND snapshot_date <
+                   date('now', 'start of month')
+             ORDER BY snapshot_date DESC
+             LIMIT 1
+            """,
+        ).fetchone()
+    if not row:
+        return {}
+    return dict(row)
 
 
 def flag_sku_as_slow_mover(sku: str, user_id: str = "") -> None:
