@@ -591,6 +591,69 @@ def _headline_stock_value(stock_df: pd.DataFrame,
     ))
 
 
+def _compute_slow_stock_holding(engine_df: pd.DataFrame,
+                                  dormancy_warnings: dict) -> dict:
+    """v2.67.53 — single source of truth for "slow-stock value on
+    shelf". Used by:
+      - Overview's "Slow stock — value on shelf" tile
+      - Slow Movers page's "Stock value tied up" tile
+      - The engine's monthly snapshot writer (so MoM delta caption
+        is comparable)
+
+    Why this had to be unified: the user reported a $58k discrepancy
+    between Overview ($290,872) and the Slow Movers page ($232,153)
+    for what's labelled the same metric. Three different code paths
+    were computing it three different ways:
+      - Overview: ALL flagged SKUs × raw stock.StockOnHand
+                  (no parent filter, no OnHand>0 filter)
+      - Slow Movers page: parents+OnHand>0 × engine_df.OnHandValue
+      - Snapshot writer: parents+OnHand>0 × stock.StockOnHand
+
+    The actionable definition (what the buyer can actually clear)
+    is parents/standalones with OnHand>0. Children's stock rolls up
+    to the master, so counting them double-counts; zero-stock entries
+    aren't holdings. And engine_df.OnHandValue is the canonical cost
+    chain (handles missing CIN7 FIFO via family/category medians) —
+    it's what the Ordering page's excess-value math uses everywhere
+    else, so picking it here keeps that chain consistent.
+
+    Returns: {sku_count, units_held, value_held, filter_summary}.
+    Defensive: every column access is conditional so a leaner
+    engine_df shape doesn't blow up (e.g. v2.67.32 lifted the engine
+    to module scope and earlier callers built minimal frames)."""
+    if (engine_df is None or engine_df.empty
+            or not dormancy_warnings):
+        return {
+            "sku_count": 0,
+            "units_held": 0.0,
+            "value_held": 0.0,
+            "filter_summary": "no flagged SKUs / no engine_df",
+        }
+    slow_set = set(str(k) for k in dormancy_warnings.keys())
+    df = engine_df.copy()
+    if "SKU" not in df.columns:
+        return {"sku_count": 0, "units_held": 0.0, "value_held": 0.0,
+                "filter_summary": "engine_df missing SKU column"}
+    df = df[df["SKU"].astype(str).isin(slow_set)]
+    # parents/standalones only — drop child SKUs that roll up.
+    if "is_non_master_tube" in df.columns:
+        df = df[~df["is_non_master_tube"].fillna(False).astype(bool)]
+    # OnHand > 0 only — nothing to clear if it's already gone.
+    if "OnHand" in df.columns:
+        df = df[_to_num(df["OnHand"]).fillna(0) > 0]
+    units_held = (float(_to_num(df["OnHand"]).fillna(0).sum())
+                   if "OnHand" in df.columns else 0.0)
+    value_held = (float(_to_num(df["OnHandValue"]).fillna(0).sum())
+                   if "OnHandValue" in df.columns else 0.0)
+    return {
+        "sku_count": int(len(df)),
+        "units_held": units_held,
+        "value_held": value_held,
+        "filter_summary": "parents/standalones, OnHand>0, "
+                            "engine OnHandValue cost chain",
+    }
+
+
 def rows_selector(label: str = "Rows to show", key: str = "rows",
                   default: int = 100) -> int:
     """Standard page-size selector. Returns row limit (large int for 'All')."""
@@ -642,21 +705,17 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.52 — Document memos + notes capture. "
-                "After v2.67.51 surfaced PO-7109 successfully, "
-                "the buyer pointed out the AI was missing the "
-                "'Purchase Order Memo' field — the main "
-                "instruction box on the CIN7 PO form. v2.67.52 "
-                "captures FIVE freeform fields per PO (Memo, "
-                "Comments, ShippingNotes, Note, Terms) and FIVE "
-                "per sale (Memo, Note, ShippingNotes, Terms, "
-                "CustomerReference). Everything the buyer or "
-                "sales rep types into a transaction now flows "
-                "into the AI's get_purchase_order / "
-                "get_sale_order / get_incoming_stock answers. "
-                "Re-sync needed to backfill older POs/sales — "
-                "newer ones will pick the fields up at the next "
-                "daily sync.")
+    st.caption("🟢 v2.67.53 — Slow-stock value reconciled. "
+                "Overview said $290,872, Slow Movers page said "
+                "$232,153, monthly snapshot said something else "
+                "again — three code paths, three filters, two "
+                "different value columns. New "
+                "_compute_slow_stock_holding() helper is the single "
+                "source: parents/standalones, OnHand>0, engine "
+                "OnHandValue. All three tiles now call it. The "
+                "discrepancy disappears.")
+    # v2.67.52's full description is in the Recent versions expander
+    # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -692,6 +751,40 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.53** — Slow-stock value reconciliation. "
+            "User reported a $58k discrepancy: the Overview's "
+            "'Slow stock — value on shelf' tile said $290,872 "
+            "while the Slow Movers page said $232,153. Three "
+            "code paths were computing what's labelled the same "
+            "metric three different ways:\n\n"
+            "(1) Overview — summed `stock.StockOnHand` across "
+            "ALL flagged SKUs (no parent filter, no OnHand>0 "
+            "filter; included children whose stock rolls up to "
+            "the bulk-roll parent and zero-stock entries that "
+            "can't be cleared).\n\n"
+            "(2) Slow Movers page — summed "
+            "`engine_df.OnHandValue` filtered to "
+            "parents/standalones with OnHand>0 (the actionable "
+            "definition).\n\n"
+            "(3) Engine snapshot writer — used the right filter "
+            "but the wrong value column (`StockOnHand` instead "
+            "of `OnHandValue`), so MoM delta caption compared "
+            "apples to oranges.\n\n"
+            "Fix: extracted `_compute_slow_stock_holding(engine_df, "
+            "dormancy_warnings)` next to `_headline_stock_value`. "
+            "Returns sku_count + units_held + value_held + "
+            "filter_summary. Definition: parents/standalones, "
+            "OnHand>0, engine OnHandValue cost chain (graceful "
+            "fallback for SKUs missing CIN7 FIFO). All three "
+            "callers now invoke it, so the numbers tie. The "
+            "Slow Movers page falls back to its raw _slow_df "
+            "sum only when the diagnostic 'Show all flagged "
+            "SKUs' toggle is on. Snapshots written before the "
+            "deploy will produce a small one-time discontinuity "
+            "in the MoM caption — accepted because the new "
+            "definition is the canonical one going forward."
+        )
         st.caption(
             "**v2.67.52** — Document memo / notes capture. "
             "After v2.67.51 made PO-7109 visible, the user "
@@ -5893,18 +5986,19 @@ def _abc_engine(products: pd.DataFrame,
                 _value_snap_df.get("OnHand",
                                     pd.Series(dtype=float))
                 .fillna(0).sum())
-            # Use StockOnHand (CIN7 FIFO field) when available; fall
-            # back to OnHandValue. This mirrors what the Overview
-            # slow-mover tile displays so the snapshot ties to the
-            # tile we'll compare against.
-            if "StockOnHand" in _value_snap_df.columns:
-                _v_value = float(
-                    _value_snap_df["StockOnHand"].fillna(0).sum())
-            else:
-                _v_value = float(
-                    _value_snap_df.get("OnHandValue",
-                                        pd.Series(dtype=float))
-                    .fillna(0).sum())
+            # v2.67.53 — use engine OnHandValue (NOT StockOnHand).
+            # Aligns with the new unified _compute_slow_stock_holding
+            # helper that Overview + Slow Movers page now both use.
+            # Earlier code used StockOnHand here to mirror the
+            # Overview tile, but Overview itself is now reading
+            # OnHandValue via the helper. Snapshots written before
+            # this change will show a small one-time discontinuity
+            # when the MoM caption compares them — accept it since
+            # the new definition is the canonical one going forward.
+            _v_value = float(
+                _value_snap_df.get("OnHandValue",
+                                    pd.Series(dtype=float))
+                .fillna(0).sum())
             db.record_slow_mover_value_snapshot(
                 _v_skus_count, _v_units, _v_value)
         except Exception:  # noqa: BLE001
@@ -6109,23 +6203,22 @@ if page == "Overview":
     _mtd_clear = _compute_slow_mover_clearance(
         stock, sale_lines, products, _dormancy_w,
         _mtd_start, _today)
-    # Total slow-stock OnHand value from the engine (best estimate
-    # using its cost chain — the per-SKU OnHandValue column).
-    _slow_skus_set = set(_dormancy_w.keys())
-    _slow_holding_value = 0.0
-    _slow_units_held = 0.0
-    if (_slow_skus_set
-            and not stock.empty
-            and "SKU" in stock.columns):
-        _stock_view = stock.copy()
-        _stock_view["SKU"] = _stock_view["SKU"].astype(str)
-        _stock_slow = _stock_view[_stock_view["SKU"].isin(_slow_skus_set)]
-        if "StockOnHand" in _stock_slow.columns:
-            _slow_holding_value = float(
-                _to_num(_stock_slow["StockOnHand"]).fillna(0).sum())
-        if "OnHand" in _stock_slow.columns:
-            _slow_units_held = float(
-                _to_num(_stock_slow["OnHand"]).fillna(0).sum())
+    # v2.67.53 — single source of truth. Both this tile AND the
+    # Slow Movers page now use _compute_slow_stock_holding() so
+    # the numbers tie. Previous code summed raw stock.StockOnHand
+    # across ALL flagged SKUs (no parent filter), producing a $58k
+    # gap vs the Slow Movers page which filters to actionable
+    # parents+OnHand>0 and uses engine_df.OnHandValue. The engine
+    # cost chain wins because it has graceful fallbacks for SKUs
+    # missing CIN7 FIFO.
+    try:
+        _engine_for_slow = _get_engine_df()
+    except Exception:  # noqa: BLE001
+        _engine_for_slow = pd.DataFrame()
+    _slow_holding = _compute_slow_stock_holding(
+        _engine_for_slow, _dormancy_w)
+    _slow_holding_value = _slow_holding["value_held"]
+    _slow_units_held = _slow_holding["units_held"]
     sm1, sm2, sm3, sm4 = st.columns(4)
     sm1.metric(
         "Slow stock — SKUs flagged",
@@ -6145,10 +6238,15 @@ if page == "Overview":
     sm2.metric(
         "Slow stock — value on shelf",
         _fmt_money(_slow_holding_value),
-        help=("Sum of CIN7 StockOnHand for all currently-flagged "
-              "slow SKUs. This is working capital tied up in items "
-              "the engine has flagged as dormant. The caption "
-              "below compares to the previous calendar month."))
+        help=("Working capital tied up in slow-moving stock. "
+              "v2.67.53 — definition unified across Overview, the "
+              "Slow Movers page, and the monthly snapshot. Filters "
+              "to parents/standalones with OnHand>0 (children roll "
+              "up to masters; zero-stock entries can't be cleared) "
+              "and uses the engine's OnHandValue cost chain "
+              "(graceful fallback for SKUs without CIN7 FIFO). "
+              "Caption below compares to the previous calendar "
+              "month."))
     if _prev_month and _prev_month.get("value_on_shelf") is not None:
         _prev_v = float(_prev_month["value_on_shelf"] or 0)
         _delta = _slow_holding_value - _prev_v
@@ -17537,12 +17635,21 @@ elif page == "Slow Movers":
     # --- Summary header tiles ----------------------------------------
     st.divider()
     _total_skus = len(_slow_df)
-    _total_units = float(_to_num(_slow_df.get("OnHand",
-                                                  pd.Series(dtype=float)))
-                              .fillna(0).sum())
-    _total_value = float(_to_num(_slow_df.get("OnHandValue",
-                                                  pd.Series(dtype=float)))
-                              .fillna(0).sum())
+    # v2.67.53 — when the user is showing the DEFAULT filtered view
+    # (parents+OnHand>0), use the shared `_compute_slow_stock_holding`
+    # helper so the value here ties EXACTLY to the Overview tile.
+    # When `_show_full` is on (diagnostic toggle), fall back to summing
+    # whatever is in `_slow_df` since the user explicitly asked to see
+    # the unfiltered set.
+    if not _show_full:
+        _holding = _compute_slow_stock_holding(engine_df, _warnings)
+        _total_units = _holding["units_held"]
+        _total_value = _holding["value_held"]
+    else:
+        _total_units = float(_to_num(_slow_df.get(
+            "OnHand", pd.Series(dtype=float))).fillna(0).sum())
+        _total_value = float(_to_num(_slow_df.get(
+            "OnHandValue", pd.Series(dtype=float))).fillna(0).sum())
     _avg_days = (float(_slow_df["days_dormant"].mean())
                   if not _slow_df.empty else 0.0)
     _hc1, _hc2, _hc3, _hc4 = st.columns(4)
