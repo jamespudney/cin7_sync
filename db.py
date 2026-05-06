@@ -3912,6 +3912,59 @@ def get_dormancy_warnings() -> dict:
     return out
 
 
+def flag_sku_as_slow_mover(sku: str, user_id: str = "") -> None:
+    """v2.67.40 — manually mark a SKU as a slow mover from the
+    Slow Movers page UI. Inserts (or revives) a row in
+    sku_dormancy_log so the SKU shows up everywhere the engine-
+    driven warnings show up:
+      - Overview slow-mover panel
+      - Slow Movers detail table
+      - Ordering page Status column (❗ prefix)
+      - Notes column auto-prefix
+      - Weekly digest email
+
+    Use case: buyer/sales spots a slow-mover by eye that the engine
+    didn't flag (e.g. seasonal item, project leftover, sample stock).
+    The flag persists across engine recomputes and is sticky against
+    auto-lifts (since the buyer set it deliberately)."""
+    sku = str(sku).strip()
+    if not sku:
+        return
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO sku_dormancy_log
+                (sku, first_seen_dormant_at, last_seen_dormant_at,
+                 recovered_at, last_engine_run_at)
+            VALUES
+                (?, datetime('now'), datetime('now'),
+                 NULL, datetime('now'))
+            ON CONFLICT(sku) DO UPDATE SET
+                last_seen_dormant_at = datetime('now'),
+                last_engine_run_at = datetime('now'),
+                -- A manual flag re-engages a previously-lifted
+                -- warning. Reasoning mirrors the SQL in
+                -- record_dormancy_snapshot but with a manual
+                -- intent marker.
+                warning_lifted_at = NULL,
+                warning_lift_reason = NULL,
+                warning_lifted_by = NULL,
+                recovered_at = NULL
+            """,
+            (sku,),
+        )
+        c.execute(
+            """
+            INSERT INTO feedback_events
+                (source, entity_type, entity_id, feedback,
+                 note, user_id)
+            VALUES ('slow_movers_page', 'sku', ?,
+                    'manual_flag_as_slow', '', ?)
+            """,
+            (sku, user_id or ""),
+        )
+
+
 def dismiss_dormancy_warning(sku: str, user_id: str = "",
                                 reason: str = "manual_dismiss") -> None:
     """v2.67.36 — buyer override. Clears the once-slow warning so

@@ -365,12 +365,15 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.39 — Hotfix: Slow Movers page was "
-                "raising KeyError 'Family' because engine_df has "
-                "no literal Family column (CIN7 stores family in "
-                "AdditionalAttribute1). Page now derives Family "
-                "from AdditionalAttribute1 with a '(no family)' "
-                "fallback so it renders cleanly.")
+    st.caption("🟢 v2.67.40 — Slow Movers page reworked. "
+                "Filters to parents/standalones with OnHand>0 by "
+                "default (children rolled-up to masters no longer "
+                "double-counted; zero-stock entries hidden). New "
+                "🔎 search box finds ANY SKU and lets you toggle "
+                "its slow-mover flag (Flag / Unflag buttons). "
+                "Engine fixed too: non-master tubes are no longer "
+                "flagged dormant since their demand is rolled up "
+                "to the bulk master.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -406,6 +409,40 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.40** — Slow Movers page rework + engine "
+            "fix. Three issues addressed.\n\n"
+            "(1) **Engine fix.** `_refine_dormancy_by_class` was "
+            "flagging non-master tubes (per-foot cuts, BOM "
+            "derivatives) as dormant because their "
+            "`effective_units_90d=0` — but that zero is by "
+            "design. The engine deliberately rolls UP a child's "
+            "demand to its bulk master so the master's optimum/"
+            "excess math reflects real consumption. Flagging the "
+            "child as dormant on the basis of its own zero is "
+            "double-counting at the wrong granularity. The "
+            "function now early-returns False for any SKU with "
+            "`is_non_master_tube=True`. The dormancy log will "
+            "stop accumulating children on the next engine "
+            "recompute.\n\n"
+            "(2) **Page filters.** The Slow Movers page now "
+            "filters to (a) parents/standalones only (mirrors the "
+            "Ordering page's PO-suggestion logic), (b) OnHand>0 "
+            "(zero-stock entries can't be liquidated). A toggle "
+            "`Show all flagged SKUs` reveals the raw log "
+            "including children + zero-stock for diagnostic "
+            "users. Default is the filtered view because that's "
+            "what's actionable.\n\n"
+            "(3) **🔎 SKU search + toggle.** New search box "
+            "matches across SKU + Name (substring, top 25 "
+            "results). Each match shows its current state "
+            "(⚠️ FLAGGED / ✅ active / 🧩 child SKU) plus OnHand "
+            "+ value + ABC + trend. Per-row Flag-as-slow / "
+            "Unflag button writes to sku_dormancy_log. Manual "
+            "flags persist across re-dormancy and propagate to "
+            "the Ordering page's ❗ prefix and the weekly digest "
+            "email."
+        )
         st.caption(
             "**v2.67.39** — Slow Movers page hotfix. The pie "
             "chart's groupby was reading `_slow_df['Family']` "
@@ -4907,6 +4944,20 @@ def _abc_engine(products: pd.DataFrame,
     # "dormant" for a C-class SKU — letting attrition run down
     # slow-moving inventory automatically.
     def _refine_dormancy_by_class(row):
+        # v2.67.40 — non-master tubes / strip cuts / BOM derivatives
+        # have their 12mo and 90d demand DELIBERATELY rolled UP to
+        # the master (`_effective_units` and `_effective_units_90d`
+        # both return 0 when `is_non_master_tube` is True). That's
+        # the right answer for the master's optimum/excess math.
+        # But it means a per-foot child's `effective_units_90d=0`
+        # represents "demand has been counted at the master level",
+        # NOT "this SKU is slow-moving". Flagging the child as
+        # dormant duplicates the signal at the wrong granularity
+        # AND fills the dormancy log with non-orderable cuts that
+        # the buyer can't action separately. Skip them entirely;
+        # the master IS what gets evaluated.
+        if bool(row.get("is_non_master_tube", False)):
+            return False
         if bool(row.get("is_dormant", False)):
             return True  # already flagged by base rules
         abc = str(row.get("ABC") or "C")
@@ -16320,12 +16371,12 @@ elif page == "AI Assistant":
 elif page == "Slow Movers":
     st.header("🪫 Slow Movers — stock-reduction workspace")
     st.caption(
-        "Every SKU the ABC engine has flagged as dormant (90d "
-        "activity dropped vs 12mo baseline) with active stock on "
-        "hand. Clear these via promotions, AI-Assistant surfacing, "
-        "or supplier returns — every dollar moved here is working "
-        "capital freed up. Warnings auto-lift after 90 days "
-        "sustained recovery; you can manually dismiss any row.")
+        "Parent / standalone SKUs the ABC engine has flagged as "
+        "slow-moving AND that have actual stock on hand. Clear "
+        "these via promotions, AI-Assistant surfacing, or supplier "
+        "returns — every dollar moved here is working capital "
+        "freed up. Use the search box below to find any SKU and "
+        "toggle its slow-mover flag manually.")
 
     try:
         _warnings = db.get_dormancy_warnings()
@@ -16333,18 +16384,8 @@ elif page == "Slow Movers":
         st.error(f"Could not load dormancy warnings: {_exc!r}")
         _warnings = {}
 
-    if not _warnings:
-        st.info(
-            "No SKUs currently flagged as slow movers. Either the "
-            "engine hasn't had a chance to write its first snapshot "
-            "yet (visit the Ordering page or wait for the next "
-            "sync), or all flagged items have lifted their warnings.")
-        st.stop()
-
-    # --- Build the slow-mover table ----------------------------------
-    # Source: engine_df has all the engine signals. Merge in the
-    # dormancy timestamps so we can show "first/last flagged",
-    # "recovered" etc.
+    # We need engine_df for both the flagged-list view AND the
+    # search-by-any-SKU view, so build it unconditionally.
     if 'engine_df' not in dir():
         try:
             engine_df = _abc_engine(
@@ -16356,13 +16397,133 @@ elif page == "Slow Movers":
                 "engine cache.")
             st.stop()
 
-    _slow_skus = set(_warnings.keys())
-    _slow_df = engine_df[engine_df["SKU"].astype(str).isin(_slow_skus)].copy()
+    _slow_skus_all = set(_warnings.keys())
+    _flagged_df = engine_df[
+        engine_df["SKU"].astype(str).isin(_slow_skus_all)].copy()
+
+    # v2.67.40 — apply the page-level filters that match the user's
+    # mental model:
+    #   1. parents / standalones only (drop non-master tubes whose
+    #      demand is rolled up to the bulk roll — a 100m roll's
+    #      per-foot child showing here is double-counting)
+    #   2. OnHand > 0 (we don't care about zero-stock entries — if
+    #      it's all sold, there's nothing to liquidate)
+    # The full unfiltered list stays available for diagnostic users
+    # via the toggle below. Default: filtered view.
+    _show_full = st.toggle(
+        "Show all flagged SKUs (including children + zero-stock "
+        "entries)",
+        value=False,
+        help=(
+            "Default OFF. By default the page hides: (a) child SKUs "
+            "(per-foot cuts, BOM derivatives — their demand rolls "
+            "up to the master); (b) entries with zero on-hand stock "
+            "(nothing to liquidate). Toggle ON to see the raw "
+            "dormancy log including those."))
+    _slow_df = _flagged_df.copy()
+    if not _show_full and not _slow_df.empty:
+        if "is_non_master_tube" in _slow_df.columns:
+            _slow_df = _slow_df[
+                ~_slow_df["is_non_master_tube"].fillna(False)]
+        if "OnHand" in _slow_df.columns:
+            _slow_df = _slow_df[
+                _to_num(_slow_df["OnHand"]).fillna(0) > 0]
+
+    # --- SEARCH-AND-TOGGLE PANEL --------------------------------------
+    # v2.67.40 — robust SKU search that lets the buyer find ANY SKU
+    # (whether currently flagged or not) and toggle its slow-mover
+    # status. Substring match across SKU + Name; first 25 hits with
+    # current OnHand and flag state. Per-row Flag/Dismiss button.
+    st.divider()
+    st.subheader("🔎 Search any SKU and toggle slow-mover status")
+    _search = st.text_input(
+        "Search by SKU or product name",
+        placeholder="e.g. LEDIRIS2700-120-100M, white iris, "
+                     "neon flex…",
+        key="slowmovers_search",
+    )
+    if _search:
+        _q = _search.lower().strip()
+        _hay_sku = engine_df["SKU"].astype(str).str.lower()
+        _hay_name = engine_df.get(
+            "Name", pd.Series("", index=engine_df.index)
+        ).astype(str).str.lower()
+        _match_mask = (_hay_sku.str.contains(_q, na=False)
+                        | _hay_name.str.contains(_q, na=False))
+        _matches = engine_df[_match_mask].head(25)
+        if _matches.empty:
+            st.info(f"No SKUs match `{_search}`.")
+        else:
+            st.caption(f"Showing first {len(_matches)} of "
+                          f"{int(_match_mask.sum())} matching SKU(s).")
+            for _, _row in _matches.iterrows():
+                _sku_s = str(_row["SKU"])
+                _is_flagged = _sku_s in _slow_skus_all
+                _is_child = bool(_row.get("is_non_master_tube"))
+                _onh = float(_row.get("OnHand") or 0)
+                _ohv = float(_row.get("OnHandValue") or 0)
+                _name_s = str(_row.get("Name") or "")[:80]
+                _abc_s = str(_row.get("ABC") or "")
+                _trend_s = str(_row.get("trend_flag") or "Stable")
+                _r1, _r2 = st.columns([5, 1])
+                _flag_label = ("⚠️ FLAGGED" if _is_flagged
+                                else "✅ active")
+                _child_tag = (" · 🧩 child SKU" if _is_child else "")
+                _r1.markdown(
+                    f"**{_sku_s}** — {_name_s}  \n"
+                    f"<small>OnHand {_onh:.2f} · "
+                    f"value {_fmt_money(_ohv)} · "
+                    f"ABC={_abc_s} · {_trend_s}{_child_tag} · "
+                    f"{_flag_label}</small>",
+                    unsafe_allow_html=True)
+                if _is_flagged:
+                    if _r2.button("Unflag",
+                                    key=f"sm_unflag_{_sku_s}",
+                                    help=("Lift the slow-mover "
+                                          "warning. Manual "
+                                          "dismissals are sticky "
+                                          "across re-dormancy.")):
+                        try:
+                            db.dismiss_dormancy_warning(
+                                _sku_s,
+                                user_id=current_user or "anonymous",
+                                reason="manual_dismiss")
+                            st.success(f"Unflagged {_sku_s}.")
+                            st.rerun()
+                        except Exception as _exc:  # noqa: BLE001
+                            st.error(f"Could not unflag: {_exc!r}")
+                else:
+                    if _r2.button("Flag as slow",
+                                    key=f"sm_flag_{_sku_s}",
+                                    help=("Manually mark this SKU as "
+                                          "a slow mover. Will appear "
+                                          "in the Ordering page (❗ "
+                                          "prefix) and weekly email.")):
+                        try:
+                            db.flag_sku_as_slow_mover(
+                                _sku_s,
+                                user_id=current_user or "anonymous")
+                            st.success(f"Flagged {_sku_s} as slow.")
+                            st.rerun()
+                        except Exception as _exc:  # noqa: BLE001
+                            st.error(f"Could not flag: {_exc!r}")
+
+    # --- If the filtered list is empty, stop after the search panel.
     if _slow_df.empty:
-        st.warning(
-            "Dormancy log has flagged SKUs but engine_df returned "
-            "no matching rows. The SKUs may have been deleted or "
-            "renamed since they were flagged.")
+        st.divider()
+        if not _slow_skus_all:
+            st.info(
+                "No SKUs currently flagged as slow movers. Either "
+                "the engine hasn't had a chance to write its first "
+                "snapshot yet (visit the Ordering page or wait for "
+                "the next sync), or all flagged items have lifted "
+                "their warnings.")
+        else:
+            st.info(
+                f"{len(_flagged_df):,} flagged SKUs total but none "
+                "have OnHand>0 AND parent/standalone status. Toggle "
+                "**Show all flagged SKUs** above to see the raw log "
+                "(includes children + zero-stock entries).")
         st.stop()
 
     # Merge in dormancy metadata.
@@ -16376,7 +16537,6 @@ elif page == "Slow Movers":
         lambda s: (_warnings.get(str(s), {}).get(
             "recovered_at") or "")[:10])
 
-    # Days since flagged (oldest first = most urgent to clear).
     _today_ts = pd.Timestamp(datetime.now().date())
     def _days_since(d_str: str) -> int:
         try:
@@ -16387,32 +16547,34 @@ elif page == "Slow Movers":
         _days_since)
 
     # --- Summary header tiles ----------------------------------------
+    st.divider()
     _total_skus = len(_slow_df)
-    _total_units = float(_slow_df.get("OnHand", pd.Series(dtype=float))
-                          .fillna(0).sum())
-    _total_value = float(_slow_df.get("OnHandValue", pd.Series(dtype=float))
-                          .fillna(0).sum())
+    _total_units = float(_to_num(_slow_df.get("OnHand",
+                                                  pd.Series(dtype=float)))
+                              .fillna(0).sum())
+    _total_value = float(_to_num(_slow_df.get("OnHandValue",
+                                                  pd.Series(dtype=float)))
+                              .fillna(0).sum())
     _avg_days = (float(_slow_df["days_dormant"].mean())
                   if not _slow_df.empty else 0.0)
     _hc1, _hc2, _hc3, _hc4 = st.columns(4)
-    _hc1.metric("Slow SKUs", _fmt_number(_total_skus),
-                  help="Active warnings — auto-lifts after 90d recovery.")
-    _hc2.metric("Units on shelf", _fmt_number(_total_units))
+    _hc1.metric("Slow parent / standalone SKUs",
+                  _fmt_number(_total_skus),
+                  help=("Active warnings filtered to parents + "
+                        "standalones with OnHand > 0. Toggle the "
+                        "filter above to see the raw count."))
+    _hc2.metric("Units on shelf",
+                  f"{_total_units:,.0f}")
     _hc3.metric("Stock value tied up",
                   _fmt_money(_total_value),
                   help="Per-SKU cost-chain estimate (engine OnHandValue).")
     _hc4.metric("Avg days dormant",
                   f"{_avg_days:.0f}",
-                  help="Mean of (today - first_seen_dormant_at) across all "
-                       "flagged SKUs. Higher = more urgent to clear.")
+                  help=("Mean of (today - first_seen_dormant_at) "
+                        "across all flagged SKUs. Higher = more "
+                        "urgent to clear."))
 
-    # --- Pie chart by family ------------------------------------------
-    st.divider()
-    st.subheader("Where is the slow stock concentrated?")
-    # v2.67.39 — engine_df has no literal `Family` column; CIN7's
-    # family lives in AdditionalAttribute1. Build a Family series
-    # from whichever source is present and fall back to "(no family)"
-    # so the page still renders cleanly when neither is set.
+    # --- Family resolution ---
     if "Family" in _slow_df.columns:
         _family_series = _slow_df["Family"].fillna("(no family)")
     elif "AdditionalAttribute1" in _slow_df.columns:
@@ -16423,19 +16585,30 @@ elif page == "Slow Movers":
         _family_series = pd.Series(
             ["(no family)"] * len(_slow_df), index=_slow_df.index)
     _slow_df = _slow_df.assign(_family=_family_series)
+
+    # --- Pie chart by family -----------------------------------------
+    st.divider()
+    st.subheader("Where is the slow stock concentrated?")
     _by_family = (_slow_df
-                   .assign(_v=_slow_df.get("OnHandValue",
-                                            pd.Series(dtype=float))
-                            .fillna(0))
+                   .assign(_v=_to_num(_slow_df.get(
+                                "OnHandValue",
+                                pd.Series(dtype=float))).fillna(0))
                    .groupby("_family", dropna=False)
                    .agg(SKU_count=("SKU", "count"),
                           Value_at_risk=("_v", "sum"))
                    .reset_index()
                    .sort_values("Value_at_risk", ascending=False))
     _by_family.columns = ["Family", "SKU_count", "Value_at_risk"]
-    _pc1, _pc2 = st.columns([1, 1])
-    with _pc1:
-        if not _by_family.empty:
+    # Guard: don't render the pie if all values are zero (would
+    # produce an empty wheel).
+    if (_by_family.empty
+            or float(_by_family["Value_at_risk"].sum()) <= 0):
+        st.caption(
+            "_Pie chart not rendered — no slow-stock value to "
+            "segment after filtering._")
+    else:
+        _pc1, _pc2 = st.columns([1, 1])
+        with _pc1:
             _fig = px.pie(
                 _by_family.head(15),
                 values="Value_at_risk",
@@ -16450,30 +16623,24 @@ elif page == "Slow Movers":
                 height=350, margin=dict(l=0, r=0, t=40, b=0),
                 showlegend=False)
             st.plotly_chart(_fig, width="stretch")
-    with _pc2:
-        st.dataframe(
-            _by_family,
-            width="stretch", hide_index=True, height=350,
-            column_config={
-                "Value_at_risk": st.column_config.NumberColumn(
-                    format="$%.0f"),
-            },
-        )
+        with _pc2:
+            st.dataframe(
+                _by_family,
+                width="stretch", hide_index=True, height=350,
+                column_config={
+                    "Value_at_risk": st.column_config.NumberColumn(
+                        format="$%.0f"),
+                },
+            )
 
-    # --- Sortable detail table ----------------------------------------
+    # --- Sortable detail table ---------------------------------------
     st.divider()
-    st.subheader("Detail — every flagged SKU")
+    st.subheader("Detail — every flagged parent / standalone SKU")
     st.caption(
-        "Sort by `days_dormant` (descending) to triage oldest "
-        "stuck stock first. Click **Dismiss** to lift a warning "
-        "manually if you've made a deliberate buyer decision "
-        "(e.g. you've already discounted, returned to supplier, "
-        "or accepted the SKU as long-tail strategic stock).")
+        "Sorted by `days_dormant` descending — oldest stuck stock "
+        "surfaces first. Use the search box above to dismiss any "
+        "individual warning.")
 
-    # v2.67.39 — include the resolved _family column (built above)
-    # under a friendly "Family" header. Engine_df doesn't carry a
-    # native Family column; we materialised it from
-    # AdditionalAttribute1 with a sensible fallback.
     _slow_df = _slow_df.rename(columns={"_family": "Family"})
     _detail_cols = [c for c in (
         "SKU", "Name", "Family", "ABC", "trend_flag",
@@ -16495,34 +16662,6 @@ elif page == "Slow Movers":
             "days_dormant": st.column_config.NumberColumn(format="%d"),
         },
     )
-
-    # --- Manual dismiss panel -----------------------------------------
-    st.divider()
-    st.subheader("Dismiss a warning manually")
-    st.caption(
-        "Manual dismiss is sticky — it persists across re-dormancy "
-        "(if the SKU goes dormant again later, the warning won't "
-        "re-engage). Use this for deliberate buyer decisions.")
-    _dismiss_options = [""] + sorted(_slow_df["SKU"].astype(str).tolist())
-    _to_dismiss = st.selectbox(
-        "SKU to dismiss",
-        _dismiss_options,
-        index=0,
-        help="Pick the SKU whose slow-mover warning you want to lift.")
-    if _to_dismiss and st.button(
-            f"Dismiss warning for {_to_dismiss}",
-            key=f"dismiss_{_to_dismiss}"):
-        try:
-            db.dismiss_dormancy_warning(
-                _to_dismiss,
-                user_id=current_user or "anonymous",
-                reason="manual_dismiss")
-            st.success(
-                f"Warning lifted for {_to_dismiss}. "
-                "Refreshing…")
-            st.rerun()
-        except Exception as _exc:  # noqa: BLE001
-            st.error(f"Could not dismiss: {_exc!r}")
 
 # ---------------------------------------------------------------------------
 # Page: My Profile — edit your own profile, admins can manage all (v2.66)
