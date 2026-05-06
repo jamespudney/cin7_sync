@@ -3896,6 +3896,42 @@ def record_dormancy_snapshot(dormant_skus: set,
     return summary
 
 
+def auto_lift_aclass_dormancy(active_aclass_skus: set,
+                                 reason: str = "aclass_grace_v2_67_48"
+                                 ) -> int:
+    """v2.67.48 — auto-lift dormancy warnings on any SKU the engine
+    no longer flags due to the A-class grace rule. Existing entries
+    in `sku_dormancy_log` would otherwise wait the standard 90-day
+    auto-lift window, leaving over-bought A-class items showing in
+    the Slow Movers list for months after the engine fix landed.
+
+    `active_aclass_skus` should be the set of SKU strings that the
+    current engine recompute classifies as ABC=A with positive
+    12mo activity (i.e. covered by the grace rule).
+
+    Returns the number of warnings lifted by this call. Idempotent
+    — already-lifted entries aren't re-touched."""
+    if not active_aclass_skus:
+        return 0
+    skus = [str(s).strip() for s in active_aclass_skus
+             if str(s).strip()]
+    if not skus:
+        return 0
+    placeholders = ",".join("?" for _ in skus)
+    with connect() as c:
+        cur = c.execute(
+            f"""
+            UPDATE sku_dormancy_log
+               SET warning_lifted_at = datetime('now'),
+                   warning_lift_reason = ?
+             WHERE warning_lifted_at IS NULL
+               AND sku IN ({placeholders})
+            """,
+            (reason, *skus),
+        )
+        return int(cur.rowcount or 0)
+
+
 def get_dormancy_warnings() -> dict:
     """v2.67.36 — return {sku: warning_info} for SKUs with an active
     once-slow warning. Used by the Ordering page to render a "!" in

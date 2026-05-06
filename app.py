@@ -365,12 +365,16 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.47 — Slow Movers detail table now "
-                "includes Category, Overstock qty, and Overstock "
-                "value columns. Naive baseline computed in "
-                "_abc_engine (OnHand minus 12mo demand); "
-                "Ordering-page values are more precise and will "
-                "overwrite once that page runs in your session.")
+    st.caption("🟢 v2.67.48 — A-class grace in dormancy "
+                "detection. A-class SKUs with positive 12mo "
+                "activity will no longer be flagged as slow "
+                "movers, even if 90d activity is low — they're "
+                "steady earners and a recent lull (often from "
+                "over-buying for pricing) shouldn't push the "
+                "buyer away from reordering. Ordering page also "
+                "gets a 💼 grace-applied note explaining the "
+                "behavior. Existing A-class log entries auto-"
+                "lift on the next engine recompute.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -406,6 +410,46 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.48** — A-class grace in dormancy detection. "
+            "User reported A-class SKUs appearing in Slow Movers "
+            "because the buyer over-buys for better pricing — "
+            "stock-on-hand goes up so 90d activity briefly "
+            "drops below threshold, engine flagged dormancy, "
+            "buyer gets discouraged from reordering a steady "
+            "mover. Wrong outcome.\n\n"
+            "(1) `_is_dormant` and `_refine_dormancy_by_class` "
+            "now both early-return `False` for any SKU with "
+            "ABC=A and positive `effective_units_12mo`. "
+            "Rationale: ABC=A means top cumulative 70% of "
+            "annual revenue — by definition a steady-revenue "
+            "item. If it had ANY 12mo demand we trust the "
+            "long-term pattern over a short-term lull.\n\n"
+            "(2) `db.auto_lift_aclass_dormancy(active_aclass_skus)` "
+            "called from inside the engine recompute lifts "
+            "existing A-class warnings immediately rather than "
+            "waiting the standard 90-day auto-lift window. "
+            "Reason='aclass_grace_v2_67_48' so the lift is "
+            "auditable.\n\n"
+            "(3) Ordering page Notes column now also surfaces "
+            "a 💼 note on A-class items where 90d activity is "
+            "below the dormancy threshold (would have flagged "
+            "if not A-class). Tells the buyer the engine's "
+            "reasoning explicitly: 'A-class steady mover (90d "
+            "activity low — possibly over-bought for pricing). "
+            "Engine grace applied … verify need before "
+            "ordering more.' So the over-buying signal isn't "
+            "lost; it's just not framed as dormancy.\n\n"
+            "Confirm on unflag: when the user clicks Unflag in "
+            "the Slow Movers search, db.dismiss_dormancy_warning "
+            "sets warning_lifted_at on that row. Every dashboard "
+            "(Overview slow-mover panel, Slow Movers page, "
+            "Ordering ❗ prefix + auto-note, weekly digest email) "
+            "reads via `db.get_dormancy_warnings()` which filters "
+            "WHERE warning_lifted_at IS NULL — so dismissed "
+            "SKUs vanish from every figure and calculation that "
+            "consumes the dormancy log."
+        )
         st.caption(
             "**v2.67.47** — Slow Movers detail table gets two "
             "new columns: **Overstock qty** (`excess_units`) "
@@ -4783,6 +4827,19 @@ def _abc_engine(products: pd.DataFrame,
         eff_90d = float(row.get("effective_units_90d") or 0)
         if eff_12mo <= 0:
             return False
+        # v2.67.48 — A-class grace. ABC=A by definition means a
+        # high-revenue SKU with steady monthly movement; if it has
+        # ANY 12mo activity (already gated above) we should not
+        # flag it as dormant just because of a 90d lull. Common
+        # case: the buyer over-bought a few months' supply to
+        # secure a better price, sales naturally slowed because
+        # there's plenty on hand, but the demand pattern is
+        # unchanged. Flagging that as dormant would push the
+        # buyer to NOT reorder a steady mover — exactly wrong.
+        # The same grace applies in _refine_dormancy_by_class.
+        abc_class = str(row.get("ABC") or "C").strip().upper()
+        if abc_class == "A":
+            return False
         # Tier 1: ~zero 90d activity. The threshold is expressed in
         # PHYSICAL UNITS so master rolls and leaf SKUs are compared
         # consistently:
@@ -5158,6 +5215,16 @@ def _abc_engine(products: pd.DataFrame,
         # the master IS what gets evaluated.
         if bool(row.get("is_non_master_tube", False)):
             return False
+        # v2.67.48 — A-class grace. Defensive duplicate of the
+        # check in _is_dormant so the refine pass also exempts
+        # A-class items even if some other path flagged them.
+        # A-class = high-revenue steady mover; we don't want
+        # over-buying for better pricing to reclassify these as
+        # slow movers and discourage future reorders.
+        abc_early = str(row.get("ABC") or "C").strip().upper()
+        eff_12mo_early = float(row.get("effective_units_12mo") or 0)
+        if abc_early == "A" and eff_12mo_early > 0:
+            return False
         if bool(row.get("is_dormant", False)):
             return True  # already flagged by base rules
         abc = str(row.get("ABC") or "C")
@@ -5372,6 +5439,25 @@ def _abc_engine(products: pd.DataFrame,
         if _dormant_skus or _recovered_skus:
             db.record_dormancy_snapshot(
                 _dormant_skus, _recovered_skus)
+        # v2.67.48 — auto-lift any active dormancy warnings on
+        # A-class SKUs with positive 12mo activity. The new grace
+        # rule means these would no longer be flagged by the
+        # engine, but existing log entries would otherwise sit
+        # there for the 90-day auto-lift window. This clears
+        # them on the very next engine recompute after deploy.
+        try:
+            _aclass_active = set(df.loc[
+                (df["ABC"].astype(str).str.strip().str.upper() == "A")
+                & (df.get("effective_units_12mo",
+                            pd.Series(0)).fillna(0) > 0),
+                "SKU"
+            ].astype(str).tolist())
+            if _aclass_active:
+                _lifted = db.auto_lift_aclass_dormancy(_aclass_active)
+                # No log/print here — the snapshot recap below
+                # is enough; quiet operation.
+        except Exception:  # noqa: BLE001
+            pass
         # v2.67.42 — also snapshot the slow-stock VALUE on shelf
         # so the Overview tile can render a month-over-month delta
         # caption. Filter to in-stock + parents only to match the
@@ -10946,11 +11032,51 @@ engine shows every input and how it got to the suggestion.
     # since it comes from sku_dormancy_log, not the notes table) —
     # buyers can lift it via the dismiss button, not by deleting
     # from the Note column.
+    # v2.67.48 — also surface a grace-applied note on A-class
+    # items where recent activity is below threshold (would have
+    # flagged dormant if not A-class). Lets the buyer see the
+    # engine's reasoning explicitly so over-buying doesn't get
+    # re-ordered through inertia.
+    _aclass_low_90d_skus: set = set()
+    if "ABC" in engine_df.columns and "effective_units_90d" in engine_df.columns:
+        try:
+            _aclass_low_mask = (
+                (engine_df["ABC"].astype(str).str.strip()
+                  .str.upper() == "A")
+                & (pd.to_numeric(
+                    engine_df.get("effective_units_12mo",
+                                    pd.Series(0)),
+                    errors="coerce").fillna(0) > 0)
+                & (pd.to_numeric(
+                    engine_df["effective_units_90d"],
+                    errors="coerce").fillna(0) < 1.0)
+            )
+            _aclass_low_90d_skus = set(
+                engine_df.loc[_aclass_low_mask, "SKU"]
+                .astype(str).tolist())
+        except Exception:  # noqa: BLE001
+            _aclass_low_90d_skus = set()
+
     def _build_note(sku_s: str) -> str:
         manual = latest_notes_map.get(sku_s, "") or ""
         warning_info = dormancy_warnings_map.get(sku_s)
+        # v2.67.48 — A-class grace note. Surface BEFORE the
+        # warning_info check so it shows even when no dormancy
+        # warning is active (which is the entire point — the
+        # engine grace prevented flagging).
+        aclass_note = ""
+        if sku_s in _aclass_low_90d_skus:
+            aclass_note = (
+                "💼 A-class steady mover (90d activity low — "
+                "possibly over-bought for pricing). Engine grace "
+                "applied: A-class with positive 12mo demand "
+                "won't be flagged dormant. Verify need before "
+                "ordering more."
+            )
         if not warning_info:
-            return manual
+            if aclass_note and manual:
+                return f"{aclass_note} | {manual}"
+            return aclass_note or manual
         last_flagged = (
             str(warning_info.get("last_seen_dormant_at") or "")[:10])
         recovered = warning_info.get("recovered_at")
@@ -10970,7 +11096,12 @@ engine shows every input and how it got to the suggestion.
                 f"this — verify demand is genuine before reordering. "
                 f"Warning auto-lifts after 90d sustained activity."
             )
-        return f"{prefix} | {manual}" if manual else prefix
+        parts = [prefix]
+        if aclass_note:
+            parts.append(aclass_note)
+        if manual:
+            parts.append(manual)
+        return " | ".join(parts)
     _work["Note"] = _work["SKU"].astype(str).apply(_build_note)
     # Exclude? always False in this view — excluded SKUs are already
     # filtered out above. Ticking here + saving moves a row to the
