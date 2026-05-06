@@ -2519,6 +2519,15 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                 if "Terms" in df.columns and pd.notna(r.get("Terms"))
                 and str(r.get("Terms")).strip()
                 else None),
+            # v2.67.55b — extra positional attributes (any
+            # AdditionalAttributeN content beyond the canonical
+            # Shipping Notes position).
+            "attribute_notes": (
+                str(r.get("AttributeNotes")).strip()
+                if "AttributeNotes" in df.columns
+                and pd.notna(r.get("AttributeNotes"))
+                and str(r.get("AttributeNotes")).strip()
+                else None),
         }
         out_rows.append(_serialise_row(rec))
 
@@ -2748,6 +2757,12 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 if "Terms" in gdf.columns
                 and pd.notna(head_row.get("Terms"))
                 and str(head_row.get("Terms")).strip()
+                else None),
+            "attribute_notes": (
+                str(head_row.get("AttributeNotes")).strip()
+                if "AttributeNotes" in gdf.columns
+                and pd.notna(head_row.get("AttributeNotes"))
+                and str(head_row.get("AttributeNotes")).strip()
                 else None),
             "line_count": len(line_rows),
             "lines": line_rows,

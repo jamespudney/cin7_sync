@@ -731,28 +731,58 @@ def _extract_po_freight_signals(detail: Dict[str, Any],
     if not isinstance(comments, str):
         comments = str(comments or "")
 
-    # ShippingNotes — CIN7 may expose AdditionalAttributes as a list
-    # of {Name, Value} dicts OR a flat dict with named keys. Probe
-    # both shapes plus the flat-field fallback.
+    # ShippingNotes — CIN7 stores attribute values POSITIONALLY in a
+    # `AdditionalAttribute1`-`AdditionalAttribute10` flat dict. The
+    # label-to-position mapping comes from the `AttributeSet`
+    # definition, which is configured per CIN7 account. For Wired4
+    # Signs as of v2.67.55b (verified via /ref/attributeSet on
+    # 2026-05-06), the relevant sets for purchases are:
+    #   - "Vendor Purchase" set: AdditionalAttribute2 = Shipping Notes
+    #     (also AdditionalAttribute1 = Trello Card)
+    #   - "PO special instructions" set: AdditionalAttribute1/2/3 =
+    #     Note 1 / Note 2 / Note 3
+    # In practice, position 2 has carried shipping-tracking content
+    # ("Ship 5/4 UPS 1Z5WE3350454840014 (ERROR!)" on PO-7109 confirmed
+    # the Vendor Purchase set is what's attached to active POs). We
+    # capture position 2 as ShippingNotes, plus any other non-empty
+    # positional value in AttributeNotes (concatenated) so nothing
+    # is silently dropped if the buyer types into a different slot.
+    # Defensive against the legacy LIST-of-dicts shape too just in
+    # case CIN7 changes the response format on us.
     shipping_notes = ""
-    attrs_list = (detail.get("AdditionalAttributes")
+    other_attr_parts = []
+    attrs_blob = (detail.get("AdditionalAttributes")
                    or detail.get("AttributeSet")
-                   or header.get("AdditionalAttributes")
-                   or [])
-    if isinstance(attrs_list, list):
-        for a in attrs_list:
+                   or header.get("AdditionalAttributes"))
+    if isinstance(attrs_blob, dict):
+        # Positional dict — the live CIN7 shape as of 2026-05.
+        for i in range(1, 11):
+            v = attrs_blob.get(f"AdditionalAttribute{i}")
+            if v in (None, "", False):
+                continue
+            sv = str(v).strip()
+            if not sv or sv.lower() == "false":
+                continue
+            if i == 2 and not shipping_notes:
+                # Vendor Purchase set: position 2 = Shipping Notes.
+                shipping_notes = sv
+            else:
+                other_attr_parts.append(f"attr{i}: {sv}")
+    elif isinstance(attrs_blob, list):
+        # Defensive fallback: legacy list-of-{Name,Value}-dicts shape.
+        for a in attrs_blob:
             if not isinstance(a, dict):
                 continue
             name = str(a.get("Name") or a.get("name") or "")
+            value = str(a.get("Value") or a.get("value") or "").strip()
+            if not value:
+                continue
             if name.lower().strip() == "shipping notes":
-                shipping_notes = str(a.get("Value")
-                                      or a.get("value") or "")
-                break
-    elif isinstance(attrs_list, dict):
-        for k, v in attrs_list.items():
-            if isinstance(k, str) and k.lower().strip() == "shipping notes":
-                shipping_notes = str(v or "")
-                break
+                shipping_notes = value
+            else:
+                other_attr_parts.append(f"{name}: {value}")
+    # Top-level flat field fallback (some accounts surface
+    # ShippingNotes at the top of the response).
     if not shipping_notes:
         for k in ("ShippingNotes", "Shipping_Notes", "shipping_notes"):
             v = detail.get(k) or header.get(k)
@@ -779,12 +809,19 @@ def _extract_po_freight_signals(detail: Dict[str, Any],
     terms_raw = detail.get("Terms") or header.get("Terms") or ""
     terms = str(terms_raw) if terms_raw else ""
 
+    # v2.67.55b — also surface any non-empty AdditionalAttributeN
+    # values that weren't position 2 (the canonical Shipping Notes
+    # slot). Concatenated into AttributeNotes column so the AI
+    # tool can show them when the buyer used a different slot than
+    # we expect (e.g. moved Trello Card content into Note 3).
+    attribute_notes = "; ".join(other_attr_parts) if other_attr_parts else ""
     return {
         "Comments": comments.strip() if comments else "",
         "ShippingNotes": shipping_notes.strip() if shipping_notes else "",
         "Memo": memo.strip() if memo else "",
         "Note": note.strip() if note else "",
         "Terms": terms.strip() if terms else "",
+        "AttributeNotes": attribute_notes,
     }
 
 
@@ -837,6 +874,7 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
             "Memo": freight_signals["Memo"],
             "Note": freight_signals["Note"],
             "Terms": freight_signals["Terms"],
+            "AttributeNotes": freight_signals.get("AttributeNotes", ""),
         })
 
     # Received qty from stock-received blocks, if present.
