@@ -750,20 +750,16 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.57 — Slack integration + shipping P&L. "
-                "Big batch: (1) Slack bot live in 6 channels "
-                "with question detection + PO-review commentary "
-                "in #purchase-backorders + audit mirror to "
-                "#ai-audit; (2) v2.67.55c column-semantics fix — "
-                "ShipmentCost is now actually the carrier-billed "
-                "cost, customer charge is in "
-                "CustomerShippingCharge, and ShippingMargin = "
-                "charge - cost; (3) new `get_shipping_margin` AI "
-                "tool surfaces shipping P&L by SKU / carrier / "
-                "service / date. After deploy, the OOM that "
-                "killed the parallel backfills overnight will be "
-                "addressed in v2.67.58 by switching the sync "
-                "scripts to incremental CSV writes.")
+    st.caption("🟢 v2.67.58 — Worker self-sufficiency. The Render "
+                "Background Worker that runs the Slack bot now "
+                "bootstraps its own 30-day data on first boot "
+                "(~30 min) and refreshes via in-loop NearSync "
+                "every 30 min. Decouples the worker from the web "
+                "service's disk — Render disks are exclusive per "
+                "service, so the worker has its own. While "
+                "bootstrapping, the bot replies '⏳ I'm still "
+                "loading data, ask again in a few minutes' "
+                "instead of silently failing.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -801,6 +797,50 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.58** — Worker self-sufficiency. v2.67.57 "
+            "shipped the Slack code but assumed the worker could "
+            "share the web service's disk. Render disks are "
+            "exclusive per service — confirmed by attempting to "
+            "set up the worker. Solution: worker has its own "
+            "disk and bootstraps its own data.\n\n"
+            "**Updated `slack_loop.sh`:**\n"
+            "- First-boot detection (no products_*.csv in /data) "
+            "→ runs `cin7_sync quick --days 30` + salelines + "
+            "purchaselines + shipstation_sync recent 30d + "
+            "shopify_sync orders-recent 30d. Takes ~20-40 min "
+            "on first deploy.\n"
+            "- Steady-state main loop now interleaves: every "
+            "60s Slack poll/respond, every 30 min data refresh "
+            "(NearSync 1d window). Cadence configurable via "
+            "WORKER_DATA_SYNC_MINUTES env var.\n"
+            "- All sync calls are gated on the relevant env vars "
+            "being set (CIN7_ACCOUNT_ID for cin7_sync, "
+            "SHIPSTATION_API_KEY for shipstation, etc.) — the "
+            "worker no-ops cleanly for any data source not "
+            "configured rather than crashing.\n\n"
+            "**`slack_listener.py` graceful degrade:**\n"
+            "- When `_get_data_for_listener` returns None "
+            "(bootstrap not yet complete), the composer returns "
+            "a user-friendly '⏳ still loading data, ask again' "
+            "message instead of silently failing. Bot stays "
+            "polite and informative during the first-boot "
+            "warm-up window.\n\n"
+            "Setup steps for the worker (refreshed):\n"
+            "1. Render → New → Background Worker, repo + branch "
+            "= same as web service.\n"
+            "2. Build: `pip install -r requirements.txt`. "
+            "Start: `bash slack_loop.sh`.\n"
+            "3. Region: same as web service (Ohio).\n"
+            "4. Plan: Starter (512 MB).\n"
+            "5. Add a NEW disk (separate from web service's) — "
+            "mount path `/data`, size 1 GB+.\n"
+            "6. Env vars: copy ALL the keys from the web service "
+            "(SLACK_*, ANTHROPIC_API_KEY, CIN7_*, "
+            "SHIPSTATION_API_KEY, SHOPIFY_*).\n"
+            "7. Deploy. First boot bootstraps data (~30 min), "
+            "then the bot is live."
+        )
         st.caption(
             "**v2.67.57** — Big batch ship: Slack integration + "
             "shipping cost-semantics fix + Shipping P&L AI tool.\n\n"

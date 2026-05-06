@@ -236,7 +236,19 @@ def _compose_response(msg: Dict[str, Any],
         # holder pattern.
         engine_df, sale_lines_df = _get_data_for_listener()
         if engine_df is None:
-            return ("", ["ERROR: data not loadable"])
+            # v2.67.58 — bootstrapping graceful degrade. Worker's
+            # /data is empty on first boot; the wrapper script runs
+            # an initial sync before the loop starts, but until that
+            # finishes the listener has no CSVs to read. Instead of
+            # silently failing, return a friendly message to the
+            # user. We post this DIRECTLY (skip the LLM call) since
+            # we can't do any AI tool calls without data anyway.
+            bootstrap_msg = (
+                "_:hourglass: I'm still loading the team's data — "
+                "first-boot sync runs ~30 minutes after deploy. "
+                "Please ask again in a few minutes._"
+            )
+            return (bootstrap_msg, ["BOOTSTRAP_IN_PROGRESS"])
     except Exception as exc:  # noqa: BLE001
         return ("", [f"ERROR: data load failed: {exc!r}"])
 
