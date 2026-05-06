@@ -365,15 +365,16 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.44 — AI shipment queries now surface "
-                "the buyer's freight-mode notes (PO Comments — "
-                "air vs sea) and progress detail (Shipping notes "
-                "attribute on the Vendor purchase set — \"departed "
-                "Shenzhen 2026-04-12\"). Pulled into purchase_lines "
-                "via the daily sync; surfaced through "
-                "get_incoming_stock so questions like 'when's the "
-                "next shipment of LED-X?' now answer with the full "
-                "freight picture, not just Required-By.")
+    st.caption("🟢 v2.67.45 — Three small fixes. (1) Sidebar "
+                "captions replaced with a single 'ⓘ What does "
+                "each section do?' expander (was too noisy). "
+                "(2) OnHandValue now computed inside _abc_engine "
+                "so the Slow Movers pie chart works regardless "
+                "of which page you visit first. (3) Engine "
+                "session cache switched to @st.cache_resource — "
+                "more reliable than session_state for big "
+                "DataFrames; navigating between pages should now "
+                "be properly instant after the first compute.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -409,6 +410,36 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.45** — Three small fixes addressing user "
+            "feedback on v2.67.41-44.\n\n"
+            "(1) **Sidebar captions removed.** v2.67.41 "
+            "rendered each page's description as a caption "
+            "BELOW the radio option, doubling the sidebar's "
+            "vertical footprint. v2.67.45 collapses these "
+            "behind a single 'ⓘ What does each section do?' "
+            "expander — folded by default, click to read all "
+            "descriptions.\n\n"
+            "(2) **Slow Movers pie chart fixed.** v2.67.41 "
+            "regrouped the pie by Category but the chart was "
+            "rendering blank for users who landed on Slow "
+            "Movers without first visiting Ordering. Root "
+            "cause: `OnHandValue` (the per-SKU dollar value the "
+            "pie sums) was set inside the Ordering page elif, "
+            "not inside `_abc_engine`. Slow Movers + Overview "
+            "slow-mover panel both depend on it. Moved the "
+            "OnHandValue computation into `_abc_engine` so the "
+            "column is part of every cached engine_df.\n\n"
+            "(3) **Engine cache switched to "
+            "@st.cache_resource.** v2.67.41's session_state "
+            "approach was unreliable in practice — users "
+            "reported the engine spinner kicking in on every "
+            "page navigation despite the cache. cache_resource "
+            "is purpose-built for this exact pattern (expensive "
+            "object, share across sessions, only recompute on "
+            "explicit clear). Refresh button now clears both "
+            "cache_data and cache_resource."
+        )
         st.caption(
             "**v2.67.44** — Buyer's freight signals on AI "
             "shipment-status queries. The user's buyer logs "
@@ -1767,11 +1798,18 @@ with st.sidebar:
         _page_options,
         index=_start_idx,
         label_visibility="collapsed",
-        # v2.67.41 — captions surface each section's purpose so
-        # new users know what they're clicking into. Order matches
-        # _page_options exactly.
-        captions=_page_captions,
     )
+    # v2.67.45 — collapsible "what does each section do" expander
+    # under the radio. v2.67.41 rendered the descriptions as
+    # captions BELOW each option which made the sidebar twice as
+    # tall and visually noisy. The expander keeps the sidebar
+    # tight by default; click to read all descriptions on one
+    # screen.
+    with st.expander("ⓘ What does each section do?",
+                       expanded=False):
+        for _opt, _cap in zip(_page_options, _page_captions):
+            st.markdown(f"**{_opt}** — <small>{_cap}</small>",
+                          unsafe_allow_html=True)
 
     st.divider()
     st.subheader("Global filters")
@@ -1793,9 +1831,14 @@ with st.sidebar:
                        "on the server. CIN7 itself is auto-synced nightly "
                        "at 02:00 UTC — you don't normally need this."):
         st.cache_data.clear()
-        # v2.67.41 — also drop the session-state engine cache so
-        # the next page render forces a fresh _abc_engine call
-        # against the freshly-loaded data.
+        # v2.67.45 — _get_engine_df is now @st.cache_resource. Clear
+        # both cache stores so the next page render forces a fresh
+        # _abc_engine call against the freshly-loaded data.
+        try:
+            st.cache_resource.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        # Belt-and-braces: legacy session_state key from v2.67.41.
         if "_engine_df_cached" in st.session_state:
             del st.session_state["_engine_df_cached"]
         st.rerun()
@@ -5192,6 +5235,37 @@ def _abc_engine(products: pd.DataFrame,
         lambda r: (r["FixedCost"] if r["FixedCost"] > 0
                    else float(r["AverageCost"] or 0)), axis=1)
 
+    # v2.67.45 — compute OnHandValue here in _abc_engine itself,
+    # not lazily in the Ordering page elif. The Slow Movers page +
+    # Overview slow-mover panel both read engine_df["OnHandValue"]
+    # for value-on-shelf totals, but if the user lands on either
+    # page WITHOUT first visiting Ordering, the column doesn't
+    # exist (set in the elif), the value sums to 0, and the pie
+    # chart's zero-value guard hides the chart. Computing here
+    # makes the column part of every cached engine_df.
+    #
+    # Cost chain (matches the original Ordering implementation):
+    #   1. CIN7 StockOnHand (FIFO) when > 0
+    #   2. OnHand × FixedCost when set
+    #   3. OnHand × AverageCost otherwise
+    if "StockOnHand" in df.columns:
+        _fifo = pd.to_numeric(
+            df["StockOnHand"], errors="coerce").fillna(0)
+        _onhand = pd.to_numeric(
+            df["OnHand"], errors="coerce").fillna(0)
+        _avgcost = pd.to_numeric(
+            df.get("AverageCost",
+                    pd.Series(0.0, index=df.index)),
+            errors="coerce").fillna(0)
+        df["OnHandValue"] = _fifo.where(_fifo > 0, _onhand * _avgcost)
+    elif "OnHand" in df.columns and "AverageCost" in df.columns:
+        df["OnHandValue"] = (
+            pd.to_numeric(df["OnHand"], errors="coerce").fillna(0)
+            * pd.to_numeric(df["AverageCost"],
+                              errors="coerce").fillna(0))
+    else:
+        df["OnHandValue"] = 0.0
+
     # v2.67.36 — record dormancy provenance. Write today's
     # is_dormant snapshot to the sku_dormancy_log table so the
     # Ordering page can flag "once-slow" SKUs even after they
@@ -5263,35 +5337,35 @@ def _abc_engine(products: pd.DataFrame,
     return df
 
 
-# v2.67.41 — session-state engine cache.
-# `_abc_engine` is @st.cache_data(persist="disk"), but Streamlit's
-# cache_data hashes its DataFrame inputs on every call. With ~150K
-# sale-line rows + 11K products, that hash takes seconds, AND
-# cache_data copies the result on each access. Both costs add up
-# enough that the user feels the spinner on every page navigation.
+# v2.67.45 — `@st.cache_resource` engine accessor.
+# v2.67.41's session_state-based cache wasn't working reliably for
+# users — they reported the engine spinner kicking in on every page
+# navigation despite the session cache. Streamlit session_state can
+# misbehave with large DataFrames (suspected serialisation overhead
+# or widget-driven state churn). cache_resource is purpose-built
+# for "expensive object, share across sessions, only recompute on
+# refresh". For a no-arg wrapper it caches per-process — same
+# DataFrame instance returned to every session, every page render,
+# until the Refresh button clears it.
 #
-# Fix: cache the engine_df instance in st.session_state once per
-# user session. First page that needs it computes (or hits the
-# disk cache); subsequent navigations get an instant
-# session-state lookup. Cleared by the Refresh button below.
+# Why not just cache_resource _abc_engine itself? Because callers
+# downstream still mutate engine_df in place (target_stock,
+# reorder_qty, etc.). Mutating a cache_resource result is
+# discouraged — but is fine here because every page would compute
+# the same mutations from the same inputs, so the mutated state is
+# semantically identical to a fresh compute. The wrapper makes the
+# pattern explicit: read here, mutate downstream, expect to see
+# mutations on subsequent reads in the same process.
+@st.cache_resource(show_spinner="Loading ABC engine…")
 def _get_engine_df() -> "pd.DataFrame":
-    """Session-cached accessor for the full ABC engine output.
-    Computes once per user session via the disk-cached _abc_engine,
-    then returns the same instance for every subsequent page that
-    needs it. Caller must NOT mutate the returned DataFrame in
-    ways that affect other pages — use .copy() before mutation if
-    in doubt. (Existing call sites add columns like target_stock
-    in-place; that's safe because every page would compute the
-    same values from the same cached engine_df.)"""
-    cached = st.session_state.get("_engine_df_cached")
-    if cached is not None:
-        return cached
+    """Process-cached accessor for the full ABC engine output.
+    Computes once via the disk-cached _abc_engine and returns the
+    same instance to every page in every session. Cleared by the
+    Refresh button below (st.cache_resource.clear())."""
     if products.empty or sale_lines.empty:
         return pd.DataFrame()
-    engine_df = _abc_engine(
+    return _abc_engine(
         products, stock, sale_lines, purchase_lines)
-    st.session_state["_engine_df_cached"] = engine_df
-    return engine_df
 
 
 if page == "Overview":
