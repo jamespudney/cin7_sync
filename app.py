@@ -750,20 +750,20 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.55 — Shopify order tracing for "
-                "conversion attribution. CIN7 records sales with "
-                "SourceChannel='Shopify' but doesn't carry the "
-                "Shopify-side fields (landing_site, "
-                "referring_site, source_name, UTM params). New AI "
-                "tool `get_shopify_order` mirrors them locally so "
-                "staff can ask 'how did we get this conversion' / "
-                "'what coupon did they use' / 'is this a "
-                "returning customer'. When `get_sale_order` "
-                "returns SourceChannel=Shopify the AI proactively "
-                "follows up with `get_shopify_order` for the "
-                "joined view. Setup: SHOPIFY_DOMAIN + "
-                "SHOPIFY_ACCESS_TOKEN env vars + one-time "
-                "`python shopify_sync.py --orders-full 1825`.")
+    st.caption("🟢 v2.67.57 — Slack integration + shipping P&L. "
+                "Big batch: (1) Slack bot live in 6 channels "
+                "with question detection + PO-review commentary "
+                "in #purchase-backorders + audit mirror to "
+                "#ai-audit; (2) v2.67.55c column-semantics fix — "
+                "ShipmentCost is now actually the carrier-billed "
+                "cost, customer charge is in "
+                "CustomerShippingCharge, and ShippingMargin = "
+                "charge - cost; (3) new `get_shipping_margin` AI "
+                "tool surfaces shipping P&L by SKU / carrier / "
+                "service / date. After deploy, the OOM that "
+                "killed the parallel backfills overnight will be "
+                "addressed in v2.67.58 by switching the sync "
+                "scripts to incremental CSV writes.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -801,6 +801,55 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.57** — Big batch ship: Slack integration + "
+            "shipping cost-semantics fix + Shipping P&L AI tool.\n\n"
+            "**Slack** — bot now polls 6 channels every 60s "
+            "(#purchase-backorders, #stock-issues-queries, "
+            "#shipping-issues, #fulfilment, "
+            "#shopify-website-improvement, #saleschat) plus "
+            "mirrors every response to #ai-audit. Threaded replies "
+            "only. Question-detection + trigger-detection (SO/"
+            "PO/INV numbers + SKU patterns + customer names + "
+            "@-mentions). PO-review channel gets per-SKU "
+            "commentary using the engine's signals (ABC, "
+            "OnHand, OnOrder, is_dormant, excess_units, "
+            "trend_flag) plus duplicate-PO check. New AI tool "
+            "`get_slack_messages` lets the AI cross-reference "
+            "team chat from any channel. New SQLite tables: "
+            "slack_messages, slack_bot_responses, "
+            "slack_channel_cursors. Two new scripts: "
+            "`slack_sync.py` (poller) and `slack_listener.py` "
+            "(responder). Background-worker entrypoint: "
+            "`slack_loop.sh`.\n\n"
+            "**Shipping cost semantics (v2.67.55c rolled in)** — "
+            "fixed a bug uncovered via SO-55451 / SO-55971: the "
+            "v2 ShipStation `shipping_paid` field was being "
+            "mapped to `ShipmentCost`, but it's actually what "
+            "the CUSTOMER paid (revenue), not what UPS billed "
+            "us (cost). Cost lives on the /labels endpoint. New "
+            "split: `CustomerShippingCharge` (revenue), "
+            "`ShipmentCost` (true cost from label.shipment_cost), "
+            "`ShippingMargin` (charge - cost). "
+            "_merge_label_data populates both. Monthly Metrics' "
+            "Shipping Cost row now sums the true cost; label "
+            "shows '⚠️ stale CSV' if reading legacy data.\n\n"
+            "**get_shipping_margin AI tool** — first revealed "
+            "$149k/year shipping bleed via ad-hoc analysis "
+            "(LEDKIT-NICHO-UT180 alone losing $2.7k/month from "
+            "DIM-weight underquoting). Now an AI-callable tool "
+            "for any future P&L question, filterable by "
+            "SKU/customer/carrier/service/date with optional "
+            "loss-only flag. Returns headline totals + worst-N "
+            "rows.\n\n"
+            "**Memory note** — the OOM that killed last night's "
+            "parallel backfills is real (4 concurrent Python "
+            "processes + Streamlit caches exceeded the web "
+            "service's memory limit). Mitigation: run backfills "
+            "SERIALLY (one at a time). v2.67.58 will refactor "
+            "the sync scripts to write CSVs incrementally so "
+            "memory peaks stay flat."
+        )
         st.caption(
             "**v2.67.55** — Shopify order tracing for conversion "
             "attribution. User asked: 'can you trace shopify "
@@ -14124,16 +14173,19 @@ elif page == "Monthly Metrics":
         _row("Margins", "Shipping Charged",
              _per_month(lambda m: float(
                  ship_charged_per_month.get(m, 0) or 0)))
-        # v2.67.54 — populate Shipping Cost row from ShipStation
-        # when configured. Aggregates ShipmentCost by month-of-
-        # ShipDate, skipping voided shipments. Returns 0 for months
-        # without data so the row still renders for pre-ShipStation
-        # months. Label reflects whether the integration is live.
+        # v2.67.55c — populate the TRUE Shipping Cost row.
+        # In v2.67.54 we summed `ShipmentCost` from shipments, but
+        # that column actually held customer-charge (the v2 API's
+        # `shipping_paid.amount`) — the SO-55451 case study revealed
+        # the semantics bug. v2.67.55c corrected the column to be
+        # the actual carrier-billed cost (from label.shipment_cost),
+        # so this aggregation now reflects true cost. Pre-v2.67.55c
+        # CSVs that only have the customer-charge column get a
+        # stale-data label until they're re-synced.
         _ship_cost_per_month = {}
+        _data_quality_stale = False
         try:
-            if (not shipments.empty
-                    and "ShipDate" in shipments.columns
-                    and "ShipmentCost" in shipments.columns):
+            if not shipments.empty and "ShipDate" in shipments.columns:
                 _sc_df = shipments.copy()
                 if "Voided" in _sc_df.columns:
                     _sc_df = _sc_df[
@@ -14143,17 +14195,32 @@ elif page == "Monthly Metrics":
                 _sc_df = _sc_df.dropna(subset=["_dt"])
                 _sc_df["_month"] = (_sc_df["_dt"].dt.tz_convert(None)
                                                   .dt.strftime("%Y-%m"))
-                _sc_df["_cost"] = pd.to_numeric(
-                    _sc_df["ShipmentCost"], errors="coerce").fillna(0)
+                # If we have the proper cost column (v2.67.55c+),
+                # use it; otherwise fall back to the legacy
+                # ShipmentCost field with a stale-data warning.
+                if "ShipmentCost" in _sc_df.columns and (
+                        "CustomerShippingCharge" in _sc_df.columns):
+                    _sc_df["_cost"] = pd.to_numeric(
+                        _sc_df["ShipmentCost"], errors="coerce").fillna(0)
+                else:
+                    _data_quality_stale = True
+                    _sc_df["_cost"] = pd.to_numeric(
+                        _sc_df.get("ShipmentCost",
+                                      pd.Series(dtype=float)),
+                        errors="coerce").fillna(0)
                 _ship_cost_per_month = (
                     _sc_df.groupby("_month")["_cost"].sum().to_dict())
         except Exception:
             _ship_cost_per_month = {}
-        _ship_cost_label = (
-            "Shipping Cost (ShipStation)"
-            if _ship_cost_per_month
-            else "Shipping Cost (ShipStation pending — set "
-                 "SHIPSTATION_API_KEY+SECRET)")
+        if _data_quality_stale:
+            _ship_cost_label = (
+                "Shipping Cost (⚠️ stale CSV — re-sync needed)")
+        elif _ship_cost_per_month:
+            _ship_cost_label = "Shipping Cost (ShipStation)"
+        else:
+            _ship_cost_label = (
+                "Shipping Cost (ShipStation pending — set "
+                "SHIPSTATION_API_KEY)")
         _row("Margins", _ship_cost_label,
              _per_month(lambda m: float(
                  _ship_cost_per_month.get(m, 0) or 0)))

@@ -28,6 +28,7 @@ implementation in TOOL_HANDLERS. Both are required.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Optional
 
 import pandas as pd
@@ -763,6 +764,153 @@ TOOL_SCHEMAS: list[dict] = [
                     "description": (
                         "Max shipments to return (cap 50, "
                         "default 25).")
+                },
+            },
+        },
+    },
+    {
+        # v2.67.55c — shipping P&L analysis tool. Built after the
+        # SO-55451 / SO-55971 case study revealed ~$149k/year
+        # shipping bleed across long-channel SKUs (DIM-weight not
+        # being applied at storefront-quote time). Powers questions
+        # like 'which SKUs are losing us money on shipping?',
+        # 'what's our shipping P&L this month?', 'show me the
+        # worst 20 loss-makers'.
+        "name": "get_shipping_margin",
+        "description": (
+            "Shipping P&L analysis. Filters shipments by SKU / "
+            "customer / carrier / date / margin threshold, "
+            "computes margin = customer_charge - actual_cost per "
+            "shipment, and rolls up to a summary. Use this for "
+            "ANY question involving shipping profitability: "
+            "'which SKUs lose us money', 'how much did we lose "
+            "on shipping last month', 'is UPS Ground "
+            "underpriced', 'show me free-shipping orders that "
+            "cost us $X+'. Returns headline totals (revenue, "
+            "cost, net margin, loss-maker count) plus per-row "
+            "details for the worst N losses. Requires shipments "
+            "synced post-v2.67.55c (with both customer_charge "
+            "and actual_cost columns); reports a data_quality "
+            "warning if the CSV is pre-v2.67.55c."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": (
+                        "Filter to shipments whose ItemSummary "
+                        "contains this SKU substring (e.g. "
+                        "'LEDKIT-NICHO' to scan one family).")
+                },
+                "customer": {
+                    "type": "string",
+                    "description": (
+                        "Customer name substring filter.")
+                },
+                "carrier": {
+                    "type": "string",
+                    "description": (
+                        "Carrier code (ups / usps / fedex). "
+                        "Useful for carrier-mix analysis.")
+                },
+                "service": {
+                    "type": "string",
+                    "description": (
+                        "Service code substring (e.g. "
+                        "'2nd_day_air', 'ground'). Compares "
+                        "service-tier P&L.")
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD).")
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": (
+                        "ISO date (YYYY-MM-DD).")
+                },
+                "loss_only": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, only return shipments with "
+                        "margin < 0. Default false.")
+                },
+                "margin_below": {
+                    "type": "number",
+                    "description": (
+                        "Threshold: only return shipments with "
+                        "margin < this value (e.g. -30 to find "
+                        "shipments losing $30+).")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max shipments to return in `worst_rows` "
+                        "(cap 50, default 20). Summary stats "
+                        "always cover the FULL filtered set.")
+                },
+            },
+        },
+    },
+    {
+        # v2.67.57 — Slack message lookup. The bot ingests team
+        # chat in 5 channels (#purchase-backorders, #shipping-issues,
+        # #fulfilment, #shopify-website-improvement, #saleschat).
+        # When a question in another tool relates to a recent
+        # discussion ("did Andrew approve the Topmet PO?", "what
+        # did Mike say about INV-53104?"), this tool greps the
+        # local slack_messages mirror.
+        "name": "get_slack_messages",
+        "description": (
+            "Search the local mirror of Slack messages from "
+            "channels the AI watches (#purchase-backorders, "
+            "#shipping-issues, #fulfilment, #shopify-website-"
+            "improvement, #saleschat). Use this when the user's "
+            "question references a Slack discussion or when "
+            "answering a question would benefit from team "
+            "context — e.g. 'did anyone flag PO-7109?', 'what "
+            "did the team say about INV-53104?', 'when was the "
+            "last backorder discussion for SKU X'. Filter by "
+            "channel name, search term, user name, or date range. "
+            "Returns the message text, channel, user, and "
+            "timestamp. Note: the bot only sees channels it's "
+            "been invited to."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": (
+                        "Substring to grep for in message text. "
+                        "Case-insensitive. Useful for SKUs / PO# / "
+                        "INV# / customer name.")
+                },
+                "channel": {
+                    "type": "string",
+                    "description": (
+                        "Channel name (with or without #) or "
+                        "channel_id. Filters to one channel.")
+                },
+                "user": {
+                    "type": "string",
+                    "description": (
+                        "User display-name substring (e.g. "
+                        "'andrew'). Case-insensitive.")
+                },
+                "since_hours": {
+                    "type": "integer",
+                    "description": (
+                        "Only return messages from the last N "
+                        "hours. Default 168 (7 days).")
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max messages to return (cap 50, "
+                        "default 20).")
                 },
             },
         },
@@ -3186,6 +3334,25 @@ def get_shipping_details(engine_df: pd.DataFrame,
 
     out = []
     for _, r in work.head(limit).iterrows():
+        # v2.67.55c — distinguish customer_charge (revenue, what we
+        # billed the customer for shipping) from actual_cost (what
+        # UPS billed us). Compute margin from both. Pre-v2.67.55c
+        # CSVs have only the legacy ShipmentCost column with the
+        # WRONG semantics (it held customer-charge); detect that
+        # case and label it cleanly.
+        cust_charge = r.get("CustomerShippingCharge")
+        actual_cost = r.get("ShipmentCost")
+        margin = r.get("ShippingMargin")
+        # Backwards compat: legacy CSVs (pre-v2.67.55c) have
+        # ShipmentCost = customer charge and no
+        # CustomerShippingCharge column. Detect by absence of the
+        # new column. In that case we can't compute margin without
+        # an additional /labels API call — flag it.
+        legacy_csv = "CustomerShippingCharge" not in work.columns
+        if legacy_csv:
+            cust_charge = r.get("ShipmentCost")  # legacy field
+            actual_cost = None
+            margin = None
         out.append(_serialise_row({
             "shipment_id": r.get("ShipmentID"),
             "order_number": r.get("OrderNumber"),
@@ -3196,11 +3363,25 @@ def get_shipping_details(engine_df: pd.DataFrame,
             "voided": bool(r.get("Voided"))
                        if pd.notna(r.get("Voided")) else False,
             "tracking_number": r.get("TrackingNumber"),
+            "tracking_url": r.get("TrackingURL"),
             "carrier": r.get("CarrierCode"),
             "service": r.get("ServiceCode"),
-            "shipment_cost": (
-                float(r.get("ShipmentCost"))
-                if pd.notna(r.get("ShipmentCost")) else None),
+            # v2.67.55c — three distinct fields. Customer charge
+            # (revenue), actual cost (what UPS billed us), and
+            # margin (revenue - cost). Negative margin = we lost
+            # money on this shipment.
+            "customer_charge": (
+                float(cust_charge)
+                if cust_charge is not None and pd.notna(cust_charge)
+                else None),
+            "actual_cost": (
+                float(actual_cost)
+                if actual_cost is not None and pd.notna(actual_cost)
+                else None),
+            "shipping_margin": (
+                float(margin)
+                if margin is not None and pd.notna(margin)
+                else None),
             "insurance_cost": (
                 float(r.get("InsuranceCost"))
                 if pd.notna(r.get("InsuranceCost")) else None),
@@ -3210,6 +3391,10 @@ def get_shipping_details(engine_df: pd.DataFrame,
             "ship_to_postal": r.get("ShipToPostal"),
             "weight_value": r.get("WeightValue"),
             "weight_units": r.get("WeightUnits"),
+            "dim_length": r.get("DimensionsLength"),
+            "dim_width": r.get("DimensionsWidth"),
+            "dim_height": r.get("DimensionsHeight"),
+            "dim_units": r.get("DimensionsUnits"),
             "item_count": r.get("ItemCount"),
             "item_summary": r.get("ItemSummary"),
             "customer_notes": (
@@ -3228,14 +3413,23 @@ def get_shipping_details(engine_df: pd.DataFrame,
         "matched": len(out),
         "limit_applied": limit,
         "shipments": out,
+        "data_quality_note": (
+            "Pre-v2.67.55c CSVs only carry customer_charge (no "
+            "actual_cost or margin). If actual_cost is null "
+            "across all rows, the data was synced before the "
+            "cost-semantics fix — re-run shipstation_sync to "
+            "backfill."
+            if "CustomerShippingCharge" not in work.columns
+            else None),
         "note": (
             "Show the user: ship_date · order_number · customer · "
-            "carrier+service · tracking_number · shipment_cost. "
-            "Voided shipments are flagged voided=true — surface "
-            "that as 'VOIDED' so users don't think it shipped. "
-            "If customer_notes / internal_notes are non-null, "
-            "include them — the warehouse / sales rep typed them "
-            "for a reason."),
+            "carrier+service · tracking_number · customer_charge "
+            "vs actual_cost. If shipping_margin < 0, flag explicitly "
+            "as a LOSS-MAKING shipment with the dollar amount. "
+            "Voided shipments → mark 'VOIDED'. Surface "
+            "customer_notes / internal_notes if non-null. If "
+            "tracking_url is set, include it as a clickable "
+            "link."),
     }
 
 
@@ -3428,6 +3622,273 @@ def get_shopify_order(engine_df: pd.DataFrame,
             "'utm_source' or 'utm_campaign' substrings, those "
             "are the marketing-attribution params; surface "
             "them."),
+    }
+
+
+def get_shipping_margin(engine_df: pd.DataFrame,
+                          sale_lines_df: pd.DataFrame,
+                          args: dict) -> dict:
+    """v2.67.55c — Shipping P&L analysis. Reads the merged
+    shipments DataFrame (set via set_shipments), filters,
+    computes margin per shipment, returns headline totals + worst
+    rows.
+
+    Why a dedicated tool vs reusing get_shipping_details: this one
+    operates over the WHOLE filtered set (returns aggregate stats
+    across thousands of shipments), whereas get_shipping_details
+    is for ONE specific lookup. Different intent, different
+    output shape — separate tool.
+    """
+    sku = (args.get("sku") or "").strip().upper()
+    customer = (args.get("customer") or "").strip().upper()
+    carrier = (args.get("carrier") or "").strip().lower()
+    service = (args.get("service") or "").strip().lower()
+    date_from = (args.get("date_from") or "").strip()
+    date_to = (args.get("date_to") or "").strip()
+    loss_only = bool(args.get("loss_only", False))
+    margin_below = args.get("margin_below")
+    limit = max(1, min(int(args.get("limit", 20) or 20), 50))
+
+    df = _SHIPMENTS_HOLDER.get("df")
+    if df is None or df.empty:
+        return {
+            "error": ("Shipments not loaded. ShipStation env vars "
+                      "not configured OR the first sync hasn't run."),
+        }
+
+    # Detect data quality — pre-v2.67.55c CSVs lack the new column.
+    if "CustomerShippingCharge" not in df.columns:
+        return {
+            "error": ("Shipments CSV is pre-v2.67.55c — only "
+                      "carries customer_charge (mislabelled as "
+                      "ShipmentCost). Margin analysis requires "
+                      "true cost from /labels. Re-run "
+                      "`shipstation_sync.py full --days 1825` "
+                      "OR wait for the next daily sync."),
+            "data_quality": "stale",
+        }
+
+    work = df.copy()
+    if sku and "ItemSummary" in work.columns:
+        work = work[work["ItemSummary"].astype(str).str.upper()
+                     .str.contains(sku, na=False)]
+    if customer and "CustomerName" in work.columns:
+        work = work[work["CustomerName"].astype(str).str.upper()
+                     .str.contains(customer, na=False)]
+    if carrier and "CarrierCode" in work.columns:
+        work = work[work["CarrierCode"].astype(str).str.lower()
+                     .str.contains(carrier, na=False)]
+    if service and "ServiceCode" in work.columns:
+        work = work[work["ServiceCode"].astype(str).str.lower()
+                     .str.contains(service, na=False)]
+    if date_from and "ShipDate" in work.columns:
+        try:
+            cutoff = pd.Timestamp(date_from)
+            parsed = pd.to_datetime(work["ShipDate"], errors="coerce",
+                                       utc=True).dt.tz_convert(None)
+            work = work[parsed >= cutoff]
+        except Exception:
+            pass
+    if date_to and "ShipDate" in work.columns:
+        try:
+            cutoff = pd.Timestamp(date_to) + pd.Timedelta(days=1)
+            parsed = pd.to_datetime(work["ShipDate"], errors="coerce",
+                                       utc=True).dt.tz_convert(None)
+            work = work[parsed < cutoff]
+        except Exception:
+            pass
+    # Drop shipments without both numbers — can't compute margin.
+    if "CustomerShippingCharge" in work.columns and "ShipmentCost" in work.columns:
+        work = work.dropna(subset=["CustomerShippingCharge",
+                                       "ShipmentCost"])
+    # Drop voided.
+    if "Voided" in work.columns:
+        work = work[~work["Voided"].fillna(False).astype(bool)]
+    # Compute margin (recompute defensively even though it's stored).
+    work = work.copy()
+    work["_margin"] = (
+        pd.to_numeric(work["CustomerShippingCharge"], errors="coerce")
+        - pd.to_numeric(work["ShipmentCost"], errors="coerce"))
+    if loss_only:
+        work = work[work["_margin"] < 0]
+    if margin_below is not None:
+        try:
+            work = work[work["_margin"] < float(margin_below)]
+        except (TypeError, ValueError):
+            pass
+
+    if work.empty:
+        return {
+            "matched": 0,
+            "filters": {
+                "sku": sku or None, "customer": customer or None,
+                "carrier": carrier or None, "service": service or None,
+                "date_from": date_from or None, "date_to": date_to or None,
+                "loss_only": loss_only, "margin_below": margin_below,
+            },
+            "note": "No shipments match — try widening the filter.",
+        }
+
+    total_revenue = float(
+        pd.to_numeric(work["CustomerShippingCharge"],
+                       errors="coerce").sum())
+    total_cost = float(
+        pd.to_numeric(work["ShipmentCost"], errors="coerce").sum())
+    net_margin = total_revenue - total_cost
+    losses = work[work["_margin"] < -5]
+    loss_count = int(len(losses))
+    total_loss_dollars = float(losses["_margin"].sum()) if loss_count else 0.0
+
+    # Worst rows.
+    worst = work.sort_values("_margin").head(limit)
+    worst_rows = []
+    for _, r in worst.iterrows():
+        worst_rows.append(_serialise_row({
+            "order_number": r.get("OrderNumber"),
+            "customer": r.get("CustomerName"),
+            "ship_date": (str(r.get("ShipDate"))
+                            if pd.notna(r.get("ShipDate")) else None),
+            "carrier": r.get("CarrierCode"),
+            "service": r.get("ServiceCode"),
+            "customer_charge": (
+                float(r.get("CustomerShippingCharge"))
+                if pd.notna(r.get("CustomerShippingCharge")) else None),
+            "actual_cost": (
+                float(r.get("ShipmentCost"))
+                if pd.notna(r.get("ShipmentCost")) else None),
+            "margin": float(r.get("_margin")),
+            "weight_value": r.get("WeightValue"),
+            "weight_units": r.get("WeightUnits"),
+            "dim_lwh": (
+                f"{r.get('DimensionsLength')}×"
+                f"{r.get('DimensionsWidth')}×"
+                f"{r.get('DimensionsHeight')} "
+                f"{r.get('DimensionsUnits') or ''}"
+                if (r.get("DimensionsLength") and r.get("DimensionsWidth")
+                    and r.get("DimensionsHeight"))
+                else None),
+            "tracking_number": r.get("TrackingNumber"),
+            "item_summary": str(r.get("ItemSummary") or "")[:200],
+        }))
+
+    return {
+        "matched": int(len(work)),
+        "summary": {
+            "shipments_analysed": int(len(work)),
+            "total_revenue": round(total_revenue, 2),
+            "total_cost": round(total_cost, 2),
+            "net_margin": round(net_margin, 2),
+            "loss_count": loss_count,
+            "total_loss_dollars": round(total_loss_dollars, 2),
+            "avg_margin": (round(net_margin / len(work), 2)
+                            if len(work) else 0),
+        },
+        "worst_rows": worst_rows,
+        "filters": {
+            "sku": sku or None, "customer": customer or None,
+            "carrier": carrier or None, "service": service or None,
+            "date_from": date_from or None, "date_to": date_to or None,
+            "loss_only": loss_only, "margin_below": margin_below,
+        },
+        "note": (
+            "Lead with net_margin (positive = profit, negative = "
+            "loss). If loss_count > 0, mention that N shipments "
+            "are losing money totalling $X. Then list the worst "
+            "individual losses by SKU. If the user asked about a "
+            "specific SKU/family, focus on that subset."),
+    }
+
+
+def get_slack_messages(engine_df: pd.DataFrame,
+                          sale_lines_df: pd.DataFrame,
+                          args: dict) -> dict:
+    """v2.67.57 — query the local mirror of ingested Slack messages.
+    Same shape as get_sale_order / get_shipping_details — substring
+    search + filters → list of recent messages.
+
+    Why we need this: when staff ask the AI a question that
+    references a recent Slack discussion ('did Andrew approve...?'),
+    or when the AI is composing a response in Slack and could
+    benefit from in-channel context, the AI calls this tool to
+    grep its own message log. Same idea as cross-calling
+    get_sale_order from a shipping question — adds team-knowledge
+    context to the answer."""
+    search = (args.get("search") or "").strip()
+    channel = (args.get("channel") or "").strip().lstrip("#")
+    user = (args.get("user") or "").strip().lower()
+    since_hours = int(args.get("since_hours") or 168)
+    limit = max(1, min(int(args.get("limit", 20) or 20), 50))
+
+    if not (search or channel or user):
+        return {
+            "error": ("Specify at least one filter: search, "
+                      "channel, OR user. Empty filter would dump "
+                      "thousands of messages."),
+        }
+
+    since_unix = time.time() - (since_hours * 3600)
+
+    # Build SQL.
+    where_parts = ["CAST(ts AS REAL) >= ?"]
+    params: list = [since_unix]
+    if search:
+        where_parts.append("LOWER(text) LIKE ?")
+        params.append(f"%{search.lower()}%")
+    if user:
+        where_parts.append("LOWER(user_name) LIKE ?")
+        params.append(f"%{user}%")
+    if channel:
+        # Match either channel_id or resolved channel name.
+        where_parts.append(
+            "(channel_id = ? OR EXISTS ("
+            "SELECT 1 FROM slack_channel_cursors c "
+            "WHERE c.channel_id = slack_messages.channel_id "
+            "  AND LOWER(c.channel_name) = LOWER(?)))")
+        params.extend([channel, channel.lstrip("#")])
+
+    sql = (
+        "SELECT m.channel_id, m.ts, m.user_name, m.text, "
+        "       m.thread_ts, m.is_bot, "
+        "       (SELECT channel_name FROM slack_channel_cursors c "
+        "         WHERE c.channel_id = m.channel_id) AS channel_name "
+        "FROM slack_messages m "
+        f"WHERE {' AND '.join(where_parts)} "
+        "ORDER BY ts DESC "
+        "LIMIT ?"
+    )
+    params.append(limit)
+
+    try:
+        with db.connect() as c:
+            rows = c.execute(sql, params).fetchall()
+    except Exception as exc:
+        return {"error": f"Slack query failed: {exc}"}
+
+    msgs = []
+    for r in rows:
+        msgs.append({
+            "channel": r["channel_name"] or r["channel_id"],
+            "user": r["user_name"],
+            "text": (r["text"] or "")[:600],
+            "ts": r["ts"],
+            "thread_ts": r["thread_ts"],
+            "is_bot": bool(r["is_bot"]),
+        })
+    return {
+        "matched": len(msgs),
+        "search": search or None,
+        "channel_filter": channel or None,
+        "user_filter": user or None,
+        "since_hours": since_hours,
+        "messages": msgs,
+        "note": (
+            "Slack messages from the channels the bot watches. "
+            "Use this for team context — when answering a "
+            "question, mentioning that '#purchase-backorders had "
+            "a thread on this last week' adds value over a pure "
+            "data answer. Don't quote bot messages back at the "
+            "user (is_bot=true rows are usually our own past "
+            "responses)."),
     }
 
 
@@ -3889,8 +4350,12 @@ TOOL_HANDLERS = {
     "get_stock_adjustment": get_stock_adjustment,
     # v2.67.54 — ShipStation lookup.
     "get_shipping_details": get_shipping_details,
+    # v2.67.55c — Shipping P&L analysis.
+    "get_shipping_margin": get_shipping_margin,
     # v2.67.55 — Shopify conversion attribution.
     "get_shopify_order": get_shopify_order,
+    # v2.67.57 — Slack team-context lookup.
+    "get_slack_messages": get_slack_messages,
     "get_compatible_accessories": get_compatible_accessories,
     # v2.66.6: get_relevant_slow_stock UNREGISTERED. Slow-stock
     # promotion was breaking product-list queries. Function stays in

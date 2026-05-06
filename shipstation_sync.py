@@ -293,6 +293,24 @@ def _flatten_shipment_v2(s: Dict[str, Any]) -> Dict[str, Any]:
     status = s.get("shipment_status") or ""
     voided = status in ("cancelled", "voided")
 
+    # v2.67.55c — column-name semantics fix.
+    # OLD (v2.67.54-55b): `ShipmentCost` = `shipping_paid.amount`,
+    # which is what the CUSTOMER paid (revenue), NOT what UPS billed
+    # us (cost). Discovered via SO-55451 — customer paid $44, UPS
+    # billed $122. Mapping was conceptually wrong.
+    # NEW: `CustomerShippingCharge` (revenue, from
+    # `shipping_paid.amount`); `ShipmentCost` (cost, filled by
+    # _merge_label_data from label.shipment_cost.amount). The
+    # listing-level `/shipments` doesn't expose cost — it lives on
+    # /labels — so ShipmentCost is None until the label merge runs.
+    # `ShippingMargin` = CustomerShippingCharge - ShipmentCost,
+    # also computed in _merge_label_data once both are known.
+    # Try also to extract dimensions from the first package.
+    pkgs = s.get("packages") or []
+    pkg0_dims = {}
+    if isinstance(pkgs, list) and pkgs and isinstance(pkgs[0], dict):
+        pkg0_dims = pkgs[0].get("dimensions") or {}
+
     return {
         "ShipmentID": s.get("shipment_id"),
         "OrderID": s.get("external_order_id"),
@@ -305,11 +323,11 @@ def _flatten_shipment_v2(s: Dict[str, Any]) -> Dict[str, Any]:
         "CreateDate": s.get("created_at"),
         "VoidDate": (s.get("modified_at") if voided else None),
         "Voided": voided,
-        "ShipmentStatus": status,            # v2-only column,
-                                                # AI tool surfaces it
+        "ShipmentStatus": status,
         "MarketplaceNotified": None,
         "TrackingNumber": None,              # filled by label merge
         "TrackingURL": None,                  # filled by label merge
+        "TrackingStatus": None,               # filled by label merge
         "CarrierCode": s.get("carrier_id"),
         "ServiceCode": s.get("service_code"),
         "RequestedService": s.get("requested_shipment_service"),
@@ -317,7 +335,10 @@ def _flatten_shipment_v2(s: Dict[str, Any]) -> Dict[str, Any]:
         "Confirmation": s.get("confirmation"),
         "WarehouseID": s.get("warehouse_id"),
         "StoreID": s.get("store_id"),
-        "ShipmentCost": shipment_cost,
+        # v2.67.55c — split revenue from cost.
+        "CustomerShippingCharge": shipment_cost,    # was ShipmentCost
+        "ShipmentCost": None,                       # filled by label merge
+        "ShippingMargin": None,                     # filled by label merge
         "AmountPaid": amount_paid.get("amount"),
         "TaxPaid": tax_paid.get("amount"),
         "Currency": (shipping_paid.get("currency")
@@ -339,10 +360,10 @@ def _flatten_shipment_v2(s: Dict[str, Any]) -> Dict[str, Any]:
         "WeightValue": weight.get("value"),
         "WeightUnits": weight.get("unit"),
         "Zone": s.get("zone"),
-        "DimensionsLength": None,
-        "DimensionsWidth": None,
-        "DimensionsHeight": None,
-        "DimensionsUnits": None,
+        "DimensionsLength": pkg0_dims.get("length"),
+        "DimensionsWidth": pkg0_dims.get("width"),
+        "DimensionsHeight": pkg0_dims.get("height"),
+        "DimensionsUnits": pkg0_dims.get("unit"),
         "ItemCount": len(items) if isinstance(items, list) else 0,
         "ItemSummary": item_summary,
     }
@@ -424,6 +445,12 @@ def _fetch_labels_index(session: requests.Session,
             # no longer valid; we want the active label per shipment.
             if L.get("voided"):
                 continue
+            # v2.67.55c — also capture cost from the label so we
+            # can populate ShipmentCost (true cost) on the merged
+            # shipment row. shipment_cost is a {currency, amount}
+            # dict on v2 labels; we store the amount only.
+            ship_cost_d = L.get("shipment_cost") or {}
+            ins_cost_d = L.get("insurance_cost") or {}
             idx[sid] = {
                 "TrackingNumber": L.get("tracking_number"),
                 "TrackingURL": L.get("tracking_url"),
@@ -432,6 +459,12 @@ def _fetch_labels_index(session: requests.Session,
                                  or L.get("carrier_id"),
                 "LabelID": L.get("label_id"),
                 "BatchID": L.get("batch_id"),
+                "LabelShipmentCost": (ship_cost_d.get("amount")
+                                       if isinstance(ship_cost_d, dict)
+                                       else None),
+                "LabelInsuranceCost": (ins_cost_d.get("amount")
+                                        if isinstance(ins_cost_d, dict)
+                                        else None),
             }
         total_pages = payload.get("pages") or 1
         log.info("    Labels page %d/%d (%d labels, %d indexed)",
@@ -448,7 +481,15 @@ def _merge_label_data(shipment_row: Dict[str, Any],
     No-op when the shipment hasn't been labelled yet. Carrier code
     from the label takes precedence over the shipment's carrier_id
     (which is an internal SE-XXXX ID; the label gives the actual
-    carrier name like 'ups' / 'usps')."""
+    carrier name like 'ups' / 'usps').
+
+    v2.67.55c — also fills `ShipmentCost` (true carrier-billed cost,
+    from `label.shipment_cost.amount`) and computes `ShippingMargin`
+    = `CustomerShippingCharge - ShipmentCost`. Pre-v2.67.55c rows
+    had `shipping_paid.amount` mistakenly mapped to ShipmentCost
+    (which is actually customer revenue, not our cost). This merge
+    is what makes the Shipping P&L dashboard's margin numbers
+    meaningful."""
     sid = shipment_row.get("ShipmentID")
     if not sid:
         return shipment_row
@@ -466,6 +507,21 @@ def _merge_label_data(shipment_row: Dict[str, Any],
         out["CarrierCode"] = label["CarrierCode"]
     out["TrackingStatus"] = label.get("TrackingStatus")
     out["LabelID"] = label.get("LabelID")
+    # v2.67.55c — populate true cost from the label.
+    label_cost = label.get("LabelShipmentCost")
+    if label_cost is not None:
+        out["ShipmentCost"] = float(label_cost)
+        # Compute margin if customer-charge is also known.
+        cust_charge = out.get("CustomerShippingCharge")
+        if cust_charge is not None:
+            try:
+                out["ShippingMargin"] = (
+                    float(cust_charge) - float(label_cost))
+            except (TypeError, ValueError):
+                pass
+    label_ins = label.get("LabelInsuranceCost")
+    if label_ins is not None:
+        out["InsuranceCost"] = float(label_ins)
     return out
 
 

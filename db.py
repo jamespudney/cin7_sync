@@ -562,6 +562,77 @@ CREATE TABLE IF NOT EXISTS slow_mover_value_snapshots (
     value_on_shelf        REAL,    -- StockOnHand sum across the day's slow SKUs
     captured_at           TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ============================================================
+-- v2.67.57 — Slack integration
+-- ============================================================
+-- The bot polls Slack `conversations.history` every ~60s and
+-- writes every message it sees into slack_messages. Subsequent
+-- listener pass classifies each unprocessed message (question /
+-- trigger / chatter), and either responds (logging to
+-- slack_bot_responses) or marks the message as skipped.
+--
+-- Why not just memory-cache: the listener and AI tools (e.g.
+-- get_slack_messages for cross-channel grep) need a queryable
+-- store, AND we need a durable audit log of every bot post for
+-- accountability + retrospective tuning.
+
+CREATE TABLE IF NOT EXISTS slack_messages (
+    -- (channel_id, ts) is unique per Slack message
+    channel_id      TEXT NOT NULL,
+    ts              TEXT NOT NULL,    -- Slack timestamp (string, contains '.')
+    user_id         TEXT,             -- e.g. U02ABCDEF
+    user_name       TEXT,             -- resolved display name
+    text            TEXT,             -- raw message text
+    thread_ts       TEXT,             -- if this message is a thread reply, the parent ts
+    is_bot          INTEGER DEFAULT 0,-- 1 if posted by a bot (incl. our own)
+    is_our_bot      INTEGER DEFAULT 0,-- 1 if posted by THIS bot (so we never reply to self)
+    permalink       TEXT,             -- direct link back to the Slack message
+    raw_event       TEXT,             -- original JSON for debugging
+    ingested_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    -- Listener bookkeeping. NULL = not yet classified.
+    -- 'question' / 'trigger' / 'chatter' / 'bot_self' / 'too_old'
+    classification  TEXT,
+    classified_at   TIMESTAMP,
+    response_id     INTEGER,         -- FK into slack_bot_responses if we responded
+    PRIMARY KEY (channel_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_messages_unclassified
+    ON slack_messages(classification, ingested_at)
+    WHERE classification IS NULL;
+CREATE INDEX IF NOT EXISTS idx_slack_messages_thread
+    ON slack_messages(channel_id, thread_ts);
+
+CREATE TABLE IF NOT EXISTS slack_bot_responses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    in_channel      TEXT NOT NULL,        -- channel id where we replied
+    in_ts           TEXT NOT NULL,        -- ts of the message we replied to
+    in_thread_ts    TEXT NOT NULL,        -- thread_ts we posted into
+    user_question   TEXT,                 -- truncated copy of the user's text
+    response_text   TEXT,                 -- the full text we posted
+    response_ts     TEXT,                 -- Slack ts of our reply (returned by chat.postMessage)
+    tools_used      TEXT,                 -- comma-separated AI tool names invoked
+    classification  TEXT,                 -- question/trigger/mention
+    audit_posted    INTEGER DEFAULT 0,    -- 1 once mirrored to #ai-audit
+    posted_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    -- Feedback signals: team can react with 🛑/👎/⛔ to flag a bad response.
+    -- Updated by the listener on subsequent polls.
+    flag_count      INTEGER DEFAULT 0,
+    flagged_at      TIMESTAMP,
+    flag_reason     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_slack_bot_responses_pending_audit
+    ON slack_bot_responses(audit_posted)
+    WHERE audit_posted = 0;
+
+-- Cursor table: per-channel, the latest Slack ts we've ingested.
+-- Used by slack_sync to do incremental conversations.history pulls.
+CREATE TABLE IF NOT EXISTS slack_channel_cursors (
+    channel_id      TEXT PRIMARY KEY,
+    channel_name    TEXT,                 -- friendly name when we resolve it
+    last_ts         TEXT,                 -- highest ts ingested so far
+    last_pulled_at  TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
