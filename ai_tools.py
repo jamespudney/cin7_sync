@@ -535,8 +535,16 @@ TOOL_SCHEMAS: list[dict] = [
             "shipment, INCLUDE both fields in the answer when "
             "they're non-empty — they're the most current "
             "human-curated signal about freight status. "
+            "**v2.67.52** — every line ALSO returns `memo` (the "
+            "'Purchase Order Memo' big text box on the PO form — "
+            "what the buyer types about the entire order), `note` "
+            "(separate top-level note CIN7 sometimes uses for "
+            "reason / blame e.g. 'shipped in error'), and `terms` "
+            "(payment terms). The buyer uses ALL FIVE fields for "
+            "different purposes — surface every non-empty one. "
             "Format: `<expected_date> · qty <N> from <Supplier> · "
-            "PO <number>  \\n  ✈/🚢 <comments> · 📍 <shipping_notes>`."
+            "PO <number>  \\n  ✈/🚢 <comments> · 📍 <shipping_notes>"
+            " · 📝 <memo> · ⚠ <note> · 💳 <terms>`."
         ),
         "input_schema": {
             "type": "object",
@@ -574,15 +582,19 @@ TOOL_SCHEMAS: list[dict] = [
         "description": (
             "Look up a specific CIN7 purchase order by number "
             "(e.g. PO-7109) and return its header + every line "
-            "item, including SKU / Name / Quantity / Price / "
-            "supplier / status / required-by date / Comments / "
-            "Shipping notes. Use this when the user asks about a "
-            "SPECIFIC PO ('what's on PO-7109', 'what did we order "
-            "from Topmet on April 28', 'show me purchase 7042'). "
-            "Returns `matched`=0 with a note if the PO isn't in "
-            "the local sync window — the sync currently covers the "
-            "last ~30 days for line detail. The widest available "
-            "window is used automatically."
+            "item plus EVERY freeform text field the buyer types "
+            "into: `memo` (Purchase Order Memo box on the PO "
+            "form — main instruction field), `comments` (header "
+            "comments), `shipping_notes` (vendor-purchase attribute "
+            "for freight progress), `note` (separate top-level "
+            "note), `terms` (payment terms). v2.67.52 added the "
+            "Memo / Note / Terms fields after the buyer pointed "
+            "out the PO Memo wasn't being surfaced. Use this when "
+            "the user asks about a SPECIFIC PO ('what's on PO-7109', "
+            "'what did we order from Topmet', 'show me purchase "
+            "7042'). Returns `matched`=0 with a note if the PO "
+            "isn't in the local sync window — sync covers ~30 "
+            "days for line detail."
         ),
         "input_schema": {
             "type": "object",
@@ -626,16 +638,22 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "get_sale_order",
         "description": (
             "Look up a specific CIN7 sale order by number / invoice "
-            "and return its header + every line item including SKU, "
-            "Name, Quantity, Price, Total, Customer, Order date, "
-            "Status. Use this when the user asks about a SPECIFIC "
-            "sale ('what did Acme buy on SO-12345', 'show me sale "
+            "and return its header + every line item PLUS every "
+            "freeform text field the rep types into: `memo` (Sale "
+            "Order Memo box — build/delivery instructions), "
+            "`shipping_notes` (top-level shipping instructions on "
+            "sales — different location from POs), `note` "
+            "(top-level header note), `terms` (payment terms), "
+            "`customer_reference` (customer's own PO# referencing "
+            "this sale). v2.67.52 added the Memo / Note / "
+            "ShippingNotes / Terms / CustomerReference fields. "
+            "Use this when the user asks about a SPECIFIC sale "
+            "('what did Acme buy on SO-12345', 'show me sale "
             "INV-9981', 'who ordered LED-V3060001-2 last week'). "
-            "Searches by order_number, invoice_number, OR by customer "
-            "name + date range when the user doesn't have a number. "
-            "Returns `matched`=0 with a note if the sale isn't in "
-            "the local sync window (line detail covers the last 30 "
-            "days; the widest available window is used)."
+            "Searches by order_number, invoice_number, OR by "
+            "customer name + date range when the user doesn't "
+            "have a number. Returns `matched`=0 with a note if "
+            "the sale isn't in the local sync window."
         ),
         "input_schema": {
             "type": "object",
@@ -2319,6 +2337,27 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                 and pd.notna(r.get("ShippingNotes"))
                 and str(r.get("ShippingNotes")).strip()
                 else None),
+            # v2.67.52 — surface every freeform PO text field. The
+            # buyer types DIFFERENT things into Memo vs Note vs
+            # Comments — surfacing only one of them hides what they
+            # said. Memo is the big text box on the PO form
+            # ('Purchase Order Memo'); Note is a separate top-level
+            # note; Terms is payment terms.
+            "memo": (
+                str(r.get("Memo")).strip()
+                if "Memo" in df.columns and pd.notna(r.get("Memo"))
+                and str(r.get("Memo")).strip()
+                else None),
+            "note": (
+                str(r.get("Note")).strip()
+                if "Note" in df.columns and pd.notna(r.get("Note"))
+                and str(r.get("Note")).strip()
+                else None),
+            "terms": (
+                str(r.get("Terms")).strip()
+                if "Terms" in df.columns and pd.notna(r.get("Terms"))
+                and str(r.get("Terms")).strip()
+                else None),
         }
         out_rows.append(_serialise_row(rec))
 
@@ -2530,6 +2569,25 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 and pd.notna(head_row.get("ShippingNotes"))
                 and str(head_row.get("ShippingNotes")).strip()
                 else None),
+            # v2.67.52 — full freeform-text field map.
+            "memo": (
+                str(head_row.get("Memo")).strip()
+                if "Memo" in gdf.columns
+                and pd.notna(head_row.get("Memo"))
+                and str(head_row.get("Memo")).strip()
+                else None),
+            "note": (
+                str(head_row.get("Note")).strip()
+                if "Note" in gdf.columns
+                and pd.notna(head_row.get("Note"))
+                and str(head_row.get("Note")).strip()
+                else None),
+            "terms": (
+                str(head_row.get("Terms")).strip()
+                if "Terms" in gdf.columns
+                and pd.notna(head_row.get("Terms"))
+                and str(head_row.get("Terms")).strip()
+                else None),
             "line_count": len(line_rows),
             "lines": line_rows,
         }
@@ -2542,9 +2600,15 @@ def get_purchase_order(engine_df: pd.DataFrame,
         "note": (
             "When showing the user, lead with PO number + supplier "
             "+ status, then list each line as `<qty> × <SKU> – "
-            "<Name> @ <price>`. If `comments` or `shipping_notes` "
-            "are set, surface them — they're the buyer's freight "
-            "notes."),
+            "<Name> @ <price>`. v2.67.52 — FIVE freeform text "
+            "fields are populated independently: `memo` (PO Memo "
+            "box — buyer's instructions for the whole order), "
+            "`comments` (header comments), `shipping_notes` "
+            "(vendor-purchase attribute — freight progress), "
+            "`note` (top-level note), `terms` (payment terms). "
+            "Surface EVERY non-null one — the buyer uses each "
+            "for different purposes; suppressing any of them "
+            "hides what they recorded."),
     }
 
 
@@ -2665,6 +2729,18 @@ def get_sale_order(engine_df: pd.DataFrame,
                 "uom": lr.get("UOM"),
             }))
 
+        # v2.67.52 — sale-side freeform text fields. Each is independently
+        # populated by sales reps for different purposes (build
+        # instructions in Memo, customer PO# in CustomerReference,
+        # delivery quirks in ShippingNotes, header note in Note,
+        # payment terms in Terms). Surface them all when present.
+        def _txt(col):
+            if (col not in gdf.columns
+                    or not pd.notna(head.get(col))
+                    or not str(head.get(col)).strip()):
+                return None
+            return str(head.get(col)).strip()
+
         sales_out.append(_serialise_row({
             "sale_id": sale_id,
             "order_number": head.get("OrderNumber"),
@@ -2680,6 +2756,11 @@ def get_sale_order(engine_df: pd.DataFrame,
             "sale_type": head.get("SaleType"),
             "source_channel": head.get("SourceChannel"),
             "customer": head.get("Customer"),
+            "memo": _txt("Memo"),
+            "note": _txt("Note"),
+            "shipping_notes": _txt("ShippingNotes"),
+            "terms": _txt("Terms"),
+            "customer_reference": _txt("CustomerReference"),
             "line_count": len(lines),
             "line_total": round(line_total, 2),
             "lines": lines,
@@ -2693,7 +2774,16 @@ def get_sale_order(engine_df: pd.DataFrame,
             "Show the user: order number + customer + date + status, "
             "then each line as `<qty> × <SKU> – <Name> @ <price> = "
             "$<total>`. line_total is the sum of line `Total` values "
-            "(excludes header-level shipping / tax adjustments)."),
+            "(excludes header-level shipping / tax adjustments). "
+            "v2.67.52 — FIVE freeform text fields are populated "
+            "independently: `memo` (Sale Order Memo — rep's "
+            "build/delivery instructions), `note` (top-level "
+            "header note), `shipping_notes` (top-level shipping "
+            "instructions on sales — different location from POs), "
+            "`terms` (payment terms), `customer_reference` "
+            "(customer's own PO# referencing this sale). Surface "
+            "EVERY non-null one — sales reps use each for different "
+            "purposes."),
     }
 
 

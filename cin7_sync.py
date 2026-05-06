@@ -496,6 +496,12 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
     order_date = header.get("OrderDate") or detail.get("OrderDate")
     source = header.get("SourceChannel") or detail.get("SourceChannel")
     sale_type = header.get("Type") or detail.get("Type")
+    # v2.67.52 — capture freeform sale-side text fields so the AI's
+    # get_sale_order tool can surface what the rep typed (build
+    # instructions, customer PO #, delivery requirements). Same
+    # pattern as the PO side — same value across every line of the
+    # same sale.
+    text_fields = _extract_sale_text_fields(detail, header)
 
     out: List[Dict[str, Any]] = []
 
@@ -530,6 +536,9 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Total": line.get("Total"),
                 "UOM": line.get("UOM"),
                 "AverageCost": line.get("AverageCost"),
+                # v2.67.52 — sale-side freeform text fields. Same
+                # value on every line of the same sale.
+                **text_fields,
             })
 
         # Emit a synthetic line for each AdditionalCharges entry on the
@@ -573,6 +582,7 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Total": c_total,
                 "UOM": "charge",
                 "AverageCost": 0,
+                **text_fields,
             })
 
     # If no invoice yet, fall back to order lines (what was booked) —
@@ -607,6 +617,7 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Total": line.get("Total"),
                 "UOM": line.get("UOM"),
                 "AverageCost": line.get("AverageCost"),
+                **text_fields,
             })
         # Order-level AdditionalCharges (same structure as invoice-level)
         for charge in (order.get("AdditionalCharges") or []):
@@ -638,22 +649,78 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Total": c_total,
                 "UOM": "charge",
                 "AverageCost": 0,
+                **text_fields,
             })
 
     return out
 
 
+def _extract_sale_text_fields(detail: Dict[str, Any],
+                                header: Dict[str, Any]) -> Dict[str, Any]:
+    """v2.67.52 — sale-side mirror of _extract_po_freight_signals.
+    The CIN7 /sale endpoint exposes the same family of freeform
+    fields but at slightly different paths:
+
+      - Memo              ← detail.Order.Memo  (THE 'Sale Order Memo'
+                            text box — what the sales rep types)
+      - Note              ← detail.Note  (top-level)
+      - ShippingNotes     ← detail.ShippingNotes  (TOP-LEVEL on
+                            sales, unlike POs where it's an
+                            additional attribute)
+      - Terms             ← detail.Terms
+      - CustomerReference ← detail.CustomerReference  (the
+                            customer's PO number against this sale)
+
+    These are typed by sales reps to flag custom build instructions,
+    delivery requirements, customer PO numbers, etc. The user
+    explicitly asked to surface them in the AI.
+    """
+    order_block = detail.get("Order") if isinstance(
+        detail.get("Order"), dict) else {}
+    memo = (order_block.get("Memo") or detail.get("Memo")
+            or detail.get("OrderMemo") or "")
+    note = detail.get("Note") or header.get("Note") or ""
+    shipping_notes = (detail.get("ShippingNotes")
+                      or header.get("ShippingNotes") or "")
+    terms = detail.get("Terms") or header.get("Terms") or ""
+    customer_ref = (detail.get("CustomerReference")
+                    or header.get("CustomerReference") or "")
+    return {
+        "Memo": str(memo).strip() if memo else "",
+        "Note": str(note).strip() if note else "",
+        "ShippingNotes": (str(shipping_notes).strip()
+                          if shipping_notes else ""),
+        "Terms": str(terms).strip() if terms else "",
+        "CustomerReference": (str(customer_ref).strip()
+                              if customer_ref else ""),
+    }
+
+
 def _extract_po_freight_signals(detail: Dict[str, Any],
                                   header: Dict[str, Any]
                                   ) -> Dict[str, Any]:
-    """v2.67.44 — pull two fields the buyer uses to signal shipment
-    progress on POs:
-      - Comments (top-level header field, e.g. "airfreight" /
-        "seafreight" / "ETA pushed back to Aug")
-      - Shipping notes — an additional attribute under the "Vendor
-        purchase" attribute set, where the buyer logs progress
-        details ("departed Shenzhen 2026-04-12, in customs")
-    Defensive extraction across possible CIN7 response shapes."""
+    """Pull every freeform text field on a PO that staff might type
+    into. v2.67.52 — expanded from 2 fields to 5 after the user
+    flagged 'Purchase Order Memo' as a distinct field that the buyer
+    actually uses (the existing Comments + ShippingNotes capture
+    didn't cover it).
+
+    Field map (per CIN7 /advanced-purchase response):
+      - Comments     ← detail.Comments / Comment / InternalComments
+                       (top-level — used inconsistently across accounts)
+      - ShippingNotes ← AdditionalAttributes 'shipping notes'
+                       (where the buyer logs freight progress)
+      - Memo         ← detail.Order.Memo  (THE 'Purchase Order Memo'
+                       field on the CIN7 PO form — what the buyer
+                       sees as a big text box)
+      - Note         ← detail.Note  (separate top-level note;
+                       sometimes used for status / blame
+                       e.g. 'SHIPPED IN ERROR BY TOPMET')
+      - Terms        ← detail.Terms  (payment terms, e.g. 'Net 30')
+
+    Every field is independently captured so the AI can surface them
+    individually — the buyer types DIFFERENT things into each one."""
+    # Comments — same logic as before.
     comments = (
         detail.get("Comments")
         or detail.get("Comment")
@@ -663,8 +730,10 @@ def _extract_po_freight_signals(detail: Dict[str, Any],
         or "")
     if not isinstance(comments, str):
         comments = str(comments or "")
-    # Additional attributes: CIN7 may expose them as a list of
-    # {Name, Value} dicts, OR as flat AdditionalAttributeN fields.
+
+    # ShippingNotes — CIN7 may expose AdditionalAttributes as a list
+    # of {Name, Value} dicts OR a flat dict with named keys. Probe
+    # both shapes plus the flat-field fallback.
     shipping_notes = ""
     attrs_list = (detail.get("AdditionalAttributes")
                    or detail.get("AttributeSet")
@@ -684,16 +753,38 @@ def _extract_po_freight_signals(detail: Dict[str, Any],
             if isinstance(k, str) and k.lower().strip() == "shipping notes":
                 shipping_notes = str(v or "")
                 break
-    # Flat-field fallback.
     if not shipping_notes:
         for k in ("ShippingNotes", "Shipping_Notes", "shipping_notes"):
             v = detail.get(k) or header.get(k)
             if v:
                 shipping_notes = str(v)
                 break
+
+    # v2.67.52 — Memo lives under detail.Order.Memo (nested). Defend
+    # against detail.Memo too just in case some accounts surface it
+    # at the top level.
+    memo = ""
+    order_block = detail.get("Order") if isinstance(
+        detail.get("Order"), dict) else {}
+    memo_raw = (order_block.get("Memo") or detail.get("Memo")
+                or detail.get("OrderMemo") or "")
+    if memo_raw:
+        memo = str(memo_raw)
+
+    # v2.67.52 — Note (top-level, distinct from Memo).
+    note_raw = detail.get("Note") or header.get("Note") or ""
+    note = str(note_raw) if note_raw else ""
+
+    # v2.67.52 — Terms (payment terms).
+    terms_raw = detail.get("Terms") or header.get("Terms") or ""
+    terms = str(terms_raw) if terms_raw else ""
+
     return {
         "Comments": comments.strip() if comments else "",
         "ShippingNotes": shipping_notes.strip() if shipping_notes else "",
+        "Memo": memo.strip() if memo else "",
+        "Note": note.strip() if note else "",
+        "Terms": terms.strip() if terms else "",
     }
 
 
@@ -739,6 +830,13 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
             # PO. Same value across lines from the same PO.
             "Comments": freight_signals["Comments"],
             "ShippingNotes": freight_signals["ShippingNotes"],
+            # v2.67.52 — additional freeform fields the buyer types
+            # into. Memo is the PO Memo box visible on the CIN7 PO
+            # form; Note is a separate top-level note (sometimes used
+            # for status); Terms is payment terms.
+            "Memo": freight_signals["Memo"],
+            "Note": freight_signals["Note"],
+            "Terms": freight_signals["Terms"],
         })
 
     # Received qty from stock-received blocks, if present.
@@ -770,6 +868,10 @@ def _extract_purchase_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> L
                 # captured on the original PO.
                 "Comments": freight_signals["Comments"],
                 "ShippingNotes": freight_signals["ShippingNotes"],
+                # v2.67.52 — same expansion on stock-received rows.
+                "Memo": freight_signals["Memo"],
+                "Note": freight_signals["Note"],
+                "Terms": freight_signals["Terms"],
             })
 
     return out

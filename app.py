@@ -263,15 +263,38 @@ Warehouse shelf location for each SKU, pulled from `stock_on_hand`
 and surfaced through the AI Assistant's `get_sku_details`. Answers
 "where do we keep X?".
 
-#### PO Comments + Shipping notes (v2.67.44)
-Two buyer-curated freight signals on every PO line:
+#### PO Comments + Shipping notes (v2.67.44, expanded v2.67.52)
+The AI now surfaces FIVE freeform text fields on every PO — each
+typed by the buyer for a different purpose:
 - **Comments** — top-level header free-text the buyer uses to
   record airfreight/seafreight or one-line ETA notes.
 - **Shipping notes** — attribute under the "Vendor purchase"
   attribute set, used for richer progress detail like "departed
   Shenzhen 2026-04-12, in customs".
-Both flow through `get_incoming_stock` so AI shipment-status
-answers report freight mode + progress, not just Required-By.
+- **Memo** *(v2.67.52)* — the "Purchase Order Memo" big text box
+  on the CIN7 PO form. The buyer's main instruction field for
+  the entire order.
+- **Note** *(v2.67.52)* — separate top-level note field. CIN7
+  sometimes uses this for status / blame, e.g. "shipped in error
+  by supplier — original PO-XXXX cancelled".
+- **Terms** *(v2.67.52)* — payment terms (Net 30, Payment with
+  Order, etc.).
+All five flow through `get_incoming_stock` and `get_purchase_order`
+so AI shipment-status answers report every signal the buyer
+recorded.
+
+#### Sale-side freeform fields (v2.67.52)
+Sale orders have a parallel set of freeform fields the rep types
+into. `get_sale_order` surfaces all of them:
+- **Memo** — "Sale Order Memo" big text box. Rep's
+  build/delivery instructions (e.g. "solder 5ft wire lead to
+  each 5m roll").
+- **Note** — top-level header note.
+- **ShippingNotes** — delivery instructions (top-level on sales,
+  unlike POs where it's an attribute).
+- **Terms** — payment terms.
+- **CustomerReference** — customer's own PO# referencing this
+  sale.
 
 #### Transaction lookup (v2.67.51)
 The AI Assistant can pull up specific CIN7 documents on demand.
@@ -619,18 +642,21 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.51 — Transaction lookup + PO sync fix. "
-                "Adds three AI tools (get_purchase_order, "
-                "get_sale_order, get_stock_adjustment) so staff "
-                "can ask 'what's on PO-7109' / 'what did Acme buy "
-                "on SO-12345' / 'show me ST-2034'. Also fixes the "
-                "PO-7109 visibility bug — daily sync now refreshes "
-                "purchase lines on a 30-day window (was 7d), and "
-                "the AI's purchase-lines holder uses the longest-"
-                "window merged loader so 1d top-ups patch a stale "
-                "90d base. New OnOrder data-gap hint stops false "
-                "'no PO exists' answers when the line is outside "
-                "the sync window.")
+    st.caption("🟢 v2.67.52 — Document memos + notes capture. "
+                "After v2.67.51 surfaced PO-7109 successfully, "
+                "the buyer pointed out the AI was missing the "
+                "'Purchase Order Memo' field — the main "
+                "instruction box on the CIN7 PO form. v2.67.52 "
+                "captures FIVE freeform fields per PO (Memo, "
+                "Comments, ShippingNotes, Note, Terms) and FIVE "
+                "per sale (Memo, Note, ShippingNotes, Terms, "
+                "CustomerReference). Everything the buyer or "
+                "sales rep types into a transaction now flows "
+                "into the AI's get_purchase_order / "
+                "get_sale_order / get_incoming_stock answers. "
+                "Re-sync needed to backfill older POs/sales — "
+                "newer ones will pick the fields up at the next "
+                "daily sync.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -666,6 +692,42 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.52** — Document memo / notes capture. "
+            "After v2.67.51 made PO-7109 visible, the user "
+            "noticed the AI was leaving out the 'Purchase Order "
+            "Memo' field — the main instruction text box on the "
+            "CIN7 PO form, where the buyer types the most "
+            "detailed instructions. Probed the live CIN7 API "
+            "and found the PO endpoint exposes Memo at "
+            "`detail.Order.Memo`, plus three sibling freeform "
+            "fields (`Note` top-level, `Terms` payment terms, "
+            "and the existing `Comments`/`ShippingNotes`).\n\n"
+            "Sale endpoint has the parallel set: Memo, Note, "
+            "ShippingNotes, Terms, CustomerReference (the "
+            "customer's own PO#).\n\n"
+            "Changes:\n"
+            "(1) `_extract_po_freight_signals` now pulls Memo, "
+            "Note, Terms in addition to Comments + ShippingNotes. "
+            "All five carried through into purchase_lines CSV.\n"
+            "(2) New `_extract_sale_text_fields` mirror, wired "
+            "into `_extract_sale_lines` at all four emission "
+            "points (invoice line, invoice charge, fallback "
+            "order line, fallback order charge).\n"
+            "(3) AI tools `get_incoming_stock`, "
+            "`get_purchase_order`, `get_sale_order` all return "
+            "every non-empty field per record.\n"
+            "(4) Tool descriptions and system prompt updated "
+            "with explicit 'surface every non-null one' rule "
+            "so the AI doesn't suppress fields it doesn't "
+            "recognise.\n"
+            "(5) Glossary documents the field map.\n\n"
+            "Re-sync needed to backfill older transactions. "
+            "Next daily sync will pick up the new fields for "
+            "anything in its 30-day window. For deeper history, "
+            "run a manual `cin7_sync.py purchaselines --days "
+            "180 && cin7_sync.py salelines --days 180`."
+        )
         st.caption(
             "**v2.67.51** — Transaction lookup tools + PO-7109 "
             "visibility fix. User reported the AI couldn't find "
@@ -16640,8 +16702,17 @@ elif page == "AI Assistant":
                 "      • PO numbers (`PO-XXXX` or `purchase "
                 "XXXX`) → `get_purchase_order` with "
                 "po_number=`PO-XXXX`. Returns header + every "
-                "line. If matched=0, the PO isn't in the local "
-                "sync window — tell the user and suggest CIN7 "
+                "line + FIVE freeform text fields (memo, "
+                "comments, shipping_notes, note, terms — "
+                "v2.67.52). The buyer uses each field for "
+                "DIFFERENT purposes (Memo = main instruction "
+                "box, Comments = header comments, ShippingNotes "
+                "= freight progress, Note = top-level note, "
+                "Terms = payment terms). **Surface every "
+                "non-null one in your answer** — suppressing "
+                "any of them hides what the buyer recorded. If "
+                "matched=0, the PO isn't in the local sync "
+                "window — tell the user and suggest CIN7 "
                 "lookup. NOTE: get_purchase_order INCLUDES "
                 "received/closed POs by default; "
                 "get_incoming_stock is OPEN-only.\n"
@@ -16649,7 +16720,14 @@ elif page == "AI Assistant":
                 "or 'what did <customer> buy') → "
                 "`get_sale_order` with order_number / "
                 "invoice_number / customer + date_from/date_to. "
-                "Returns header + every line + line_total.\n"
+                "Returns header + every line + line_total + "
+                "FIVE freeform text fields (memo, note, "
+                "shipping_notes, terms, customer_reference — "
+                "v2.67.52). Reps use Memo for build / delivery "
+                "instructions, CustomerReference for the "
+                "customer's own PO#, ShippingNotes for delivery "
+                "quirks. **Surface every non-null one** — same "
+                "rule as POs.\n"
                 "      • Stocktake / adjustment numbers (`ST-"
                 "XXXX`) or 'what adjustments ran' → "
                 "`get_stock_adjustment` with stocktake_number "
