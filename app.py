@@ -588,17 +588,14 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.49 — Single-source glossary. The "
-                "definitions panel from the Ordering page now "
-                "lives in one constant (`GLOSSARY_MARKDOWN`) and "
-                "is rendered on the Ordering page, on the Slow "
-                "Movers page, AND injected into the AI Assistant "
-                "system prompt — so adding a new concept like "
-                "A-class grace or 🪫 REMNANT documents itself "
-                "in every place at once. New entries cover "
-                "dormancy, A-class grace, overstock, REMNANT, "
-                "parents_only, Bin location, freight signals, "
-                "and the stock-reduction fly-wheel flags.")
+    st.caption("🟢 v2.67.50 — Hotfix: Slow Movers detail "
+                "table was raising ValueError on duplicate "
+                "Category columns. Engine_df already carries "
+                "Category from products; v2.67.47's _category → "
+                "Category rename then created a second "
+                "Category column → pyarrow couldn't serialise. "
+                "Fixed by overwriting Category in place "
+                "instead of renaming.")
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -634,6 +631,20 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.50** — Slow Movers detail-table hotfix. "
+            "v2.67.47's `_category → Category` rename created "
+            "a duplicate Category column — engine_df inherits "
+            "Category from `products`, and the rename added a "
+            "second one. pyarrow refused to serialise the "
+            "DataFrame with duplicate column names, raising "
+            "ValueError in `st.dataframe`. Fixed by overwriting "
+            "the existing Category column in place rather than "
+            "creating a parallel `_category` and renaming it. "
+            "Pie chart groupby and detail-table column list "
+            "both updated to reference the resolved Category "
+            "directly."
+        )
         st.caption(
             "**v2.67.49** — Single-source glossary. The 'How "
             "to read this page' panel was previously inline "
@@ -17328,28 +17339,39 @@ elif page == "Slow Movers":
     # missing on a row.
     st.divider()
     st.subheader("Where is the slow stock concentrated?")
+    # v2.67.50 — resolve Category in-place, overwriting any
+    # existing Category column on engine_df. Earlier code used a
+    # `_category` interim column then renamed to Category, which
+    # collided with the engine's existing Category column inherited
+    # from products and caused a duplicate-column ValueError on
+    # st.dataframe.
     if "Category" in _slow_df.columns:
         _category_series = (_slow_df["Category"]
                               .fillna("(no category)")
+                              .astype(str)
                               .replace("", "(no category)"))
     elif "AdditionalAttribute1" in _slow_df.columns:
         _category_series = (_slow_df["AdditionalAttribute1"]
                               .fillna("(no category)")
+                              .astype(str)
                               .replace("", "(no category)"))
     else:
         _category_series = pd.Series(
             ["(no category)"] * len(_slow_df), index=_slow_df.index)
-    _slow_df = _slow_df.assign(_category=_category_series)
+    _slow_df = _slow_df.copy()
+    _slow_df["Category"] = _category_series
+    # v2.67.50 — pie chart groupby uses the resolved Category
+    # column directly (was `_category` before; collided with
+    # engine's Category on rename).
     _by_cat = (_slow_df
                 .assign(_v=_to_num(_slow_df.get(
                             "OnHandValue",
                             pd.Series(dtype=float))).fillna(0))
-                .groupby("_category", dropna=False)
+                .groupby("Category", dropna=False)
                 .agg(SKU_count=("SKU", "count"),
                        Value_at_risk=("_v", "sum"))
                 .reset_index()
                 .sort_values("Value_at_risk", ascending=False))
-    _by_cat.columns = ["Category", "SKU_count", "Value_at_risk"]
     # Guard: don't render the pie if all values are zero (would
     # produce an empty wheel).
     if (_by_cat.empty
@@ -17392,11 +17414,10 @@ elif page == "Slow Movers":
         "surfaces first. Use the search box above to dismiss any "
         "individual warning.")
 
-    # v2.67.47 — surface resolved Category as a column on the
-    # detail table (was rendering only as the pie's group key).
-    # Rename _category → Category for display. Also drops the
-    # stale rename of _family which v2.67.41 removed.
-    _slow_df = _slow_df.rename(columns={"_category": "Category"})
+    # v2.67.50 — Category is already resolved on _slow_df (in-place
+    # overwrite above). The previous _category → Category rename
+    # was creating a duplicate column when engine_df already had
+    # Category from the products master.
     _detail_cols = [c for c in (
         "SKU", "Name", "Category", "ABC", "trend_flag",
         "OnHand", "OnHandValue",
