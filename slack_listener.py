@@ -135,6 +135,16 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
         if len(skus) >= 2:
             return "po_review"
 
+    # v2.67.59 — Returns channel: ANY message mentioning a SKU is a
+    # signal worth processing. The whole point of ingesting #returns
+    # is to warn the buyer if the returned SKU is on an open PO. So
+    # a 1-SKU mention is enough — staff don't ask "questions" about
+    # returns, they just log them, and the AI's job is the proactive
+    # cross-link.
+    if channel_intent == "returns":
+        if SKU_RE.search(text) or SO_RE.search(text) or INV_RE.search(text):
+            return "returns_warning"
+
     # Question detection: ends in '?' OR starts with question word.
     stripped = text.rstrip("!.")
     if stripped.endswith("?"):
@@ -158,7 +168,7 @@ def _channel_intent(channel_name: str) -> str:
     """Map channel name to its dominant intent. Used to bias the
     response composer.
 
-    Channel intent map (v2.67.57):
+    Channel intent map (v2.67.57+, v2.67.59 added returns):
       - po_review     → PO submissions + backorder discussions.
                         AI runs per-SKU commentary using engine
                         signals + open-PO checks.
@@ -166,6 +176,13 @@ def _channel_intent(channel_name: str) -> str:
                         submissions + sales-order backorder
                         review), #stock-issues-queries (general
                         stock / PO questions).
+      - returns       → customer returns. v2.67.59 — when a SKU
+                        appears here, AI proactively warns the
+                        buyer if that SKU is on an open PO so he
+                        doesn't double-order. The whole point of
+                        ingesting this channel is the
+                        return→purchase warning loop.
+                        Hits: #returns.
       - shipping      → freight / fulfilment questions. AI calls
                         get_shipping_details, get_shipping_margin
                         (post-v2.67.55c).
@@ -181,6 +198,11 @@ def _channel_intent(channel_name: str) -> str:
                         Hits: #shopify-website-improvement.
       - general       → fallback for anything else."""
     name = (channel_name or "").lower().strip("#")
+    # Returns checked first — 'returns' could otherwise hit on
+    # 'sales' if a channel was named 'sales-returns' (it isn't,
+    # but defensive ordering matters).
+    if "return" in name:
+        return "returns"
     if ("purchase" in name or "backorder" in name
             or "stock" in name or "po-" in name or "po_" in name):
         return "po_review"
@@ -393,6 +415,46 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
             "12mo demand, current OnOrder, days-of-stock, "
             "is_dormant flag. Don't recommend a quantity — that's "
             "Andrew's call."
+        )
+    elif channel_intent == "returns":
+        base += (
+            "RETURNS MODE (v2.67.59): this channel is "
+            "#returns — sales/fulfilment staff post when a "
+            "customer returns an item. The buyer (Andrew) is "
+            "in this channel. Your PRIMARY job here is the "
+            "**return→purchase warning loop**: when a SKU is "
+            "mentioned in a return, immediately check if that "
+            "SKU is on an open PO and warn the buyer so he "
+            "doesn't double-order.\n\n"
+            "Workflow when you see a SKU in #returns:\n"
+            "1. Call `get_incoming_stock` with the SKU. If "
+            "matched > 0, the buyer has an open PO for it.\n"
+            "2. Call `get_sku_details` or "
+            "`search_products_by_text` to surface engine "
+            "signals (OnHand, OnOrder, 12mo demand, "
+            "is_dormant, excess_units, trend_flag).\n"
+            "3. Post a SHORT warning thread reply, format:\n"
+            "   `⚠️ Heads-up @<buyer> — <SKU> just returned. "
+            "Currently: OnHand <X> · OnOrder <Y> from "
+            "<supplier> on <PO-ZZZZ>. With this return, "
+            "incoming stock would total <Y+returned>. 12mo "
+            "demand <Z>. Consider reducing PO or holding off.`\n"
+            "4. If the SKU is dormant or excess-flagged, make "
+            "that VERY clear — those are the highest-value "
+            "warnings (don't order more of stock that isn't "
+            "selling).\n"
+            "5. If there's NO open PO for the returned SKU, "
+            "still post a brief `📦 noted — <SKU> "
+            "returned, no open POs, OnHand now <X>` so the "
+            "fulfilment team has confirmation the return is "
+            "registered with the system. Keep it ONE LINE.\n\n"
+            "Don't pull the customer's history or comment on "
+            "WHY they returned — that's not your call. Stay "
+            "focused on the procurement-warning angle. If the "
+            "message also references a SO/INV number, you can "
+            "briefly call get_sale_order to confirm "
+            "what was on the original sale, but lead with "
+            "the procurement warning."
         )
     elif channel_intent == "shipping":
         base += (

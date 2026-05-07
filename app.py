@@ -750,16 +750,17 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.58 — Worker self-sufficiency. The Render "
-                "Background Worker that runs the Slack bot now "
-                "bootstraps its own 30-day data on first boot "
-                "(~30 min) and refreshes via in-loop NearSync "
-                "every 30 min. Decouples the worker from the web "
-                "service's disk — Render disks are exclusive per "
-                "service, so the worker has its own. While "
-                "bootstrapping, the bot replies '⏳ I'm still "
-                "loading data, ask again in a few minutes' "
-                "instead of silently failing.")
+    st.caption("🟢 v2.67.59 — #returns channel intent + "
+                "return→purchase warning loop. When a customer "
+                "returns an item, sales staff post the SKU in "
+                "#returns. The bot now proactively cross-checks "
+                "open POs for that SKU and warns the buyer "
+                "(@-mention) BEFORE he double-orders. Format: "
+                "'⚠️ <SKU> just returned. OnHand X · OnOrder Y "
+                "on PO-ZZZZ from <supplier>. 12mo demand Z. "
+                "Consider reducing PO.' Returns where the SKU "
+                "is dormant or excess-flagged get extra-loud "
+                "warnings.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -797,6 +798,34 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.59** — #returns channel intent. User pointed "
+            "out we'd discussed earlier wanting the bot to watch "
+            "#returns and warn the buyer when a returned SKU is "
+            "on an open PO (so he doesn't double-order). I'd "
+            "missed adding it in v2.67.57. Fixed by:\n\n"
+            "1. New `returns` value in the channel-intent map "
+            "(triggers on channel name containing 'return').\n"
+            "2. Classification rule: in #returns, ANY SKU mention "
+            "is enough to fire — staff don't ask 'questions' here, "
+            "they post returns; the bot's job is the proactive "
+            "cross-link, not Q&A.\n"
+            "3. Returns-mode system prompt: workflow is "
+            "(a) get_incoming_stock for the SKU, (b) "
+            "get_sku_details for engine signals, (c) post a "
+            "short warning thread reply with @-mention to the "
+            "buyer if open PO exists. Format spec'd in the "
+            "prompt — one line if no open PO, full warning "
+            "with units / supplier / 12mo demand if there is "
+            "one.\n"
+            "4. Dormant / excess-flagged SKUs get extra-loud "
+            "warnings in the response — those are the "
+            "highest-value catches (don't order more of stock "
+            "that isn't selling, especially when a customer just "
+            "returned some).\n\n"
+            "User's SLACK_AI_CHANNELS env var on the worker now "
+            "includes #returns (C08TU462G9Z) — 7 channels total."
+        )
         st.caption(
             "**v2.67.58** — Worker self-sufficiency. v2.67.57 "
             "shipped the Slack code but assumed the worker could "
