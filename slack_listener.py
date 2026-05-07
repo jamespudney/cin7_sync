@@ -432,7 +432,25 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
         "trend_flag, is_dormant, excess_units. These are facts, "
         "not opinions.\n"
         "• Round dollar amounts to whole dollars, units to whole "
-        "numbers unless context demands precision.\n\n"
+        "numbers unless context demands precision.\n"
+        # v2.67.65 — bin/location surfacing. User: 'on the "
+        # stock-issues-queries chats and any other query on "
+        # product it would be good to tell the user the bin or "
+        # location of the stock'. The data IS in engine_df (Bin "
+        # column merged from stock_on_hand) — just need the prompt "
+        # to actually surface it in answers.
+        "• **Always include Bin location for stock answers.** "
+        "When listing SKUs with their stock counts, ALSO show "
+        "the Bin location (warehouse shelf code) when known. "
+        "Format: `<SKU> · <name> · OnHand <X> · Bin <bin>`. "
+        "If Bin is unknown / null for a SKU, just omit it for "
+        "that row (don't say 'Bin: unknown'). The warehouse "
+        "team needs to know WHERE to pick from, not just "
+        "whether stock exists.\n"
+        "• When showing one SKU in detail (single-SKU lookup), "
+        "call get_sku_details and surface the full set: "
+        "OnHand, OnOrder, Available, Bin, Location, ABC, "
+        "trend_flag, is_dormant if true.\n\n"
     )
     if channel_intent == "po_review":
         base += (
@@ -651,14 +669,21 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         stock = pd.read_csv(stk_files[-1], low_memory=False)
         sale_lines = pd.read_csv(sl_files[-1], low_memory=False) if sl_files else pd.DataFrame()
 
-        # Minimal engine_df: products joined with stock OnHand. The
-        # Streamlit version has way more derived columns (ABC,
-        # trend_flag, is_dormant) but the listener can still answer
-        # most questions with this slim shape. Tools will gracefully
-        # fallback if columns are missing.
+        # Minimal engine_df: products joined with the useful stock
+        # columns. The Streamlit version has way more derived
+        # columns (ABC, trend_flag, is_dormant) but the listener
+        # can still answer most questions with this shape.
+        # v2.67.65 — also merge Bin + Location so the bot can
+        # surface bin info on stock answers (the warehouse needs
+        # to know WHERE to find the SKU, not just that it's in
+        # stock).
+        stock_cols = ["SKU"]
+        for opt in ("OnHand", "Bin", "Location",
+                      "OnOrder", "Available", "StockOnHand"):
+            if opt in stock.columns:
+                stock_cols.append(opt)
         engine_df = products.merge(
-            stock[["SKU", "OnHand"]] if "OnHand" in stock.columns else stock[["SKU"]],
-            on="SKU", how="left")
+            stock[stock_cols], on="SKU", how="left")
         if "AdditionalAttribute1" in engine_df.columns:
             engine_df["Family"] = engine_df["AdditionalAttribute1"]
 
