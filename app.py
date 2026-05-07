@@ -750,17 +750,18 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.59 — #returns channel intent + "
-                "return→purchase warning loop. When a customer "
-                "returns an item, sales staff post the SKU in "
-                "#returns. The bot now proactively cross-checks "
-                "open POs for that SKU and warns the buyer "
-                "(@-mention) BEFORE he double-orders. Format: "
-                "'⚠️ <SKU> just returned. OnHand X · OnOrder Y "
-                "on PO-ZZZZ from <supplier>. 12mo demand Z. "
-                "Consider reducing PO.' Returns where the SKU "
-                "is dormant or excess-flagged get extra-loud "
-                "warnings.")
+    st.caption("🟢 v2.67.62 — #w4s-orders intent + "
+                "DATA_DIR auto-detect. New 'orders' channel "
+                "intent for #w4s-orders covers order management "
+                "+ cancellations: when a SO/INV is mentioned, "
+                "bot posts a one-line summary; if cancellation "
+                "keywords appear, bot ALSO checks open POs for "
+                "the cancelled order's SKUs and warns the "
+                "buyer about downstream impact. Plus: "
+                "data_paths.py now auto-detects /data if it "
+                "exists + is writable, so new Render workers "
+                "don't silently write to ephemeral container "
+                "storage when DATA_DIR isn't set explicitly.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

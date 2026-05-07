@@ -145,6 +145,23 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
         if SKU_RE.search(text) or SO_RE.search(text) or INV_RE.search(text):
             return "returns_warning"
 
+    # v2.67.62 — Orders channel: any SO/INV/customer reference is
+    # actionable, especially mentions of cancellations. Like
+    # #returns, staff don't ask questions here — they discuss
+    # specific orders. Bot's job is to surface context + flag
+    # downstream PO impact when something gets cancelled.
+    if channel_intent == "orders":
+        cancel_kw = any(k in lower for k in
+                          ("cancel", "cancelled", "cancellation",
+                            "void", "refund", "abort"))
+        if SO_RE.search(text) or INV_RE.search(text):
+            return ("orders_cancel" if cancel_kw
+                     else "orders_summary")
+        if cancel_kw:
+            # Cancellation discussion without a specific number —
+            # bot can prompt for which order, or comment generically.
+            return "orders_cancel"
+
     # Question detection: ends in '?' OR starts with question word.
     stripped = text.rstrip("!.")
     if stripped.endswith("?"):
@@ -203,9 +220,18 @@ def _channel_intent(channel_name: str) -> str:
     # but defensive ordering matters).
     if "return" in name:
         return "returns"
+    # PO review checked before 'orders' so 'purchase-backorders'
+    # hits this branch (it contains 'order' as substring).
     if ("purchase" in name or "backorder" in name
             or "stock" in name or "po-" in name or "po_" in name):
         return "po_review"
+    # v2.67.62 — orders intent. Channel for order management +
+    # cancellations (#w4s-orders). Distinct from #saleschat (which
+    # is sales-staff product queries) — this one is workflow:
+    # who's cancelling what, what changed on which order, what
+    # downstream POs need adjusting.
+    if "order" in name:
+        return "orders"
     if "shipping" in name or "fulfil" in name:
         return "shipping"
     if "sales" in name:
@@ -455,6 +481,45 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
             "briefly call get_sale_order to confirm "
             "what was on the original sale, but lead with "
             "the procurement warning."
+        )
+    elif channel_intent == "orders":
+        base += (
+            "ORDERS MODE (v2.67.62): this channel is "
+            "#w4s-orders — staff discuss order status, "
+            "changes, and **cancellations**. Your job is to "
+            "surface context and flag downstream procurement "
+            "effects so the team has full visibility when "
+            "decisions are made.\n\n"
+            "When you see a SO/INV number:\n"
+            "1. Call `get_sale_order` with that number.\n"
+            "2. Post a one-line summary: `📋 SO-XXXXX · "
+            "<customer> · <date> · $<total> · <status>. "
+            "<N items: top SKUs in compact form>`.\n"
+            "3. If status is 'CANCELLED' or 'VOIDED' OR the "
+            "message text contains 'cancel' / 'cancelled' / "
+            "'cancellation' alongside the order number, ALSO "
+            "do the **downstream check**: for each line-item "
+            "SKU, call `get_incoming_stock` to see if there's "
+            "an open PO. If yes, flag it: `⚠️ <SKU> has open "
+            "PO-ZZZZ for X units from <supplier>. With this "
+            "cancellation, may want to reduce/hold.`\n"
+            "4. If the sale is Shopify-channel "
+            "(SourceChannel='Shopify'), proactively follow up "
+            "with `get_shopify_order` for conversion-attribution "
+            "context (referring_site, source_name, "
+            "discount_codes) — useful for understanding cancel "
+            "patterns.\n\n"
+            "When a customer name is mentioned without a "
+            "specific order number:\n"
+            "1. Call `get_sale_order` with customer + "
+            "date_from=<7 days ago> to surface their recent "
+            "orders.\n"
+            "2. Post a summary listing each one as a bullet.\n\n"
+            "Style: ONE bullet per key piece of info, no "
+            "preamble like 'Here's what I found'. Lead with "
+            "facts. Use the 📋 emoji to mark a fresh order "
+            "summary, ⚠️ for downstream-PO warnings, ❌ for "
+            "cancellations."
         )
     elif channel_intent == "shipping":
         base += (

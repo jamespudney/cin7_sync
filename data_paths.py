@@ -13,8 +13,13 @@ there's exactly one knob to turn.
 
 Resolution order (first match wins)
 -----------------------------------
-1. $DATA_DIR (set on Render to e.g. /data)
-2. The folder containing this file (i.e. the project root)
+1. $DATA_DIR env var (explicit override)
+2. /data if it exists and is writable (v2.67.62 — Render workers
+   with a persistent disk attached. This was previously requiring
+   manual DATA_DIR env-var on every new worker; the new worker the
+   user set up wrote 350MB of data to ephemeral container storage
+   for hours before this was caught.)
+3. The folder containing this file (project root — local dev)
 
 Both options resolve to an absolute path. OUTPUT_DIR and DB_PATH are
 derived from DATA_DIR — never construct your own. Importing this
@@ -40,13 +45,27 @@ from pathlib import Path
 
 
 def _resolve_data_dir() -> Path:
-    """Resolve DATA_DIR with safe fallback to the project folder."""
+    """Resolve DATA_DIR with safe fallback chain.
+
+    Order:
+      1. $DATA_DIR env var (explicit override)
+      2. /data if it exists AND is writable (Render workers with
+         persistent disk attached)
+      3. The folder containing this file (project root — local dev)
+
+    v2.67.62: option 2 added after a worker silently wrote 350MB to
+    ephemeral container storage for hours because DATA_DIR wasn't set.
+    Now any Render service with /data mounted automatically uses it
+    without per-service env-var configuration.
+    """
     env = os.environ.get("DATA_DIR", "").strip()
     if env:
         p = Path(env).resolve()
+    elif Path("/data").exists() and os.access("/data", os.W_OK):
+        p = Path("/data")
     else:
-        # Default: directory containing this file. Works for any CLI
-        # script invoked from anywhere AND for Streamlit.
+        # Local dev or no persistent disk: directory containing
+        # this file. Works for any CLI script AND Streamlit.
         p = Path(__file__).resolve().parent
     p.mkdir(parents=True, exist_ok=True)
     return p
