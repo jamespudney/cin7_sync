@@ -45,6 +45,11 @@ APP_DIR = Path(__file__).resolve().parent
 # OUTPUT_DIR follows the DATA_DIR env var (set to /data on Render,
 # defaults to the project folder locally). See data_paths.py.
 from data_paths import OUTPUT_DIR  # noqa: E402
+# v2.67.70 — single source of truth for engine rules. The bot
+# worker imports the SAME constant so its system prompt + the
+# dashboard's glossary expander render identical content. Edit
+# only intelligence_glossary.py; both consumers re-render.
+from intelligence_glossary import GLOSSARY_MARKDOWN  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -60,7 +65,7 @@ from data_paths import OUTPUT_DIR  # noqa: E402
 #   - AI Assistant system prompt (so the AI can explain any term)
 # Edit HERE; consumers re-render on next page load.
 # ===========================================================================
-GLOSSARY_MARKDOWN = """
+_GLOSSARY_DEPRECATED_INLINE = """
 #### ABC class
 Every SKU is ranked A / B / C on a hybrid score (60% of 12-month value
 rank + 40% of 12-month quantity rank):

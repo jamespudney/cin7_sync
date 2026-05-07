@@ -459,12 +459,63 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
     # apply the learned rules.
     lessons = _get_lessons_learned_block()
 
+    # v2.67.70 — prepend the canonical engine rule book so the
+    # bot reasons identically to the dashboard's AI Assistant.
+    # Same constant rendered in the dashboard's "How to read this
+    # page" expander. Bot can now explain WHY a SKU is dormant /
+    # A-class / excess using the exact rules the engine uses.
+    # User principle: "the slack bot must always match answers
+    # that our ai assistant would give".
+    try:
+        from intelligence_glossary import GLOSSARY_MARKDOWN
+        glossary_block = (
+            "## INTELLIGENCE MODEL CONTEXT\n\n"
+            "These are the canonical rules the dashboard's engine "
+            "uses. When you answer questions about ABC class, "
+            "is_dormant, excess_units, trend_flag, REMNANT, "
+            "A-class grace, etc., reason from THESE rules. When "
+            "asked WHY something is flagged, cite the rule. Your "
+            "answers must match the dashboard's AI Assistant — "
+            "same terminology, same logic, same surfacing patterns.\n\n"
+            f"{GLOSSARY_MARKDOWN}\n\n"
+            "---\n\n"
+        )
+    except Exception:  # noqa: BLE001
+        glossary_block = ""
+
     base = (
+        glossary_block +
         lessons +
         "You're a Slack assistant for the Wired4Signs ops team. "
         "Answer questions and offer relevant context using the "
         "tools provided. Your output goes directly into a Slack "
         "thread reply.\n\n"
+        # v2.67.70 — strongest possible parity rule. User: 'the
+        # slack bot must always match answers that our ai
+        # assistant would give'. The intelligence model is
+        # imported from intelligence_glossary.py (above); same
+        # constant powers the dashboard's glossary expander.
+        "**PARITY WITH DASHBOARD AI ASSISTANT (v2.67.70):** Your "
+        "answers must match what the dashboard's AI Assistant "
+        "would give for the same question. Same engine rules "
+        "(see INTELLIGENCE MODEL CONTEXT above), same tool "
+        "chain (search_products_by_text, get_sku_details, "
+        "get_velocity, get_dead_stock, get_purchase_order, "
+        "get_sale_order, get_shipping_details, get_shopify_order, "
+        "get_shipping_margin, get_compatible_accessories), same "
+        "terminology (ABC / is_dormant / excess_units / "
+        "trend_flag / REMNANT / A-class grace / once-slow), "
+        "same response shape (group by family, surface engine "
+        "signals, cite source IDs). The bot's slim engine on "
+        "the worker can drift slightly from the dashboard's "
+        "full engine on edge cases (bulk-master rollup, A-class "
+        "grace refinement, buyer manual corrections); when you "
+        "notice numbers that look slightly off vs what staff "
+        "expect from the dashboard, mention the drift "
+        "explicitly: '_my engine is a slim mirror of the "
+        "dashboard; for buyer-corrected dormancy or bulk-master "
+        "rollup the dashboard is canonical_'. Don't pretend to "
+        "be more authoritative than you are.\n\n"
         # v2.67.64 — proactive-tool-use principle. Added after the
         # bot kept asking users to paste data ("could you paste the "
         # "SKU list from PO-7124?") instead of trying alternative
