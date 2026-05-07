@@ -87,6 +87,13 @@ QUESTION_WORDS = {
     "can", "could", "does", "do", "did", "is", "are", "was",
     "were", "has", "have", "had", "should", "would", "will",
     "may", "might",
+    # v2.67.68 — imperative / request phrases sales staff use.
+    # Caught two real misses: 'I'm looking for a channel like
+    # slim8' and 'show me 2700K stock' — neither ended with '?'
+    # and neither started with a traditional question word.
+    "i", "i'm", "im", "looking", "need", "want", "show",
+    "find", "tell", "give", "list", "search", "check",
+    "any", "anyone", "anybody", "got", "gotta",
 }
 
 # SKU + transaction-number patterns we recognise as triggers.
@@ -95,6 +102,22 @@ SO_RE = re.compile(r"\bSO-\d+\b", re.IGNORECASE)
 PO_RE = re.compile(r"\bPO-\d+\b", re.IGNORECASE)
 INV_RE = re.compile(r"\bINV-\d+\b", re.IGNORECASE)
 TRACKING_RE = re.compile(r"\b1Z[A-Z0-9]{16}\b")  # UPS tracking format
+
+# v2.67.68 — known product family / channel names. These don't
+# match SKU_RE (no LED- prefix) but are clear product references
+# that should fire the listener. Curated from the Wired4Signs
+# catalog. Add new families here as they're released.
+FAMILY_NAME_RE = re.compile(
+    r"\b("
+    r"slim8|sierra38|sierra65|oslo|nicho|trimless|"
+    r"white\s*iris|white\s*lily|elite\s*gold|honey\s*suckle|"
+    r"cardinal\s*flower|liatris|baltic\s*ivy|sauna\s*pro|"
+    r"glow67|king\s*protea|decor|hannover|enoled|"
+    r"vario30|begtin12|topmet|"
+    r"slim10|romano|kentucky|tokyo|new\s*york|monorail"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +200,13 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
         return "trigger"
     if SKU_RE.search(text):
         return "trigger_sku"
+    # v2.67.68 — family-name detection (slim8 / sierra38 / etc.)
+    # for sales channels. A bare family-name mention WITHOUT
+    # explicit question form is still a reasonable trigger in
+    # sales / website / stock contexts.
+    if (channel_intent in ("sales", "website", "po_review")
+            and FAMILY_NAME_RE.search(text)):
+        return "trigger_family"
 
     return "chatter"
 
