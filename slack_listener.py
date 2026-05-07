@@ -499,7 +499,26 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
         "• When showing one SKU in detail (single-SKU lookup), "
         "call get_sku_details and surface the full set: "
         "OnHand, OnOrder, Available, Bin, Location, ABC, "
-        "trend_flag, is_dormant if true.\n\n"
+        "trend_flag, is_dormant if true.\n"
+        # v2.67.67 — slow-mover responses MUST include unit count
+        # AND dollar value of overstock. The whole point of slow-
+        # mover surfacing is the stock-reduction flywheel: staff
+        # need to see what's at risk in $ to decide what to push
+        # to customers / discount.
+        "• **Slow-mover / dead-stock / excess-stock answers MUST "
+        "include both unit count and dollar value.** When "
+        "responding to questions like 'what slow movers do we "
+        "have', 'what's dormant', 'what's overstocked', '...for "
+        "<colour temp / family>': for EACH flagged SKU, surface "
+        "(a) excess_units (units over the engine's target), and "
+        "(b) excess_value (dollar value of those units, "
+        "computed from OnHandValue or unit cost). Format: "
+        "`<SKU> · <name> · OnHand X · *excess Y units / "
+        "$Z*`. If excess columns are missing on a row, fall "
+        "back to OnHand × cost as the value figure but flag the "
+        "estimate (`~$Z`). End with a one-line total: 'Combined "
+        "overstock: N SKUs, M units, $Y total.' Whole-dollar "
+        "rounding.\n\n"
     )
     if channel_intent == "po_review":
         base += (
