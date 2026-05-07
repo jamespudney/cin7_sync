@@ -633,6 +633,65 @@ CREATE TABLE IF NOT EXISTS slack_channel_cursors (
     last_ts         TEXT,                 -- highest ts ingested so far
     last_pulled_at  TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ============================================================
+-- v2.67.66 — Feedback ingest + auto-improvement loop
+-- ============================================================
+-- The bot now reads its own audit trail (#ai-audit + thread replies
+-- on its posts in any monitored channel) and the team's emoji
+-- reactions on its replies. A daily summarizer (bot_self_improvement
+-- .py) digests these signals into a markdown 'lessons learned'
+-- snippet that gets prepended to every system prompt. Feedback loop
+-- closes itself overnight.
+
+CREATE TABLE IF NOT EXISTS slack_audit_feedback (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- FK to slack_bot_responses.id. NULL when feedback can't be
+    -- linked to a specific response (rare — kept defensive).
+    response_id     INTEGER,
+    -- 'reaction' (emoji on bot post),
+    -- 'thread_reply' (human posted in same thread as bot),
+    -- 'audit_thread' (human posted in #ai-audit thread on bot mirror)
+    feedback_type   TEXT NOT NULL,
+    user_id         TEXT,
+    user_name       TEXT,
+    -- For reactions: emoji shortcode (e.g. '+1', '-1', 'no_entry')
+    -- For thread replies: the message text
+    content         TEXT NOT NULL,
+    -- Polarity hint computed at ingest time:
+    --   1 = positive (👍 ✅ 💯 🎉 ❤️ 🙏 etc.)
+    --  -1 = negative (👎 🛑 ❌ ⛔ 😠 etc.)
+    --   0 = neutral (eyes, thinking, etc., or text reply)
+    is_positive     INTEGER DEFAULT 0,
+    -- Slack ts of the feedback message (for dedup on re-poll)
+    feedback_ts     TEXT,
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_slack_audit_feedback_response
+    ON slack_audit_feedback(response_id);
+CREATE INDEX IF NOT EXISTS idx_slack_audit_feedback_recent
+    ON slack_audit_feedback(captured_at);
+-- Dedup guard for re-polled feedback events.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_slack_audit_feedback_unique
+    ON slack_audit_feedback(response_id, feedback_type, user_id, content);
+
+-- Daily summary of feedback patterns. Read by slack_listener at
+-- compose time, prepended to the system prompt as 'TEAM FEEDBACK
+-- CONTEXT'.
+CREATE TABLE IF NOT EXISTS bot_lessons_learned (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary_date    DATE NOT NULL UNIQUE,    -- one row per day
+    feedback_window_days  INTEGER NOT NULL,  -- how far back the
+                                              -- summarizer looked
+    feedback_count  INTEGER NOT NULL,        -- N feedback events
+                                              -- considered
+    summary_text    TEXT NOT NULL,           -- markdown bullets
+    raw_feedback_json TEXT,                  -- the input the LLM
+                                              -- saw, for audit
+    generated_at    TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bot_lessons_recent
+    ON bot_lessons_learned(summary_date DESC);
 """
 
 

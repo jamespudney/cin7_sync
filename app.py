@@ -750,18 +750,17 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.62 — #w4s-orders intent + "
-                "DATA_DIR auto-detect. New 'orders' channel "
-                "intent for #w4s-orders covers order management "
-                "+ cancellations: when a SO/INV is mentioned, "
-                "bot posts a one-line summary; if cancellation "
-                "keywords appear, bot ALSO checks open POs for "
-                "the cancelled order's SKUs and warns the "
-                "buyer about downstream impact. Plus: "
-                "data_paths.py now auto-detects /data if it "
-                "exists + is writable, so new Render workers "
-                "don't silently write to ephemeral container "
-                "storage when DATA_DIR isn't set explicitly.")
+    st.caption("🟢 v2.67.66 — Feedback ingest + auto-improvement "
+                "loop. Bot now reads its own audit trail: "
+                "emoji reactions on its posts (👍/👎/🛑/✅), "
+                "human thread replies in bot threads, comments "
+                "in #ai-audit threads. A daily summarizer "
+                "(`bot_self_improvement.py`) digests the last "
+                "7 days of feedback into a 'lessons learned' "
+                "markdown that's auto-prepended to the system "
+                "prompt. Closes the loop overnight — staff "
+                "react/comment, bot adjusts tomorrow. No "
+                "manual prompt edits needed.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -799,6 +798,45 @@ with st.sidebar:
         # Don't break the sidebar over a status caption.
         pass
     with st.expander("Recent versions", expanded=False):
+        st.caption(
+            "**v2.67.66** — Auto-improvement loop. The bot now "
+            "reads its own audit trail: emoji reactions on its "
+            "posts (👍/👎/🛑/✅), human thread replies in any "
+            "thread the bot has posted in, and comments in "
+            "#ai-audit threads. A daily summarizer "
+            "(`bot_self_improvement.py`) digests the last 7 "
+            "days of feedback into a 'lessons learned' markdown "
+            "that's auto-prepended to the system prompt at "
+            "compose time. Closes the loop overnight — staff "
+            "react/comment, bot adjusts tomorrow.\n\n"
+            "Architecture:\n"
+            "1. `slack_sync._capture_feedback_from_message` "
+            "extracts feedback signals during the normal poll "
+            "cycle. New `slack_audit_feedback` table holds "
+            "every event (idempotent via UNIQUE index).\n"
+            "2. `slack_loop.sh` invokes "
+            "`bot_self_improvement.py daily --days 7` once per "
+            "24h. Self-healing: a worker reboot mid-day "
+            "re-fires the summarizer.\n"
+            "3. New `bot_lessons_learned` table (one row per "
+            "day) stores the markdown summary. Markdown also "
+            "written to `/data/output/bot_lessons_learned.md` "
+            "for human review.\n"
+            "4. `slack_listener._get_lessons_learned_block` "
+            "fetches the latest summary at compose time and "
+            "prepends it as 'TEAM FEEDBACK CONTEXT' to every "
+            "system prompt. 10-min in-process cache.\n\n"
+            "Polarity classifier (curated emoji lists): 👍/✅/"
+            "💯/🎉/🚀/🙏 → +1. 👎/🛑/❌/⛔/😠 → −1. Others + "
+            "thread-reply text are neutral context.\n\n"
+            "Cost: ~$0.30/day for the summarizer Anthropic "
+            "call. Negligible.\n\n"
+            "Setup: no env-var changes. Worker picks up new "
+            "tables via db.py auto-migration on connect. First "
+            "summary generates ~24h after deploy, OR run "
+            "manually with `python bot_self_improvement.py "
+            "daily` for an immediate first cut."
+        )
         st.caption(
             "**v2.67.59** — #returns channel intent. User pointed "
             "out we'd discussed earlier wanting the bot to watch "

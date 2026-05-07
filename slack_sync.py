@@ -247,6 +247,170 @@ def _configured_channels() -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# v2.67.66 — Feedback ingest helpers
+# ---------------------------------------------------------------------------
+# When ingesting messages, we ALSO capture two flavours of feedback
+# the team gives on bot replies:
+#   1. Emoji reactions ON OUR BOT'S POSTS — 👍 / 👎 / 🛑 / ✅ / etc.
+#   2. Thread replies in threads where our bot has posted (humans
+#      replying to the bot, or the bot's audit-channel mirror).
+# Both feed slack_audit_feedback. The daily summarizer
+# (bot_self_improvement.py) digests this into 'lessons learned'
+# that gets prepended to the system prompt.
+
+# Polarity classification — common Slack emoji shortcodes.
+_POSITIVE_EMOJI = {
+    "+1", "thumbsup", "white_check_mark", "heavy_check_mark",
+    "ok", "ok_hand", "100", "tada", "raised_hands", "muscle",
+    "clap", "fire", "star", "sparkles", "heart", "green_heart",
+    "blue_heart", "purple_heart", "yellow_heart", "pray",
+    "bow", "thank_you", "trophy", "medal", "gold_medal",
+    "rocket", "saluting_face",
+}
+_NEGATIVE_EMOJI = {
+    "-1", "thumbsdown", "x", "no_entry", "no_entry_sign",
+    "stop_sign", "warning", "rage", "angry", "facepalm",
+    "person_facepalming", "man_facepalming", "woman_facepalming",
+    "exclamation", "heavy_exclamation_mark", "skull",
+    "skull_and_crossbones", "poop", "negative_squared_cross_mark",
+}
+
+
+def _emoji_polarity(name: str) -> int:
+    """Return 1/-1/0 polarity for a reaction emoji shortcode."""
+    n = (name or "").strip().lower()
+    if n in _POSITIVE_EMOJI:
+        return 1
+    if n in _NEGATIVE_EMOJI:
+        return -1
+    return 0
+
+
+def _lookup_response_id_by_ts(channel_id: str,
+                                 message_ts: str) -> Optional[int]:
+    """Find the slack_bot_responses row whose response_ts matches
+    this message ts. Used to map an incoming reaction/thread-reply
+    back to the bot reply being commented on."""
+    if not message_ts:
+        return None
+    try:
+        with db.connect() as c:
+            row = c.execute(
+                "SELECT id FROM slack_bot_responses "
+                "WHERE in_channel = ? AND response_ts = ?",
+                (channel_id, message_ts)).fetchone()
+        return int(row["id"]) if row else None
+    except Exception:
+        return None
+
+
+def _lookup_response_id_by_thread(channel_id: str,
+                                     thread_ts: str
+                                     ) -> Optional[int]:
+    """Find the slack_bot_responses row whose in_thread_ts matches
+    (i.e. our bot replied in this thread). Used when a human posts
+    in the same thread as the bot — that reply is feedback on our
+    bot's contribution to the thread."""
+    if not thread_ts:
+        return None
+    try:
+        with db.connect() as c:
+            row = c.execute(
+                "SELECT id FROM slack_bot_responses "
+                "WHERE in_channel = ? AND in_thread_ts = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (channel_id, thread_ts)).fetchone()
+        return int(row["id"]) if row else None
+    except Exception:
+        return None
+
+
+def _record_feedback(response_id: int,
+                      feedback_type: str,
+                      user_id: str,
+                      user_name: str,
+                      content: str,
+                      is_positive: int,
+                      feedback_ts: str = "") -> bool:
+    """Insert a feedback row, idempotent via the UNIQUE index on
+    (response_id, feedback_type, user_id, content). Returns True
+    if a new row was inserted."""
+    if not response_id or not content:
+        return False
+    try:
+        with db.connect() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO slack_audit_feedback "
+                "(response_id, feedback_type, user_id, user_name, "
+                " content, is_positive, feedback_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (response_id, feedback_type, user_id, user_name,
+                 content[:2000], is_positive, feedback_ts))
+            return c.total_changes > 0
+    except Exception as exc:
+        log.warning("Failed to record feedback: %s", exc)
+        return False
+
+
+def _capture_feedback_from_message(session: requests.Session,
+                                       channel_id: str,
+                                       m: Dict[str, Any],
+                                       bot_self_id: str
+                                       ) -> int:
+    """Inspect one message for feedback signals and persist any
+    found. Returns count of new feedback rows inserted.
+
+    Two signal types extracted:
+      1. The message is a bot reply with `reactions` array →
+         capture each reaction as feedback against that response.
+      2. The message is a HUMAN reply in a thread where our bot
+         replied → capture the message text as thread-reply
+         feedback against the bot's response.
+    """
+    if not isinstance(m, dict):
+        return 0
+    inserted = 0
+    msg_ts = m.get("ts")
+    user_id = m.get("user") or m.get("bot_id") or ""
+    is_our_bot = (user_id == bot_self_id)
+
+    # Case 1: reactions on our bot's posts.
+    if is_our_bot and msg_ts:
+        response_id = _lookup_response_id_by_ts(channel_id, msg_ts)
+        if response_id:
+            for r in (m.get("reactions") or []):
+                if not isinstance(r, dict):
+                    continue
+                emoji = r.get("name") or ""
+                polarity = _emoji_polarity(emoji)
+                # Each user who reacted is a separate feedback event.
+                for u in (r.get("users") or []):
+                    u_name = _resolve_user(session, u)
+                    if _record_feedback(
+                            response_id, "reaction", u, u_name,
+                            emoji, polarity, msg_ts):
+                        inserted += 1
+
+    # Case 2: human reply in a thread where bot also replied.
+    thread_ts = m.get("thread_ts")
+    if (thread_ts and not is_our_bot
+            and not (m.get("bot_id") or m.get("subtype")
+                      == "bot_message")):
+        response_id = _lookup_response_id_by_thread(
+            channel_id, thread_ts)
+        if response_id:
+            text = (m.get("text") or "").strip()
+            if text and len(text) > 2:
+                u_name = _resolve_user(session, user_id)
+                if _record_feedback(
+                        response_id, "thread_reply", user_id,
+                        u_name, text, 0, msg_ts):
+                    inserted += 1
+
+    return inserted
+
+
+# ---------------------------------------------------------------------------
 # Ingest a single channel
 # ---------------------------------------------------------------------------
 
@@ -336,6 +500,17 @@ def _ingest_channel(session: requests.Session,
             except Exception as exc:  # noqa: BLE001
                 log.warning("Failed to store slack message %s/%s: %s",
                               channel_id, ts, exc)
+
+            # v2.67.66 — also capture feedback signals from this
+            # message (reactions on bot posts + thread replies in
+            # bot threads). Idempotent via unique index, so
+            # safe to call on every poll.
+            try:
+                _capture_feedback_from_message(
+                    session, channel_id, m, bot_self_id)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Feedback capture failed for "
+                              "%s/%s: %s", channel_id, ts, exc)
 
         cursor = (body.get("response_metadata") or {}).get("next_cursor")
         if not cursor:

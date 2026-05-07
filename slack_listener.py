@@ -375,13 +375,62 @@ def _compose_response(msg: Dict[str, Any],
     return (text.strip(), tools_used)
 
 
+def _get_lessons_learned_block() -> str:
+    """v2.67.66 — fetch the most recent 'lessons learned' summary
+    from bot_lessons_learned and format it for prepending to the
+    system prompt. Returns an empty string when no recent summary
+    exists (first deployment, or summarizer hasn't run yet).
+
+    Cached for 10 min per process to avoid hitting the DB on every
+    compose call. The summary changes at most once per day so this
+    is fine."""
+    import time as _time
+    cache_key = "_lessons_cache"
+    cache = globals().setdefault(cache_key, {"text": None, "loaded_at": 0})
+    if (cache["text"] is not None
+            and _time.time() - cache["loaded_at"] < 600):
+        return cache["text"]
+    try:
+        import bot_self_improvement
+        summary_row = bot_self_improvement.get_latest_summary()
+        if summary_row and summary_row.get("summary_text"):
+            cache["text"] = (
+                "## TEAM FEEDBACK CONTEXT (auto-generated daily)\n\n"
+                "These are the lessons the bot has learned from "
+                "team reactions and corrections in #ai-audit + "
+                "thread replies. Apply them to your responses. "
+                "Updated daily based on a sliding window of "
+                "feedback.\n\n"
+                + summary_row["summary_text"]
+                + f"\n\n_(summary date: "
+                  f"{summary_row.get('summary_date')}, "
+                  f"based on {summary_row.get('feedback_count')} "
+                  f"feedback events)_\n\n"
+                  "---\n\n"
+            )
+        else:
+            cache["text"] = ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Failed to load lessons-learned: %s", exc)
+        cache["text"] = ""
+    cache["loaded_at"] = _time.time()
+    return cache["text"]
+
+
 def _build_slack_system_prompt(channel_intent: str) -> str:
     """Slack-shaped system prompt. Different from the Streamlit
     one in three ways:
       1. Be MUCH shorter — Slack readers scan, don't read paragraphs.
       2. Cite source IDs (PO numbers, INV numbers, SKU codes) at end.
       3. If no data, say so — don't hallucinate."""
+    # v2.67.66 — prepend the daily lessons-learned summary if we
+    # have one. This is the auto-improvement loop: feedback →
+    # daily summary → injected into prompt → future answers
+    # apply the learned rules.
+    lessons = _get_lessons_learned_block()
+
     base = (
+        lessons +
         "You're a Slack assistant for the Wired4Signs ops team. "
         "Answer questions and offer relevant context using the "
         "tools provided. Your output goes directly into a Slack "

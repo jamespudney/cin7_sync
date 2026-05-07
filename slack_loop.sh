@@ -122,6 +122,11 @@ fi
 # Main loop
 # ----------------------------------------------------------------------
 last_data_sync_epoch=$(date -u +%s)
+# v2.67.66 — track when we last ran the lessons-learned summarizer.
+# Runs at most once per day. Initial value 0 forces a run on first
+# pass through the loop after boot (so a freshly-booted worker
+# generates a summary if one doesn't exist for today).
+last_lessons_epoch=0
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -143,6 +148,19 @@ while true; do
                 echo "[$(stamp)] shopify 1d FAILED" >> "$LOG"
         fi
         last_data_sync_epoch=$(date -u +%s)
+    fi
+
+    # v2.67.66 — daily lessons-learned summarizer.
+    # Once per ~24h, digest recent feedback into a 'lessons learned'
+    # markdown that the listener prepends to the system prompt. Self-
+    # healing: if the worker reboots, this runs again on first loop
+    # pass so the summary is always fresh.
+    seconds_since_lessons=$(( now_epoch - last_lessons_epoch ))
+    if [ "$seconds_since_lessons" -ge 86400 ]; then
+        echo "[$(stamp)] running bot_self_improvement summarizer" >> "$LOG"
+        python bot_self_improvement.py daily --days 7 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] summarizer FAILED" >> "$LOG"
+        last_lessons_epoch=$(date -u +%s)
     fi
 
     # Slack ingest → DB
