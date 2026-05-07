@@ -539,23 +539,51 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         # AI tools that need them.
         try:
             import ai_tools
+            import gc
             pl_files = sorted(_glob.glob(str(OUTPUT_DIR / "purchase_lines_last_*d_*.csv")))
             if pl_files:
                 ai_tools.set_purchase_lines(pd.read_csv(pl_files[-1], low_memory=False))
-            sh_full = OUTPUT_DIR / "shipments_full.csv"
+            # v2.67.61 — memory fix. The Render Starter worker plan
+            # has only 512 MB RAM. shipments_full.csv (43k rows) +
+            # shopify_orders_full.csv (24k rows) + everything else
+            # the listener loads = OOM kill.
+            #
+            # PREFER the windowed CSVs (shipments_last_30d_*.csv ~5MB,
+            # shopify_orders_last_30d_*.csv ~3MB). Fall back to *_full
+            # only if no windowed file exists.
+            #
+            # Trade-off: bot can't answer questions about shipments /
+            # orders older than the windowed file's coverage. Most
+            # questions are about recent stuff anyway. For older
+            # transactions the bot can suggest the user check the
+            # source system directly.
             sh_recent = sorted(_glob.glob(str(OUTPUT_DIR / "shipments_last_*d_*.csv")))
-            if sh_full.exists() and sh_recent:
-                ships = pd.concat([
-                    pd.read_csv(sh_full, low_memory=False),
-                    pd.read_csv(sh_recent[-1], low_memory=False),
-                ], ignore_index=True).drop_duplicates(subset=["ShipmentID"], keep="last")
-                ai_tools.set_shipments(ships)
-            elif sh_recent:
+            if sh_recent:
                 ai_tools.set_shipments(pd.read_csv(sh_recent[-1], low_memory=False))
-            so_full = OUTPUT_DIR / "shopify_orders_full.csv"
-            if so_full.exists():
-                ai_tools.set_shopify_orders(pd.read_csv(so_full, low_memory=False))
+            else:
+                # No windowed file → fall back to full but warn.
+                sh_full = OUTPUT_DIR / "shipments_full.csv"
+                if sh_full.exists():
+                    log.warning(
+                        "Loading shipments_full.csv (no windowed file). "
+                        "Memory pressure risk on 512MB plans.")
+                    ai_tools.set_shipments(
+                        pd.read_csv(sh_full, low_memory=False))
+            so_recent = sorted(_glob.glob(
+                str(OUTPUT_DIR / "shopify_orders_last_*d_*.csv")))
+            if so_recent:
+                ai_tools.set_shopify_orders(
+                    pd.read_csv(so_recent[-1], low_memory=False))
+            else:
+                so_full = OUTPUT_DIR / "shopify_orders_full.csv"
+                if so_full.exists():
+                    log.warning(
+                        "Loading shopify_orders_full.csv (no windowed "
+                        "file). Memory pressure risk on 512MB plans.")
+                    ai_tools.set_shopify_orders(
+                        pd.read_csv(so_full, low_memory=False))
             ai_tools.set_sale_lines_longest(sale_lines)
+            gc.collect()  # free any transient pandas allocations
         except Exception as exc:  # noqa: BLE001
             log.warning("listener data wiring partial: %s", exc)
 
