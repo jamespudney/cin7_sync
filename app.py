@@ -17805,12 +17805,70 @@ elif page == "AI Assistant":
                 "on every relevant page).\n\n"
                 + GLOSSARY_MARKDOWN
                 + "\n=== END GLOSSARY ===\n")
+
+            # v2.67.71 — pull the latest 'lessons learned' summary
+            # from bot_lessons_learned (written by the Slack bot's
+            # daily self-improvement run). User principle: "any
+            # feedback from the slack bot must be used to improve
+            # the ai assistant". This closes the loop: Slack-side
+            # 👍/👎/thread-replies → daily summarizer → BOTH the
+            # bot AND the dashboard AI assistant pick up the same
+            # learned rules. Currently only works when the lessons
+            # summary lives on the WEB SERVICE'S disk; until v2.68
+            # Postgres migration the worker writes to its own DB
+            # so this addendum is empty in production. Wiring is
+            # in place so it'll start producing value the moment
+            # the shared store lands. Reading from local files /
+            # local DB graceful-degrades when nothing exists yet.
+            _lessons_addendum = ""
+            try:
+                lessons_path = OUTPUT_DIR / "bot_lessons_learned.md"
+                lessons_text = ""
+                if lessons_path.exists():
+                    lessons_text = lessons_path.read_text(
+                        encoding="utf-8")[:4000]
+                else:
+                    # Fallback to DB lookup on the web service's
+                    # own DB. Empty until shared.
+                    try:
+                        with db.connect() as _c:
+                            _row = _c.execute(
+                                "SELECT summary_text, summary_date, "
+                                "feedback_count "
+                                "FROM bot_lessons_learned "
+                                "ORDER BY summary_date DESC LIMIT 1"
+                            ).fetchone()
+                        if _row and _row["summary_text"]:
+                            lessons_text = (
+                                f"_Generated {_row['summary_date']} "
+                                f"from {_row['feedback_count']} "
+                                f"feedback events_\n\n"
+                                + _row["summary_text"])
+                    except Exception:
+                        pass
+                if lessons_text:
+                    _lessons_addendum = (
+                        "\n\n=== TEAM FEEDBACK CONTEXT (auto-"
+                        "generated daily from Slack-bot feedback) "
+                        "===\n"
+                        "These rules were learned from the team's "
+                        "reactions / corrections on bot replies in "
+                        "Slack. Apply them here too — anything the "
+                        "team flagged in Slack as wrong / unhelpful "
+                        "is also flagged for the dashboard "
+                        "Assistant.\n\n"
+                        + lessons_text
+                        + "\n\n=== END FEEDBACK CONTEXT ===\n")
+            except Exception:
+                _lessons_addendum = ""
+
             _system_prompt = (_system_prompt
                               + (_alias_addendum or "")
                               + (_similarity_addendum or "")
                               + (_accessory_addendum or "")
                               + _corrections_addendum
-                              + _glossary_addendum)
+                              + _glossary_addendum
+                              + _lessons_addendum)
 
             _tool_calls_log: list = []
             # Charts collected from tool results during this turn.
