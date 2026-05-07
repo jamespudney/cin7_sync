@@ -138,7 +138,35 @@ Rules:
 - "channel_width" = width of the slot that holds the LED strip.
 - For mud-in / drywall profiles, set wing_count to 2 and wing_width
   to one side's wing extension.
-- Return ONLY the JSON object. No preamble."""
+- Return ONLY the JSON object. No preamble.
+
+MOUNTING TYPE CLASSIFICATION (Wired4Signs trade conventions):
+
+DEFAULT: when the cross-section is a plain U-shape, square, or
+rectangle with NO wide flanges extending beyond the body, classify
+as "surface". Most LED channels are surface mount. Small internal
+clip ribs or top-edge cover-retention lips do NOT count as flanges.
+
+Use "mud-in" ONLY when wide flanges/wings clearly extend BEYOND the
+profile body on one or both sides — the wings are designed to be
+plastered into drywall, leaving only the diffuser visible. The
+flanges are typically 8–25 mm wider than the body itself, and look
+like horizontal "ears" sticking out from the sides of the body.
+If you see ears, set wing_count and wing_width.
+
+Use "recessed" ONLY when the diagram or product context makes clear
+the profile is designed to sit FULLY FLUSH inside a routed groove
+(no part of the body visible above the mounting surface, only the
+diffuser shows). This is rare. If unsure between "surface" and
+"recessed", choose "surface".
+
+Use "corner" when the body cross-section is triangular or has
+visible 45° angled mounting faces (designed for 90° corners).
+
+Use "pendant" when there is an additional groove/channel on TOP
+of the body for a suspension cable.
+
+Use "unknown" only if the diagram is too unclear to classify."""
 
 
 log = logging.getLogger("extract_dimensions")
