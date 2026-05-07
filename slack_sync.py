@@ -267,13 +267,19 @@ def _ingest_channel(session: requests.Session,
 
     # If we've never pulled this channel and lookback_hours is set
     # (backfill mode), seed the cursor with that age.
+    # v2.67.60 — when there's NO cursor AND NO explicit lookback,
+    # default to a 1-hour window. Prevents the first-run pull from
+    # grabbing the ENTIRE channel history (the v2.67.59 boot pulled
+    # 8,000+ historical messages from 7 channels — overwhelmed the
+    # listener queue and risked spamming responses to old threads).
     oldest = None
     if last_ts:
         oldest = last_ts
     elif lookback_hours:
         oldest = str(int(time.time()) - lookback_hours * 3600) + ".000000"
-    # else: leave None → Slack returns from beginning of channel
-    # history (we cap at 200 messages for safety).
+    else:
+        # No cursor + no explicit lookback → default to 1 hour.
+        oldest = str(int(time.time()) - 3600) + ".000000"
 
     cursor = None
     new_count = 0
