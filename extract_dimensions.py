@@ -405,6 +405,28 @@ def _normalise_mounting_type(raw: Optional[str]) -> Optional[str]:
     return s
 
 
+def _title_to_mounting_type(title: Optional[str]) -> Optional[str]:
+    """Walk the synonym table against a product title. Returns the
+    canonical mounting_type if any term matches, else None.
+
+    Critically, this iterates synonyms in order — and the table
+    starts with mud-in family terms — so a title like 'Recessed
+    Drywall Channel' resolves to mud-in (drywall wins) rather than
+    recessed. This matches W4S trade convention: drywall products
+    are mud-in even if they also happen to sit flush.
+
+    Differs from _normalise_mounting_type by returning None on no
+    match (rather than the original string) — so callers can
+    distinguish 'no signal' from 'unknown mount'."""
+    if not title:
+        return None
+    s = str(title).lower()
+    for needle, canonical in _MOUNTING_SYNONYMS.items():
+        if needle in s:
+            return canonical
+    return None
+
+
 # Metafield keys (any namespace) that explicitly carry dimension /
 # classification data. If we find these we treat them as authoritative
 # and overwrite vision's values.
@@ -722,6 +744,20 @@ def _extract_one(prod: dict, anthropic_client: Any,
                 result["mounting_type"] = canonical
             break
 
+    # v2.67.78 — title-driven mounting type override.
+    # Title is the strongest signal because it's what merchandisers
+    # actually wrote. If the title contains 'drywall', 'plaster-in',
+    # 'trimless', or 'mud-in', force mud-in regardless of vision.
+    # Same for 'surface mount', 'corner', 'pendant' etc.
+    title_canonical = _title_to_mounting_type(title)
+    if title_canonical:
+        if result.get("mounting_type") != title_canonical:
+            log.info("[%s] mounting_type from TITLE: %s -> %s "
+                      "(title='%s')",
+                      handle, result.get("mounting_type"),
+                      title_canonical, title)
+            result["mounting_type"] = title_canonical
+
     # v2.67.76 — apply metafield overrides. Merchandiser-curated
     # metafields are authoritative over visual inference.
     overrides = _metafields_to_dim_overrides(metafields)
@@ -940,6 +976,52 @@ def cmd_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reclassify_from_titles(args: argparse.Namespace) -> int:
+    """v2.67.78 repair: walk product_dimensions rows, apply the
+    title-based mounting-type rule, fix any misclassifications.
+    Free — no API calls. Run after upgrading the synonym table."""
+    _setup_log(args.verbose)
+    rows = db.all_product_dimensions()
+    log.info("Loaded %d product_dimensions rows", len(rows))
+
+    fixed = 0
+    unchanged = 0
+    no_signal = 0
+    for r in rows:
+        title = r.get("title") or ""
+        current = r.get("mounting_type") or ""
+        canonical = _title_to_mounting_type(title)
+        if canonical is None:
+            no_signal += 1
+            continue
+        if canonical == current:
+            unchanged += 1
+            continue
+        if args.dry_run:
+            log.info("[%s] WOULD fix: %s -> %s  (title='%s')",
+                      r["shopify_handle"], current, canonical, title)
+            fixed += 1
+            continue
+        # Build a row dict for upsert. Preserve all existing fields,
+        # just swap mounting_type.
+        new_row = dict(r)
+        new_row["mounting_type"] = canonical
+        # Drop autoincrement id so upsert keys on shopify_handle.
+        new_row.pop("id", None)
+        db.upsert_product_dimensions(new_row)
+        log.info("[%s] fixed: %s -> %s  (title='%s')",
+                  r["shopify_handle"], current, canonical, title)
+        fixed += 1
+
+    log.info("=" * 60)
+    if args.dry_run:
+        log.info("DRY RUN — would have fixed %d rows", fixed)
+    else:
+        log.info("Fixed %d rows | %d unchanged | %d no title signal",
+                  fixed, unchanged, no_signal)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract dimensions from Shopify product images "
@@ -977,6 +1059,17 @@ def main() -> int:
     p_all.add_argument("--model", default=None)
     p_all.add_argument("--verbose", action="store_true")
     p_all.set_defaults(func=cmd_all)
+
+    # v2.67.78 — title-based reclassification (no API spend)
+    p_re = sub.add_parser(
+        "reclassify-from-titles",
+        help="Walk existing product_dimensions rows and fix "
+              "mounting_type using the title-keyword rule. Free — "
+              "no API calls. Run after synonym-table upgrades.")
+    p_re.add_argument("--dry-run", action="store_true",
+                         help="Print what WOULD change, don't write.")
+    p_re.add_argument("--verbose", action="store_true")
+    p_re.set_defaults(func=cmd_reclassify_from_titles)
 
     args = parser.parse_args()
     return args.func(args)
