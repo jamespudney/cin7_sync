@@ -767,23 +767,34 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         stock = pd.read_csv(stk_files[-1], low_memory=False)
         sale_lines = pd.read_csv(sl_files[-1], low_memory=False) if sl_files else pd.DataFrame()
 
-        # Minimal engine_df: products joined with the useful stock
-        # columns. The Streamlit version has way more derived
-        # columns (ABC, trend_flag, is_dormant) but the listener
-        # can still answer most questions with this shape.
-        # v2.67.65 — also merge Bin + Location so the bot can
-        # surface bin info on stock answers (the warehouse needs
-        # to know WHERE to find the SKU, not just that it's in
-        # stock).
-        stock_cols = ["SKU"]
-        for opt in ("OnHand", "Bin", "Location",
-                      "OnOrder", "Available", "StockOnHand"):
-            if opt in stock.columns:
-                stock_cols.append(opt)
-        engine_df = products.merge(
-            stock[stock_cols], on="SKU", how="left")
-        if "AdditionalAttribute1" in engine_df.columns:
-            engine_df["Family"] = engine_df["AdditionalAttribute1"]
+        # v2.67.69 — full engine intelligence on the worker.
+        # Earlier versions merged products+stock for a slim engine_df
+        # with no ABC, no dormancy flag, no excess columns — bot's
+        # slow-mover / overstock answers were inconsistent with the
+        # dashboard. worker_engine.compute_engine_signals now adds:
+        # ABC, effective_units_12mo, effective_units_90d, is_dormant,
+        # excess_units, excess_value, OnHandValue, trend_flag,
+        # is_non_master_tube. Faithful-but-simplified vs the web
+        # service's _abc_engine; v2.67.70 (Postgres migration) will
+        # eliminate any remaining drift.
+        try:
+            import worker_engine
+            engine_df = worker_engine.compute_engine_signals(
+                products, stock, sale_lines)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "worker_engine.compute_engine_signals failed: "
+                "%s — falling back to slim products+stock merge",
+                exc)
+            stock_cols = ["SKU"]
+            for opt in ("OnHand", "Bin", "Location",
+                          "OnOrder", "Available", "StockOnHand"):
+                if opt in stock.columns:
+                    stock_cols.append(opt)
+            engine_df = products.merge(
+                stock[stock_cols], on="SKU", how="left")
+            if "AdditionalAttribute1" in engine_df.columns:
+                engine_df["Family"] = engine_df["AdditionalAttribute1"]
 
         # Wire up purchase-line / shipment / shopify holders for the
         # AI tools that need them.
