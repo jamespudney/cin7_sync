@@ -166,7 +166,30 @@ visible 45° angled mounting faces (designed for 90° corners).
 Use "pendant" when there is an additional groove/channel on TOP
 of the body for a suspension cable.
 
-Use "unknown" only if the diagram is too unclear to classify."""
+Use "unknown" only if the diagram is too unclear to classify.
+
+USING SHOPIFY COLLECTIONS AS CLASSIFICATION HINTS:
+
+If the user-supplied product context lists Shopify collections this
+product belongs to, treat them as MERCHANDISER-CURATED ground truth
+for category questions. Examples:
+- A collection named "Mud-In Channels" or "Plaster-In Profiles" or
+  "Drywall LED Channels" → mounting_type = "mud-in" (regardless
+  of what the diagram alone might suggest).
+- "Surface Mount Channels" → mounting_type = "surface".
+- "Recessed Channels" → mounting_type = "recessed".
+- "Corner Profiles" or "45 Degree Channels" → "corner".
+- "Pendant Profiles" or "Suspended Profiles" → "pendant".
+
+When collections and diagram disagree, COLLECTIONS WIN.
+
+USING SHOPIFY METAFIELDS:
+
+Metafields are structured product data set by the merchandiser. They
+override anything inferred from the diagram. If a metafield like
+'mounting_type' or 'outer_width_mm' is present, use it as the value.
+The user-supplied prompt will list metafields explicitly with their
+namespace.key and value."""
 
 
 log = logging.getLogger("extract_dimensions")
@@ -213,6 +236,165 @@ def _fetch_product(client: ShopifyClient,
 def _fetch_all_products(client: ShopifyClient) -> List[dict]:
     """All products from Shopify (paginated)."""
     return client.paginate("products.json", "products")
+
+
+# ---------------------------------------------------------------------------
+# v2.67.76 — Collections + metafields enrichment
+# ---------------------------------------------------------------------------
+def _build_collections_index(client: ShopifyClient
+                                ) -> Dict[str, List[str]]:
+    """Pull every collection + its products to build
+    {product_id: [collection_title, ...]}.
+
+    Why this matters: collections like 'Mud-In Channels' or
+    'Surface Mount Profiles' encode mounting type far more reliably
+    than image interpretation. We pass collection memberships to
+    the vision model as context so it can prefer the merchandiser's
+    classification over its own visual inference."""
+    log.info("Building collections index...")
+    out: Dict[str, List[str]] = {}
+
+    try:
+        customs = client.paginate(
+            "custom_collections.json", "custom_collections")
+    except Exception as exc:
+        log.warning("custom_collections fetch failed: %s", exc)
+        customs = []
+    try:
+        smarts = client.paginate(
+            "smart_collections.json", "smart_collections")
+    except Exception as exc:
+        log.warning("smart_collections fetch failed: %s", exc)
+        smarts = []
+
+    log.info("  %d custom + %d smart collections",
+              len(customs), len(smarts))
+
+    for coll in customs + smarts:
+        coll_id = coll.get("id")
+        title = (coll.get("title") or "").strip()
+        if not coll_id or not title:
+            continue
+        # Each collection has its own products endpoint.
+        try:
+            prods = client.paginate(
+                f"collections/{coll_id}/products.json", "products")
+        except Exception as exc:
+            log.warning("collection %s products fetch failed: %s",
+                          title, exc)
+            continue
+        for p in prods:
+            pid = str(p.get("id") or "")
+            if not pid:
+                continue
+            out.setdefault(pid, []).append(title)
+
+    log.info("  index covers %d products", len(out))
+    return out
+
+
+def _fetch_metafields(client: ShopifyClient,
+                        product_id: Any) -> List[dict]:
+    """Fetch every metafield attached to one Shopify product.
+    Returns list of {namespace, key, value, type} dicts. Empty
+    list on any error — metafields are advisory, not required."""
+    if not product_id:
+        return []
+    try:
+        url = f"{client.base}/products/{product_id}/metafields.json"
+        r = client._get(url)
+        if r.status_code != 200:
+            return []
+        return (r.json() or {}).get("metafields", []) or []
+    except Exception as exc:
+        log.debug("metafields(%s) failed: %s", product_id, exc)
+        return []
+
+
+# Metafield keys (any namespace) that explicitly carry dimension /
+# classification data. If we find these we treat them as authoritative
+# and overwrite vision's values.
+_DIM_KEY_MAP = {
+    # Outer dimensions
+    "outer_width_mm": "outer_width_mm",
+    "outer_width": "outer_width_mm",
+    "width_mm": "outer_width_mm",
+    "outer_height_mm": "outer_height_mm",
+    "outer_height": "outer_height_mm",
+    "height_mm": "outer_height_mm",
+    # Channel
+    "channel_width_mm": "channel_width_mm",
+    "channel_width": "channel_width_mm",
+    "channel_depth_mm": "channel_depth_mm",
+    "channel_depth": "channel_depth_mm",
+    # Strip fit
+    "max_strip_width_mm": "max_strip_width_mm",
+    "max_strip_width": "max_strip_width_mm",
+    "compatible_strip_width": "max_strip_width_mm",
+    # Wings
+    "wing_width_mm": "wing_width_mm",
+    "wing_count": "wing_count",
+    # Classification
+    "mounting_type": "mounting_type",
+    "mount_type": "mounting_type",
+    "profile_shape": "profile_shape",
+}
+
+
+def _metafields_to_dim_overrides(metafields: List[dict]) -> dict:
+    """Walk metafields, return a dict of {dim_field: value} for any
+    that match our known keys. Numeric fields are coerced to float."""
+    out: dict = {}
+    for m in metafields:
+        key = (m.get("key") or "").lower().strip()
+        target = _DIM_KEY_MAP.get(key)
+        if not target:
+            continue
+        value = m.get("value")
+        if value in (None, "", "null"):
+            continue
+        # Coerce numerics where appropriate.
+        if target in ("outer_width_mm", "outer_height_mm",
+                       "channel_width_mm", "channel_depth_mm",
+                       "max_strip_width_mm", "wing_width_mm"):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+        elif target == "wing_count":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+        else:
+            value = str(value).strip().lower()
+        out[target] = value
+    return out
+
+
+def _format_collections_for_prompt(titles: List[str]) -> str:
+    if not titles:
+        return ""
+    return ", ".join(sorted(set(titles))[:12])
+
+
+def _format_metafields_for_prompt(metafields: List[dict]) -> str:
+    """Render a compact summary of metafields for the vision prompt.
+    Caps at ~20 entries to keep token usage bounded."""
+    if not metafields:
+        return ""
+    lines = []
+    for m in metafields[:20]:
+        ns = m.get("namespace") or ""
+        k = m.get("key") or ""
+        v = m.get("value")
+        if v is None:
+            continue
+        v_str = str(v)
+        if len(v_str) > 80:
+            v_str = v_str[:77] + "..."
+        lines.append(f"- {ns}.{k}: {v_str}")
+    return "\n".join(lines)
 
 
 def _is_likely_led_profile(prod: dict) -> bool:
@@ -292,7 +474,10 @@ def _build_anthropic_client():
 
 def _call_vision(client: Any, image_urls: List[str],
                    product_title: str,
-                   model: str) -> Dict[str, Any]:
+                   model: str,
+                   collections_summary: str = "",
+                   metafields_summary: str = ""
+                   ) -> Dict[str, Any]:
     """One Anthropic vision call. Returns parsed JSON dict.
     Defensive: returns {'has_diagram': False, '_error': ...} on
     any failure."""
@@ -305,14 +490,29 @@ def _call_vision(client: Any, image_urls: List[str],
             "type": "image",
             "source": {"type": "url", "url": url},
         })
+
+    context_lines = [
+        f"Product title: {product_title}",
+        f"Number of images attached: {len(image_urls)}",
+        f"Image positions: 1..{len(image_urls)} in order.",
+    ]
+    if collections_summary:
+        context_lines.append(
+            f"\nShopify collections this product belongs to "
+            f"(merchandiser-curated; PREFER these over visual "
+            f"inference for mounting_type and profile category):\n"
+            f"  {collections_summary}")
+    if metafields_summary:
+        context_lines.append(
+            f"\nShopify metafields (structured product data; "
+            f"AUTHORITATIVE — if a metafield contradicts the "
+            f"diagram, the metafield is correct):\n"
+            f"{metafields_summary}")
+    context_lines.append("\nExtract dimensions per the schema.")
+
     content_blocks.append({
         "type": "text",
-        "text": (
-            f"Product title: {product_title}\n"
-            f"Number of images attached: {len(image_urls)}\n"
-            f"Image positions: 1..{len(image_urls)} in order.\n\n"
-            f"Extract dimensions per the schema."
-        ),
+        "text": "\n".join(context_lines),
     })
 
     try:
@@ -356,12 +556,20 @@ def _call_vision(client: Any, image_urls: List[str],
 # Per-product extraction
 # ---------------------------------------------------------------------------
 def _extract_one(prod: dict, anthropic_client: Any,
-                   model: str, dry_run: bool = False
+                   model: str, dry_run: bool = False,
+                   shopify_client: Optional[ShopifyClient] = None,
+                   collections_index: Optional[Dict[str, List[str]]] = None,
                    ) -> Optional[dict]:
     """Run extraction for a single Shopify product. Returns the
-    parsed result dict (also persists to DB unless dry_run=True)."""
+    parsed result dict (also persists to DB unless dry_run=True).
+
+    v2.67.76: when shopify_client + collections_index are supplied,
+    we enrich the vision prompt with collection memberships +
+    metafields, AND apply metafield overrides on the final result
+    (metafield values are authoritative)."""
     handle = prod.get("handle") or ""
     title = prod.get("title") or handle
+    pid = prod.get("id")
     skus = _variants_skus(prod)
     family = _family_from_skus(skus)
     image_urls = _pick_image_urls(prod, MAX_IMAGES_PER_PRODUCT)
@@ -369,11 +577,47 @@ def _extract_one(prod: dict, anthropic_client: Any,
         log.info("[%s] no images — skipping", handle)
         return None
 
-    log.info("[%s] %d images, family=%s, %d variants",
-              handle, len(image_urls), family or "?", len(skus))
+    # Pull metafields + collection memberships if we have a client.
+    metafields: List[dict] = []
+    collections: List[str] = []
+    if shopify_client is not None:
+        metafields = _fetch_metafields(shopify_client, pid)
+        if collections_index is not None:
+            collections = collections_index.get(str(pid), [])
+        else:
+            # one-product path: just fetch this product's collects
+            collections = []
 
-    result = _call_vision(anthropic_client, image_urls, title, model)
+    coll_summary = _format_collections_for_prompt(collections)
+    meta_summary = _format_metafields_for_prompt(metafields)
+
+    log.info("[%s] %d images, family=%s, %d variants, "
+              "%d collections, %d metafields",
+              handle, len(image_urls), family or "?",
+              len(skus), len(collections), len(metafields))
+
+    result = _call_vision(anthropic_client, image_urls, title, model,
+                            collections_summary=coll_summary,
+                            metafields_summary=meta_summary)
     has_diagram = bool(result.get("has_diagram"))
+
+    # v2.67.76 — apply metafield overrides. Merchandiser-curated
+    # metafields are authoritative over visual inference.
+    overrides = _metafields_to_dim_overrides(metafields)
+    if overrides:
+        for k, v in overrides.items():
+            result[k] = v
+        log.info("[%s] metafield overrides applied: %s",
+                  handle, list(overrides.keys()))
+        # If metafields supplied core dims, mark has_diagram=true
+        # even if vision said no — we still have authoritative data.
+        if any(k in overrides for k in
+                  ("outer_width_mm", "outer_height_mm",
+                   "channel_width_mm")):
+            result["has_diagram"] = True
+            has_diagram = True
+            if not result.get("confidence"):
+                result["confidence"] = "high"
 
     log.info("[%s] has_diagram=%s confidence=%s",
               handle, has_diagram, result.get("confidence"))
@@ -431,6 +675,45 @@ def _extract_one(prod: dict, anthropic_client: Any,
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
+def _fetch_collections_for_one_product(client: ShopifyClient,
+                                          product_id: Any
+                                          ) -> List[str]:
+    """For single-product runs, walk collects.json to find the
+    collection IDs this product belongs to, then resolve titles.
+    Cheaper than building the full index for one lookup."""
+    if not product_id:
+        return []
+    titles: List[str] = []
+    try:
+        url = f"{client.base}/collects.json"
+        r = client._get(url, params={"product_id": product_id})
+        if r.status_code != 200:
+            return []
+        collects = (r.json() or {}).get("collects", []) or []
+    except Exception:
+        return []
+    for c in collects:
+        cid = c.get("collection_id")
+        if not cid:
+            continue
+        # Try custom_collections then smart_collections.
+        for endpoint in ("custom_collections", "smart_collections"):
+            try:
+                cu = f"{client.base}/{endpoint}/{cid}.json"
+                rc = client._get(cu)
+                if rc.status_code == 200:
+                    blob = (rc.json() or {})
+                    item = (blob.get("custom_collection")
+                              or blob.get("smart_collection") or {})
+                    t = (item.get("title") or "").strip()
+                    if t:
+                        titles.append(t)
+                    break
+            except Exception:
+                continue
+    return titles
+
+
 def cmd_one(args: argparse.Namespace) -> int:
     _setup_log(args.verbose)
     client = _make_shopify_client()
@@ -442,11 +725,18 @@ def cmd_one(args: argparse.Namespace) -> int:
     if args.dry_run:
         log.info("DRY RUN — calling Anthropic but not persisting")
 
+    # v2.67.76: build a single-product collections index.
+    pid = prod.get("id")
+    titles = _fetch_collections_for_one_product(client, pid)
+    coll_index = {str(pid): titles} if pid else {}
+
     anth_client = _build_anthropic_client()
     model = (args.model or os.environ.get(
         "ANTHROPIC_MODEL_VISION", DEFAULT_MODEL))
     result = _extract_one(prod, anth_client, model,
-                            dry_run=args.dry_run)
+                            dry_run=args.dry_run,
+                            shopify_client=client,
+                            collections_index=coll_index)
     if result is None:
         return 1
 
@@ -486,6 +776,13 @@ def cmd_all(args: argparse.Namespace) -> int:
     if args.dry_run:
         log.info("DRY RUN — calling Anthropic but not persisting")
 
+    # v2.67.76: build collections index ONCE for all products.
+    # This adds ~30s-2min depending on collection count but lets
+    # every per-product call hit a local dict instead of paginating.
+    coll_index: Dict[str, List[str]] = {}
+    if not args.skip_collections:
+        coll_index = _build_collections_index(client)
+
     anth_client = _build_anthropic_client()
     model = (args.model or os.environ.get(
         "ANTHROPIC_MODEL_VISION", DEFAULT_MODEL))
@@ -496,7 +793,9 @@ def cmd_all(args: argparse.Namespace) -> int:
     for i, prod in enumerate(work, start=1):
         try:
             res = _extract_one(prod, anth_client, model,
-                                 dry_run=args.dry_run)
+                                 dry_run=args.dry_run,
+                                 shopify_client=client,
+                                 collections_index=coll_index)
             if res is None:
                 n_errors += 1
             elif res.get("has_diagram"):
@@ -551,6 +850,9 @@ def main() -> int:
                           help="Stop after N products (0 = no limit)")
     p_all.add_argument("--dry-run", action="store_true",
                           help="Call API but don't persist to DB")
+    p_all.add_argument("--skip-collections", action="store_true",
+                          help="Skip the (slow) collections index "
+                                "build. Vision still gets metafields.")
     p_all.add_argument("--model", default=None)
     p_all.add_argument("--verbose", action="store_true")
     p_all.set_defaults(func=cmd_all)
