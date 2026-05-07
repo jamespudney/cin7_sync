@@ -168,14 +168,46 @@ of the body for a suspension cable.
 
 Use "unknown" only if the diagram is too unclear to classify.
 
+MOUNTING-TYPE SYNONYMS (Wired4Signs trade language):
+
+Treat these as ALL meaning the same mounting_type. Always emit
+the canonical value on the right.
+
+  Drywall            → "mud-in"
+  Mud-in / Mud in    → "mud-in"
+  Plaster-in         → "mud-in"
+  Plaster mount      → "mud-in"
+  Trimless           → "mud-in"
+  Recessed-flange    → "mud-in"
+  Flange-mount       → "mud-in"
+
+  Surface            → "surface"
+  Surface mount      → "surface"
+  SMD mount          → "surface"
+  Top mount          → "surface"
+
+  Recessed           → "recessed"  (only when fully flush-fit, no
+                                    flanges; rare)
+  In-groove          → "recessed"
+  Flush mount        → "recessed"
+
+  Corner             → "corner"
+  45-degree / 45 deg → "corner"
+  Angle              → "corner"
+
+  Pendant            → "pendant"
+  Suspended          → "pendant"
+  Hanging            → "pendant"
+
 USING SHOPIFY COLLECTIONS AS CLASSIFICATION HINTS:
 
 If the user-supplied product context lists Shopify collections this
 product belongs to, treat them as MERCHANDISER-CURATED ground truth
-for category questions. Examples:
+for category questions. Match using the synonym table above.
+Examples:
 - A collection named "Mud-In Channels" or "Plaster-In Profiles" or
-  "Drywall LED Channels" → mounting_type = "mud-in" (regardless
-  of what the diagram alone might suggest).
+  "Drywall LED Channels" or "Trimless Profiles" → mounting_type =
+  "mud-in" (regardless of what the diagram alone might suggest).
 - "Surface Mount Channels" → mounting_type = "surface".
 - "Recessed Channels" → mounting_type = "recessed".
 - "Corner Profiles" or "45 Degree Channels" → "corner".
@@ -188,6 +220,7 @@ USING SHOPIFY METAFIELDS:
 Metafields are structured product data set by the merchandiser. They
 override anything inferred from the diagram. If a metafield like
 'mounting_type' or 'outer_width_mm' is present, use it as the value.
+Apply the synonym table above to normalise mounting_type values.
 The user-supplied prompt will list metafields explicitly with their
 namespace.key and value."""
 
@@ -311,6 +344,67 @@ def _fetch_metafields(client: ShopifyClient,
         return []
 
 
+# Synonym table — normalise mounting_type values from metafields,
+# collections, or vision so we always store the canonical value.
+# Keys are lower-cased + space-stripped substrings to match against.
+_MOUNTING_SYNONYMS = {
+    # Mud-in family
+    "drywall": "mud-in",
+    "mud-in": "mud-in",
+    "mud in": "mud-in",
+    "mudin": "mud-in",
+    "plaster-in": "mud-in",
+    "plaster in": "mud-in",
+    "plasterin": "mud-in",
+    "plaster mount": "mud-in",
+    "trimless": "mud-in",
+    "recessed-flange": "mud-in",
+    "recessed flange": "mud-in",
+    "flange-mount": "mud-in",
+    "flange mount": "mud-in",
+    # Surface family
+    "surface": "surface",
+    "surface mount": "surface",
+    "surface-mount": "surface",
+    "smd mount": "surface",
+    "top mount": "surface",
+    # Recessed family
+    "recessed": "recessed",
+    "in-groove": "recessed",
+    "in groove": "recessed",
+    "flush mount": "recessed",
+    "flush-mount": "recessed",
+    # Corner family
+    "corner": "corner",
+    "45-degree": "corner",
+    "45 degree": "corner",
+    "45 deg": "corner",
+    "angle": "corner",
+    "angled": "corner",
+    # Pendant family
+    "pendant": "pendant",
+    "suspended": "pendant",
+    "hanging": "pendant",
+}
+
+
+def _normalise_mounting_type(raw: Optional[str]) -> Optional[str]:
+    """Look up `raw` in the synonym table. Returns the canonical
+    value, or the lowercased input if no match (so we don't lose
+    data we don't recognise). None for falsy input."""
+    if not raw:
+        return None
+    s = str(raw).lower().strip()
+    if s in _MOUNTING_SYNONYMS:
+        return _MOUNTING_SYNONYMS[s]
+    # Try substring match — collection titles like
+    # "Mud-In LED Channels for Drywall" should still resolve.
+    for needle, canonical in _MOUNTING_SYNONYMS.items():
+        if needle in s:
+            return canonical
+    return s
+
+
 # Metafield keys (any namespace) that explicitly carry dimension /
 # classification data. If we find these we treat them as authoritative
 # and overwrite vision's values.
@@ -368,6 +462,11 @@ def _metafields_to_dim_overrides(metafields: List[dict]) -> dict:
                 continue
         else:
             value = str(value).strip().lower()
+            # Normalise mounting_type via synonym table.
+            if target == "mounting_type":
+                normed = _normalise_mounting_type(value)
+                if normed:
+                    value = normed
         out[target] = value
     return out
 
@@ -600,6 +699,28 @@ def _extract_one(prod: dict, anthropic_client: Any,
                             collections_summary=coll_summary,
                             metafields_summary=meta_summary)
     has_diagram = bool(result.get("has_diagram"))
+
+    # Normalise mounting_type from vision output via synonym table.
+    if result.get("mounting_type"):
+        normed = _normalise_mounting_type(result["mounting_type"])
+        if normed and normed != result["mounting_type"]:
+            log.info("[%s] mounting_type normalised: %s -> %s",
+                      handle, result["mounting_type"], normed)
+            result["mounting_type"] = normed
+
+    # Collection-driven mounting type: if any of the product's
+    # collections match a synonym, it WINS over diagram inference.
+    for coll_title in collections:
+        canonical = _normalise_mounting_type(coll_title)
+        if canonical in ("mud-in", "surface", "recessed",
+                          "corner", "pendant"):
+            if result.get("mounting_type") != canonical:
+                log.info("[%s] mounting_type from collection '%s': "
+                          "%s -> %s",
+                          handle, coll_title,
+                          result.get("mounting_type"), canonical)
+                result["mounting_type"] = canonical
+            break
 
     # v2.67.76 — apply metafield overrides. Merchandiser-curated
     # metafields are authoritative over visual inference.
