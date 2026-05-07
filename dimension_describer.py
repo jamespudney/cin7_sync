@@ -1,4 +1,4 @@
-"""dimension_describer.py (v2.67.72)
+"""dimension_describer.py (v2.67.73)
 =========================================
 
 Generates structured 'Parameter: Value' dimension blocks for every
@@ -68,6 +68,14 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from data_paths import OUTPUT_DIR  # noqa: E402
+
+# v2.67.73 — vision-extracted cross-section dimensions (when present).
+# We try-import db so the script still runs in a non-DB environment
+# (e.g. local one-off CSV generation without SQLite).
+try:
+    import db  # noqa: E402
+except Exception:
+    db = None  # type: ignore
 
 LOG_FORMAT = "%(asctime)s  %(levelname)-8s %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -219,16 +227,60 @@ def _build_structured_block(name: str, family: str,
                                 height_mm: Optional[float],
                                 weight_g: Optional[float],
                                 needs_manual: bool,
-                                manual_reason: str
+                                manual_reason: str,
+                                vision: Optional[dict] = None,
                                 ) -> str:
-    """Render the markdown 'Parameter: Value' block."""
+    """Render the markdown 'Parameter: Value' block.
+
+    If `vision` is supplied (from product_dimensions table), the
+    cross-section fields override CIN7's W/H — diagrams are the
+    authoritative source for outer profile dimensions."""
     lines = ["**Dimensions**"]
+
+    # CIN7 length is per-variant cut length; that's still the source
+    # of truth for the SKU's length. Vision fills in cross-section.
     if length_mm is not None:
         lines.append(f"- Length: {length_mm:.0f} mm")
-    if width_mm is not None:
-        lines.append(f"- Width: {width_mm:.0f} mm")
-    if height_mm is not None:
-        lines.append(f"- Height: {height_mm:.0f} mm")
+
+    # Outer width/height: prefer vision values, fall back to CIN7.
+    v_w = vision.get("outer_width_mm") if vision else None
+    v_h = vision.get("outer_height_mm") if vision else None
+    eff_w = v_w if v_w is not None else width_mm
+    eff_h = v_h if v_h is not None else height_mm
+    if eff_w is not None:
+        suffix = " (from spec diagram)" if v_w is not None else ""
+        lines.append(f"- Outer width: {float(eff_w):.1f} mm{suffix}")
+    if eff_h is not None:
+        suffix = " (from spec diagram)" if v_h is not None else ""
+        lines.append(f"- Outer height: {float(eff_h):.1f} mm{suffix}")
+
+    if vision:
+        cw = vision.get("channel_width_mm")
+        cd = vision.get("channel_depth_mm")
+        if cw is not None:
+            lines.append(f"- LED-strip channel width: {float(cw):.1f} mm")
+        if cd is not None:
+            lines.append(f"- LED-strip channel depth: {float(cd):.1f} mm")
+        msw = vision.get("max_strip_width_mm")
+        if msw is not None:
+            lines.append(f"- Max LED-strip width that fits: "
+                          f"{float(msw):.1f} mm")
+        ww = vision.get("wing_width_mm")
+        wc = vision.get("wing_count")
+        if ww is not None and wc:
+            lines.append(f"- Wings/flanges: {wc} × {float(ww):.1f} mm "
+                          f"(each side)")
+        mt = vision.get("mounting_type")
+        if mt and mt != "unknown":
+            lines.append(f"- Mounting type: {mt}")
+        ps = vision.get("profile_shape")
+        if ps and ps != "unknown":
+            lines.append(f"- Profile shape: {ps}")
+        clip = vision.get("has_clip_lips")
+        if clip is not None:
+            lines.append(f"- Cover-grip clip lips: "
+                          f"{'yes' if clip else 'no'}")
+
     if weight_g is not None:
         # Render as kg if > 1000 g.
         if weight_g >= 1000:
@@ -237,10 +289,44 @@ def _build_structured_block(name: str, family: str,
             lines.append(f"- Weight: {weight_g:.0f} g")
     if family and family.strip() and family.lower() != "nan":
         lines.append(f"- Family: {family}")
-    if needs_manual:
+
+    if vision and vision.get("extra_notes"):
+        lines.append(f"- Notes: {vision['extra_notes']}")
+
+    if needs_manual and not vision:
+        # If we have vision data, the auto block is usually
+        # sufficient — only flag manual review when both CIN7 and
+        # vision data are missing the shape-specific signals.
         lines.append("")
         lines.append(f"**[TODO]** {manual_reason}")
     return "\n".join(lines)
+
+
+def _load_vision_by_family() -> dict:
+    """Build {family_upper: vision_dict} from product_dimensions
+    table. Returns empty dict if table unavailable / empty."""
+    if db is None:
+        return {}
+    try:
+        rows = db.all_product_dimensions()
+    except Exception as exc:
+        log.warning("Could not read product_dimensions: %s", exc)
+        return {}
+    out: dict = {}
+    for r in rows:
+        if not r.get("has_diagram"):
+            continue
+        fam = (r.get("family") or "").upper().strip()
+        if not fam:
+            continue
+        # If multiple Shopify products share a family, prefer the
+        # highest-confidence one. (Cheaper than ranking; just keep
+        # first-seen unless we hit a 'high' later.)
+        existing = out.get(fam)
+        if existing and existing.get("confidence") == "high":
+            continue
+        out[fam] = r
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +397,15 @@ def main(argv=None) -> int:
     out_path = (Path(args.output) if args.output
                   else OUTPUT_DIR / "dimension_descriptions.csv")
 
+    # v2.67.73 — load vision-extracted cross-sections (if any).
+    vision_by_family = _load_vision_by_family()
+    log.info("Vision-extracted cross-sections available for %d families",
+              len(vision_by_family))
+
     rows_written = 0
     needs_review = 0
     auto_only = 0
+    vision_enriched = 0
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -351,9 +443,12 @@ def main(argv=None) -> int:
 
             needs_manual, reason = _classify_elaboration(
                 sku, family, name)
+            vision = vision_by_family.get(family.upper().strip())
+            if vision:
+                vision_enriched += 1
             block = _build_structured_block(
                 name, family, l_mm, w_mm, h_mm, wg_g,
-                needs_manual, reason)
+                needs_manual, reason, vision=vision)
 
             writer.writerow([
                 sku, name, family, ptype,
@@ -380,6 +475,9 @@ def main(argv=None) -> int:
     log.info("  auto-block sufficient: %d (%.1f%%)",
               auto_only,
               100.0 * auto_only / max(1, rows_written))
+    log.info("  enriched with vision cross-section: %d (%.1f%%)",
+              vision_enriched,
+              100.0 * vision_enriched / max(1, rows_written))
     return 0
 
 

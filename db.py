@@ -692,6 +692,54 @@ CREATE TABLE IF NOT EXISTS bot_lessons_learned (
 );
 CREATE INDEX IF NOT EXISTS idx_bot_lessons_recent
     ON bot_lessons_learned(summary_date DESC);
+
+-- v2.67.73 — vision-extracted dimensional data per Shopify product.
+-- Most LED profiles have their cross-section dimensions baked into
+-- spec-diagram PNGs in Shopify (see Slim8 example: 12.2mm × 7mm with
+-- 8mm channel). CIN7's Length/Width/Height fields are largely empty.
+-- extract_dimensions.py uses Claude vision to read those diagrams
+-- once, caches the result here, and the AI Assistant + dimension
+-- describer + Slack bot all read from this table.
+CREATE TABLE IF NOT EXISTS product_dimensions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Identity (one row per Shopify product; SKUs join via handle).
+    shopify_product_id  TEXT,
+    shopify_handle  TEXT NOT NULL,
+    family          TEXT,
+    title           TEXT,
+    -- Source diagram.
+    source_image_url TEXT,
+    source_image_position INTEGER,
+    -- Cross-section dimensions (mm). Channel = LED-strip recess.
+    outer_width_mm   REAL,
+    outer_height_mm  REAL,
+    channel_width_mm REAL,
+    channel_depth_mm REAL,
+    -- Wing geometry for mud-in / recessed profiles.
+    wing_width_mm    REAL,
+    wing_count       INTEGER,
+    -- Mounting + strip-fit semantics.
+    mounting_type    TEXT,   -- 'surface'|'recessed'|'mud-in'|
+                              -- 'corner'|'pendant'|'unknown'
+    profile_shape    TEXT,   -- 'U'|'square'|'angled'|'round'|'oval'|
+                              -- 'wing'|'unknown'
+    has_clip_lips    INTEGER, -- 0/1 — whether top edges grip a cover
+    max_strip_width_mm REAL,
+    extra_notes      TEXT,
+    -- Extraction metadata.
+    raw_response     TEXT,    -- full JSON from Claude vision
+    confidence       TEXT,    -- 'high'|'medium'|'low' (model self-rating)
+    has_diagram      INTEGER NOT NULL DEFAULT 0,
+                              -- 0 if no spec diagram detected (so
+                              -- we don't keep retrying empty products)
+    model_used       TEXT,
+    extracted_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(shopify_handle)
+);
+CREATE INDEX IF NOT EXISTS idx_product_dimensions_handle
+    ON product_dimensions(shopify_handle);
+CREATE INDEX IF NOT EXISTS idx_product_dimensions_family
+    ON product_dimensions(family);
 """
 
 
@@ -1073,6 +1121,67 @@ def latest_note_per_sku() -> dict:
             """
         ).fetchall()
     return {r["sku"]: (r["body"] or "") for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Vision-extracted product dimensions (v2.67.73)
+# ---------------------------------------------------------------------------
+
+def upsert_product_dimensions(row: dict) -> int:
+    """Insert or replace one product_dimensions row keyed on
+    shopify_handle. Returns the row id."""
+    cols = (
+        "shopify_product_id", "shopify_handle", "family", "title",
+        "source_image_url", "source_image_position",
+        "outer_width_mm", "outer_height_mm",
+        "channel_width_mm", "channel_depth_mm",
+        "wing_width_mm", "wing_count",
+        "mounting_type", "profile_shape", "has_clip_lips",
+        "max_strip_width_mm", "extra_notes",
+        "raw_response", "confidence", "has_diagram",
+        "model_used", "extracted_at",
+    )
+    values = [row.get(c) for c in cols]
+    placeholders = ",".join("?" for _ in cols)
+    col_list = ",".join(cols)
+    sql = (
+        f"INSERT INTO product_dimensions ({col_list}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(shopify_handle) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in cols)
+    )
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def get_product_dimensions(shopify_handle: str) -> Optional[dict]:
+    """Return the product_dimensions row for a Shopify handle, or
+    None if no extraction has run yet."""
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM product_dimensions WHERE shopify_handle = ?",
+            (shopify_handle,)
+        ).fetchone()
+    return dict(r) if r else None
+
+
+def all_product_dimensions() -> list:
+    """Return every product_dimensions row as list of dicts. Used by
+    dimension_describer.py to enrich the per-SKU CSV."""
+    with connect() as c:
+        rows = c.execute("SELECT * FROM product_dimensions").fetchall()
+    return [dict(r) for r in rows]
+
+
+def product_dimensions_handles() -> set:
+    """Return set of Shopify handles already extracted (for skip-
+    if-cached logic in extract_dimensions.py)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT shopify_handle FROM product_dimensions"
+        ).fetchall()
+    return {r["shopify_handle"] for r in rows}
 
 
 # ---------------------------------------------------------------------------
