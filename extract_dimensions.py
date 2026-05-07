@@ -201,6 +201,19 @@ def _is_likely_led_profile(prod: dict) -> bool:
     return any(k in blob for k in keywords)
 
 
+def _matches_filter(prod: dict, needle: str) -> bool:
+    """Case-insensitive substring match against title / product_type
+    / tags / handle. Used by --match to prioritise specific
+    categories like 'channel'."""
+    if not needle:
+        return True
+    n = needle.lower()
+    return (n in (prod.get("title") or "").lower()
+              or n in (prod.get("product_type") or "").lower()
+              or n in (prod.get("tags") or "").lower()
+              or n in (prod.get("handle") or "").lower())
+
+
 def _pick_image_urls(prod: dict, cap: int) -> List[str]:
     """Sort product images by position and return up to `cap` URLs.
     The diagram is usually at position 2 or 3 — early images are
@@ -424,6 +437,12 @@ def cmd_all(args: argparse.Namespace) -> int:
         products = [p for p in products if _is_likely_led_profile(p)]
         log.info("Filtered to %d LED-profile-like products", len(products))
 
+    if args.match:
+        products = [p for p in products
+                      if _matches_filter(p, args.match)]
+        log.info("Filtered by --match='%s': %d remain",
+                  args.match, len(products))
+
     already_done = set()
     if not args.force:
         already_done = db.product_dimensions_handles()
@@ -495,6 +514,11 @@ def main() -> int:
                           help="Re-extract products already cached")
     p_all.add_argument("--include-non-led", action="store_true",
                           help="Include non-LED-profile products too")
+    p_all.add_argument(
+        "--match", default=None,
+        help="Only process products whose title/product_type/tags/"
+              "handle contains this substring (case-insensitive). "
+              "E.g. --match channel  for LED channels first.")
     p_all.add_argument("--limit", type=int, default=0,
                           help="Stop after N products (0 = no limit)")
     p_all.add_argument("--dry-run", action="store_true",
