@@ -756,16 +756,14 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.102 — six campaign-level AI tools added so the "
-        "Slack bot AND dashboard AI Assistant can answer "
-        "Moby-style questions: get_ad_overview, "
-        "get_campaign_performance, find_campaigns_to_cut, "
-        "find_campaigns_to_scale, attribution_sanity_check, "
-        "compare_ad_periods. Both surfaces share TOOL_HANDLERS "
-        "via ai_tools.py — adding tools there lights them up "
-        "everywhere. Phase 1+2 Moby replacement now FUNCTIONALLY "
-        "complete: data flowing nightly + queryable via "
-        "conversational tools on dashboard + Slack.")
+        "🟢 v2.67.103 — proper multi-year backfill for Google "
+        "Ads + GA4. v2.67.97's `full` subcommand only did one "
+        "365-day chunk before breaking. New sync_backfill() "
+        "walks backwards through time in 365-day chunks "
+        "(Google Ads) / 90-day chunks (GA4) so we can pull 3+ "
+        "years of history. Run `python google_ads_sync.py full "
+        "--days 1095` for 3 years; same for ga4_sync.py "
+        "backfill. Ad-Umpire dashboard page coming next.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

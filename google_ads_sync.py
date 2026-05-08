@@ -230,13 +230,16 @@ def _parse_campaign_daily_row(r: dict) -> dict:
     }
 
 
-def sync_recent(client: GoogleAdsClient, days: int) -> dict:
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days)
+def sync_range(client: GoogleAdsClient,
+                  start_date,
+                  end_date) -> dict:
+    """Pull campaign daily metrics for an explicit date range.
+    Both args are date objects. The Google Ads API caps date
+    ranges at 365 days per query — caller chunks if needed."""
     gaql = _CAMPAIGN_DAILY_GAQL.format(
-        start=start.isoformat(), end=end.isoformat())
+        start=start_date.isoformat(), end=end_date.isoformat())
     log.info("Pulling campaign daily metrics %s -> %s",
-              start.isoformat(), end.isoformat())
+              start_date.isoformat(), end_date.isoformat())
     results = client.search_stream(gaql)
     log.info("Got %d row(s) from Google Ads API", len(results))
 
@@ -255,7 +258,48 @@ def sync_recent(client: GoogleAdsClient, days: int) -> dict:
             n_skipped += 1
 
     return {"written": n_written, "skipped": n_skipped,
-              "from": start.isoformat(), "to": end.isoformat()}
+              "from": start_date.isoformat(),
+              "to": end_date.isoformat()}
+
+
+def sync_recent(client: GoogleAdsClient, days: int) -> dict:
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    return sync_range(client, start, end)
+
+
+def sync_backfill(client: GoogleAdsClient, days: int,
+                     chunk_days: int = 365) -> dict:
+    """Walk backwards through time in chunk_days windows. Lets us
+    backfill multi-year history despite Google Ads API's 365-day
+    per-query limit. v2.67.103."""
+    today = datetime.now(timezone.utc).date()
+    days_remaining = days
+    cursor_end = today
+    total_written = 0
+    total_skipped = 0
+    chunk_no = 0
+
+    while days_remaining > 0:
+        chunk_no += 1
+        size = min(days_remaining, chunk_days)
+        chunk_start = cursor_end - timedelta(days=size)
+        log.info("=== chunk %d (%s -> %s, %d days) ===",
+                  chunk_no, chunk_start.isoformat(),
+                  cursor_end.isoformat(), size)
+        result = sync_range(client, chunk_start, cursor_end)
+        total_written += result["written"]
+        total_skipped += result["skipped"]
+        cursor_end = chunk_start - timedelta(days=1)
+        days_remaining -= size
+
+    return {
+        "total_written": total_written,
+        "total_skipped": total_skipped,
+        "chunks": chunk_no,
+        "earliest": cursor_end.isoformat(),
+        "latest": today.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -322,26 +366,31 @@ def cmd_recent(args: argparse.Namespace) -> int:
 
 
 def cmd_full(args: argparse.Namespace) -> int:
+    """Backfill N days of history, chunking in 365-day windows
+    backwards through time. v2.67.103 — fixed multi-year
+    backfill (was previously a single chunk + break)."""
     _setup_log(args.verbose)
     client = _make_client()
-    # Google Ads API max date range per query is 365 days; loop in chunks.
-    days_remaining = args.days
-    total_written = 0
-    total_skipped = 0
-    while days_remaining > 0:
-        chunk = min(days_remaining, 365)
-        result = sync_recent(client, chunk)
-        total_written += result["written"]
-        total_skipped += result["skipped"]
-        days_remaining -= chunk
-        # If we're walking back further, we'd need to adjust the
-        # start/end dates. For now, --days N pulls last N days.
-        # Multi-year backfill needs a richer date-range loop —
-        # leaving as a TODO.
-        break
+    result = sync_backfill(client, args.days, chunk_days=365)
+    log.info("=" * 60)
+    log.info("BACKFILL DONE: %d written | %d skipped | %d chunks "
+              "| range %s -> %s",
+              result["total_written"], result["total_skipped"],
+              result["chunks"], result["earliest"], result["latest"])
+    return 0
 
-    log.info("DONE: total written=%d skipped=%d",
-              total_written, total_skipped)
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Alias for cmd_full with explicit chunk control."""
+    _setup_log(args.verbose)
+    client = _make_client()
+    result = sync_backfill(client, args.days,
+                              chunk_days=args.chunk_days)
+    log.info("=" * 60)
+    log.info("BACKFILL DONE: %d written | %d skipped | %d chunks "
+              "| range %s -> %s",
+              result["total_written"], result["total_skipped"],
+              result["chunks"], result["earliest"], result["latest"])
     return 0
 
 
@@ -358,10 +407,21 @@ def main() -> int:
     p_r.set_defaults(func=cmd_recent)
 
     p_f = sub.add_parser("full",
-                            help="Backfill (max 365 days per chunk)")
-    p_f.add_argument("--days", type=int, default=365)
+                            help="Backfill N days, chunked in "
+                                  "365-day windows")
+    p_f.add_argument("--days", type=int, default=1095,
+                       help="Days to backfill (default 1095 = 3 years)")
     p_f.add_argument("--verbose", action="store_true")
     p_f.set_defaults(func=cmd_full)
+
+    p_b = sub.add_parser("backfill",
+                            help="Same as full, with chunk-size knob")
+    p_b.add_argument("--days", type=int, default=1095,
+                       help="Days to backfill (default 1095 = 3 years)")
+    p_b.add_argument("--chunk-days", type=int, default=365,
+                       help="Days per API call (max 365)")
+    p_b.add_argument("--verbose", action="store_true")
+    p_b.set_defaults(func=cmd_backfill)
 
     args = parser.parse_args()
     return args.func(args)

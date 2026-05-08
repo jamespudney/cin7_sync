@@ -180,11 +180,14 @@ def _ga4_rows(payload: dict) -> List[dict]:
     return out
 
 
-def sync_campaign_totals(client: GA4Client, days: int) -> dict:
-    """Per-campaign daily totals: conversions + revenue from GA4
-    events, attributed to googleAds source."""
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days)
+def sync_campaign_totals_range(client: GA4Client,
+                                    start_date,
+                                    end_date) -> dict:
+    """v2.67.103 — per-campaign totals for explicit date range.
+    Used for both daily refresh (sync_campaign_totals wraps this)
+    and multi-year backfill (sync_backfill chunks)."""
+    start = start_date
+    end = end_date
     body = {
         "dateRanges": [{
             "startDate": start.isoformat(),
@@ -275,10 +278,17 @@ def sync_campaign_totals(client: GA4Client, days: int) -> dict:
               "from": start.isoformat(), "to": end.isoformat()}
 
 
-def sync_per_sku(client: GA4Client, days: int) -> dict:
-    """Per-product daily ecommerce metrics by campaign. Uses GA4's
-    item-scoped dimensions (itemId is the Shopify variant id /
-    SKU).
+def sync_campaign_totals(client: GA4Client, days: int) -> dict:
+    """Daily-refresh wrapper: last N days through to today."""
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    return sync_campaign_totals_range(client, start, end)
+
+
+def sync_per_sku_range(client: GA4Client,
+                          start_date,
+                          end_date) -> dict:
+    """v2.67.103 — per-SKU report for explicit date range.
 
     v2.67.100 — split into two reports because GA4 doesn't allow
     combining event-scoped metrics (itemViewEvents, addToCarts)
@@ -286,8 +296,8 @@ def sync_per_sku(client: GA4Client, days: int) -> dict:
     purchase quantity + revenue (item-scoped, OK with itemId).
     Report B pulls campaign-level view + add-to-cart counts
     (event-scoped, no itemId)."""
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days)
+    start = start_date
+    end = end_date
 
     # --- Report A: per-SKU purchases + revenue ---
     body_a = {
@@ -383,6 +393,54 @@ def sync_per_sku(client: GA4Client, days: int) -> dict:
               "from": start.isoformat(), "to": end.isoformat()}
 
 
+def sync_per_sku(client: GA4Client, days: int) -> dict:
+    """Daily-refresh wrapper: last N days through to today."""
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    return sync_per_sku_range(client, start, end)
+
+
+def sync_backfill(client: GA4Client, days: int,
+                     chunk_days: int = 90) -> dict:
+    """v2.67.103 — multi-year backfill via 90-day chunks.
+
+    GA4 Data API doesn't enforce a hard date-range cap but rows
+    cap at limit:100000 per call. 90 days keeps us well under that
+    even on high-volume properties. Walks backwards through time."""
+    today = datetime.now(timezone.utc).date()
+    days_remaining = days
+    cursor_end = today
+    chunk_no = 0
+    totals = {"campaign_written": 0, "campaign_skipped": 0,
+              "sku_written": 0, "sku_skipped": 0,
+              "chunks": 0}
+
+    while days_remaining > 0:
+        chunk_no += 1
+        size = min(days_remaining, chunk_days)
+        chunk_start = cursor_end - timedelta(days=size)
+        log.info("=== chunk %d (%s -> %s, %d days) ===",
+                  chunk_no, chunk_start.isoformat(),
+                  cursor_end.isoformat(), size)
+
+        ct = sync_campaign_totals_range(
+            client, chunk_start, cursor_end)
+        totals["campaign_written"] += ct["written"]
+        totals["campaign_skipped"] += ct["skipped"]
+
+        ps = sync_per_sku_range(client, chunk_start, cursor_end)
+        totals["sku_written"] += ps["written"]
+        totals["sku_skipped"] += ps["skipped"]
+
+        cursor_end = chunk_start - timedelta(days=1)
+        days_remaining -= size
+        totals["chunks"] = chunk_no
+
+    totals["earliest"] = cursor_end.isoformat()
+    totals["latest"] = today.isoformat()
+    return totals
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -460,6 +518,24 @@ def cmd_per_sku(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """v2.67.103 — multi-year backfill chunked through time."""
+    _setup_log(args.verbose)
+    client = _make_client()
+    result = sync_backfill(client, args.days,
+                              chunk_days=args.chunk_days)
+    log.info("=" * 60)
+    log.info("BACKFILL DONE: campaign(%d/%d) per_sku(%d/%d) "
+              "| %d chunks | %s -> %s",
+              result["campaign_written"],
+              result["campaign_skipped"],
+              result["sku_written"],
+              result["sku_skipped"],
+              result["chunks"],
+              result["earliest"], result["latest"])
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Sync GA4 ecommerce events into local DB")
@@ -482,6 +558,15 @@ def main() -> int:
     p_s.add_argument("--days", type=int, default=7)
     p_s.add_argument("--verbose", action="store_true")
     p_s.set_defaults(func=cmd_per_sku)
+
+    p_b = sub.add_parser("backfill",
+                            help="Multi-year backfill, chunked")
+    p_b.add_argument("--days", type=int, default=1095,
+                       help="Days to backfill (default 1095 = 3 years)")
+    p_b.add_argument("--chunk-days", type=int, default=90,
+                       help="Days per chunk (default 90)")
+    p_b.add_argument("--verbose", action="store_true")
+    p_b.set_defaults(func=cmd_backfill)
 
     args = parser.parse_args()
     return args.func(args)
