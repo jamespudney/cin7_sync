@@ -756,16 +756,17 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.89 — Monthly Metrics shipping cost ROOT CAUSE "
-        "FOUND. `_ship_cost_per_month` was keyed by 'YYYY-MM' "
-        "strings (via .strftime), but `_per_month` looked up using "
-        "pd.Period objects from `months`. Period vs string mismatch "
-        "→ every lookup returned the default 0 → every month showed "
-        "$0 despite the DataFrame having real data. Bug had been "
-        "present since v2.67.55c but unmasked only when the 5-year "
-        "backfill landed and shipments was no longer empty. One-line "
-        "fix: str(period) before lookup. Real shipping cost numbers "
-        "now render across all 14 months.")
+        "🟢 v2.67.96 — Moby replacement infrastructure landed: "
+        "Klaviyo + Reviews.io + SEMrush sync scripts, 4 new AI "
+        "tools (get_email_attribution, get_seo_signals, "
+        "get_product_reviews, get_marketing_intelligence), "
+        "marketing schema in DB, syncs wired into worker's "
+        "daily/weekly cycles, housekeeping audit covers the new "
+        "tables. Google Ads + GA4 syncs queued for next session "
+        "once OAuth is provisioned. Independent of these: "
+        "v2.67.89 fixed the Monthly Metrics shipping cost row "
+        "(Period vs string key mismatch) so 14 months of "
+        "ShipStation data now render correctly.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

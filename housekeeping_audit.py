@@ -179,6 +179,42 @@ DB_FEEDS: List[DBTableSpec] = [
         consumed_by="Slack listener bot",
         min_rows=1,
         services=("worker",)),
+    # v2.67.96 — marketing intelligence feeds.
+    DBTableSpec(
+        "Klaviyo email campaigns",
+        table="email_campaigns",
+        timestamp_col="captured_at",
+        # Daily refresh; warn after 30h slack
+        max_hours=30.0,
+        consumed_by="AI bot get_email_attribution",
+        min_rows=1,
+        services=("worker",)),
+    DBTableSpec(
+        "Klaviyo per-SKU click attribution",
+        table="email_campaign_skus",
+        timestamp_col="captured_at",
+        max_hours=30.0,
+        consumed_by="AI bot get_email_attribution",
+        min_rows=1,
+        services=("worker",)),
+    DBTableSpec(
+        "Reviews.io product reviews",
+        table="product_reviews",
+        timestamp_col="captured_at",
+        # Daily refresh
+        max_hours=30.0,
+        consumed_by="AI bot get_product_reviews",
+        min_rows=1,
+        services=("worker",)),
+    DBTableSpec(
+        "SEMrush keyword positions",
+        table="seo_keyword_positions",
+        timestamp_col="captured_at",
+        # Weekly refresh — allow 8 days slack
+        max_hours=8 * 24.0,
+        consumed_by="AI bot get_seo_signals",
+        min_rows=1,
+        services=("worker",)),
 ]
 
 
