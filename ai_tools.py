@@ -1565,6 +1565,29 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_sku_ad_spend",
+        "description": (
+            "Returns total Google Ads spend, attributed revenue, "
+            "clicks, impressions, purchases, ROAS for a specific "
+            "SKU over a date window. Plus the per-campaign "
+            "breakdown showing which campaigns drove which spend "
+            "on this product. Use for 'what did we spend on "
+            "advertising LED-Slim8' / 'which campaigns target "
+            "this product' / 'is this SKU profitable to advertise'."
+            " Source: shopping_performance_view (Shopping + PMax "
+            "shopping component)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string"},
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback (default 30)"},
+            },
+            "required": ["sku"],
+        },
+    },
+    {
         "name": "compare_ad_periods",
         "description": (
             "Compares two date windows side-by-side: spend, "
@@ -5218,6 +5241,68 @@ def attribution_sanity_check(engine_df: pd.DataFrame,
     }
 
 
+def get_sku_ad_spend(engine_df: pd.DataFrame,
+                        sale_lines_df: pd.DataFrame,
+                        args: dict) -> dict:
+    """v2.67.105 — per-SKU Google Ads spend + ROAS.
+    Answers: 'what did we spend on ads for LED-X', 'which campaigns
+    target this SKU', 'is this SKU profitable to advertise'."""
+    sku = (args.get("sku") or "").strip()
+    days = int(args.get("days") or 30)
+    if not sku:
+        return {"error": "sku is required"}
+
+    try:
+        summary = db.get_sku_ad_summary(sku, days=days)
+        per_campaign = db.get_ad_attribution_for_sku(sku, days=days)
+    except Exception as exc:
+        return {"error": f"DB query failed: {exc}"}
+
+    if not summary or not summary.get("total_spend"):
+        return {
+            "sku": sku,
+            "lookback_days": days,
+            "total_spend": 0,
+            "total_revenue": 0,
+            "matched": 0,
+            "note": (
+                "No advertising spend on this SKU in window. "
+                "Either it's not in any active Shopping/PMax "
+                "campaign, or shopping_performance_view hasn't "
+                "been synced yet (run "
+                "google_ads_sync.py per-sku-backfill)."),
+        }
+
+    return {
+        "sku": sku,
+        "lookback_days": days,
+        "summary": {
+            "total_spend": round(summary.get("total_spend") or 0, 2),
+            "total_revenue":
+                round(summary.get("total_revenue") or 0, 2),
+            "roas": summary.get("roas"),
+            "cpc": summary.get("cpc"),
+            "total_clicks": summary.get("total_clicks") or 0,
+            "total_impressions":
+                summary.get("total_impressions") or 0,
+            "total_purchases":
+                summary.get("total_purchases") or 0,
+            "n_campaigns_targeting":
+                summary.get("n_campaigns") or 0,
+            "earliest_date": summary.get("earliest"),
+            "latest_date": summary.get("latest"),
+        },
+        "by_campaign": per_campaign[:25],
+        "note": (
+            "spend / clicks / impressions are from Google Ads' "
+            "shopping_performance_view (per-SKU). revenue / "
+            "purchases are from GA4's per-SKU attribution. ROAS "
+            "uses both. >2x = profitable, <1x = losing money. "
+            "If spend > 0 but revenue = 0, the campaign is "
+            "burning budget on a SKU customers aren't buying."),
+    }
+
+
 def compare_ad_periods(engine_df: pd.DataFrame,
                           sale_lines_df: pd.DataFrame,
                           args: dict) -> dict:
@@ -5334,6 +5419,7 @@ TOOL_HANDLERS = {
     "find_campaigns_to_scale": find_campaigns_to_scale,
     "attribution_sanity_check": attribution_sanity_check,
     "compare_ad_periods": compare_ad_periods,
+    "get_sku_ad_spend": get_sku_ad_spend,  # v2.67.105
 }
 
 

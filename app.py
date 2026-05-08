@@ -756,17 +756,17 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.104 — Ad-Umpire dashboard page added. New page "
-        "in the sidebar shows: total spend, GA4-attributed "
-        "revenue (DDA), platform self-report, ROAS for both, "
-        "attribution-inflation ratio with traffic-light status, "
-        "daily spend vs revenue time series, sortable campaign "
-        "table (sort by ROAS / inflation / cut-candidates), top "
-        "50 SKUs by ad-attributed revenue. Date range picker "
-        "supports up to 'Last 3 years' so the multi-year "
-        "backfill from v2.67.103 has somewhere to land. Future "
-        "platforms (Meta, Pinterest) auto-show via "
-        "ad_campaigns_daily's platform tag.")
+        "🟢 v2.67.105 — per-SKU ad spend tracking. Pulls from "
+        "Google Ads' shopping_performance_view to answer 'what "
+        "did we spend advertising LED-Slim8 last month' and "
+        "'which SKUs are losing money in PMax'. New columns "
+        "spend / impressions / clicks added to ad_campaign_skus "
+        "(migration handles existing DBs). Ad-Umpire page now "
+        "shows per-SKU table with spend / revenue / ROAS, "
+        "sortable to find money-losing SKUs (>$10 spend with "
+        "<1x ROAS). New AI tool get_sku_ad_spend exposes the "
+        "same data conversationally. Wired into slack_loop's "
+        "daily Google Ads cycle so per-SKU spend stays current.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -14343,24 +14343,55 @@ elif page == "Ad-Umpire":
 
         st.markdown("---")
 
-        # ----- Per-SKU attribution -----
+        # ----- Per-SKU attribution + spend (v2.67.105) -----
         sku_df = _load_ad_skus(_ad_start.isoformat(),
                                   _ad_end.isoformat())
         if not sku_df.empty:
-            st.markdown("##### Top SKUs by ad-attributed revenue")
+            st.markdown(
+                "##### Per-SKU performance — spend, revenue, ROAS")
             sku_agg = (sku_df.groupby(
                 ["platform", "sku", "family"])
-                        .agg(purchases=("purchases", "sum"),
+                        .agg(spend=("spend", "sum"),
+                              clicks=("clicks", "sum"),
+                              purchases=("purchases", "sum"),
                               revenue=("revenue", "sum"))
-                        .reset_index()
-                        .sort_values("revenue", ascending=False)
-                        .head(50))
-            st.dataframe(sku_agg, use_container_width=True,
+                        .reset_index())
+            # Compute per-SKU ROAS.
+            sku_agg["roas"] = (
+                sku_agg["revenue"] / sku_agg["spend"].replace(
+                    0, pd.NA))
+            sku_agg["spend"] = sku_agg["spend"].round(2)
+            sku_agg["revenue"] = sku_agg["revenue"].round(2)
+            sku_agg["roas"] = sku_agg["roas"].round(2)
+
+            _sku_sort = st.selectbox(
+                "Sort by",
+                ["Revenue (highest)",
+                 "Spend (highest)",
+                 "ROAS (highest)",
+                 "ROAS (lowest — money-losers)"],
+                key="ad_umpire_sku_sort")
+            if "Revenue" in _sku_sort:
+                sku_agg = sku_agg.sort_values(
+                    "revenue", ascending=False)
+            elif "Spend" in _sku_sort:
+                sku_agg = sku_agg.sort_values(
+                    "spend", ascending=False)
+            elif "highest" in _sku_sort:
+                sku_agg = sku_agg.sort_values(
+                    "roas", ascending=False, na_position="last")
+            else:
+                sku_agg = sku_agg[sku_agg["spend"] > 10].sort_values(
+                    "roas", ascending=True, na_position="first")
+            st.dataframe(sku_agg.head(100),
+                            use_container_width=True,
                             hide_index=True)
             st.caption(
-                f"Top 50 SKUs by GA4-attributed ad revenue. SKU "
-                f"is GA4's itemId (Shopify variant SKU). Family "
-                f"derived from SKU prefix.")
+                "spend = Google Ads shopping_performance_view per-"
+                "SKU cost. revenue = GA4 per-SKU attributed "
+                "revenue. roas = revenue / spend. Money-losers "
+                "view filters to SKUs with > $10 spend so noise "
+                "from $0.50 trial bids doesn't drown the signal.")
 
 elif page == "Monthly Metrics":
     st.header(":bar_chart: Monthly Metrics")

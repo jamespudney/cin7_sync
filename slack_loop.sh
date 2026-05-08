@@ -279,6 +279,9 @@ while true; do
     fi
 
     # v2.67.97 — daily Google Ads campaign metrics sync.
+    # v2.67.105 — also pulls per-SKU shopping spend in the same
+    # cycle so the Ad-Umpire / AI tools have current per-SKU
+    # ROAS data.
     # Gated on the full OAuth env-var stack so unprovisioned setups
     # silently skip rather than erroring.
     seconds_since_googleads=$(( now_epoch - last_googleads_epoch ))
@@ -291,6 +294,9 @@ while true; do
         echo "[$(stamp)] google_ads_sync recent --days 7" >> "$LOG"
         python google_ads_sync.py recent --days 7 >> "$LOG" 2>&1 || \
             echo "[$(stamp)] google_ads_sync FAILED" >> "$LOG"
+        echo "[$(stamp)] google_ads_sync per-sku --days 7" >> "$LOG"
+        python google_ads_sync.py per-sku --days 7 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] google_ads per-sku FAILED" >> "$LOG"
         last_googleads_epoch=$(date -u +%s)
     fi
 

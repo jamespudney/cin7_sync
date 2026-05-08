@@ -268,6 +268,147 @@ def sync_recent(client: GoogleAdsClient, days: int) -> dict:
     return sync_range(client, start, end)
 
 
+# ---------------------------------------------------------------------------
+# v2.67.105 — Per-SKU spend from Shopping campaigns + PMax
+# ---------------------------------------------------------------------------
+# shopping_performance_view exposes per-product daily metrics for
+# Shopping AND the shopping component of Performance Max campaigns.
+# Without this we can only see CAMPAIGN-level spend; with this we
+# get per-SKU spend so the buyer can see what they're paying to
+# advertise each product, and compute per-SKU ROAS.
+
+_PER_SKU_GAQL = """
+SELECT
+  segments.product_item_id,
+  segments.product_title,
+  segments.date,
+  campaign.id,
+  campaign.name,
+  campaign.advertising_channel_type,
+  metrics.cost_micros,
+  metrics.impressions,
+  metrics.clicks,
+  metrics.conversions,
+  metrics.conversions_value
+FROM shopping_performance_view
+WHERE segments.date BETWEEN '{start}' AND '{end}'
+"""
+
+
+def _derive_family_from_sku(sku: str) -> str:
+    """Best-effort family extraction from variant SKU prefix."""
+    if not sku:
+        return ""
+    s = sku.upper()
+    if s.startswith("LED-"):
+        parts = s.split("-")
+        if len(parts) >= 2:
+            return parts[1]
+    if s.startswith("LEDKIT-"):
+        parts = s.split("-")
+        if len(parts) >= 2:
+            return f"KIT-{parts[1]}"
+    return ""
+
+
+def _parse_per_sku_row(r: dict) -> dict:
+    seg = r.get("segments") or {}
+    camp = r.get("campaign") or {}
+    m = r.get("metrics") or {}
+    sku = (seg.get("productItemId") or "").strip()
+    return {
+        "platform": "google_ads",
+        "campaign_id": str(camp.get("id") or ""),
+        "date": seg.get("date"),
+        "sku": sku,
+        "family": _derive_family_from_sku(sku),
+        # ga4_sync owns these — pass None so COALESCE preserves
+        # whatever GA4 wrote (item_views, add_to_carts, purchases,
+        # revenue).
+        "item_views": None,
+        "add_to_carts": None,
+        "purchases": None,
+        "revenue": None,
+        # google_ads owns these
+        "spend": int(m.get("costMicros", 0) or 0) / 1e6,
+        "impressions": int(m.get("impressions", 0) or 0),
+        "clicks": int(m.get("clicks", 0) or 0),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def sync_per_sku_range(client: GoogleAdsClient,
+                          start_date,
+                          end_date) -> dict:
+    """Pull per-SKU spend / clicks / impressions for an explicit
+    date range from shopping_performance_view."""
+    gaql = _PER_SKU_GAQL.format(
+        start=start_date.isoformat(), end=end_date.isoformat())
+    log.info("Pulling per-SKU shopping metrics %s -> %s",
+              start_date.isoformat(), end_date.isoformat())
+    results = client.search_stream(gaql)
+    log.info("Got %d shopping_performance_view rows", len(results))
+
+    n_written = 0
+    n_skipped = 0
+    for r in results:
+        row = _parse_per_sku_row(r)
+        if not row.get("sku") or not row.get("date") \
+                or not row.get("campaign_id"):
+            n_skipped += 1
+            continue
+        try:
+            db.upsert_ad_campaign_sku(row)
+            n_written += 1
+        except Exception as exc:
+            log.error("upsert per-sku spend failed: %s", exc)
+            n_skipped += 1
+
+    return {"written": n_written, "skipped": n_skipped,
+              "from": start_date.isoformat(),
+              "to": end_date.isoformat()}
+
+
+def sync_per_sku_recent(client: GoogleAdsClient,
+                            days: int) -> dict:
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    return sync_per_sku_range(client, start, end)
+
+
+def sync_per_sku_backfill(client: GoogleAdsClient,
+                              days: int,
+                              chunk_days: int = 365
+                              ) -> dict:
+    """Multi-year backfill of per-SKU shopping spend, chunked."""
+    today = datetime.now(timezone.utc).date()
+    days_remaining = days
+    cursor_end = today
+    chunk_no = 0
+    total_written = 0
+    total_skipped = 0
+    while days_remaining > 0:
+        chunk_no += 1
+        size = min(days_remaining, chunk_days)
+        chunk_start = cursor_end - timedelta(days=size)
+        log.info("=== per-sku chunk %d (%s -> %s) ===",
+                  chunk_no, chunk_start.isoformat(),
+                  cursor_end.isoformat())
+        result = sync_per_sku_range(
+            client, chunk_start, cursor_end)
+        total_written += result["written"]
+        total_skipped += result["skipped"]
+        cursor_end = chunk_start - timedelta(days=1)
+        days_remaining -= size
+    return {
+        "total_written": total_written,
+        "total_skipped": total_skipped,
+        "chunks": chunk_no,
+        "earliest": cursor_end.isoformat(),
+        "latest": today.isoformat(),
+    }
+
+
 def sync_backfill(client: GoogleAdsClient, days: int,
                      chunk_days: int = 365) -> dict:
     """Walk backwards through time in chunk_days windows. Lets us
@@ -394,6 +535,29 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_per_sku(args: argparse.Namespace) -> int:
+    """v2.67.105 — daily refresh of per-SKU shopping spend."""
+    _setup_log(args.verbose)
+    client = _make_client()
+    result = sync_per_sku_recent(client, args.days)
+    log.info("DONE: %s", result)
+    return 0
+
+
+def cmd_per_sku_backfill(args: argparse.Namespace) -> int:
+    """v2.67.105 — multi-year per-SKU shopping spend backfill."""
+    _setup_log(args.verbose)
+    client = _make_client()
+    result = sync_per_sku_backfill(client, args.days,
+                                       chunk_days=args.chunk_days)
+    log.info("=" * 60)
+    log.info("PER-SKU BACKFILL DONE: %d written | %d skipped "
+              "| %d chunks | range %s -> %s",
+              result["total_written"], result["total_skipped"],
+              result["chunks"], result["earliest"], result["latest"])
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Sync Google Ads campaign daily metrics into "
@@ -422,6 +586,23 @@ def main() -> int:
                        help="Days per API call (max 365)")
     p_b.add_argument("--verbose", action="store_true")
     p_b.set_defaults(func=cmd_backfill)
+
+    # v2.67.105 — per-SKU shopping spend
+    p_ps = sub.add_parser(
+        "per-sku",
+        help="Pull last N days of per-SKU shopping spend "
+              "(shopping_performance_view)")
+    p_ps.add_argument("--days", type=int, default=7)
+    p_ps.add_argument("--verbose", action="store_true")
+    p_ps.set_defaults(func=cmd_per_sku)
+
+    p_pb = sub.add_parser(
+        "per-sku-backfill",
+        help="Multi-year per-SKU shopping spend backfill")
+    p_pb.add_argument("--days", type=int, default=1095)
+    p_pb.add_argument("--chunk-days", type=int, default=365)
+    p_pb.add_argument("--verbose", action="store_true")
+    p_pb.set_defaults(func=cmd_per_sku_backfill)
 
     args = parser.parse_args()
     return args.func(args)

@@ -907,7 +907,12 @@ CREATE TABLE IF NOT EXISTS ad_campaign_skus (
     item_views      INTEGER,
     add_to_carts    INTEGER,
     purchases       INTEGER,
-    revenue         REAL,
+    revenue         REAL,                 -- attributed revenue (GA4)
+    spend           REAL,                 -- v2.67.105: per-SKU ad
+                                            -- spend from Google Ads
+                                            -- shopping_performance_view
+    impressions     INTEGER,              -- v2.67.105
+    clicks          INTEGER,              -- v2.67.105
     captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
     UNIQUE(platform, campaign_id, date, sku)
 );
@@ -1098,6 +1103,32 @@ def _migrate_demand_signal_match_columns(conn: sqlite3.Connection) -> None:
         if "match_confidence" not in cols:
             conn.execute(
                 "ALTER TABLE demand_signals ADD COLUMN match_confidence TEXT")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_ad_campaign_skus_spend(conn: sqlite3.Connection) -> None:
+    """v2.67.105 — add per-SKU spend tracking columns to existing
+    ad_campaign_skus tables. Original v2.67.90 schema only had
+    revenue (from GA4). Now we also pull spend from Google Ads'
+    shopping_performance_view so the dashboard can show per-SKU
+    ROAS, not just per-SKU revenue."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('ad_campaign_skus')").fetchall()}
+        if not cols:
+            return  # table doesn't exist yet (fresh DB)
+        if "spend" not in cols:
+            conn.execute(
+                "ALTER TABLE ad_campaign_skus ADD COLUMN spend REAL")
+        if "impressions" not in cols:
+            conn.execute(
+                "ALTER TABLE ad_campaign_skus ADD COLUMN "
+                "impressions INTEGER")
+        if "clicks" not in cols:
+            conn.execute(
+                "ALTER TABLE ad_campaign_skus ADD COLUMN clicks "
+                "INTEGER")
     except sqlite3.Error:
         pass
 
@@ -1540,16 +1571,23 @@ def upsert_ad_campaign_daily(row: dict) -> int:
 
 
 def upsert_ad_campaign_sku(row: dict) -> int:
+    """v2.67.105 — adds spend/impressions/clicks columns + COALESCE
+    so each sync only updates fields it owns:
+      ga4_sync owns:        item_views, add_to_carts,
+                              purchases, revenue
+      google_ads_sync owns: spend, impressions, clicks (per-SKU
+                              from shopping_performance_view)
+    Both can write platform / family / captured_at."""
     cols = ("platform", "campaign_id", "date", "sku", "family",
               "item_views", "add_to_carts", "purchases", "revenue",
-              "captured_at")
+              "spend", "impressions", "clicks", "captured_at")
     values = [row.get(c) for c in cols]
     sql = (
         f"INSERT INTO ad_campaign_skus ({','.join(cols)}) "
         f"VALUES ({','.join('?' for _ in cols)}) "
         f"ON CONFLICT(platform, campaign_id, date, sku) "
         f"DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}"
+        + ",".join(f"{c}=COALESCE(excluded.{c}, {c})"
                      for c in cols
                      if c not in ("platform", "campaign_id",
                                     "date", "sku")))
@@ -1559,27 +1597,61 @@ def upsert_ad_campaign_sku(row: dict) -> int:
 
 
 def get_ad_attribution_for_sku(sku: str, days: int = 30) -> list:
-    """Return ad campaigns that drove revenue on this SKU."""
+    """Return ad campaigns that drove revenue on this SKU.
+    v2.67.105 — adds per-SKU spend (acs.spend) so we can compute
+    SKU-level ROAS, not just campaign-level."""
     sql = (
         "SELECT ad.platform, ad.campaign_id, "
         "       ad.campaign_name, ad.campaign_type, "
-        "       SUM(ad.spend) AS total_spend, "
-        "       SUM(ad.revenue_ga4) AS attributed_revenue_ga4, "
+        "       SUM(ad.spend) AS campaign_spend, "
+        "       SUM(ad.revenue_ga4) AS campaign_attributed_revenue, "
+        "       SUM(acs.spend) AS sku_spend, "
+        "       SUM(acs.clicks) AS sku_clicks, "
+        "       SUM(acs.impressions) AS sku_impressions, "
         "       SUM(acs.revenue) AS sku_revenue, "
         "       SUM(acs.purchases) AS sku_purchases, "
-        "       SUM(acs.add_to_carts) AS sku_atcs "
+        "       SUM(acs.add_to_carts) AS sku_atcs, "
+        "       CASE WHEN SUM(acs.spend) > 0 THEN "
+        "         ROUND(SUM(acs.revenue) / SUM(acs.spend), 2) "
+        "       ELSE NULL END AS sku_roas "
         "FROM ad_campaign_skus acs "
-        "JOIN ad_campaigns_daily ad "
+        "LEFT JOIN ad_campaigns_daily ad "
         "  ON ad.platform = acs.platform "
         "  AND ad.campaign_id = acs.campaign_id "
         "  AND ad.date = acs.date "
         "WHERE acs.sku = ? "
         "  AND acs.date >= date('now', '-' || ? || ' days') "
         "GROUP BY ad.platform, ad.campaign_id "
-        "ORDER BY total_spend DESC")
+        "ORDER BY sku_spend DESC NULLS LAST")
     with connect() as c:
         rows = c.execute(sql, (sku, days)).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_sku_ad_summary(sku: str, days: int = 30) -> dict:
+    """v2.67.105 — single-row total for a SKU's ad performance.
+    Used by the AI tool that answers 'what did we spend on
+    advertising LED-Slim8 last month'."""
+    sql = (
+        "SELECT SUM(spend) AS total_spend, "
+        "       SUM(revenue) AS total_revenue, "
+        "       SUM(clicks) AS total_clicks, "
+        "       SUM(impressions) AS total_impressions, "
+        "       SUM(purchases) AS total_purchases, "
+        "       COUNT(DISTINCT campaign_id) AS n_campaigns, "
+        "       MIN(date) AS earliest, MAX(date) AS latest, "
+        "       CASE WHEN SUM(spend) > 0 THEN "
+        "         ROUND(SUM(revenue) / SUM(spend), 2) "
+        "       ELSE NULL END AS roas, "
+        "       CASE WHEN SUM(clicks) > 0 THEN "
+        "         ROUND(SUM(spend) / SUM(clicks), 2) "
+        "       ELSE NULL END AS cpc "
+        "FROM ad_campaign_skus "
+        "WHERE sku = ? "
+        "  AND date >= date('now', '-' || ? || ' days')")
+    with connect() as c:
+        r = c.execute(sql, (sku, days)).fetchone()
+    return dict(r) if r else {}
 
 
 # ---------------------------------------------------------------------------
@@ -1597,6 +1669,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_supplier_stockout_recovery(conn)
         _migrate_demand_signal_match_columns(conn)
         _migrate_product_aliases_multi_target(conn)
+        _migrate_ad_campaign_skus_spend(conn)  # v2.67.105
         yield conn
     finally:
         conn.close()
