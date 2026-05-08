@@ -1295,6 +1295,118 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["query"],
         },
     },
+    # -----------------------------------------------------------------
+    # v2.67.95 — Marketing intelligence tools.
+    # These read from tables populated by klaviyo_sync, reviewsio_sync,
+    # semrush_sync (and Phase 2: google_ads_sync, ga4_sync). They
+    # answer 'why might this SKU be moving / not moving' by surfacing
+    # the marketing context.
+    # -----------------------------------------------------------------
+    {
+        "name": "get_email_attribution",
+        "description": (
+            "Return Klaviyo email campaigns that drove clicks or "
+            "revenue on a given SKU/family/handle in the last N "
+            "days. Use this when the user asks why a product spiked "
+            "in sales, or wants to see the impact of a recent "
+            "newsletter on a specific product."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": (
+                        "SKU to query — e.g. LED-V3060001-2390 or "
+                        "the family code if SKU not known.")},
+                "shopify_handle": {
+                    "type": "string",
+                    "description": (
+                        "Shopify product handle, e.g. "
+                        "'slim-led-channel-slim8-ac2-z'. Use this "
+                        "if you have the handle but not the SKU.")},
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "Lookback window in days (default 90).")},
+            },
+        },
+    },
+    {
+        "name": "get_seo_signals",
+        "description": (
+            "Return SEMrush keyword ranking observations for a "
+            "SKU/family/handle in the last N days. Shows position, "
+            "previous_position, search_volume, ranking URL. Use "
+            "when the user asks why a product's traffic / sales "
+            "shifted, or wants to see SEO performance on a "
+            "specific item or family."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": "SKU to query"},
+                "family": {
+                    "type": "string",
+                    "description": (
+                        "Family code (e.g. 'V3060001'). Use this "
+                        "for category-level questions when SKU not "
+                        "known.")},
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "Lookback window in days (default 30).")},
+            },
+        },
+    },
+    {
+        "name": "get_product_reviews",
+        "description": (
+            "Return reviews.io review summary + recent reviews for "
+            "a SKU. Includes average rating, count, low-star count, "
+            "and the latest 5 reviews so the buyer can see "
+            "qualitative feedback. Use this when the user asks "
+            "about product quality, customer satisfaction, "
+            "complaints, or whether to reorder based on reviews."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": "SKU to query (required)"},
+                "include_recent": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, include the 5 most recent "
+                        "reviews verbatim (default true).")},
+            },
+            "required": ["sku"],
+        },
+    },
+    {
+        "name": "get_marketing_intelligence",
+        "description": (
+            "One-shot composite tool: returns ALL marketing signals "
+            "for a SKU/family in one call — recent SEO ranks, email "
+            "campaigns that touched it, review summary, and "
+            "(Phase 2 onwards) ad-campaign attribution. Use this "
+            "when the user asks an open-ended 'what's happening "
+            "with this product' question. Cheaper than calling "
+            "get_email_attribution + get_seo_signals + "
+            "get_product_reviews separately."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {"type": "string"},
+                "family": {"type": "string"},
+                "shopify_handle": {"type": "string"},
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "Lookback window in days (default 30).")},
+            },
+        },
+    },
 ]
 
 
@@ -4338,6 +4450,298 @@ def find_products(engine_df: pd.DataFrame,
     return _impl(engine_df, sale_lines_df, args)
 
 
+# ---------------------------------------------------------------------------
+# v2.67.95 — Marketing intelligence handlers
+# ---------------------------------------------------------------------------
+def _resolve_sku_family(args: dict) -> tuple:
+    """Common helper: pull sku/family/handle from args. Returns
+    (sku, family, handle). Either may be None."""
+    sku = (args.get("sku") or "").strip() or None
+    family = (args.get("family") or "").strip().upper() or None
+    handle = (args.get("shopify_handle") or "").strip() or None
+    # If SKU given but no family, derive family from SKU prefix.
+    if sku and not family:
+        s = sku.upper()
+        if s.startswith("LED-"):
+            parts = s.split("-")
+            if len(parts) >= 2:
+                family = parts[1]
+        elif s.startswith("LEDKIT-"):
+            parts = s.split("-")
+            if len(parts) >= 2:
+                family = f"KIT-{parts[1]}"
+    return sku, family, handle
+
+
+def get_email_attribution(engine_df: pd.DataFrame,
+                              sale_lines_df: pd.DataFrame,
+                              args: dict) -> dict:
+    """Surface Klaviyo email campaigns that touched a SKU."""
+    sku, family, handle = _resolve_sku_family(args)
+    days = int(args.get("days") or 90)
+    if not (sku or family or handle):
+        return {
+            "error": "Specify sku, family, or shopify_handle.",
+        }
+
+    # email_campaign_skus stores by sku (which today is shopify_handle
+    # for klaviyo since we don't have variant-level mapping). Try
+    # multiple keys.
+    rows = []
+    keys_tried = []
+    for key in (sku, handle):
+        if not key:
+            continue
+        keys_tried.append(key)
+        try:
+            r = db.get_email_attribution_for_sku(key, days=days)
+            if r:
+                rows.extend(r)
+        except Exception as exc:
+            return {"error": f"DB query failed: {exc}"}
+
+    if not rows and family:
+        # Fall back: any campaign click on a product in this family
+        try:
+            with db.connect() as c:
+                fam_rows = c.execute(
+                    "SELECT ec.id, ec.name, ec.subject, ec.sent_at, "
+                    "       ec.recipients, ec.open_rate, "
+                    "       ec.click_rate, "
+                    "       ec.revenue AS campaign_revenue, "
+                    "       ecs.click_count, ecs.unique_clicks, "
+                    "       ecs.attributed_revenue AS sku_revenue, "
+                    "       ecs.sku, ecs.shopify_handle "
+                    "FROM email_campaign_skus ecs "
+                    "JOIN email_campaigns ec "
+                    "  ON ec.id = ecs.campaign_id "
+                    "WHERE ecs.family = ? "
+                    "  AND ec.sent_at >= datetime('now', "
+                    "                                '-' || ? || ' days') "
+                    "ORDER BY ec.sent_at DESC",
+                    (family, days)).fetchall()
+            rows = [dict(r) for r in fam_rows]
+        except Exception as exc:
+            return {"error": f"DB query failed: {exc}"}
+
+    return {
+        "matched": len(rows),
+        "sku": sku,
+        "family": family,
+        "shopify_handle": handle,
+        "lookback_days": days,
+        "campaigns": rows[:25],
+        "note": (
+            "Klaviyo-attributed campaigns. click_count is total "
+            "clicks on the product link; unique_clicks is unique "
+            "recipients who clicked. attributed_revenue may be null "
+            "if Klaviyo didn't surface per-product revenue for that "
+            "campaign."),
+    }
+
+
+def get_seo_signals(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """Surface SEMrush ranking observations for a SKU/family."""
+    sku, family, _handle = _resolve_sku_family(args)
+    days = int(args.get("days") or 30)
+    if not (sku or family):
+        return {
+            "error": "Specify sku or family.",
+        }
+
+    rows = []
+    try:
+        if sku:
+            rows = db.get_seo_signals_for_sku(sku, days=days)
+        if not rows and family:
+            rows = db.get_seo_signals_for_family(family, days=days)
+    except Exception as exc:
+        return {"error": f"DB query failed: {exc}"}
+
+    # For nicer output, group by keyword and show position trend
+    by_keyword: dict = {}
+    for r in rows:
+        kw = r.get("keyword") or ""
+        existing = by_keyword.setdefault(kw, {
+            "keyword": kw,
+            "url": r.get("url"),
+            "search_volume": r.get("search_volume"),
+            "observations": [],
+        })
+        existing["observations"].append({
+            "captured_at": r.get("captured_at"),
+            "position": r.get("position"),
+            "previous_position": r.get("previous_position"),
+        })
+
+    keywords = list(by_keyword.values())
+    keywords.sort(key=lambda k: (
+        min((o.get("position") or 999.0)
+              for o in k["observations"]),
+        -(k.get("search_volume") or 0)))
+
+    return {
+        "matched": len(keywords),
+        "sku": sku,
+        "family": family,
+        "lookback_days": days,
+        "keywords": keywords[:25],
+        "note": (
+            "Position 1 = top of organic results. Lower number = "
+            "better. previous_position is from the last week's "
+            "pull. Sorted by best current position then volume."),
+    }
+
+
+def get_product_reviews(engine_df: pd.DataFrame,
+                          sale_lines_df: pd.DataFrame,
+                          args: dict) -> dict:
+    """Surface review summary + recent reviews for a SKU."""
+    sku = (args.get("sku") or "").strip()
+    include_recent = args.get("include_recent")
+    if include_recent is None:
+        include_recent = True
+    if not sku:
+        return {"error": "sku is required"}
+
+    try:
+        summary = db.get_reviews_summary_for_sku(sku)
+        recent = (db.get_recent_reviews_for_sku(sku, limit=5)
+                    if include_recent else [])
+    except Exception as exc:
+        return {"error": f"DB query failed: {exc}"}
+
+    if not summary or not summary.get("count"):
+        return {
+            "sku": sku,
+            "matched": 0,
+            "note": "No reviews on file for this SKU.",
+        }
+
+    # Trim review bodies for compact response
+    trimmed = []
+    for r in recent:
+        rev = dict(r)
+        if rev.get("body") and len(rev["body"]) > 400:
+            rev["body"] = rev["body"][:400] + "..."
+        trimmed.append(rev)
+
+    return {
+        "sku": sku,
+        "summary": {
+            "count": summary.get("count"),
+            "avg_rating": summary.get("avg_rating"),
+            "low_star_count": summary.get("low_count"),
+            "high_star_count": summary.get("high_count"),
+            "latest_review": summary.get("latest_review"),
+        },
+        "recent_reviews": trimmed,
+        "note": (
+            "low_star_count = ratings 1-2 (warning signs); "
+            "high_star_count = ratings 4-5. Recent reviews shown "
+            "verbatim (truncated to 400 chars). Use these to "
+            "qualify a buyer recommendation."),
+    }
+
+
+def get_marketing_intelligence(engine_df: pd.DataFrame,
+                                  sale_lines_df: pd.DataFrame,
+                                  args: dict) -> dict:
+    """Composite: SEO + email + reviews + (Phase 2) ads in one call.
+    Cheaper than 4 separate tool calls when the user asks an
+    open-ended 'what's happening with this SKU' question."""
+    sku, family, handle = _resolve_sku_family(args)
+    days = int(args.get("days") or 30)
+
+    if not (sku or family or handle):
+        return {
+            "error": "Specify sku, family, or shopify_handle.",
+        }
+
+    out: dict = {
+        "sku": sku,
+        "family": family,
+        "shopify_handle": handle,
+        "lookback_days": days,
+    }
+
+    # SEO signals
+    try:
+        if sku:
+            seo_rows = db.get_seo_signals_for_sku(sku, days=days)
+        elif family:
+            seo_rows = db.get_seo_signals_for_family(family,
+                                                          days=days)
+        else:
+            seo_rows = []
+        out["seo"] = {
+            "observations": len(seo_rows),
+            "top_movements": seo_rows[:10],
+        }
+    except Exception as exc:
+        out["seo"] = {"error": f"{exc}"}
+
+    # Email attribution
+    try:
+        email_rows = []
+        for k in (sku, handle):
+            if not k:
+                continue
+            email_rows.extend(
+                db.get_email_attribution_for_sku(k, days=days * 3))
+        out["email"] = {
+            "campaigns": len(email_rows),
+            "recent": email_rows[:5],
+        }
+    except Exception as exc:
+        out["email"] = {"error": f"{exc}"}
+
+    # Reviews
+    try:
+        if sku:
+            summary = db.get_reviews_summary_for_sku(sku)
+            recent = db.get_recent_reviews_for_sku(sku, limit=3)
+        else:
+            summary = {}
+            recent = []
+        if summary and summary.get("count"):
+            out["reviews"] = {
+                "count": summary.get("count"),
+                "avg_rating": summary.get("avg_rating"),
+                "low_star_count": summary.get("low_count"),
+                "high_star_count": summary.get("high_count"),
+                "recent": [
+                    {"rating": r.get("rating"),
+                     "title": r.get("title"),
+                     "body": (r.get("body") or "")[:200],
+                     "review_date": r.get("review_date")}
+                    for r in recent],
+            }
+        else:
+            out["reviews"] = {"count": 0,
+                               "note": "no reviews on file"}
+    except Exception as exc:
+        out["reviews"] = {"error": f"{exc}"}
+
+    # Ad attribution (Phase 2 onwards — populated by
+    # google_ads_sync.py + ga4_sync.py)
+    try:
+        if sku:
+            ads = db.get_ad_attribution_for_sku(sku, days=days)
+            out["ads"] = {
+                "campaigns": len(ads),
+                "rows": ads[:5],
+                "note": ("populated by google_ads + ga4 syncs "
+                            "(Phase 2)"),
+            }
+    except Exception as exc:
+        out["ads"] = {"error": f"{exc}"}
+
+    return out
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
@@ -4371,6 +4775,11 @@ TOOL_HANDLERS = {
     "get_rising_demand": get_rising_demand,
     "get_demand_score": get_demand_score,
     "search_knowledge_base": search_knowledge_base,
+    # v2.67.95 — marketing intelligence layer
+    "get_email_attribution": get_email_attribution,
+    "get_seo_signals": get_seo_signals,
+    "get_product_reviews": get_product_reviews,
+    "get_marketing_intelligence": get_marketing_intelligence,
 }
 
 
