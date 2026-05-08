@@ -756,19 +756,13 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.98 — ingest-only Slack channels. New env var "
-        "SLACK_INGEST_ONLY_CHANNELS lets the bot POLL a channel "
-        "(into slack_messages so the AI can reference it) but "
-        "never RESPOND. Used for external/sensitive channels like "
-        "the marketing-content discussion thread. Bot reads to "
-        "build awareness, stays silent so the channel's flow "
-        "isn't disturbed. Same get_slack_messages tool can search "
-        "the content; only the auto-reply pathway is blocked. "
-        "Combined with v2.67.97 marketing infrastructure, the "
-        "bot's marketing-context knowledge now spans: Klaviyo "
-        "(what we sent), Reviews.io (customer feedback), SEMrush "
-        "(SEO ranks), and ingest-only Slack threads (what's "
-        "PLANNED but not yet sent).")
+        "🟢 v2.67.99 — Google Ads API version bumped (v17 -> v19) "
+        "after first-call 404 confirmed v17 has been deprecated. "
+        "API_VERSION now configurable via GOOGLE_ADS_API_VERSION "
+        "env var so future quarterly Google deprecations don't "
+        "require a code push. Default tracks current stable. "
+        "Once user re-runs google_ads_sync, Phase 2 of the Moby "
+        "replacement is fully live.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

@@ -99,9 +99,27 @@ class GoogleAdsClient:
 
     Avoids the heavy google-ads-python SDK dependency. Sends GAQL
     queries to /googleAds:search and /googleAds:searchStream. Works
-    for the read-only data we need (campaigns, spend, performance)."""
+    for the read-only data we need (campaigns, spend, performance).
 
-    BASE = "https://googleads.googleapis.com/v17"
+    v2.67.99 — version made configurable. Google Ads API releases
+    a new version each quarter and deprecates old ones ~2 years
+    later. Set GOOGLE_ADS_API_VERSION env var to bump without code
+    change. Default tracked to a recent stable version."""
+
+    DEFAULT_VERSION = "v19"
+    _BASE_TEMPLATE = "https://googleads.googleapis.com/{ver}"
+
+    @classmethod
+    def _resolved_base(cls) -> str:
+        ver = os.environ.get(
+            "GOOGLE_ADS_API_VERSION", cls.DEFAULT_VERSION).strip()
+        if not ver.startswith("v"):
+            ver = "v" + ver
+        return cls._BASE_TEMPLATE.format(ver=ver)
+
+    @property
+    def BASE(self) -> str:
+        return self._resolved_base()
 
     def __init__(self, customer_id: str, access_token: str,
                   developer_token: str,
