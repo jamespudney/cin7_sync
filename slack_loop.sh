@@ -136,6 +136,13 @@ last_lessons_epoch=0
 #     extracts vision dims for any new SKUs added since last run
 last_dim_refresh_epoch=0
 last_dim_weekly_epoch=0
+# v2.67.93 — marketing-data syncs:
+#   klaviyo:    daily (campaigns from last 7 days + per-SKU clicks)
+#   reviewsio:  daily (reviews modified in last 30 days)
+#   semrush:    weekly (top 500 keyword positions, ~5k units)
+last_klaviyo_epoch=0
+last_reviewsio_epoch=0
+last_semrush_epoch=0
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -230,6 +237,39 @@ while true; do
         python housekeeping_audit.py --verbose \
             --log "${DATA_DIR}/output/housekeeping.log" >> "$LOG" 2>&1 || \
             echo "[$(stamp)] housekeeping_audit FAILED" >> "$LOG"
+    fi
+
+    # v2.67.93 — daily Klaviyo email-campaign + per-SKU click sync.
+    # Last 7 days, idempotent on (campaign_id, sku) so safe.
+    seconds_since_klaviyo=$(( now_epoch - last_klaviyo_epoch ))
+    if [ "$seconds_since_klaviyo" -ge 86400 ] \
+            && [ -n "${KLAVIYO_API_KEY:-}" ]; then
+        echo "[$(stamp)] klaviyo_sync recent --days 7" >> "$LOG"
+        python klaviyo_sync.py recent --days 7 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] klaviyo_sync FAILED" >> "$LOG"
+        last_klaviyo_epoch=$(date -u +%s)
+    fi
+
+    # v2.67.93 — daily Reviews.io review sync.
+    seconds_since_reviewsio=$(( now_epoch - last_reviewsio_epoch ))
+    if [ "$seconds_since_reviewsio" -ge 86400 ] \
+            && [ -n "${REVIEWSIO_API_KEY:-}" ] \
+            && [ -n "${REVIEWSIO_STORE_ID:-}" ]; then
+        echo "[$(stamp)] reviewsio_sync recent --days 30" >> "$LOG"
+        python reviewsio_sync.py recent --days 30 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] reviewsio_sync FAILED" >> "$LOG"
+        last_reviewsio_epoch=$(date -u +%s)
+    fi
+
+    # v2.67.93 — weekly SEMrush position sync. ~5000 units/week,
+    # well within Guru plan's 30k/month allowance.
+    seconds_since_semrush=$(( now_epoch - last_semrush_epoch ))
+    if [ "$seconds_since_semrush" -ge 604800 ] \
+            && [ -n "${SEMRUSH_API_KEY:-}" ]; then
+        echo "[$(stamp)] semrush_sync weekly --limit 500" >> "$LOG"
+        python semrush_sync.py weekly --limit 500 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] semrush_sync FAILED" >> "$LOG"
+        last_semrush_epoch=$(date -u +%s)
     fi
 
     # Slack ingest → DB
