@@ -756,17 +756,13 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.105 — per-SKU ad spend tracking. Pulls from "
-        "Google Ads' shopping_performance_view to answer 'what "
-        "did we spend advertising LED-Slim8 last month' and "
-        "'which SKUs are losing money in PMax'. New columns "
-        "spend / impressions / clicks added to ad_campaign_skus "
-        "(migration handles existing DBs). Ad-Umpire page now "
-        "shows per-SKU table with spend / revenue / ROAS, "
-        "sortable to find money-losing SKUs (>$10 spend with "
-        "<1x ROAS). New AI tool get_sku_ad_spend exposes the "
-        "same data conversationally. Wired into slack_loop's "
-        "daily Google Ads cycle so per-SKU spend stays current.")
+        "🟢 v2.67.106 — Ad-Umpire page bug fix. v2.67.104 "
+        "introduced 'NameError: sqlite3 is not defined' because "
+        "the cached loader functions referenced `sqlite3` but "
+        "only the aliased `_sql_ad` was imported. Fix: local "
+        "imports inside each @st.cache_data function so they're "
+        "self-contained even when Streamlit caches and reruns "
+        "across pages.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -14162,7 +14158,7 @@ elif page == "Ad-Umpire":
         "Paid-marketing dashboard. Real spend (from ad platforms) "
         "vs real attribution (from GA4). Replaces Triple Whale.")
 
-    import sqlite3 as _sql_ad
+    import sqlite3
     from datetime import date as _date_ad, timedelta as _td_ad
 
     # Date range picker
@@ -14196,8 +14192,13 @@ elif page == "Ad-Umpire":
     @st.cache_data(ttl=300)
     def _load_ad_campaigns(start_iso: str, end_iso: str
                               ) -> pd.DataFrame:
+        # v2.67.106 — local imports so the function works even
+        # when Streamlit's cache decorator pickles and rehydrates
+        # it across reruns (the enclosing elif block's import
+        # may not be in scope at that point).
+        import sqlite3 as _sq3
         from data_paths import DB_PATH as _DB_AD
-        conn = sqlite3.connect(_DB_AD, timeout=5)
+        conn = _sq3.connect(_DB_AD, timeout=5)
         try:
             return pd.read_sql_query(
                 "SELECT * FROM ad_campaigns_daily "
@@ -14211,8 +14212,9 @@ elif page == "Ad-Umpire":
 
     @st.cache_data(ttl=300)
     def _load_ad_skus(start_iso: str, end_iso: str) -> pd.DataFrame:
+        import sqlite3 as _sq3
         from data_paths import DB_PATH as _DB_AD
-        conn = sqlite3.connect(_DB_AD, timeout=5)
+        conn = _sq3.connect(_DB_AD, timeout=5)
         try:
             return pd.read_sql_query(
                 "SELECT * FROM ad_campaign_skus "
