@@ -14301,8 +14301,25 @@ elif page == "Monthly Metrics":
             if not shipments.empty and "ShipDate" in shipments.columns:
                 _sc_df = shipments.copy()
                 if "Voided" in _sc_df.columns:
-                    _sc_df = _sc_df[
-                        ~_sc_df["Voided"].fillna(False).astype(bool)]
+                    # v2.67.83 — bug fix. Previous logic was
+                    #   ~Voided.fillna(False).astype(bool)
+                    # which is broken when Voided arrives as
+                    # CSV strings ('False'/'True') because Python's
+                    # bool('False') is True (non-empty string).
+                    # That filter was silently removing every
+                    # shipment, leaving zero rows and showing $0
+                    # for every month in Monthly Metrics despite
+                    # the loader reporting the data correctly.
+                    # New logic: explicit string normalisation.
+                    _voided = _sc_df["Voided"]
+                    if _voided.dtype == "bool":
+                        _voided_bool = _voided.fillna(False)
+                    else:
+                        _voided_bool = (_voided.astype(str)
+                                                .str.strip().str.lower()
+                                                .isin(["true", "1",
+                                                        "yes", "t"]))
+                    _sc_df = _sc_df[~_voided_bool]
                 _sc_df["_dt"] = pd.to_datetime(
                     _sc_df["ShipDate"], errors="coerce", utc=True)
                 _sc_df = _sc_df.dropna(subset=["_dt"])
