@@ -755,17 +755,19 @@ with st.sidebar:
     # was eating most of the sidebar; keep one short line here, push
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
-    st.caption("🟢 v2.67.66 — Feedback ingest + auto-improvement "
-                "loop. Bot now reads its own audit trail: "
-                "emoji reactions on its posts (👍/👎/🛑/✅), "
-                "human thread replies in bot threads, comments "
-                "in #ai-audit threads. A daily summarizer "
-                "(`bot_self_improvement.py`) digests the last "
-                "7 days of feedback into a 'lessons learned' "
-                "markdown that's auto-prepended to the system "
-                "prompt. Closes the loop overnight — staff "
-                "react/comment, bot adjusts tomorrow. No "
-                "manual prompt edits needed.")
+    st.caption(
+        "🟢 v2.67.84 — Monthly Metrics shipping cost FIX. "
+        "Voided column was being parsed as string 'False' which "
+        "Python's bool() considers truthy, so every shipment was "
+        "filtering out as voided → all months $0 despite full "
+        "5-year backfill being on disk. v2.67.84 normalises the "
+        "Voided column robustly. Banner string also bumped — was "
+        "stuck at .66 since the auto-improvement loop work; "
+        "every commit between .67 and .83 shipped fine but the "
+        "header didn't reflect it. If you see v2.67.84 here, "
+        "Render auto-deploy is working AND the shipping-cost fix "
+        "is live. If you still see .66, Render is not deploying "
+        "this branch — manual deploy needed.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
