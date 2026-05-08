@@ -756,13 +756,17 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.99 — Google Ads API version bumped (v17 -> v19) "
-        "after first-call 404 confirmed v17 has been deprecated. "
-        "API_VERSION now configurable via GOOGLE_ADS_API_VERSION "
-        "env var so future quarterly Google deprecations don't "
-        "require a code push. Default tracks current stable. "
-        "Once user re-runs google_ads_sync, Phase 2 of the Moby "
-        "replacement is fully live.")
+        "🟢 v2.67.100 — GA4 per-SKU query fixed. v2.67.97 had "
+        "combined event-scoped metrics (itemViewEvents, "
+        "addToCarts) with the item-scoped itemId dimension which "
+        "GA4 rejects with HTTP 400. Per-SKU query now pulls only "
+        "item-scoped metrics (itemPurchaseQuantity + itemRevenue) "
+        "— good enough for ad attribution. Funnel-step metrics "
+        "(views, ATCs) come from a separate campaign-level "
+        "report we'll add when the buyer needs them. GA4 "
+        "campaign totals already work (476 rows on first run). "
+        "Combined with v2.67.99's API version bump, both Google "
+        "Ads + GA4 syncs should now complete cleanly.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

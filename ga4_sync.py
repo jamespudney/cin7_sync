@@ -274,10 +274,19 @@ def sync_campaign_totals(client: GA4Client, days: int) -> dict:
 def sync_per_sku(client: GA4Client, days: int) -> dict:
     """Per-product daily ecommerce metrics by campaign. Uses GA4's
     item-scoped dimensions (itemId is the Shopify variant id /
-    SKU)."""
+    SKU).
+
+    v2.67.100 — split into two reports because GA4 doesn't allow
+    combining event-scoped metrics (itemViewEvents, addToCarts)
+    with item-scoped dimensions (itemId). Report A pulls per-SKU
+    purchase quantity + revenue (item-scoped, OK with itemId).
+    Report B pulls campaign-level view + add-to-cart counts
+    (event-scoped, no itemId)."""
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
-    body = {
+
+    # --- Report A: per-SKU purchases + revenue ---
+    body_a = {
         "dateRanges": [{
             "startDate": start.isoformat(),
             "endDate": end.isoformat(),
@@ -288,8 +297,6 @@ def sync_per_sku(client: GA4Client, days: int) -> dict:
             {"name": "itemId"},
         ],
         "metrics": [
-            {"name": "itemViewEvents"},
-            {"name": "addToCarts"},
             {"name": "itemPurchaseQuantity"},
             {"name": "itemRevenue"},
         ],
@@ -304,11 +311,11 @@ def sync_per_sku(client: GA4Client, days: int) -> dict:
         },
         "limit": 100000,
     }
-    log.info("GA4 per-sku %s -> %s",
+    log.info("GA4 per-sku purchases %s -> %s",
               start.isoformat(), end.isoformat())
-    payload = client.run_report(body)
+    payload = client.run_report(body_a)
     rows = _ga4_rows(payload)
-    log.info("Got %d per-sku rows", len(rows))
+    log.info("Got %d per-sku rows (purchases/revenue)", len(rows))
 
     # Look up family from product_dimensions for each SKU
     handle_lookup: Dict[str, dict] = {}
@@ -350,9 +357,14 @@ def sync_per_sku(client: GA4Client, days: int) -> dict:
                 "date": iso_date,
                 "sku": sku,
                 "family": family,
-                "item_views": int(r.get("itemViewEvents") or 0),
-                "add_to_carts": int(r.get("addToCarts") or 0),
-                "purchases": int(r.get("itemPurchaseQuantity") or 0),
+                # v2.67.100 — item_views + add_to_carts come from
+                # a separate report (not item-scoped). Left as None
+                # here; populated by sync_funnel_by_campaign if
+                # added later.
+                "item_views": None,
+                "add_to_carts": None,
+                "purchases": int(float(
+                    r.get("itemPurchaseQuantity") or 0)),
                 "revenue": float(r.get("itemRevenue") or 0),
                 "captured_at": datetime.now(
                     timezone.utc).isoformat(),
