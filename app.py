@@ -756,15 +756,14 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.85 — OOM fix on shipments loader. Loading 5-year "
-        "shipments_full.csv (43,984 rows × 50 cols) was pushing "
-        "the 2GB Render instance over its memory limit, causing "
-        "the page render to crash mid-flight (you saw $0 across "
-        "every Monthly Metrics shipping row). v2.67.85 reads only "
-        "the columns we use, casts numerics to float32, drops "
-        "voided rows at load time. Estimated ~70% RAM reduction "
-        "on shipments. Combined with v2.67.84's Voided string-bool "
-        "fix, Monthly Metrics shipping cost now renders correctly.")
+        "🟢 v2.67.86 — robust shipments loader. v2.67.85's Int8 + "
+        "category dtype hints were silently failing on rare edge "
+        "cases (empty Zone fields, etc.) → loader returned empty "
+        "DataFrame → page showed $0 even after the OOM was fixed. "
+        "v2.67.86 keeps only float32 hints, falls back to no-dtype "
+        "load on any cast failure, logs to stderr so future "
+        "failures are visible. With 4GB instance + this defensive "
+        "loader, Monthly Metrics shipping cost should now render.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -3027,6 +3026,11 @@ _SHIPMENTS_USECOLS = [
     "LabelID",
 ]
 _SHIPMENTS_DTYPE = {
+    # v2.67.86 — only float32 hints retained. Earlier Int8/Int16
+    # casts silently failed on rare non-numeric Zone/ItemCount
+    # values, dropping the whole file load. category dtypes also
+    # removed for now to be conservative; we can re-add them once
+    # we confirm a clean baseline.
     "ShipmentCost": "float32",
     "CustomerShippingCharge": "float32",
     "ShippingMargin": "float32",
@@ -3037,16 +3041,6 @@ _SHIPMENTS_DTYPE = {
     "DimensionsLength": "float32",
     "DimensionsWidth": "float32",
     "DimensionsHeight": "float32",
-    "ItemCount": "Int16",
-    "Zone": "Int8",
-    "CarrierCode": "category",
-    "ServiceCode": "category",
-    "ShipmentStatus": "category",
-    "Currency": "category",
-    "WeightUnits": "category",
-    "DimensionsUnits": "category",
-    "ShipToCountry": "category",
-    "ShipToState": "category",
 }
 
 
@@ -3083,18 +3077,40 @@ def _load_longest_shipments_cached(fingerprint: tuple) -> pd.DataFrame:
     # Build a usecols filter that's tolerant of older CSVs missing
     # some columns. pandas' usecols= raises on missing names, so we
     # peek at the header first per-file.
+    # v2.67.86 — robust dtype handling. v2.67.85's eager dtype hints
+    # could silently fail on edge cases (e.g. Int8 cast on a Zone
+    # column containing rare non-numeric values) → _read_lean
+    # returned None → loader returned empty DataFrame → all months
+    # showed $0. New approach: try with dtype hints; on failure,
+    # fall back to no-dtype load (safe but uses more RAM); on second
+    # failure, log and skip.
+    import sys as _sys
+
     def _read_lean(p):
         try:
             header = pd.read_csv(p, nrows=0).columns.tolist()
-        except Exception:
+        except Exception as exc:
+            print(f"[shipments] header read failed for {p.name}: {exc}",
+                    file=_sys.stderr)
             return None
         cols = [c for c in _SHIPMENTS_USECOLS if c in header]
         dtypes = {k: v for k, v in _SHIPMENTS_DTYPE.items()
                     if k in cols}
+        df = None
         try:
             df = pd.read_csv(p, usecols=cols, dtype=dtypes,
                                 low_memory=False)
-        except Exception:
+        except Exception as exc:
+            print(f"[shipments] dtype load failed for {p.name}: "
+                    f"{exc}; falling back to no-dtype",
+                    file=_sys.stderr)
+            try:
+                df = pd.read_csv(p, usecols=cols, low_memory=False)
+            except Exception as exc2:
+                print(f"[shipments] usecols load also failed: {exc2}",
+                        file=_sys.stderr)
+                return None
+        if df is None or df.empty:
             return None
         # Drop voided rows at load time — every consumer filters
         # them out anyway; no point holding them in RAM.
