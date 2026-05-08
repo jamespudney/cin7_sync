@@ -756,14 +756,15 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.86 — robust shipments loader. v2.67.85's Int8 + "
-        "category dtype hints were silently failing on rare edge "
-        "cases (empty Zone fields, etc.) → loader returned empty "
-        "DataFrame → page showed $0 even after the OOM was fixed. "
-        "v2.67.86 keeps only float32 hints, falls back to no-dtype "
-        "load on any cast failure, logs to stderr so future "
-        "failures are visible. With 4GB instance + this defensive "
-        "loader, Monthly Metrics shipping cost should now render.")
+        "🟢 v2.67.87 — cache-buster for shipments loader. User's "
+        "direct python test confirmed loader returns real data "
+        "(April 2026 = $38,719) but the dashboard kept showing "
+        "$0. Root cause: Streamlit's persist='disk' was serving "
+        "the stale empty-result entry from before the fixes. "
+        "v2.67.87 appends an explicit version string to the cache "
+        "fingerprint so every version bump guarantees a fresh "
+        "compute. Bumping CACHE_BUSTER in future commits is the "
+        "lever to force re-load if this happens again.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -3143,8 +3144,14 @@ def _load_longest_shipments_cached(fingerprint: tuple) -> pd.DataFrame:
 
 
 def _load_longest_shipments() -> pd.DataFrame:
-    return _load_longest_shipments_cached(
-        _dir_fingerprint("shipments_*.csv"))
+    # v2.67.87 — explicit cache-buster appended to the fingerprint.
+    # Streamlit's persist="disk" can hold stale results across
+    # function-body changes when underlying file mtimes haven't
+    # also changed. Bump CACHE_BUSTER on any code change that
+    # affects the loader output to guarantee re-computation.
+    CACHE_BUSTER = "v87"
+    fp = _dir_fingerprint("shipments_*.csv")
+    return _load_longest_shipments_cached((fp, CACHE_BUSTER))
 
 
 # v2.67.55 — Shopify orders loader. Same backfill+rolling-window
