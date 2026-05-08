@@ -83,6 +83,9 @@ class FeedSpec:
     max_hours: float        # warn if newest file is older than this
     consumed_by: str        # short note on who reads this
     severity: str = "warn"  # 'warn' or 'critical'
+    services: tuple = ()    # ('worker', 'web') — empty = both;
+                             # used so worker isn't dinged for
+                             # web-only feeds and vice versa
 
 
 CSV_FEEDS: List[FeedSpec] = [
@@ -127,7 +130,8 @@ CSV_FEEDS: List[FeedSpec] = [
         "Shopify product content (markdown)",
         "../shopify/products/*.md",         # PRODUCTS_DIR is sibling
         max_hours=180.0,                    # weekly is fine
-        consumed_by="AI knowledge base"),
+        consumed_by="AI knowledge base",
+        services=("web",)),                  # only synced by web service
 ]
 
 
@@ -141,6 +145,7 @@ class DBTableSpec:
     consumed_by: str = ""
     min_rows: int = 0
     severity: str = "warn"
+    services: tuple = ()                    # see FeedSpec.services
 
 
 DB_FEEDS: List[DBTableSpec] = [
@@ -162,16 +167,18 @@ DB_FEEDS: List[DBTableSpec] = [
         # (weekly cycle) before warning.
         max_hours=8 * 24.0,
         consumed_by="dimension_describer + AI bot",
-        min_rows=100),
+        min_rows=100,
+        services=("worker",)),               # only worker has this DB
     DBTableSpec(
         "Slack message ingest",
         table="slack_messages",
-        timestamp_col="captured_at",
+        timestamp_col="ingested_at",        # v2.67.82 — schema fix
         # Worker polls every 60s; warn if no message in last 24h
         # (could be quiet weekend, but extended silence = ingest broken)
         max_hours=24.0,
         consumed_by="Slack listener bot",
-        min_rows=1),
+        min_rows=1,
+        services=("worker",)),
 ]
 
 
@@ -320,9 +327,28 @@ def check_db_feed(spec: DBTableSpec) -> dict:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _detect_service() -> str:
+    """Return 'worker' or 'web'. Detection logic: if SLACK_BOT_TOKEN
+    is set in env, this is the Slack worker. Otherwise web service.
+    Override via HOUSEKEEPING_SERVICE env var if needed."""
+    explicit = os.environ.get("HOUSEKEEPING_SERVICE", "").strip().lower()
+    if explicit in ("worker", "web"):
+        return explicit
+    if os.environ.get("SLACK_BOT_TOKEN", "").strip():
+        return "worker"
+    return "web"
+
+
+def _spec_applies(spec, service: str) -> bool:
+    """A feed applies on this service if its services tuple is empty
+    (=both) or contains the current service."""
+    return not spec.services or service in spec.services
+
+
 def run_audit(verbose: bool = False) -> int:
     """Returns count of stale/missing/error rows."""
-    log.info("Housekeeping audit starting")
+    service = _detect_service()
+    log.info("Housekeeping audit starting (service=%s)", service)
     log.info("OUTPUT_DIR: %s", OUTPUT_DIR)
     log.info("DB_PATH:    %s", DB_PATH)
     log.info("=" * 60)
@@ -331,8 +357,12 @@ def run_audit(verbose: bool = False) -> int:
     rows: List[dict] = []
 
     for spec in CSV_FEEDS:
+        if not _spec_applies(spec, service):
+            continue
         rows.append(check_csv_feed(spec))
     for spec in DB_FEEDS:
+        if not _spec_applies(spec, service):
+            continue
         rows.append(check_db_feed(spec))
 
     for r in rows:
