@@ -1509,6 +1509,19 @@ def get_recent_reviews_for_sku(sku: str, limit: int = 5) -> list:
 
 
 def upsert_ad_campaign_daily(row: dict) -> int:
+    """v2.67.101 — COALESCE so each sync only updates the fields
+    it actually OWNS. Fixes the bug where ga4_sync was clobbering
+    google_ads_sync's spend with 0.0 (spend was $287 instead of
+    the real ~$45k for 30 days).
+
+    Each sync passes None for fields owned by the other:
+      google_ads_sync owns: spend, impressions, clicks,
+                              conv_platform, revenue_platform
+      ga4_sync owns:        conv_ga4, revenue_ga4
+
+    Both can write campaign_name / type / captured_at.
+    COALESCE(new, existing) keeps the existing value when new is
+    NULL — exactly the merge semantics we need."""
     cols = ("platform", "campaign_id", "campaign_name", "campaign_type",
               "date", "spend", "impressions", "clicks",
               "conv_platform", "conv_ga4",
@@ -1518,7 +1531,7 @@ def upsert_ad_campaign_daily(row: dict) -> int:
         f"INSERT INTO ad_campaigns_daily ({','.join(cols)}) "
         f"VALUES ({','.join('?' for _ in cols)}) "
         f"ON CONFLICT(platform, campaign_id, date) DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}"
+        + ",".join(f"{c}=COALESCE(excluded.{c}, {c})"
                      for c in cols
                      if c not in ("platform", "campaign_id", "date")))
     with connect() as c:

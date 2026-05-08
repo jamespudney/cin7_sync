@@ -756,17 +756,16 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.100 — GA4 per-SKU query fixed. v2.67.97 had "
-        "combined event-scoped metrics (itemViewEvents, "
-        "addToCarts) with the item-scoped itemId dimension which "
-        "GA4 rejects with HTTP 400. Per-SKU query now pulls only "
-        "item-scoped metrics (itemPurchaseQuantity + itemRevenue) "
-        "— good enough for ad attribution. Funnel-step metrics "
-        "(views, ATCs) come from a separate campaign-level "
-        "report we'll add when the buyer needs them. GA4 "
-        "campaign totals already work (476 rows on first run). "
-        "Combined with v2.67.99's API version bump, both Google "
-        "Ads + GA4 syncs should now complete cleanly.")
+        "🟢 v2.67.101 — fix: ga4_sync was clobbering "
+        "google_ads_sync's spend with 0.0 because both write "
+        "to ad_campaigns_daily on (platform, campaign_id, date) "
+        "and the upsert blindly overwrote ALL fields. First "
+        "30-day verification showed spend=$287.85 vs the real "
+        "~$45k. Fix: COALESCE(new, existing) in the upsert SQL "
+        "+ ga4_sync passes None (not 0.0) for fields owned by "
+        "google_ads_sync. Each sync now updates only its own "
+        "fields. Re-run google_ads_sync after deploy to "
+        "repopulate the lost spend rows.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

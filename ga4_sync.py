@@ -251,7 +251,11 @@ def sync_campaign_totals(client: GA4Client, days: int) -> dict:
                     "sessionGoogleAdsCampaignName"),
                 "campaign_type": None,
                 "date": iso_date,
-                "spend": 0.0,  # populated by google_ads_sync
+                # v2.67.101 — pass None (not 0.0) for spend so
+                # COALESCE in upsert preserves google_ads_sync's
+                # spend value. Same for impressions/clicks/
+                # conv_platform/revenue_platform.
+                "spend": None,
                 "impressions": None,
                 "clicks": None,
                 "conv_platform": None,
