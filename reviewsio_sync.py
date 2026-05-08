@@ -121,19 +121,52 @@ class ReviewsIOClient:
                        since: Optional[datetime] = None,
                        sku: Optional[str] = None
                        ) -> Optional[dict]:
-        """Pull a page of product reviews. Reviews.io's product
-        review endpoint paginates."""
-        params: Dict[str, Any] = {
+        """Pull a page of product reviews. Reviews.io has multiple
+        endpoint generations:
+          - /product/review                   (legacy)
+          - /api/products/                    (v2)
+          - /merchant/v2.6/products/...       (v2.6)
+          - /merchant/v3/reviews              (v3 — current)
+        v2.67.107 — try the merchant v3 endpoint first, fall back
+        through older paths so we work regardless of account
+        provisioning."""
+        # v3 uses store_id in query, not header
+        params_v3: Dict[str, Any] = {
+            "store": self.store_id,
             "page": page,
             "per_page": per_page,
             "order": "desc",
-            "include_unpublished": "false",
         }
         if since:
-            params["minDate"] = since.strftime("%Y-%m-%d")
+            params_v3["minDate"] = since.strftime("%Y-%m-%d")
         if sku:
-            params["sku"] = sku
-        return self._get("/product/review", params=params)
+            params_v3["sku"] = sku
+
+        # Try endpoints in order, return first that returns data
+        # (or last attempted if all empty)
+        endpoints_to_try = [
+            "/merchant/v3/reviews",
+            "/merchant/v2.6/products/reviews",
+            "/api/products/reviews",
+            "/product/review",
+        ]
+        last_payload = None
+        for ep in endpoints_to_try:
+            payload = self._get(ep, params=params_v3)
+            if payload is None:
+                continue
+            last_payload = payload
+            # Heuristic: a response with non-empty review list
+            # means this endpoint works for this account.
+            for k in ("reviews", "data", "review", "items"):
+                v = payload.get(k)
+                if isinstance(v, list) and v:
+                    log.info(
+                        "Using Reviews.io endpoint: %s", ep)
+                    return payload
+                if isinstance(v, list):
+                    last_payload = payload
+        return last_payload
 
 
 # ---------------------------------------------------------------------------

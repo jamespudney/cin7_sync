@@ -198,38 +198,38 @@ class KlaviyoClient:
             return None
         return r.json()
 
-    def get_placed_order_metric_id(self) -> Optional[str]:
-        """Find the 'Placed Order' metric — Klaviyo's standard
-        conversion metric for revenue attribution."""
+    def _get_metric_id_by_name(self, name: str) -> Optional[str]:
+        """v2.67.107 — paginate all metrics and find one by name.
+        Klaviyo doesn't allow API-side filter on 'name'."""
         url = f"{self.BASE}/metrics/"
-        params = {"filter": "equals(name,'Placed Order')",
-                    "page[size]": 5}
-        payload = self._get(url, params=params)
-        if not payload:
-            return None
-        data = payload.get("data") or []
-        for m in data:
-            if (m.get("attributes") or {}).get("name") == "Placed Order":
-                return m.get("id")
+        params = {"page[size]": 100}
+        first = True
+        while url:
+            payload = self._get(url, params=params if first else None)
+            first = False
+            if not payload:
+                return None
+            for m in (payload.get("data") or []):
+                attrs = m.get("attributes") or {}
+                if attrs.get("name") == name:
+                    return m.get("id")
+            url = (payload.get("links") or {}).get("next")
         return None
+
+    def get_placed_order_metric_id(self) -> Optional[str]:
+        """Find the 'Placed Order' metric (Klaviyo's revenue-
+        attribution conversion). Uses _get_metric_id_by_name."""
+        return self._get_metric_id_by_name("Placed Order")
 
     def list_clicked_events_for_campaign(self, campaign_id: str,
                                               limit: int = 5000
                                               ) -> List[dict]:
         """Pull Clicked Email events tagged to this campaign.
-        Each event has the URL clicked + customer."""
-        # Need the Clicked Email metric id first.
-        url = f"{self.BASE}/metrics/"
-        params = {"filter": "equals(name,'Clicked Email')",
-                    "page[size]": 5}
-        payload = self._get(url, params=params)
-        if not payload:
-            return []
-        metric_id = None
-        for m in (payload.get("data") or []):
-            if (m.get("attributes") or {}).get("name") == "Clicked Email":
-                metric_id = m.get("id")
-                break
+        Each event has the URL clicked + customer.
+
+        v2.67.107 — uses _get_metric_id_by_name (paginated client-
+        side filter) instead of the broken filter-by-name."""
+        metric_id = self._get_metric_id_by_name("Clicked Email")
         if not metric_id:
             log.warning("Clicked Email metric id not found")
             return []

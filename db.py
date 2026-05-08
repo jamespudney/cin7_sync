@@ -878,7 +878,10 @@ CREATE TABLE IF NOT EXISTS ad_campaigns_daily (
                                             -- 'pmax'|'display'|
                                             -- 'meta_advantage'
     date            DATE NOT NULL,
-    spend           REAL NOT NULL DEFAULT 0,
+    -- v2.67.107 — spend nullable so ga4_sync can INSERT rows
+    -- without google_ads_sync data yet. COALESCE in upsert
+    -- preserves existing value when google_ads later fills in.
+    spend           REAL DEFAULT 0,
     impressions     INTEGER,
     clicks          INTEGER,
     conv_platform   REAL,                  -- platform's self-report
@@ -1131,6 +1134,72 @@ def _migrate_ad_campaign_skus_spend(conn: sqlite3.Connection) -> None:
                 "INTEGER")
     except sqlite3.Error:
         pass
+
+
+def _migrate_ad_campaigns_daily_drop_spend_notnull(
+        conn: sqlite3.Connection) -> None:
+    """v2.67.107 — rebuild ad_campaigns_daily without NOT NULL on
+    spend. ga4_sync was failing with 'NOT NULL constraint failed:
+    ad_campaigns_daily.spend' because it correctly passes None
+    for fields it doesn't own (so COALESCE preserves
+    google_ads_sync's value on UPDATE) — but the INSERT path was
+    blocked by the constraint when no google_ads row existed yet.
+
+    SQLite can't ALTER COLUMN; we rebuild the table preserving
+    data + indexes."""
+    try:
+        cols_info = conn.execute(
+            "PRAGMA table_info('ad_campaigns_daily')").fetchall()
+        if not cols_info:
+            return  # fresh DB, schema created without NOT NULL
+        spend_col = next(
+            (c for c in cols_info if c[1] == "spend"), None)
+        if not spend_col or spend_col[3] == 0:
+            return  # already nullable
+
+        # Rebuild — preserve all existing data + indexes.
+        conn.executescript("""
+            BEGIN;
+            CREATE TABLE ad_campaigns_daily_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                campaign_id TEXT NOT NULL,
+                campaign_name TEXT,
+                campaign_type TEXT,
+                date DATE NOT NULL,
+                spend REAL DEFAULT 0,
+                impressions INTEGER,
+                clicks INTEGER,
+                conv_platform REAL,
+                conv_ga4 REAL,
+                revenue_platform REAL,
+                revenue_ga4 REAL,
+                captured_at TIMESTAMP NOT NULL DEFAULT
+                  (datetime('now')),
+                UNIQUE(platform, campaign_id, date)
+            );
+            INSERT INTO ad_campaigns_daily_new
+              SELECT id, platform, campaign_id, campaign_name,
+                     campaign_type, date, spend, impressions,
+                     clicks, conv_platform, conv_ga4,
+                     revenue_platform, revenue_ga4, captured_at
+              FROM ad_campaigns_daily;
+            DROP TABLE ad_campaigns_daily;
+            ALTER TABLE ad_campaigns_daily_new
+              RENAME TO ad_campaigns_daily;
+            CREATE INDEX IF NOT EXISTS idx_ad_camp_daily_recent
+                ON ad_campaigns_daily(date DESC);
+            CREATE INDEX IF NOT EXISTS idx_ad_camp_daily_platform
+                ON ad_campaigns_daily(platform, campaign_id);
+            COMMIT;
+        """)
+    except sqlite3.Error:
+        # Best-effort migration. If it fails, the next
+        # connection will retry.
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
 
 FLAG_TYPES = [
     "For review",
@@ -1670,6 +1739,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_demand_signal_match_columns(conn)
         _migrate_product_aliases_multi_target(conn)
         _migrate_ad_campaign_skus_spend(conn)  # v2.67.105
+        _migrate_ad_campaigns_daily_drop_spend_notnull(conn)  # v2.67.107
         yield conn
     finally:
         conn.close()

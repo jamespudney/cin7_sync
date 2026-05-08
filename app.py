@@ -756,13 +756,17 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.106 — Ad-Umpire page bug fix. v2.67.104 "
-        "introduced 'NameError: sqlite3 is not defined' because "
-        "the cached loader functions referenced `sqlite3` but "
-        "only the aliased `_sql_ad` was imported. Fix: local "
-        "imports inside each @st.cache_data function so they're "
-        "self-contained even when Streamlit caches and reruns "
-        "across pages.")
+        "🟢 v2.67.107 — three first-backfill bug fixes. "
+        "(1) ad_campaigns_daily.spend was NOT NULL so ga4_sync "
+        "couldn't INSERT rows for dates Google Ads hadn't "
+        "written yet. Migration drops NOT NULL while preserving "
+        "data. (2) Klaviyo metrics endpoint refused filter by "
+        "'name' (returns 400). Switched to client-side metric "
+        "lookup via paginated fetch. (3) Reviews.io endpoint "
+        "/product/review returned empty → tries newer endpoints "
+        "first (/merchant/v3, etc.), falls back through. After "
+        "deploy, re-run backfills — but TELL ME 'code-freeze "
+        "starting' first so I don't push during your run.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
