@@ -1407,6 +1407,187 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # -----------------------------------------------------------------
+    # v2.67.102 — Campaign-level Moby-replacement tools.
+    # These query ad_campaigns_daily + ad_campaign_skus (populated by
+    # google_ads_sync.py + ga4_sync.py) and replicate the analyses
+    # Triple Whale's Moby chat used to surface.
+    # -----------------------------------------------------------------
+    {
+        "name": "get_ad_overview",
+        "description": (
+            "Top-level paid-marketing summary for a date window: "
+            "total spend, GA4-attributed revenue, platform self-"
+            "reported revenue, computed ROAS for both attribution "
+            "models, # of campaigns active, top 5 spending "
+            "campaigns. Use this for 'how are our Google Ads doing "
+            "this month?' style questions. Reads the cin7_sync "
+            "ad_campaigns_daily table (populated nightly from "
+            "Google Ads API + GA4 Data API)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": (
+                        "Lookback window (default 30).")},
+                "platform": {
+                    "type": "string",
+                    "description": (
+                        "Filter by platform: 'google_ads' (default) "
+                        "or 'meta' or 'all'. Currently only "
+                        "google_ads is populated."),
+                    "enum": ["google_ads", "meta", "all"]},
+            },
+        },
+    },
+    {
+        "name": "get_campaign_performance",
+        "description": (
+            "Per-campaign performance table for a date window. "
+            "Returns each campaign's spend, clicks, conversions, "
+            "revenue (both platform self-report AND GA4-attributed), "
+            "ROAS, CPA. Use this for 'show me all my Search "
+            "campaigns' / 'sort campaigns by ROAS' / 'top spending "
+            "campaigns'."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback window (default 30)"},
+                "platform": {
+                    "type": "string",
+                    "enum": ["google_ads", "meta", "all"]},
+                "campaign_type": {
+                    "type": "string",
+                    "description": (
+                        "Filter by campaign type substring "
+                        "(case-insensitive): 'shopping', 'search', "
+                        "'pmax', 'display'. Empty = all types.")},
+                "sort_by": {
+                    "type": "string",
+                    "enum": ["spend", "ga4_roas",
+                              "platform_roas", "ga4_revenue"],
+                    "description": "Sort order (default 'spend')"},
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "Max campaigns to return (default 25, "
+                        "max 100).")},
+            },
+        },
+    },
+    {
+        "name": "find_campaigns_to_cut",
+        "description": (
+            "Campaigns underperforming against a ROAS threshold. "
+            "Use when the user asks 'which campaigns should I "
+            "pause / cut'. Returns campaigns with GA4 ROAS below "
+            "threshold AND meaningful spend (so we don't flag "
+            "$5/day campaigns as cuts)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback (default 30)"},
+                "min_roas": {
+                    "type": "number",
+                    "description": (
+                        "GA4 ROAS threshold; campaigns BELOW this "
+                        "are flagged. Default 2.0 (i.e. spending $1 "
+                        "to make less than $2).")},
+                "min_spend": {
+                    "type": "number",
+                    "description": (
+                        "Minimum total spend in window to consider "
+                        "(filters out trivial-budget campaigns). "
+                        "Default 100.")},
+            },
+        },
+    },
+    {
+        "name": "find_campaigns_to_scale",
+        "description": (
+            "Campaigns over-performing against a ROAS threshold "
+            "with budget headroom. Use when the user asks 'which "
+            "campaigns can I increase budget on'. Returns campaigns "
+            "with GA4 ROAS above threshold AND consistent "
+            "high spend."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback (default 30)"},
+                "min_roas": {
+                    "type": "number",
+                    "description": (
+                        "GA4 ROAS threshold; campaigns ABOVE this "
+                        "are flagged. Default 4.0.")},
+                "min_spend": {
+                    "type": "number",
+                    "description": (
+                        "Minimum total spend (so we don't surface "
+                        "low-volume noise). Default 500.")},
+            },
+        },
+    },
+    {
+        "name": "attribution_sanity_check",
+        "description": (
+            "Compares platform self-reported revenue vs GA4 "
+            "attribution per campaign. Surfaces campaigns where "
+            "the platform's number diverges significantly from "
+            "GA4 (typical sign of view-through inflation). This is "
+            "the same diagnostic Triple Whale's Moby chat surfaced. "
+            "Returns each campaign with platform_revenue, "
+            "ga4_revenue, and the ratio (platform/ga4)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Lookback (default 30)"},
+                "campaign_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional: drill into one campaign. "
+                        "Otherwise returns top inflators.")},
+                "min_inflation_ratio": {
+                    "type": "number",
+                    "description": (
+                        "Only surface campaigns where "
+                        "platform/ga4 >= this. Default 1.5 "
+                        "(50% inflation).")},
+            },
+        },
+    },
+    {
+        "name": "compare_ad_periods",
+        "description": (
+            "Compares two date windows side-by-side: spend, "
+            "revenue, ROAS, # campaigns. Use for 'how is May "
+            "tracking vs April' or 'last 7 days vs prior 7 "
+            "days'. Returns deltas + percentage changes."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "current_days": {
+                    "type": "integer",
+                    "description": (
+                        "Length of the current window (default 30)")},
+                "compare_to_days_ago": {
+                    "type": "integer",
+                    "description": (
+                        "How many days back the COMPARE window "
+                        "starts (default 60 = 'last 30 days vs "
+                        "prior 30 days'). Set to 7+current_days "
+                        "for week-over-week.")},
+            },
+        },
+    },
 ]
 
 
@@ -4742,6 +4923,372 @@ def get_marketing_intelligence(engine_df: pd.DataFrame,
     return out
 
 
+# ---------------------------------------------------------------------------
+# v2.67.102 — Campaign-level Moby-replacement handlers
+# ---------------------------------------------------------------------------
+
+def _ad_summary_query(days: int, platform: str = "google_ads") -> dict:
+    """Common base aggregator for ad-campaign analytics."""
+    p_filter = "" if platform == "all" else "AND platform = ?"
+    params = [days]
+    if platform != "all":
+        params.append(platform)
+    sql = (
+        "SELECT platform, "
+        "       COUNT(DISTINCT campaign_id) AS n_campaigns, "
+        "       ROUND(SUM(spend), 2) AS total_spend, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       ROUND(SUM(conv_ga4), 0) AS ga4_conversions, "
+        "       ROUND(SUM(conv_platform), 0) AS platform_conversions, "
+        "       SUM(impressions) AS impressions, "
+        "       SUM(clicks) AS clicks "
+        "FROM ad_campaigns_daily "
+        "WHERE date >= date('now', '-' || ? || ' days') "
+        f"  {p_filter} "
+        "GROUP BY platform")
+    with db.connect() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ad_overview(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """Top-level paid-marketing summary."""
+    days = int(args.get("days") or 30)
+    platform = (args.get("platform") or "google_ads").strip().lower()
+    rows = _ad_summary_query(days, platform=platform)
+    if not rows:
+        return {
+            "matched": 0,
+            "note": ("No ad data for that period. If google_ads "
+                      "data should exist, verify google_ads_sync is "
+                      "running on the worker."),
+        }
+
+    # Compute ROAS and add top campaigns per platform
+    out_rows = []
+    for r in rows:
+        spend = r.get("total_spend") or 0
+        ga4 = r.get("ga4_revenue") or 0
+        plat = r.get("platform_revenue") or 0
+        out_rows.append({
+            **r,
+            "ga4_roas": round(ga4 / spend, 2) if spend else None,
+            "platform_roas": round(plat / spend, 2) if spend else None,
+            "platform_inflation_ratio": (
+                round(plat / ga4, 2) if ga4 else None),
+        })
+
+    # Top 5 campaigns by spend
+    top_sql = (
+        "SELECT platform, campaign_id, campaign_name, campaign_type, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue "
+        "FROM ad_campaigns_daily "
+        "WHERE date >= date('now', '-' || ? || ' days') "
+        + ("AND platform = ?" if platform != "all" else "")
+        + " GROUP BY platform, campaign_id "
+        "ORDER BY spend DESC LIMIT 5")
+    p2 = [days]
+    if platform != "all":
+        p2.append(platform)
+    with db.connect() as c:
+        top_rows = [dict(r) for r in c.execute(top_sql, p2).fetchall()]
+
+    for tr in top_rows:
+        sp = tr.get("spend") or 0
+        g4 = tr.get("ga4_revenue") or 0
+        tr["ga4_roas"] = round(g4 / sp, 2) if sp else None
+
+    return {
+        "lookback_days": days,
+        "platform_filter": platform,
+        "by_platform": out_rows,
+        "top_5_by_spend": top_rows,
+        "note": (
+            "ga4_roas uses GA4 data-driven attribution (the "
+            "trustworthy ROAS for budget decisions). "
+            "platform_inflation_ratio > 1.5 means the platform's "
+            "self-report is meaningfully more optimistic than "
+            "GA4."),
+    }
+
+
+def get_campaign_performance(engine_df: pd.DataFrame,
+                                sale_lines_df: pd.DataFrame,
+                                args: dict) -> dict:
+    days = int(args.get("days") or 30)
+    platform = (args.get("platform") or "google_ads").strip().lower()
+    campaign_type = (args.get("campaign_type") or "").strip().upper()
+    sort_by = (args.get("sort_by") or "spend").strip().lower()
+    limit = max(1, min(int(args.get("limit") or 25), 100))
+
+    where_parts = ["date >= date('now', '-' || ? || ' days')"]
+    params = [days]
+    if platform != "all":
+        where_parts.append("platform = ?")
+        params.append(platform)
+    if campaign_type:
+        where_parts.append("UPPER(campaign_type) LIKE ?")
+        params.append(f"%{campaign_type}%")
+
+    sort_sql = {
+        "spend": "spend DESC",
+        "ga4_roas": "ga4_roas DESC NULLS LAST",
+        "platform_roas": "platform_roas DESC NULLS LAST",
+        "ga4_revenue": "ga4_revenue DESC",
+    }.get(sort_by, "spend DESC")
+
+    sql = (
+        "SELECT platform, campaign_id, campaign_name, campaign_type, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       SUM(impressions) AS impressions, "
+        "       SUM(clicks) AS clicks, "
+        "       ROUND(SUM(conv_ga4), 0) AS ga4_conversions, "
+        "       ROUND(SUM(conv_platform), 0) AS platform_conversions, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       CASE WHEN SUM(spend) > 0 THEN "
+        "         ROUND(SUM(revenue_ga4) / SUM(spend), 2) "
+        "       ELSE NULL END AS ga4_roas, "
+        "       CASE WHEN SUM(spend) > 0 THEN "
+        "         ROUND(SUM(revenue_platform) / SUM(spend), 2) "
+        "       ELSE NULL END AS platform_roas, "
+        "       CASE WHEN SUM(clicks) > 0 THEN "
+        "         ROUND(SUM(spend) / SUM(clicks), 2) "
+        "       ELSE NULL END AS cpc "
+        "FROM ad_campaigns_daily "
+        f"WHERE {' AND '.join(where_parts)} "
+        "GROUP BY platform, campaign_id "
+        f"ORDER BY {sort_sql} "
+        "LIMIT ?")
+    params.append(limit)
+
+    with db.connect() as c:
+        rows = c.execute(sql, params).fetchall()
+
+    return {
+        "matched": len(rows),
+        "lookback_days": days,
+        "filters": {
+            "platform": platform,
+            "campaign_type": campaign_type or None,
+            "sort_by": sort_by,
+        },
+        "campaigns": [dict(r) for r in rows],
+        "note": (
+            "ga4_roas is the trustworthy number (data-driven "
+            "attribution). platform_roas often inflates due to "
+            "view-through credit. CPC = cost per click."),
+    }
+
+
+def find_campaigns_to_cut(engine_df: pd.DataFrame,
+                              sale_lines_df: pd.DataFrame,
+                              args: dict) -> dict:
+    days = int(args.get("days") or 30)
+    min_roas = float(args.get("min_roas") or 2.0)
+    min_spend = float(args.get("min_spend") or 100.0)
+
+    sql = (
+        "SELECT platform, campaign_id, campaign_name, campaign_type, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       CASE WHEN SUM(spend) > 0 THEN "
+        "         ROUND(SUM(revenue_ga4) / SUM(spend), 2) "
+        "       ELSE NULL END AS ga4_roas "
+        "FROM ad_campaigns_daily "
+        "WHERE date >= date('now', '-' || ? || ' days') "
+        "GROUP BY platform, campaign_id "
+        "HAVING SUM(spend) >= ? "
+        "   AND (SUM(revenue_ga4) / NULLIF(SUM(spend), 0)) < ? "
+        "ORDER BY ga4_roas ASC, spend DESC")
+
+    with db.connect() as c:
+        rows = c.execute(sql, (days, min_spend, min_roas)).fetchall()
+
+    return {
+        "matched": len(rows),
+        "lookback_days": days,
+        "filters": {
+            "min_roas_threshold": min_roas,
+            "min_spend_floor": min_spend,
+        },
+        "underperformers": [dict(r) for r in rows],
+        "recommendation": (
+            f"Consider pausing or reducing budget on these "
+            f"{len(rows)} campaigns. ROAS below {min_roas}x means "
+            f"every $1 spent earns less than ${min_roas:.2f} back. "
+            f"Sorted worst-first."),
+    }
+
+
+def find_campaigns_to_scale(engine_df: pd.DataFrame,
+                                sale_lines_df: pd.DataFrame,
+                                args: dict) -> dict:
+    days = int(args.get("days") or 30)
+    min_roas = float(args.get("min_roas") or 4.0)
+    min_spend = float(args.get("min_spend") or 500.0)
+
+    sql = (
+        "SELECT platform, campaign_id, campaign_name, campaign_type, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       CASE WHEN SUM(spend) > 0 THEN "
+        "         ROUND(SUM(revenue_ga4) / SUM(spend), 2) "
+        "       ELSE NULL END AS ga4_roas, "
+        "       COUNT(DISTINCT date) AS active_days "
+        "FROM ad_campaigns_daily "
+        "WHERE date >= date('now', '-' || ? || ' days') "
+        "GROUP BY platform, campaign_id "
+        "HAVING SUM(spend) >= ? "
+        "   AND (SUM(revenue_ga4) / NULLIF(SUM(spend), 0)) >= ? "
+        "ORDER BY ga4_roas DESC, spend DESC")
+
+    with db.connect() as c:
+        rows = c.execute(sql, (days, min_spend, min_roas)).fetchall()
+
+    return {
+        "matched": len(rows),
+        "lookback_days": days,
+        "filters": {
+            "min_roas_threshold": min_roas,
+            "min_spend_floor": min_spend,
+        },
+        "overperformers": [dict(r) for r in rows],
+        "recommendation": (
+            f"These {len(rows)} campaigns have GA4 ROAS above "
+            f"{min_roas}x AND consistent spend (>${min_spend:.0f} "
+            f"in window). Candidates for budget increases. Test "
+            f"+20% increments and re-measure ROAS over a 14-day "
+            f"window before committing further."),
+    }
+
+
+def attribution_sanity_check(engine_df: pd.DataFrame,
+                                 sale_lines_df: pd.DataFrame,
+                                 args: dict) -> dict:
+    days = int(args.get("days") or 30)
+    campaign_id = (args.get("campaign_id") or "").strip()
+    min_ratio = float(args.get("min_inflation_ratio") or 1.5)
+
+    where_parts = ["date >= date('now', '-' || ? || ' days')"]
+    params = [days]
+    if campaign_id:
+        where_parts.append("campaign_id = ?")
+        params.append(campaign_id)
+
+    sql = (
+        "SELECT platform, campaign_id, campaign_name, campaign_type, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       CASE WHEN SUM(revenue_ga4) > 0 THEN "
+        "         ROUND(SUM(revenue_platform) / SUM(revenue_ga4), 2) "
+        "       ELSE NULL END AS inflation_ratio "
+        "FROM ad_campaigns_daily "
+        f"WHERE {' AND '.join(where_parts)} "
+        "GROUP BY platform, campaign_id "
+        "HAVING SUM(spend) > 0 ")
+    if not campaign_id:
+        sql += ("AND (SUM(revenue_platform) / NULLIF(SUM(revenue_ga4), "
+                 "0)) >= ? ")
+        params.append(min_ratio)
+    sql += "ORDER BY inflation_ratio DESC LIMIT 25"
+
+    with db.connect() as c:
+        rows = c.execute(sql, params).fetchall()
+
+    return {
+        "matched": len(rows),
+        "lookback_days": days,
+        "min_inflation_ratio": min_ratio,
+        "campaigns": [dict(r) for r in rows],
+        "note": (
+            "inflation_ratio > 1.0 means the platform reports more "
+            "revenue than GA4. >1.5 = 50% inflation, often from "
+            "view-through credits. Use GA4 as the truthful baseline "
+            "for budget decisions; the platform's number is for "
+            "context only."),
+    }
+
+
+def compare_ad_periods(engine_df: pd.DataFrame,
+                          sale_lines_df: pd.DataFrame,
+                          args: dict) -> dict:
+    cur_days = int(args.get("current_days") or 30)
+    back_days = int(args.get("compare_to_days_ago") or (cur_days * 2))
+
+    # Current window: last cur_days
+    sql_cur = (
+        "SELECT platform, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       COUNT(DISTINCT campaign_id) AS n_campaigns "
+        "FROM ad_campaigns_daily "
+        "WHERE date >= date('now', '-' || ? || ' days') "
+        "GROUP BY platform")
+    # Compare window: from -back_days to -(back_days - cur_days)
+    older = back_days
+    newer = back_days - cur_days
+    sql_compare = (
+        "SELECT platform, "
+        "       ROUND(SUM(spend), 2) AS spend, "
+        "       ROUND(SUM(revenue_ga4), 2) AS ga4_revenue, "
+        "       ROUND(SUM(revenue_platform), 2) AS platform_revenue, "
+        "       COUNT(DISTINCT campaign_id) AS n_campaigns "
+        "FROM ad_campaigns_daily "
+        "WHERE date >= date('now', '-' || ? || ' days') "
+        "  AND date < date('now', '-' || ? || ' days') "
+        "GROUP BY platform")
+    with db.connect() as c:
+        cur_rows = c.execute(sql_cur, (cur_days,)).fetchall()
+        cmp_rows = c.execute(sql_compare, (older, newer)).fetchall()
+
+    cur_dict = {r["platform"]: dict(r) for r in cur_rows}
+    cmp_dict = {r["platform"]: dict(r) for r in cmp_rows}
+
+    out = []
+    for plat in sorted(set(list(cur_dict.keys()) + list(cmp_dict.keys()))):
+        a = cur_dict.get(plat, {})
+        b = cmp_dict.get(plat, {})
+
+        def _delta(field):
+            av = a.get(field) or 0
+            bv = b.get(field) or 0
+            d = av - bv
+            pct = (d / bv * 100) if bv else None
+            return {"current": av, "compare": bv,
+                      "delta": round(d, 2),
+                      "pct_change": round(pct, 1) if pct is not None
+                                       else None}
+        out.append({
+            "platform": plat,
+            "spend": _delta("spend"),
+            "ga4_revenue": _delta("ga4_revenue"),
+            "platform_revenue": _delta("platform_revenue"),
+            "n_campaigns": _delta("n_campaigns"),
+        })
+
+    return {
+        "current_window_days": cur_days,
+        "compare_window_days_ago": back_days,
+        "by_platform": out,
+        "note": (
+            "current = last N days. compare = N days ending "
+            "'compare_to_days_ago' days ago. pct_change is "
+            "(current-compare)/compare. Negative pct_change in "
+            "spend with positive in revenue = improving "
+            "efficiency."),
+    }
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
@@ -4780,6 +5327,13 @@ TOOL_HANDLERS = {
     "get_seo_signals": get_seo_signals,
     "get_product_reviews": get_product_reviews,
     "get_marketing_intelligence": get_marketing_intelligence,
+    # v2.67.102 — campaign-level Moby-replacement
+    "get_ad_overview": get_ad_overview,
+    "get_campaign_performance": get_campaign_performance,
+    "find_campaigns_to_cut": find_campaigns_to_cut,
+    "find_campaigns_to_scale": find_campaigns_to_scale,
+    "attribution_sanity_check": attribution_sanity_check,
+    "compare_ad_periods": compare_ad_periods,
 }
 
 

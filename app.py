@@ -756,16 +756,16 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.101 — fix: ga4_sync was clobbering "
-        "google_ads_sync's spend with 0.0 because both write "
-        "to ad_campaigns_daily on (platform, campaign_id, date) "
-        "and the upsert blindly overwrote ALL fields. First "
-        "30-day verification showed spend=$287.85 vs the real "
-        "~$45k. Fix: COALESCE(new, existing) in the upsert SQL "
-        "+ ga4_sync passes None (not 0.0) for fields owned by "
-        "google_ads_sync. Each sync now updates only its own "
-        "fields. Re-run google_ads_sync after deploy to "
-        "repopulate the lost spend rows.")
+        "🟢 v2.67.102 — six campaign-level AI tools added so the "
+        "Slack bot AND dashboard AI Assistant can answer "
+        "Moby-style questions: get_ad_overview, "
+        "get_campaign_performance, find_campaigns_to_cut, "
+        "find_campaigns_to_scale, attribution_sanity_check, "
+        "compare_ad_periods. Both surfaces share TOOL_HANDLERS "
+        "via ai_tools.py — adding tools there lights them up "
+        "everywhere. Phase 1+2 Moby replacement now FUNCTIONALLY "
+        "complete: data flowing nightly + queryable via "
+        "conversational tools on dashboard + Slack.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
