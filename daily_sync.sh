@@ -96,20 +96,40 @@ else
     echo "[$(stamp)] shopify_sync skipped (env vars not set)" >> "$LOG"
 fi
 
-# v2.67.54 — ShipStation sync. Recent (7-day) catch-up keeps the
-# rolling shipments_last_7d_*.csv up to date so the AI's
+# v2.67.54 — ShipStation sync. Recent catch-up keeps the rolling
+# shipments_last_30d_*.csv up to date so the AI's
 # get_shipping_details tool sees yesterday's labels and the Monthly
-# Metrics shipping-cost row stays current. Skipped automatically if
-# SHIPSTATION_API_KEY / SHIPSTATION_API_SECRET aren't set. Note:
-# first-time backfill (5y of history) needs to be run manually:
+# Metrics shipping-cost row stays current. Note: first-time
+# backfill (5y of history) needs to be run manually:
 #   python shipstation_sync.py full --days 1825
-if [ -n "${SHIPSTATION_API_KEY:-}" ] && [ -n "${SHIPSTATION_API_SECRET:-}" ]; then
-    echo "[$(stamp)] shipstation_sync recent --days 7" >> "$LOG"
-    python shipstation_sync.py recent --days 7 >> "$LOG" 2>&1 || \
+#
+# v2.67.81 — gate fixed. ShipStation v2 needs only API_KEY (no
+# secret); v1 needs both. shipstation_sync.py auto-detects which
+# version to use based on which credentials are set. Old gate
+# required BOTH keys, silently skipping v2-only setups and leaving
+# Monthly Metrics' Shipping Cost row empty for weeks. New gate:
+# if API_KEY is set, run; the script handles version detection.
+#
+# v2.67.81 — bumped window from 7d to 30d so Monthly Metrics has
+# the full current month visible without waiting for a manual
+# backfill. Cost: trivial (per-shipment GET is cheap).
+if [ -n "${SHIPSTATION_API_KEY:-}" ]; then
+    echo "[$(stamp)] shipstation_sync recent --days 30" >> "$LOG"
+    python shipstation_sync.py recent --days 30 >> "$LOG" 2>&1 || \
       echo "[$(stamp)] shipstation_sync FAILED (continuing)" >> "$LOG"
 else
-    echo "[$(stamp)] shipstation_sync skipped (env vars not set)" >> "$LOG"
+    echo "[$(stamp)] shipstation_sync skipped (SHIPSTATION_API_KEY unset)" \
+      >> "$LOG"
 fi
+
+# v2.67.81 — housekeeping freshness audit. Catches silent staleness
+# in any data feed (CSVs, DB tables) the app depends on. Always
+# exits 0 — informational only. Output captured into the daily log
+# AND a dedicated housekeeping log for quick scanning.
+echo "[$(stamp)] housekeeping_audit" >> "$LOG"
+python housekeeping_audit.py --verbose \
+  --log "${DATA_DIR}/output/housekeeping.log" >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] housekeeping_audit FAILED (continuing)" >> "$LOG"
 
 echo "[$(stamp)] daily_sync.sh done" >> "$LOG"
 echo "" >> "$LOG"

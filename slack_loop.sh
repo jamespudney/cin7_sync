@@ -200,6 +200,19 @@ while true; do
         fi
     fi
 
+    # v2.67.81 — housekeeping freshness audit, daily.
+    # Catches silent staleness in any data feed the bot depends on.
+    # Always exits 0 — informational only. Reuses last_lessons_epoch's
+    # 24h cadence indirectly by gating on the dim_refresh window so
+    # we always run audit RIGHT AFTER the daily refresh chain.
+    if [ "$seconds_since_dim_refresh" -ge 86400 ] \
+            && [ -e housekeeping_audit.py ]; then
+        echo "[$(stamp)] housekeeping_audit" >> "$LOG"
+        python housekeeping_audit.py --verbose \
+            --log "${DATA_DIR}/output/housekeeping.log" >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] housekeeping_audit FAILED" >> "$LOG"
+    fi
+
     # Slack ingest → DB
     python slack_sync.py poll >> "$LOG" 2>&1 || \
         echo "[$(stamp)] slack_sync.poll failed (continuing)" >> "$LOG"
