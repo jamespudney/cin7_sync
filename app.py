@@ -756,13 +756,16 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.88 — debug panel on Monthly Metrics shows what "
-        "the page sees in the shipments DataFrame at render time. "
-        "Click the 🔧 expander on the page to see rows / cols / "
-        "ShipmentCost stats / Voided dtype. This will tell us "
-        "definitively whether the cache is delivering real data "
-        "to the page or an empty stub. Cache buster bumped to "
-        "v88 to force re-load.")
+        "🟢 v2.67.89 — Monthly Metrics shipping cost ROOT CAUSE "
+        "FOUND. `_ship_cost_per_month` was keyed by 'YYYY-MM' "
+        "strings (via .strftime), but `_per_month` looked up using "
+        "pd.Period objects from `months`. Period vs string mismatch "
+        "→ every lookup returned the default 0 → every month showed "
+        "$0 despite the DataFrame having real data. Bug had been "
+        "present since v2.67.55c but unmasked only when the 5-year "
+        "backfill landed and shipments was no longer empty. One-line "
+        "fix: str(period) before lookup. Real shipping cost numbers "
+        "now render across all 14 months.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -14494,9 +14497,14 @@ elif page == "Monthly Metrics":
             _ship_cost_label = (
                 "Shipping Cost (ShipStation pending — set "
                 "SHIPSTATION_API_KEY)")
+        # v2.67.89 — bugfix. _ship_cost_per_month is keyed by string
+        # 'YYYY-MM' (built via .strftime above), but `_per_month`
+        # passes pd.Period objects from `months`. Lookup never
+        # matched → every month showed $0 even after the data was
+        # correct. str(period) -> 'YYYY-MM' converts safely.
         _row("Margins", _ship_cost_label,
              _per_month(lambda m: float(
-                 _ship_cost_per_month.get(m, 0) or 0)))
+                 _ship_cost_per_month.get(str(m), 0) or 0)))
         _row("Margins", "Line Contribution Margin",
              _per_month(lambda m: _get(sales_per_month, m)
                                    - _get(cogs_per_month, m)))
