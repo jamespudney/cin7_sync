@@ -756,14 +756,17 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.103 — proper multi-year backfill for Google "
-        "Ads + GA4. v2.67.97's `full` subcommand only did one "
-        "365-day chunk before breaking. New sync_backfill() "
-        "walks backwards through time in 365-day chunks "
-        "(Google Ads) / 90-day chunks (GA4) so we can pull 3+ "
-        "years of history. Run `python google_ads_sync.py full "
-        "--days 1095` for 3 years; same for ga4_sync.py "
-        "backfill. Ad-Umpire dashboard page coming next.")
+        "🟢 v2.67.104 — Ad-Umpire dashboard page added. New page "
+        "in the sidebar shows: total spend, GA4-attributed "
+        "revenue (DDA), platform self-report, ROAS for both, "
+        "attribution-inflation ratio with traffic-light status, "
+        "daily spend vs revenue time series, sortable campaign "
+        "table (sort by ROAS / inflation / cut-candidates), top "
+        "50 SKUs by ad-attributed revenue. Date range picker "
+        "supports up to 'Last 3 years' so the multi-year "
+        "backfill from v2.67.103 has somewhere to land. Future "
+        "platforms (Meta, Pinterest) auto-show via "
+        "ad_campaigns_daily's platform tag.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -2640,6 +2643,7 @@ with st.sidebar:
             "AI Feedback",
             "Demand Signals",
             "Slow Movers",  # v2.67.38 — dedicated stock-reduction page
+            "Ad-Umpire",  # v2.67.104 — paid-marketing dashboard
             "My Profile",
             "Monthly Metrics",
             "Ordering",
@@ -2667,6 +2671,7 @@ with st.sidebar:
         "Review past AI answers and team-logged corrections.",
         "Track customer interest before it shows up in sales.",
         "Stock-reduction workspace: dormant SKUs, value tied up, dismiss/flag.",
+        "Paid-ads dashboard: Google Ads + GA4 attribution + ROAS.",
         "Edit your profile; admins manage all users.",
         "Month-over-month KPI report — commission reference.",
         "ABC-driven reorder workbench with PO drafts.",
@@ -14136,6 +14141,226 @@ elif page == "Ordering":
 #
 # Shipping Cost row is stubbed with "— (ShipStation pending)" — the rest is
 # computed from CIN7 data we already sync.
+
+# ---------------------------------------------------------------------------
+# Page: Ad-Umpire (v2.67.104)
+# ---------------------------------------------------------------------------
+# Paid-marketing dashboard. Replaces Triple Whale's Summary page for
+# the data we actually look at. Sources:
+#   - Google Ads API (campaign daily metrics, populated by
+#     google_ads_sync.py)
+#   - GA4 Data API (data-driven attribution, populated by
+#     ga4_sync.py)
+#   - Both write to the same ad_campaigns_daily table (COALESCE
+#     upsert so each sync only updates fields it owns)
+# Future: Meta Ads (when OAuth is provisioned), Pinterest, TikTok.
+# Each new platform writes into ad_campaigns_daily with its own
+# 'platform' tag; this page auto-picks them up.
+elif page == "Ad-Umpire":
+    st.header(":dart: Ad-Umpire")
+    st.caption(
+        "Paid-marketing dashboard. Real spend (from ad platforms) "
+        "vs real attribution (from GA4). Replaces Triple Whale.")
+
+    import sqlite3 as _sql_ad
+    from datetime import date as _date_ad, timedelta as _td_ad
+
+    # Date range picker
+    _col_dr1, _col_dr2, _col_dr3 = st.columns([2, 1, 1])
+    with _col_dr1:
+        _ad_range = st.selectbox(
+            "Date range",
+            ["Last 7 days", "Last 30 days", "Last 90 days",
+             "Last 12 months", "Last 3 years", "Custom"],
+            index=1)
+    today = _date_ad.today()
+    if _ad_range == "Custom":
+        with _col_dr2:
+            _ad_start = st.date_input(
+                "From", value=today - _td_ad(days=30))
+        with _col_dr3:
+            _ad_end = st.date_input("To", value=today)
+    else:
+        _days_map = {
+            "Last 7 days": 7, "Last 30 days": 30,
+            "Last 90 days": 90, "Last 12 months": 365,
+            "Last 3 years": 1095,
+        }
+        _ad_end = today
+        _ad_start = today - _td_ad(days=_days_map[_ad_range])
+        with _col_dr2:
+            st.metric("From", _ad_start.isoformat())
+        with _col_dr3:
+            st.metric("To", _ad_end.isoformat())
+
+    @st.cache_data(ttl=300)
+    def _load_ad_campaigns(start_iso: str, end_iso: str
+                              ) -> pd.DataFrame:
+        from data_paths import DB_PATH as _DB_AD
+        conn = sqlite3.connect(_DB_AD, timeout=5)
+        try:
+            return pd.read_sql_query(
+                "SELECT * FROM ad_campaigns_daily "
+                "WHERE date >= ? AND date <= ? "
+                "ORDER BY date ASC, platform, campaign_id",
+                conn, params=(start_iso, end_iso))
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            conn.close()
+
+    @st.cache_data(ttl=300)
+    def _load_ad_skus(start_iso: str, end_iso: str) -> pd.DataFrame:
+        from data_paths import DB_PATH as _DB_AD
+        conn = sqlite3.connect(_DB_AD, timeout=5)
+        try:
+            return pd.read_sql_query(
+                "SELECT * FROM ad_campaign_skus "
+                "WHERE date >= ? AND date <= ?",
+                conn, params=(start_iso, end_iso))
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            conn.close()
+
+    ad_df = _load_ad_campaigns(_ad_start.isoformat(),
+                                  _ad_end.isoformat())
+    if ad_df.empty:
+        st.warning(
+            "No ad data for that range. Run "
+            "`python google_ads_sync.py full --days 1095` and "
+            "`python ga4_sync.py backfill --days 1095` on the "
+            "worker to backfill 3 years of history.")
+    else:
+        # ----- Headline scorecards -----
+        _spend = float(ad_df["spend"].fillna(0).sum())
+        _ga4_rev = float(ad_df["revenue_ga4"].fillna(0).sum())
+        _plat_rev = float(ad_df["revenue_platform"].fillna(0).sum())
+        _ga4_roas = (_ga4_rev / _spend) if _spend > 0 else 0
+        _plat_roas = (_plat_rev / _spend) if _spend > 0 else 0
+        _n_campaigns = int(ad_df["campaign_id"].nunique())
+        _n_clicks = int(ad_df["clicks"].fillna(0).sum())
+        _cpc = (_spend / _n_clicks) if _n_clicks > 0 else 0
+        _inflation = (_plat_rev / _ga4_rev) if _ga4_rev > 0 else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total spend", f"${_spend:,.2f}")
+        c2.metric("GA4 revenue (DDA)",
+                    f"${_ga4_rev:,.2f}",
+                    f"ROAS {_ga4_roas:.2f}x")
+        c3.metric("Platform revenue",
+                    f"${_plat_rev:,.2f}",
+                    f"ROAS {_plat_roas:.2f}x")
+        c4.metric("Active campaigns", str(_n_campaigns),
+                    f"CPC ${_cpc:.2f}")
+
+        # Reconciliation strip
+        st.markdown("##### Attribution reconciliation")
+        c5, c6, c7 = st.columns(3)
+        c5.metric("GA4 attributed (trustworthy)",
+                    f"${_ga4_rev:,.2f}")
+        c6.metric("Platform self-report",
+                    f"${_plat_rev:,.2f}")
+        if _inflation:
+            _inf_label = (
+                "✅ within tolerance" if _inflation < 1.2
+                else "⚠️ moderate" if _inflation < 1.5
+                else "🔴 high inflation")
+            c7.metric("Inflation ratio",
+                        f"{_inflation:.2f}×",
+                        _inf_label)
+        else:
+            c7.metric("Inflation ratio", "n/a", "")
+
+        st.markdown("---")
+
+        # ----- Time series: daily spend vs revenue -----
+        st.markdown("##### Daily spend vs revenue")
+        ts_df = (ad_df.assign(
+            _date=pd.to_datetime(ad_df["date"], errors="coerce"))
+                  .dropna(subset=["_date"])
+                  .groupby("_date")
+                  .agg(spend=("spend", "sum"),
+                         ga4_revenue=("revenue_ga4", "sum"),
+                         platform_revenue=(
+                             "revenue_platform", "sum"))
+                  .reset_index())
+        if not ts_df.empty:
+            st.line_chart(ts_df.set_index("_date")[
+                ["spend", "ga4_revenue", "platform_revenue"]])
+
+        st.markdown("---")
+
+        # ----- Campaign performance table -----
+        st.markdown("##### Campaign performance")
+        _sort_options = {
+            "Spend (highest first)": ("spend", False),
+            "GA4 ROAS (highest first)": ("ga4_roas", False),
+            "GA4 ROAS (lowest — cut candidates)": ("ga4_roas", True),
+            "Inflation (highest first)": ("inflation", False),
+        }
+        _sort_label = st.selectbox(
+            "Sort by", list(_sort_options.keys()), index=0)
+        _sort_key, _sort_asc = _sort_options[_sort_label]
+
+        camp_df = (ad_df.groupby(
+            ["platform", "campaign_id", "campaign_name",
+             "campaign_type"])
+                    .agg(spend=("spend", "sum"),
+                          impressions=("impressions", "sum"),
+                          clicks=("clicks", "sum"),
+                          ga4_conversions=("conv_ga4", "sum"),
+                          platform_conversions=("conv_platform",
+                                                  "sum"),
+                          ga4_revenue=("revenue_ga4", "sum"),
+                          platform_revenue=("revenue_platform",
+                                              "sum"))
+                    .reset_index())
+        camp_df["ga4_roas"] = (
+            camp_df["ga4_revenue"] / camp_df["spend"].replace(
+                0, pd.NA))
+        camp_df["platform_roas"] = (
+            camp_df["platform_revenue"] / camp_df["spend"].replace(
+                0, pd.NA))
+        camp_df["inflation"] = (
+            camp_df["platform_revenue"] / camp_df[
+                "ga4_revenue"].replace(0, pd.NA))
+        camp_df = camp_df.sort_values(
+            _sort_key, ascending=_sort_asc, na_position="last")
+
+        # Format for display
+        for _c in ("spend", "ga4_revenue", "platform_revenue"):
+            camp_df[_c] = camp_df[_c].round(2)
+        for _c in ("ga4_roas", "platform_roas", "inflation"):
+            camp_df[_c] = camp_df[_c].round(2)
+
+        st.dataframe(camp_df, use_container_width=True,
+                       hide_index=True)
+        st.caption(
+            f"{len(camp_df)} campaigns. Sorted by {_sort_label}. "
+            "ga4_roas is the trustworthy ROAS; inflation > 1.5 "
+            "means platform is over-reporting vs GA4.")
+
+        st.markdown("---")
+
+        # ----- Per-SKU attribution -----
+        sku_df = _load_ad_skus(_ad_start.isoformat(),
+                                  _ad_end.isoformat())
+        if not sku_df.empty:
+            st.markdown("##### Top SKUs by ad-attributed revenue")
+            sku_agg = (sku_df.groupby(
+                ["platform", "sku", "family"])
+                        .agg(purchases=("purchases", "sum"),
+                              revenue=("revenue", "sum"))
+                        .reset_index()
+                        .sort_values("revenue", ascending=False)
+                        .head(50))
+            st.dataframe(sku_agg, use_container_width=True,
+                            hide_index=True)
+            st.caption(
+                f"Top 50 SKUs by GA4-attributed ad revenue. SKU "
+                f"is GA4's itemId (Shopify variant SKU). Family "
+                f"derived from SKU prefix.")
 
 elif page == "Monthly Metrics":
     st.header(":bar_chart: Monthly Metrics")
