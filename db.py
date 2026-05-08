@@ -740,6 +740,181 @@ CREATE INDEX IF NOT EXISTS idx_product_dimensions_handle
     ON product_dimensions(shopify_handle);
 CREATE INDEX IF NOT EXISTS idx_product_dimensions_family
     ON product_dimensions(family);
+
+-- v2.67.90 — marketing intelligence tables.
+-- Vision: bring SEO + email + ad + reviews data together so the
+-- buyer can answer 'why did this SKU's sales spike/dip', and so
+-- the AI bot can replace Triple Whale's Moby chat (cancel by
+-- June 1).
+--
+-- Sources flowing in:
+--   semrush_sync.py        -> seo_keyword_positions
+--   klaviyo_sync.py        -> email_campaigns + email_campaign_skus
+--   reviewsio_sync.py      -> product_reviews
+--   ga4_sync.py            -> ga4_events_daily (Phase 2 after Elevar)
+--   google_ads_sync.py     -> ad_campaigns_daily, ad_campaign_skus
+--   meta_ads_sync.py       -> same shape as google_ads_sync (Phase 3)
+
+-- SEO: per-keyword/URL ranking positions over time.
+-- Pulled weekly from SEMrush (Guru plan API, ~10 units per
+-- keyword). Also fed by per-URL Search Console data when wired up.
+CREATE TABLE IF NOT EXISTS seo_keyword_positions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    keyword         TEXT NOT NULL,
+    url             TEXT,                  -- the ranking URL on
+                                            -- our domain
+    sku             TEXT,                  -- mapped via Shopify
+                                            -- handle, may be NULL
+                                            -- for category pages
+    family          TEXT,                  -- ditto
+    position        REAL,                  -- 1.0 = top of page;
+                                            -- decimals for averaged
+                                            -- positions
+    previous_position REAL,                -- last week's position
+                                            -- for delta display
+    search_volume   INTEGER,               -- monthly search volume
+                                            -- per SEMrush
+    serp_features   TEXT,                  -- json: featured snippet,
+                                            -- people-also-ask, etc.
+    source          TEXT NOT NULL DEFAULT 'semrush',
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(keyword, url, source, captured_at)
+);
+CREATE INDEX IF NOT EXISTS idx_seo_kw_sku
+    ON seo_keyword_positions(sku);
+CREATE INDEX IF NOT EXISTS idx_seo_kw_family
+    ON seo_keyword_positions(family);
+CREATE INDEX IF NOT EXISTS idx_seo_kw_recent
+    ON seo_keyword_positions(captured_at DESC);
+
+-- Email campaigns from Klaviyo.
+-- Headline metrics per campaign. Tied to per-SKU click data via
+-- email_campaign_skus.
+CREATE TABLE IF NOT EXISTS email_campaigns (
+    id              TEXT PRIMARY KEY,      -- klaviyo campaign id
+    name            TEXT,
+    subject         TEXT,
+    sent_at         TIMESTAMP,
+    list_name       TEXT,                  -- target list/segment
+    recipients      INTEGER,
+    delivered       INTEGER,
+    opens_unique    INTEGER,
+    clicks_unique   INTEGER,
+    open_rate       REAL,
+    click_rate      REAL,
+    revenue         REAL,                  -- klaviyo's attributed
+                                            -- revenue
+    orders          INTEGER,               -- klaviyo's attributed
+                                            -- order count
+    raw_payload     TEXT,                  -- full klaviyo response
+                                            -- for re-parsing
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_email_campaigns_sent
+    ON email_campaigns(sent_at DESC);
+
+-- Per-SKU click data for each email campaign.
+-- Klaviyo's "Clicked Email" event has the URL clicked; we resolve
+-- URL -> Shopify handle -> CIN7 SKU and aggregate clicks per SKU
+-- per campaign.
+CREATE TABLE IF NOT EXISTS email_campaign_skus (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id     TEXT NOT NULL,         -- FK to email_campaigns
+    sku             TEXT NOT NULL,
+    family          TEXT,
+    shopify_handle  TEXT,
+    click_count     INTEGER NOT NULL DEFAULT 0,
+    unique_clicks   INTEGER NOT NULL DEFAULT 0,
+    attributed_revenue REAL,               -- if klaviyo attributes
+                                            -- per-product revenue
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(campaign_id, sku),
+    FOREIGN KEY(campaign_id) REFERENCES email_campaigns(id)
+);
+CREATE INDEX IF NOT EXISTS idx_email_camp_sku_sku
+    ON email_campaign_skus(sku);
+CREATE INDEX IF NOT EXISTS idx_email_camp_sku_family
+    ON email_campaign_skus(family);
+
+-- Reviews from Reviews.io, per product.
+-- One row per review (so we can show recent ones / sentiment).
+-- Aggregates rolled up at query time.
+CREATE TABLE IF NOT EXISTS product_reviews (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id       TEXT NOT NULL UNIQUE,  -- reviews.io review id
+    sku             TEXT,
+    family          TEXT,
+    shopify_handle  TEXT,
+    shopify_product_id TEXT,
+    rating          REAL NOT NULL,         -- 1.0-5.0
+    title           TEXT,
+    body            TEXT,
+    reviewer_name   TEXT,
+    reviewer_email  TEXT,
+    review_date     TIMESTAMP,
+    verified_buyer  INTEGER NOT NULL DEFAULT 0,
+    helpful_count   INTEGER NOT NULL DEFAULT 0,
+    images_json     TEXT,                  -- list of image URLs
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_product_reviews_sku
+    ON product_reviews(sku);
+CREATE INDEX IF NOT EXISTS idx_product_reviews_family
+    ON product_reviews(family);
+CREATE INDEX IF NOT EXISTS idx_product_reviews_date
+    ON product_reviews(review_date DESC);
+CREATE INDEX IF NOT EXISTS idx_product_reviews_handle
+    ON product_reviews(shopify_handle);
+
+-- Daily ad-platform spend + outcomes per campaign.
+-- Phase 2 onwards (post-Elevar). Will be populated by
+-- google_ads_sync.py and meta_ads_sync.py.
+CREATE TABLE IF NOT EXISTS ad_campaigns_daily (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform        TEXT NOT NULL,         -- 'google_ads' | 'meta'
+    campaign_id     TEXT NOT NULL,
+    campaign_name   TEXT,
+    campaign_type   TEXT,                  -- 'search'|'shopping'|
+                                            -- 'pmax'|'display'|
+                                            -- 'meta_advantage'
+    date            DATE NOT NULL,
+    spend           REAL NOT NULL DEFAULT 0,
+    impressions     INTEGER,
+    clicks          INTEGER,
+    conv_platform   REAL,                  -- platform's self-report
+                                            -- conversion count
+    conv_ga4        REAL,                  -- GA4-attributed conv
+                                            -- (the trustworthy one)
+    revenue_platform REAL,                 -- platform's self-report
+    revenue_ga4     REAL,                  -- GA4-attributed
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(platform, campaign_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_camp_daily_recent
+    ON ad_campaigns_daily(date DESC);
+CREATE INDEX IF NOT EXISTS idx_ad_camp_daily_platform
+    ON ad_campaigns_daily(platform, campaign_id);
+
+-- Per-SKU ad attribution. From GA4 ecommerce events with
+-- campaign tagging.
+CREATE TABLE IF NOT EXISTS ad_campaign_skus (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform        TEXT NOT NULL,
+    campaign_id     TEXT NOT NULL,
+    date            DATE NOT NULL,
+    sku             TEXT NOT NULL,
+    family          TEXT,
+    item_views      INTEGER,
+    add_to_carts    INTEGER,
+    purchases       INTEGER,
+    revenue         REAL,
+    captured_at     TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(platform, campaign_id, date, sku)
+);
+CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
+    ON ad_campaign_skus(sku);
+CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
+    ON ad_campaign_skus(family);
 """
 
 
@@ -1194,6 +1369,204 @@ def product_dimensions_no_diagram_handles() -> set:
             "WHERE has_diagram = 0"
         ).fetchall()
     return {r["shopify_handle"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Marketing intelligence helpers (v2.67.90)
+# ---------------------------------------------------------------------------
+
+def upsert_seo_keyword_position(row: dict) -> int:
+    """Insert one SEMrush ranking observation. Idempotent on
+    (keyword, url, source, captured_at)."""
+    cols = ("keyword", "url", "sku", "family", "position",
+              "previous_position", "search_volume", "serp_features",
+              "source", "captured_at")
+    values = [row.get(c) for c in cols]
+    sql = (f"INSERT OR IGNORE INTO seo_keyword_positions "
+             f"({','.join(cols)}) VALUES "
+             f"({','.join('?' for _ in cols)})")
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def get_seo_signals_for_sku(sku: str, days: int = 30) -> list:
+    """Return SEO ranking observations for a SKU in the last N days."""
+    sql = (
+        "SELECT * FROM seo_keyword_positions "
+        "WHERE sku = ? "
+        "  AND captured_at >= datetime('now', '-' || ? || ' days') "
+        "ORDER BY captured_at DESC, position ASC")
+    with connect() as c:
+        rows = c.execute(sql, (sku, days)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_seo_signals_for_family(family: str, days: int = 30) -> list:
+    sql = (
+        "SELECT * FROM seo_keyword_positions "
+        "WHERE family = ? "
+        "  AND captured_at >= datetime('now', '-' || ? || ' days') "
+        "ORDER BY captured_at DESC, position ASC")
+    with connect() as c:
+        rows = c.execute(sql, (family, days)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_email_campaign(row: dict) -> int:
+    """Insert or replace an email campaign. Keyed on klaviyo id."""
+    cols = ("id", "name", "subject", "sent_at", "list_name",
+              "recipients", "delivered", "opens_unique",
+              "clicks_unique", "open_rate", "click_rate",
+              "revenue", "orders", "raw_payload", "captured_at")
+    values = [row.get(c) for c in cols]
+    sql = (
+        f"INSERT INTO email_campaigns ({','.join(cols)}) "
+        f"VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(id) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in cols if c != "id"))
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def upsert_email_campaign_sku(row: dict) -> int:
+    cols = ("campaign_id", "sku", "family", "shopify_handle",
+              "click_count", "unique_clicks", "attributed_revenue",
+              "captured_at")
+    values = [row.get(c) for c in cols]
+    sql = (
+        f"INSERT INTO email_campaign_skus ({','.join(cols)}) "
+        f"VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(campaign_id, sku) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}"
+                     for c in cols if c not in ("campaign_id", "sku")))
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def get_email_attribution_for_sku(sku: str, days: int = 90) -> list:
+    """Return email campaigns that drove clicks/revenue on this SKU."""
+    sql = (
+        "SELECT ec.id, ec.name, ec.subject, ec.sent_at, "
+        "       ec.recipients, ec.open_rate, ec.click_rate, "
+        "       ec.revenue AS campaign_revenue, "
+        "       ecs.click_count, ecs.unique_clicks, "
+        "       ecs.attributed_revenue AS sku_revenue "
+        "FROM email_campaign_skus ecs "
+        "JOIN email_campaigns ec ON ec.id = ecs.campaign_id "
+        "WHERE ecs.sku = ? "
+        "  AND ec.sent_at >= datetime('now', '-' || ? || ' days') "
+        "ORDER BY ec.sent_at DESC")
+    with connect() as c:
+        rows = c.execute(sql, (sku, days)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_product_review(row: dict) -> int:
+    """Insert one review. Idempotent on review_id."""
+    cols = ("review_id", "sku", "family", "shopify_handle",
+              "shopify_product_id", "rating", "title", "body",
+              "reviewer_name", "reviewer_email", "review_date",
+              "verified_buyer", "helpful_count", "images_json",
+              "captured_at")
+    values = [row.get(c) for c in cols]
+    sql = (
+        f"INSERT INTO product_reviews ({','.join(cols)}) "
+        f"VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(review_id) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}"
+                     for c in cols if c != "review_id"))
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def get_reviews_summary_for_sku(sku: str) -> dict:
+    """Aggregate review stats for a SKU."""
+    sql = (
+        "SELECT COUNT(*) as count, "
+        "       AVG(rating) as avg_rating, "
+        "       SUM(CASE WHEN rating <= 2 THEN 1 ELSE 0 END) "
+        "         as low_count, "
+        "       SUM(CASE WHEN rating >= 4 THEN 1 ELSE 0 END) "
+        "         as high_count, "
+        "       MAX(review_date) as latest_review "
+        "FROM product_reviews WHERE sku = ?")
+    with connect() as c:
+        r = c.execute(sql, (sku,)).fetchone()
+    return dict(r) if r else {}
+
+
+def get_recent_reviews_for_sku(sku: str, limit: int = 5) -> list:
+    sql = (
+        "SELECT * FROM product_reviews WHERE sku = ? "
+        "ORDER BY review_date DESC LIMIT ?")
+    with connect() as c:
+        rows = c.execute(sql, (sku, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_ad_campaign_daily(row: dict) -> int:
+    cols = ("platform", "campaign_id", "campaign_name", "campaign_type",
+              "date", "spend", "impressions", "clicks",
+              "conv_platform", "conv_ga4",
+              "revenue_platform", "revenue_ga4", "captured_at")
+    values = [row.get(c) for c in cols]
+    sql = (
+        f"INSERT INTO ad_campaigns_daily ({','.join(cols)}) "
+        f"VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(platform, campaign_id, date) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}"
+                     for c in cols
+                     if c not in ("platform", "campaign_id", "date")))
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def upsert_ad_campaign_sku(row: dict) -> int:
+    cols = ("platform", "campaign_id", "date", "sku", "family",
+              "item_views", "add_to_carts", "purchases", "revenue",
+              "captured_at")
+    values = [row.get(c) for c in cols]
+    sql = (
+        f"INSERT INTO ad_campaign_skus ({','.join(cols)}) "
+        f"VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(platform, campaign_id, date, sku) "
+        f"DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}"
+                     for c in cols
+                     if c not in ("platform", "campaign_id",
+                                    "date", "sku")))
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def get_ad_attribution_for_sku(sku: str, days: int = 30) -> list:
+    """Return ad campaigns that drove revenue on this SKU."""
+    sql = (
+        "SELECT ad.platform, ad.campaign_id, "
+        "       ad.campaign_name, ad.campaign_type, "
+        "       SUM(ad.spend) AS total_spend, "
+        "       SUM(ad.revenue_ga4) AS attributed_revenue_ga4, "
+        "       SUM(acs.revenue) AS sku_revenue, "
+        "       SUM(acs.purchases) AS sku_purchases, "
+        "       SUM(acs.add_to_carts) AS sku_atcs "
+        "FROM ad_campaign_skus acs "
+        "JOIN ad_campaigns_daily ad "
+        "  ON ad.platform = acs.platform "
+        "  AND ad.campaign_id = acs.campaign_id "
+        "  AND ad.date = acs.date "
+        "WHERE acs.sku = ? "
+        "  AND acs.date >= date('now', '-' || ? || ' days') "
+        "GROUP BY ad.platform, ad.campaign_id "
+        "ORDER BY total_spend DESC")
+    with connect() as c:
+        rows = c.execute(sql, (sku, days)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
