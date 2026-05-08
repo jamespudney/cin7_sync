@@ -127,6 +127,15 @@ last_data_sync_epoch=$(date -u +%s)
 # pass through the loop after boot (so a freshly-booted worker
 # generates a summary if one doesn't exist for today).
 last_lessons_epoch=0
+# v2.67.80 — dimension-data maintenance cadence:
+#   refresh-classifications: daily (no API spend)
+#     re-pulls collections + metafields + applies title rules so
+#     bot stays in sync if a buyer reorganises Shopify collections
+#     or adds metafields
+#   weekly-new-products: every 7 days
+#     extracts vision dims for any new SKUs added since last run
+last_dim_refresh_epoch=0
+last_dim_weekly_epoch=0
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -161,6 +170,34 @@ while true; do
         python bot_self_improvement.py daily --days 7 >> "$LOG" 2>&1 || \
             echo "[$(stamp)] summarizer FAILED" >> "$LOG"
         last_lessons_epoch=$(date -u +%s)
+    fi
+
+    # v2.67.80 — daily dimension-classifications refresh.
+    # Catches collection / metafield / title changes since the last
+    # extraction so bot answers stay in sync with Shopify reality.
+    # No vision API spend.
+    seconds_since_dim_refresh=$(( now_epoch - last_dim_refresh_epoch ))
+    if [ "$seconds_since_dim_refresh" -ge 86400 ]; then
+        if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
+            echo "[$(stamp)] refreshing product_dimensions classifications" >> "$LOG"
+            python extract_dimensions.py refresh-classifications >> "$LOG" 2>&1 || \
+                echo "[$(stamp)] dim refresh FAILED" >> "$LOG"
+            last_dim_refresh_epoch=$(date -u +%s)
+        fi
+    fi
+
+    # v2.67.80 — weekly new-product vision extraction.
+    # Picks up any SKUs added in Shopify since the last run.
+    seconds_since_dim_weekly=$(( now_epoch - last_dim_weekly_epoch ))
+    if [ "$seconds_since_dim_weekly" -ge 604800 ]; then
+        if [ -n "${SHOPIFY_DOMAIN:-}" ] \
+                && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ] \
+                && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "[$(stamp)] weekly: extracting NEW products" >> "$LOG"
+            python extract_dimensions.py weekly-new-products >> "$LOG" 2>&1 || \
+                echo "[$(stamp)] weekly extract FAILED" >> "$LOG"
+            last_dim_weekly_epoch=$(date -u +%s)
+        fi
     fi
 
     # Slack ingest → DB

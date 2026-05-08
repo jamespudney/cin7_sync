@@ -985,6 +985,165 @@ def cmd_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_refresh_classifications(args: argparse.Namespace) -> int:
+    """v2.67.80 — daily refresh: walk every product_dimensions row,
+    pull current Shopify collections + metafields, re-apply
+    mounting-type override rules. Catches collection changes and
+    metafield additions WITHOUT spending on vision API.
+
+    Designed to run daily inside slack_loop.sh's 24-hour cycle.
+    Zero LLM cost. Walking time: ~5-10 min for 400 rows."""
+    _setup_log(args.verbose)
+    rows = db.all_product_dimensions()
+    log.info("Refreshing classifications for %d product_dimensions "
+              "rows", len(rows))
+    if not rows:
+        return 0
+
+    client = _make_shopify_client()
+    log.info("Building collections index (one-time)...")
+    coll_index = _build_collections_index(client)
+
+    fixed = 0
+    unchanged = 0
+    fetch_failed = 0
+    for i, r in enumerate(rows, start=1):
+        handle = r.get("shopify_handle") or ""
+        pid = r.get("shopify_product_id")
+        title = r.get("title") or ""
+        current_mount = r.get("mounting_type") or ""
+
+        # Fresh metafields + collection memberships
+        metafields = _fetch_metafields(client, pid) if pid else []
+        collections = coll_index.get(str(pid), [])
+
+        # Determine new mounting_type via the same priority chain
+        # used in _extract_one: title > collection > metafield >
+        # current. (For refresh we do NOT call vision.)
+        new_mount = current_mount
+
+        # 1. Metafield first (lowest precedence among hints)
+        for m in metafields:
+            key = (m.get("key") or "").lower().strip()
+            target = _DIM_KEY_MAP.get(key)
+            if target == "mounting_type":
+                normed = _normalise_mounting_type(m.get("value"))
+                if normed:
+                    new_mount = normed
+                    break
+
+        # 2. Collection-driven override
+        for coll_title in collections:
+            canonical = _normalise_mounting_type(coll_title)
+            if canonical in ("mud-in", "surface", "recessed",
+                              "corner", "pendant"):
+                new_mount = canonical
+                break
+
+        # 3. Title-driven override (highest priority)
+        title_canonical = _title_to_mounting_type(title)
+        if title_canonical:
+            new_mount = title_canonical
+
+        if new_mount and new_mount != current_mount:
+            if args.dry_run:
+                log.info("[%s] WOULD refresh: %s -> %s",
+                          handle, current_mount or "(blank)", new_mount)
+            else:
+                new_row = dict(r)
+                new_row["mounting_type"] = new_mount
+                new_row.pop("id", None)
+                db.upsert_product_dimensions(new_row)
+                log.info("[%s] refreshed: %s -> %s "
+                          "(%d collections, %d metafields)",
+                          handle, current_mount or "(blank)",
+                          new_mount, len(collections),
+                          len(metafields))
+            fixed += 1
+        else:
+            unchanged += 1
+
+        if i % 50 == 0:
+            log.info("Progress: %d / %d  (%d refreshed, %d unchanged)",
+                      i, len(rows), fixed, unchanged)
+
+    log.info("=" * 60)
+    if args.dry_run:
+        log.info("DRY RUN — would refresh %d, leave %d unchanged",
+                  fixed, unchanged)
+    else:
+        log.info("Refreshed %d | unchanged %d | fetch_failed %d",
+                  fixed, unchanged, fetch_failed)
+    return 0
+
+
+def cmd_weekly_new_products(args: argparse.Namespace) -> int:
+    """v2.67.80 — weekly new-products extraction. Detects handles
+    in Shopify that are NOT yet in product_dimensions, runs the
+    full vision pipeline on them. Catches new SKUs added in the
+    last week.
+
+    Cost: depends on how many new products. Typically $0-2/week
+    based on cataloguing pace."""
+    _setup_log(args.verbose)
+    client = _make_shopify_client()
+    log.info("Fetching all Shopify products...")
+    products = _fetch_all_products(client)
+    log.info("Fetched %d total", len(products))
+
+    products = [p for p in products if _is_likely_led_profile(p)]
+    log.info("LED-profile-like: %d", len(products))
+
+    already = db.product_dimensions_handles()
+    new_products = [p for p in products
+                       if (p.get("handle") or "") not in already]
+    log.info("NEW (not yet in product_dimensions): %d",
+              len(new_products))
+
+    if not new_products:
+        log.info("Nothing new to extract — done.")
+        return 0
+
+    if args.limit and args.limit > 0:
+        new_products = new_products[:args.limit]
+        log.info("Limit applied: %d", len(new_products))
+
+    log.info("Building collections index...")
+    coll_index = _build_collections_index(client)
+
+    anth_client = _build_anthropic_client()
+    model = (args.model or os.environ.get(
+        "ANTHROPIC_MODEL_VISION", DEFAULT_MODEL))
+
+    n_diag = n_no = n_err = 0
+    for i, prod in enumerate(new_products, start=1):
+        try:
+            res = _extract_one(prod, anth_client, model,
+                                 dry_run=args.dry_run,
+                                 shopify_client=client,
+                                 collections_index=coll_index)
+            if res is None:
+                n_err += 1
+            elif res.get("has_diagram"):
+                n_diag += 1
+            else:
+                n_no += 1
+        except Exception as exc:
+            log.error("[%s] failed: %s",
+                        prod.get("handle"), exc)
+            n_err += 1
+        if i % 25 == 0:
+            log.info("Progress: %d / %d  (%d diag, %d none, %d err)",
+                      i, len(new_products), n_diag, n_no, n_err)
+        if REQ_DELAY_SECONDS > 0:
+            time.sleep(REQ_DELAY_SECONDS)
+
+    log.info("=" * 60)
+    log.info("DONE: %d new processed | %d diag | %d none | %d err",
+              len(new_products), n_diag, n_no, n_err)
+    return 0
+
+
 def cmd_reclassify_from_titles(args: argparse.Namespace) -> int:
     """v2.67.78 repair: walk product_dimensions rows, apply the
     title-based mounting-type rule, fix any misclassifications.
@@ -1084,6 +1243,31 @@ def main() -> int:
                          help="Print what WOULD change, don't write.")
     p_re.add_argument("--verbose", action="store_true")
     p_re.set_defaults(func=cmd_reclassify_from_titles)
+
+    # v2.67.80 — daily refresh (no API spend, ~5 min)
+    p_rf = sub.add_parser(
+        "refresh-classifications",
+        help="Re-pull collections + metafields for every existing "
+              "row and re-apply mounting-type rules. Daily-safe. "
+              "Zero LLM cost.")
+    p_rf.add_argument("--dry-run", action="store_true",
+                         help="Print changes, don't write.")
+    p_rf.add_argument("--verbose", action="store_true")
+    p_rf.set_defaults(func=cmd_refresh_classifications)
+
+    # v2.67.80 — weekly new-product extraction
+    p_wk = sub.add_parser(
+        "weekly-new-products",
+        help="Detect handles in Shopify that aren't in "
+              "product_dimensions yet and extract them. Catches "
+              "new SKUs. Cost depends on count of new products.")
+    p_wk.add_argument("--limit", type=int, default=0,
+                         help="Cap N products (0 = no limit)")
+    p_wk.add_argument("--dry-run", action="store_true",
+                         help="Call API but don't persist.")
+    p_wk.add_argument("--model", default=None)
+    p_wk.add_argument("--verbose", action="store_true")
+    p_wk.set_defaults(func=cmd_weekly_new_products)
 
     args = parser.parse_args()
     return args.func(args)
