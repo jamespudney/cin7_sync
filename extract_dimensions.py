@@ -919,7 +919,16 @@ def cmd_all(args: argparse.Namespace) -> int:
                   args.match, len(products))
 
     already_done = set()
-    if not args.force:
+    if args.retry_no_diagram:
+        # Only process products previously stored as has_diagram=0.
+        retry_set = db.product_dimensions_no_diagram_handles()
+        log.info("Retry-no-diagram: %d products had has_diagram=0",
+                  len(retry_set))
+        products = [p for p in products
+                      if (p.get("handle") or "") in retry_set]
+        log.info("After retry filter: %d products", len(products))
+        # Don't skip these even though they're 'cached'.
+    elif not args.force:
         already_done = db.product_dimensions_handles()
         log.info("Skip-cache: %d products already extracted",
                   len(already_done))
@@ -1042,6 +1051,11 @@ def main() -> int:
                               help="Extract every active product")
     p_all.add_argument("--force", action="store_true",
                           help="Re-extract products already cached")
+    p_all.add_argument(
+        "--retry-no-diagram", action="store_true",
+        help="Only re-process products whose previous extraction "
+              "returned has_diagram=0. Pair with "
+              "EXTRACT_DIM_MAX_IMAGES=8 to retry with more images.")
     p_all.add_argument("--include-non-led", action="store_true",
                           help="Include non-LED-profile products too")
     p_all.add_argument(

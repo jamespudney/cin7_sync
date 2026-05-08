@@ -1184,6 +1184,18 @@ def product_dimensions_handles() -> set:
     return {r["shopify_handle"] for r in rows}
 
 
+def product_dimensions_no_diagram_handles() -> set:
+    """Return set of Shopify handles where the first extraction
+    found no diagram. Used by --retry-no-diagram to selectively
+    re-process those rows (e.g. with more images per call)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT shopify_handle FROM product_dimensions "
+            "WHERE has_diagram = 0"
+        ).fetchall()
+    return {r["shopify_handle"] for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
