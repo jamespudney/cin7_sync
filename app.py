@@ -756,15 +756,13 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.87 — cache-buster for shipments loader. User's "
-        "direct python test confirmed loader returns real data "
-        "(April 2026 = $38,719) but the dashboard kept showing "
-        "$0. Root cause: Streamlit's persist='disk' was serving "
-        "the stale empty-result entry from before the fixes. "
-        "v2.67.87 appends an explicit version string to the cache "
-        "fingerprint so every version bump guarantees a fresh "
-        "compute. Bumping CACHE_BUSTER in future commits is the "
-        "lever to force re-load if this happens again.")
+        "🟢 v2.67.88 — debug panel on Monthly Metrics shows what "
+        "the page sees in the shipments DataFrame at render time. "
+        "Click the 🔧 expander on the page to see rows / cols / "
+        "ShipmentCost stats / Voided dtype. This will tell us "
+        "definitively whether the cache is delivering real data "
+        "to the page or an empty stub. Cache buster bumped to "
+        "v88 to force re-load.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -3149,7 +3147,7 @@ def _load_longest_shipments() -> pd.DataFrame:
     # function-body changes when underlying file mtimes haven't
     # also changed. Bump CACHE_BUSTER on any code change that
     # affects the loader output to guarantee re-computation.
-    CACHE_BUSTER = "v87"
+    CACHE_BUSTER = "v88"  # v2.67.88: bumped to force re-load
     fp = _dir_fingerprint("shipments_*.csv")
     return _load_longest_shipments_cached((fp, CACHE_BUSTER))
 
@@ -14144,6 +14142,46 @@ elif page == "Monthly Metrics":
         "Rolling 14-month business dashboard, replaces the Easy Insight "
         "report. Every number is live from CIN7 data."
     )
+
+    # v2.67.88 — debug panel for shipments DataFrame state. Prints
+    # what the page actually sees at render time. Once the cache /
+    # loader chain is healthy this can be removed; until then it's
+    # the fastest way to triage 'why is shipping cost $0'.
+    with st.expander("🔧 Debug: shipments state", expanded=False):
+        try:
+            st.write(f"shipments empty: {shipments.empty}")
+            st.write(f"rows: {len(shipments)}")
+            st.write(f"cols: {len(shipments.columns)}")
+            if not shipments.empty:
+                st.write(
+                    "ShipmentCost present: "
+                    f"{'ShipmentCost' in shipments.columns}")
+                st.write(
+                    "CustomerShippingCharge present: "
+                    f"{'CustomerShippingCharge' in shipments.columns}")
+                if "ShipmentCost" in shipments.columns:
+                    _dbg_cost = pd.to_numeric(
+                        shipments["ShipmentCost"], errors="coerce")
+                    st.write(
+                        f"Total ShipmentCost: ${_dbg_cost.sum():,.2f}")
+                    st.write(f"Non-null rows: {_dbg_cost.notna().sum()}")
+                    st.write(f"Non-zero rows: {(_dbg_cost > 0).sum()}")
+                if "ShipDate" in shipments.columns:
+                    _dbg_dates = pd.to_datetime(
+                        shipments["ShipDate"],
+                        errors="coerce", utc=True)
+                    st.write(
+                        f"Earliest ship date: {_dbg_dates.min()}")
+                    st.write(
+                        f"Latest ship date: {_dbg_dates.max()}")
+                if "Voided" in shipments.columns:
+                    st.write(
+                        f"Voided dtype: {shipments['Voided'].dtype}")
+                    st.write(
+                        "Voided sample: "
+                        f"{shipments['Voided'].unique()[:3].tolist()}")
+        except Exception as _dbg_exc:
+            st.error(f"debug panel error: {_dbg_exc}")
 
     if sale_lines.empty:
         st.warning(
