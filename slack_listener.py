@@ -1011,6 +1011,13 @@ def process_once(max_messages: int = 25) -> int:
     if not rows:
         return 0
 
+    # v2.67.98 — ingest-only channel set. Bot polls these channels
+    # so the AI can REFERENCE the content via get_slack_messages,
+    # but never responds to or interacts with them. Used for
+    # external/sensitive channels like ext-growmymail-wired4signs
+    # where the bot is an observer, not a participant.
+    ingest_only = slack_sync._ingest_only_channels()
+
     posts_made = 0
     for r in rows:
         msg = dict(r)
@@ -1018,6 +1025,18 @@ def process_once(max_messages: int = 25) -> int:
                                                   msg["channel_id"])
         msg["channel_name"] = ch_name
         intent = _channel_intent(ch_name)
+
+        # v2.67.98 — short-circuit ingest-only channels.
+        if msg["channel_id"] in ingest_only:
+            with db.connect() as c:
+                c.execute(
+                    "UPDATE slack_messages "
+                    "SET classification = ?, classified_at = "
+                    "    datetime('now') "
+                    "WHERE channel_id = ? AND ts = ?",
+                    ("ingest_only", msg["channel_id"], msg["ts"]))
+            continue
+
         classification = _classify(msg, bot_self, intent)
 
         # Mark classified regardless of whether we respond. Avoids

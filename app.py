@@ -756,16 +756,19 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.97 — Moby replacement Phase 2 scaffolding: "
-        "google_ads_sync.py + ga4_sync.py shipped (will silently "
-        "skip until OAuth env vars are provisioned). Setup guides "
-        "in GOOGLE_ADS_SETUP.md and SEMRUSH_SETUP.md. Once user "
-        "completes the OAuth provisioning (~10 min, walkthrough "
-        "in GOOGLE_ADS_SETUP.md), bot can answer Moby-style "
-        "questions: 'which campaigns to scale/cut', 'reconcile "
-        "Google's self-report vs GA4', 'branded search audit'. "
-        "All marketing syncs run automatically via slack_loop.sh "
-        "daily/weekly cycles with no manual intervention.")
+        "🟢 v2.67.98 — ingest-only Slack channels. New env var "
+        "SLACK_INGEST_ONLY_CHANNELS lets the bot POLL a channel "
+        "(into slack_messages so the AI can reference it) but "
+        "never RESPOND. Used for external/sensitive channels like "
+        "the marketing-content discussion thread. Bot reads to "
+        "build awareness, stays silent so the channel's flow "
+        "isn't disturbed. Same get_slack_messages tool can search "
+        "the content; only the auto-reply pathway is blocked. "
+        "Combined with v2.67.97 marketing infrastructure, the "
+        "bot's marketing-context knowledge now spans: Klaviyo "
+        "(what we sent), Reviews.io (customer feedback), SEMrush "
+        "(SEO ranks), and ingest-only Slack threads (what's "
+        "PLANNED but not yet sent).")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

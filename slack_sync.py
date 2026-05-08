@@ -240,10 +240,33 @@ def get_bot_self_id(session: requests.Session) -> str:
 
 
 def _configured_channels() -> List[str]:
-    raw = os.environ.get("SLACK_AI_CHANNELS", "").strip()
+    """Combined channel set the bot polls. Includes:
+      - SLACK_AI_CHANNELS         classify + respond
+      - SLACK_INGEST_ONLY_CHANNELS  read-only (bot stays silent;
+                                     v2.67.98)
+    Both lists are polled into slack_messages so the AI can
+    reference the content via get_slack_messages tool. Whether the
+    bot responds is decided by slack_listener.py."""
+    out: List[str] = []
+    for var in ("SLACK_AI_CHANNELS", "SLACK_INGEST_ONLY_CHANNELS"):
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            continue
+        for c in raw.split(","):
+            c = c.strip()
+            if c and c not in out:
+                out.append(c)
+    return out
+
+
+def _ingest_only_channels() -> set:
+    """Channels we POLL but never RESPOND to. Tagged on each
+    message at classification time."""
+    raw = os.environ.get(
+        "SLACK_INGEST_ONLY_CHANNELS", "").strip()
     if not raw:
-        return []
-    return [c.strip() for c in raw.split(",") if c.strip()]
+        return set()
+    return {c.strip() for c in raw.split(",") if c.strip()}
 
 
 # ---------------------------------------------------------------------------
