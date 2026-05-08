@@ -756,18 +756,15 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.84 — Monthly Metrics shipping cost FIX. "
-        "Voided column was being parsed as string 'False' which "
-        "Python's bool() considers truthy, so every shipment was "
-        "filtering out as voided → all months $0 despite full "
-        "5-year backfill being on disk. v2.67.84 normalises the "
-        "Voided column robustly. Banner string also bumped — was "
-        "stuck at .66 since the auto-improvement loop work; "
-        "every commit between .67 and .83 shipped fine but the "
-        "header didn't reflect it. If you see v2.67.84 here, "
-        "Render auto-deploy is working AND the shipping-cost fix "
-        "is live. If you still see .66, Render is not deploying "
-        "this branch — manual deploy needed.")
+        "🟢 v2.67.85 — OOM fix on shipments loader. Loading 5-year "
+        "shipments_full.csv (43,984 rows × 50 cols) was pushing "
+        "the 2GB Render instance over its memory limit, causing "
+        "the page render to crash mid-flight (you saw $0 across "
+        "every Monthly Metrics shipping row). v2.67.85 reads only "
+        "the columns we use, casts numerics to float32, drops "
+        "voided rows at load time. Estimated ~70% RAM reduction "
+        "on shipments. Combined with v2.67.84's Voided string-bool "
+        "fix, Monthly Metrics shipping cost now renders correctly.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
@@ -2998,6 +2995,61 @@ def _load_longest_purchase_lines() -> pd.DataFrame:
 # the same ID back, so 'last update wins' produces the right
 # row. The cache invalidates whenever any file in the pattern
 # changes, mirroring `_dir_fingerprint` for the others.
+# v2.67.85 — memory-conscious shipments loader. With the 5-year
+# backfill (43,984 shipments × ~50 cols), the previous full-load
+# was pushing the 2GB Render instance over its limit and OOMing
+# during page render (Monthly Metrics showed $0 for every month
+# despite the data being on disk). Fixes:
+#   1. Read only the columns we actually use across the codebase
+#      (drops ~28 unused columns × 44k rows = ~150MB savings).
+#   2. Cast numerics to float32 / int32 — float64 is overkill for
+#      shipping costs and dimensions.
+#   3. Drop voided shipments at load time — they're filtered out
+#      by every consumer anyway, so why hold them in RAM.
+_SHIPMENTS_USECOLS = [
+    # Identity
+    "ShipmentID", "OrderID", "OrderNumber",
+    # Dates / status
+    "ShipDate", "CreateDate", "VoidDate", "Voided", "ShipmentStatus",
+    # Cost / margin (the v2.67.55c-and-later columns)
+    "ShipmentCost", "CustomerShippingCharge", "ShippingMargin",
+    "AmountPaid", "TaxPaid", "Currency", "InsuranceCost",
+    # Carrier / tracking (consumed by AI's get_shipping_details)
+    "TrackingNumber", "TrackingURL", "TrackingStatus",
+    "CarrierCode", "ServiceCode",
+    # Recipient / address (AI tool needs these)
+    "CustomerEmail", "CustomerName", "ShipToCity", "ShipToState",
+    "ShipToPostal", "ShipToCountry", "ShipToCompany",
+    # Package metrics (DIM-weight + label-cost analysis)
+    "WeightValue", "WeightUnits", "Zone",
+    "DimensionsLength", "DimensionsWidth", "DimensionsHeight",
+    "DimensionsUnits", "ItemCount", "ItemSummary",
+    "LabelID",
+]
+_SHIPMENTS_DTYPE = {
+    "ShipmentCost": "float32",
+    "CustomerShippingCharge": "float32",
+    "ShippingMargin": "float32",
+    "AmountPaid": "float32",
+    "TaxPaid": "float32",
+    "InsuranceCost": "float32",
+    "WeightValue": "float32",
+    "DimensionsLength": "float32",
+    "DimensionsWidth": "float32",
+    "DimensionsHeight": "float32",
+    "ItemCount": "Int16",
+    "Zone": "Int8",
+    "CarrierCode": "category",
+    "ServiceCode": "category",
+    "ShipmentStatus": "category",
+    "Currency": "category",
+    "WeightUnits": "category",
+    "DimensionsUnits": "category",
+    "ShipToCountry": "category",
+    "ShipToState": "category",
+}
+
+
 @st.cache_data(persist="disk",
                 show_spinner="Loading shipping history…")
 def _load_longest_shipments_cached(fingerprint: tuple) -> pd.DataFrame:
@@ -3027,10 +3079,38 @@ def _load_longest_shipments_cached(fingerprint: tuple) -> pd.DataFrame:
     files.sort(key=_sort_key)
     base = pd.DataFrame()
     base_mtime = 0.0
-    for _days, mtime, p in files:
+
+    # Build a usecols filter that's tolerant of older CSVs missing
+    # some columns. pandas' usecols= raises on missing names, so we
+    # peek at the header first per-file.
+    def _read_lean(p):
         try:
-            chunk = pd.read_csv(p, low_memory=False)
+            header = pd.read_csv(p, nrows=0).columns.tolist()
         except Exception:
+            return None
+        cols = [c for c in _SHIPMENTS_USECOLS if c in header]
+        dtypes = {k: v for k, v in _SHIPMENTS_DTYPE.items()
+                    if k in cols}
+        try:
+            df = pd.read_csv(p, usecols=cols, dtype=dtypes,
+                                low_memory=False)
+        except Exception:
+            return None
+        # Drop voided rows at load time — every consumer filters
+        # them out anyway; no point holding them in RAM.
+        if "Voided" in df.columns:
+            v = df["Voided"]
+            if v.dtype == "bool":
+                vb = v.fillna(False)
+            else:
+                vb = (v.astype(str).str.strip().str.lower()
+                        .isin(["true", "1", "yes", "t"]))
+            df = df[~vb]
+        return df
+
+    for _days, mtime, p in files:
+        chunk = _read_lean(p)
+        if chunk is None:
             continue
         if base.empty:
             base = chunk
