@@ -143,6 +143,12 @@ last_dim_weekly_epoch=0
 last_klaviyo_epoch=0
 last_reviewsio_epoch=0
 last_semrush_epoch=0
+# v2.67.97 — Google Ads + GA4 syncs (Phase 2 of Moby replacement):
+#   google_ads:   daily (last 7 days of campaign daily metrics)
+#   ga4:          daily (last 7 days, both campaign-totals + per-SKU)
+# Both gated on Google OAuth env vars; silent skip if not provisioned.
+last_googleads_epoch=0
+last_ga4_epoch=0
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -270,6 +276,36 @@ while true; do
         python semrush_sync.py weekly --limit 500 >> "$LOG" 2>&1 || \
             echo "[$(stamp)] semrush_sync FAILED" >> "$LOG"
         last_semrush_epoch=$(date -u +%s)
+    fi
+
+    # v2.67.97 — daily Google Ads campaign metrics sync.
+    # Gated on the full OAuth env-var stack so unprovisioned setups
+    # silently skip rather than erroring.
+    seconds_since_googleads=$(( now_epoch - last_googleads_epoch ))
+    if [ "$seconds_since_googleads" -ge 86400 ] \
+            && [ -n "${GOOGLE_ADS_DEVELOPER_TOKEN:-}" ] \
+            && [ -n "${GOOGLE_ADS_CLIENT_ID:-}" ] \
+            && [ -n "${GOOGLE_ADS_CLIENT_SECRET:-}" ] \
+            && [ -n "${GOOGLE_ADS_REFRESH_TOKEN:-}" ] \
+            && [ -n "${GOOGLE_ADS_CUSTOMER_ID:-}" ]; then
+        echo "[$(stamp)] google_ads_sync recent --days 7" >> "$LOG"
+        python google_ads_sync.py recent --days 7 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] google_ads_sync FAILED" >> "$LOG"
+        last_googleads_epoch=$(date -u +%s)
+    fi
+
+    # v2.67.97 — daily GA4 ecommerce sync (campaign-totals + per-SKU).
+    # Shares Google OAuth client with google_ads_sync.
+    seconds_since_ga4=$(( now_epoch - last_ga4_epoch ))
+    if [ "$seconds_since_ga4" -ge 86400 ] \
+            && [ -n "${GA4_PROPERTY_ID:-}" ] \
+            && [ -n "${GOOGLE_ADS_CLIENT_ID:-}" ] \
+            && [ -n "${GOOGLE_ADS_CLIENT_SECRET:-}" ] \
+            && [ -n "${GOOGLE_ADS_REFRESH_TOKEN:-}" ]; then
+        echo "[$(stamp)] ga4_sync recent --days 7" >> "$LOG"
+        python ga4_sync.py recent --days 7 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] ga4_sync FAILED" >> "$LOG"
+        last_ga4_epoch=$(date -u +%s)
     fi
 
     # Slack ingest → DB
