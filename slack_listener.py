@@ -125,6 +125,26 @@ FAMILY_NAME_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
+def _is_thread_we_posted_in(channel_id: str,
+                                thread_ts: str) -> bool:
+    """v2.67.109 — returns True if our bot has previously posted
+    in this thread. Used so the bot continues a conversation
+    naturally without requiring a re-mention on each reply."""
+    if not channel_id or not thread_ts:
+        return False
+    try:
+        with db.connect() as c:
+            r = c.execute(
+                "SELECT 1 FROM slack_messages "
+                "WHERE channel_id = ? AND thread_ts = ? "
+                "  AND is_our_bot = 1 LIMIT 1",
+                (channel_id, thread_ts)
+            ).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
 def _classify(msg: Dict[str, Any], bot_self_id: str,
                 channel_intent: str) -> str:
     """Return classification string. Cheap pattern-match — no LLM
@@ -146,9 +166,39 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
         pass
 
     lower = text.lower()
+    channel_id = msg.get("channel_id", "")
+
     # Direct @-mention of our bot is always an answer-required.
     if bot_self_id and f"<@{bot_self_id}>" in text:
         return "mention"
+
+    # v2.67.109 — users complained the bot was responding too
+    # eagerly to channel chatter. New default: respond ONLY when
+    # the bot is directly addressed. Three ways to address it:
+    #   1. @-mention (handled above)
+    #   2. DM to the bot (Slack DM channel IDs start with 'D')
+    #   3. Reply in a thread the bot has already posted in
+    #
+    # Channels where the bot SHOULD continue to autonomously answer
+    # questions/triggers can be added to SLACK_AUTONOMOUS_CHANNELS
+    # env var (comma-separated channel IDs). Default: empty
+    # (= conservative everywhere).
+    if channel_id.startswith("D"):
+        return "mention"  # DMs always get answered
+
+    thread_ts = msg.get("thread_ts")
+    if thread_ts and _is_thread_we_posted_in(channel_id, thread_ts):
+        return "mention"  # bot-started thread reply
+
+    autonomous_raw = os.environ.get(
+        "SLACK_AUTONOMOUS_CHANNELS", "").strip()
+    autonomous = {c.strip() for c in autonomous_raw.split(",")
+                    if c.strip()}
+    if channel_id not in autonomous:
+        # Not @-mentioned, not a DM, not a bot-thread reply, and
+        # this channel isn't on the autonomous allowlist. Stay
+        # silent.
+        return "chatter"
 
     # PO-review channel-specific: in #stock-issues-queries, a message
     # that contains MULTIPLE SKUs is likely a PO Andrew submitted for
