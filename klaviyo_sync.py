@@ -1,4 +1,4 @@
-"""klaviyo_sync.py (v2.67.90)
+"""klaviyo_sync.py (v2.67.117)
 =================================
 
 Pull email-marketing data from Klaviyo into local SQLite.
@@ -61,6 +61,43 @@ import db  # noqa: E402
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 log = logging.getLogger("klaviyo_sync")
+
+
+# ---------------------------------------------------------------------------
+# Event-property campaign matcher (v2.67.117)
+# ---------------------------------------------------------------------------
+# Klaviyo stores the originating campaign id inside an event's
+# `event_properties` under one of several keys depending on whether
+# the event came from a campaign send or a flow message. We can't
+# filter on this server-side (the /events/ endpoint rejects
+# `properties` as not filterable), so we match it client-side.
+_CAMPAIGN_ID_KEYS = (
+    "$message",       # campaign send id (Klaviyo's most common)
+    "campaign_id",
+    "Campaign ID",
+    "Campaign",
+    "campaign",
+    "Campaign Name",
+)
+
+
+def _props_match_campaign(props: dict, campaign_id: str) -> bool:
+    """Return True if any of the known campaign-id-bearing keys
+    in `props` equals `campaign_id`. Tolerant of casing and of
+    Klaviyo wrapping the id in a list."""
+    if not props or not campaign_id:
+        return False
+    cid = str(campaign_id).strip()
+    for k in _CAMPAIGN_ID_KEYS:
+        v = props.get(k)
+        if v is None:
+            continue
+        if isinstance(v, list):
+            if any(str(x).strip() == cid for x in v):
+                return True
+        elif str(v).strip() == cid:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +339,19 @@ class KlaviyoClient:
             "Placed Order", fuzzy=True)
 
     def list_clicked_events_for_campaign(self, campaign_id: str,
-                                              limit: int = 5000
+                                              limit: int = 5000,
+                                              lookback_days: int = 90
                                               ) -> List[dict]:
         """Pull Clicked Email events tagged to this campaign.
         Each event has the URL clicked + customer.
+
+        v2.67.117 — Klaviyo's /events/ endpoint only allows filters
+        on: datetime, metric_id, profile, profile_id, timestamp.
+        It does NOT permit filtering by event_properties (where
+        campaign_id lives), which returned 400 'properties is not
+        a filterable field'. Fix: filter server-side by metric_id
+        + datetime, then match campaign_id client-side from each
+        event's event_properties dict.
 
         v2.67.107 — uses _get_metric_id_by_name (paginated client-
         side filter) instead of the broken filter-by-name."""
@@ -314,24 +360,45 @@ class KlaviyoClient:
             log.warning("Clicked Email metric id not found")
             return []
 
-        # Now query events for this campaign
-        # v2.67.116 — dropped page[size]; default fine.
+        # Cap server-side scan by a recent datetime window —
+        # campaigns we care about were sent within the last
+        # `lookback_days`; clicks usually arrive within hours.
+        from datetime import timedelta as _td
+        since = (datetime.now(timezone.utc)
+                  - _td(days=lookback_days)
+                  ).strftime("%Y-%m-%dT%H:%M:%S")
+
         url = f"{self.BASE}/events/"
         params = {
             "filter": (f"and(equals(metric_id,'{metric_id}'),"
-                          f"contains(properties,'{campaign_id}'))"),
+                          f"greater-than(datetime,{since}))"),
             "sort": "-datetime",
         }
         out: List[dict] = []
-        while url and len(out) < limit:
-            payload = self._get(url, params=params if not out else None)
+        pages_scanned = 0
+        # Defensive cap on pages to avoid runaway scans on noisy
+        # Clicked Email metrics — each page returns ~50 events.
+        MAX_PAGES = 200
+        while url and len(out) < limit and pages_scanned < MAX_PAGES:
+            payload = self._get(
+                url, params=params if pages_scanned == 0 else None)
             if not payload:
                 break
+            pages_scanned += 1
             data = payload.get("data") or []
-            out.extend(data)
+            # Filter for this campaign client-side. Klaviyo stores
+            # the originating campaign id in event_properties under
+            # a few possible keys depending on flow vs campaign:
+            #   - $message (campaign send id, usually == campaign id)
+            #   - Campaign / Campaign ID / campaign_id
+            for ev in data:
+                attrs = ev.get("attributes") or {}
+                props = attrs.get("event_properties") or {}
+                if _props_match_campaign(props, campaign_id):
+                    out.append(ev)
+                    if len(out) >= limit:
+                        break
             url = (payload.get("links") or {}).get("next")
-            if len(out) >= limit:
-                break
         return out
 
 

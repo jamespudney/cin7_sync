@@ -1,4 +1,4 @@
-"""semrush_sync.py (v2.67.92)
+"""semrush_sync.py (v2.67.117)
 =================================
 
 Pull SEO ranking data from SEMrush into local SQLite.
@@ -164,21 +164,41 @@ def _parse_csv(text: str) -> List[dict]:
     return out
 
 
-# Column name aliases — SEMrush uses short codes per export_columns.
-# Reference: https://developer.semrush.com/api/v3/analytics/domain-reports/#domain-organic-search-keywords
+# Column name aliases — SEMrush returns CSV headers in either the
+# SHORT codes you passed in export_columns (Ph, Po, ...) OR the
+# corresponding LONG names (Keyword, Position, ...) depending on
+# tier/account/region. v2.67.117 — accept both. Long names are
+# also case-insensitive (normalised below).
 _COL_ALIAS = {
-    "Ph": "keyword",          # phrase
-    "Po": "position",         # current position
+    # Short codes
+    "Ph": "keyword",
+    "Po": "position",
     "Pp": "previous_position",
     "Pd": "position_difference",
-    "Nq": "search_volume",    # search volume
-    "Cp": "cpc",              # cost-per-click
-    "Ur": "url",              # ranking URL
-    "Tr": "traffic_share",    # estimated traffic share
+    "Nq": "search_volume",
+    "Cp": "cpc",
+    "Ur": "url",
+    "Tr": "traffic_share",
     "Tc": "traffic_cost",
     "Co": "competition",
     "Nr": "results_count",
     "Td": "trend",
+    # Long names — lowercased for case-insensitive lookup
+    "keyword": "keyword",
+    "position": "position",
+    "previous position": "previous_position",
+    "position difference": "position_difference",
+    "search volume": "search_volume",
+    "cpc": "cpc",
+    "url": "url",
+    "traffic (%)": "traffic_share",
+    "traffic": "traffic_share",
+    "traffic cost (%)": "traffic_cost",
+    "traffic cost": "traffic_cost",
+    "competition": "competition",
+    "number of results": "results_count",
+    "trends": "trend",
+    "trend": "trend",
 }
 
 
@@ -270,11 +290,22 @@ def _safe_int(v: Any) -> Optional[int]:
 
 
 def _flatten_position_row(r: dict) -> dict:
-    """SEMrush domain_organic row -> our DB schema."""
-    # Translate short column names to long
+    """SEMrush domain_organic row -> our DB schema.
+
+    v2.67.117 — case-insensitive header lookup. SEMrush response
+    headers vary by account tier: some accounts get the short
+    codes you asked for (Ph, Po, ...), others get human-readable
+    long names ('Keyword', 'Position', ...) regardless. Try exact
+    match first (preserves short-code path), then fall back to
+    lowercase (matches long-name aliases)."""
     expanded = {}
     for k, v in r.items():
-        long_k = _COL_ALIAS.get(k, k)
+        if not isinstance(k, str):
+            expanded[k] = v
+            continue
+        long_k = _COL_ALIAS.get(k)
+        if long_k is None:
+            long_k = _COL_ALIAS.get(k.lower(), k)
         expanded[long_k] = v
     info = _resolve_url_to_product(expanded.get("url") or "")
     return {
