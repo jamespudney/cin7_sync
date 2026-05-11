@@ -306,12 +306,18 @@ while true; do
     # work takes. PID file under /tmp prevents double-runs.
     # Slack listener is reached on every 60s tick regardless of
     # sync activity.
+    # v2.67.114 — bumped Klaviyo window from 7 to 90 days.
+    # Klaviyo daily-sync only catches campaigns sent in the
+    # window; 7 days was too narrow for stores that send
+    # weekly. 90 days catches the most recent ~13 weekly
+    # newsletters and keeps the table populated even after
+    # quiet periods.
     seconds_since_klaviyo=$(( now_epoch - last_klaviyo_epoch ))
     if [ "$seconds_since_klaviyo" -ge 86400 ] \
             && [ -n "${KLAVIYO_API_KEY:-}" ]; then
         last_klaviyo_epoch=$(date -u +%s)
         _run_bg "klaviyo_sync" \
-            "python klaviyo_sync.py recent --days 7"
+            "python klaviyo_sync.py recent --days 90"
     fi
 
     seconds_since_reviewsio=$(( now_epoch - last_reviewsio_epoch ))

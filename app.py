@@ -756,16 +756,14 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.113 — backgrounded the last two synchronous "
-        "cycles missed by v2.67.111: dim_weekly (extract_"
-        "dimensions weekly-new-products, 5-10 min Shopify "
-        "products walk) and bot_self_improvement (daily LLM "
-        "feedback summarizer, 10-30 sec). Both now use _run_bg "
-        "helper. Combined with v2.67.111+112, the main loop now "
-        "ALWAYS reaches slack_listener.once within milliseconds "
-        "of starting an iteration, regardless of what syncs are "
-        "running in background. Bot fully responsive even on "
-        "first iteration after worker restart.")
+        "🟢 v2.67.114 — fix SEMrush Error 605 (still firing on "
+        "page 2 even after v2.67.112's offset>0 omission). SEMrush "
+        "requires display_offset < display_limit which makes "
+        "traditional pagination impossible. Switched to single "
+        "big call (limit=500, no offset). SEMrush's Guru tier "
+        "returns up to 10k rows per call so this is well within "
+        "limits. Also: bumped Klaviyo window 7d -> 90d so we "
+        "catch ~13 weeks of campaigns instead of just 1.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

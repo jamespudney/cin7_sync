@@ -295,36 +295,34 @@ def _flatten_position_row(r: dict) -> dict:
 def sync_domain_organic(client: SEMrushClient,
                             limit: int = 500
                             ) -> dict:
-    """Pull top organic positions for our domain. limit=500 means
-    we get the top 500 keywords by traffic — about 5,000 units."""
+    """Pull top organic positions for our domain.
+
+    v2.67.114 — fetch in a single big call instead of paginating.
+    SEMrush enforces display_offset < display_limit (Error 605
+    otherwise), which makes traditional offset-based pagination
+    impossible. Their `display_limit` accepts large values, so we
+    just request all `limit` rows at once. SEMrush returns up to
+    10,000 per call on Guru tier, so 500 in one shot is fine."""
     log.info("Pulling top %d organic positions for %s",
               limit, client.domain)
     n_written = 0
     n_skipped = 0
-    page_size = 100  # SEMrush max per call
-    offset = 0
-    while offset < limit:
-        batch_size = min(page_size, limit - offset)
-        rows = client.domain_organic_positions(
-            limit=batch_size, offset=offset)
-        if not rows:
-            break
-        log.info("  offset=%d -> %d rows", offset, len(rows))
-        for r in rows:
-            row = _flatten_position_row(r)
-            if not row.get("keyword"):
-                n_skipped += 1
-                continue
-            try:
-                db.upsert_seo_keyword_position(row)
-                n_written += 1
-            except Exception as exc:
-                log.error("upsert failed: %s", exc)
-                n_skipped += 1
-        offset += batch_size
-        if len(rows) < batch_size:
-            break  # end of results
-
+    rows = client.domain_organic_positions(
+        limit=limit, offset=0)
+    if not rows:
+        return {"written": 0, "skipped": 0}
+    log.info("  got %d rows in single call", len(rows))
+    for r in rows:
+        row = _flatten_position_row(r)
+        if not row.get("keyword"):
+            n_skipped += 1
+            continue
+        try:
+            db.upsert_seo_keyword_position(row)
+            n_written += 1
+        except Exception as exc:
+            log.error("upsert failed: %s", exc)
+            n_skipped += 1
     return {"written": n_written, "skipped": n_skipped}
 
 
