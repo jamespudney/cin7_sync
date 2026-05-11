@@ -274,12 +274,53 @@ def _flatten_review(rev: dict) -> dict:
     }
 
 
+def _extract_reviews_list(payload: dict) -> list:
+    """v2.67.115 — Reviews.io returns a Laravel paginator:
+        {
+          "reviews": {"data": [...], "current_page": N,
+                       "last_page": N, ...},
+          "stats": {...},
+          ...
+        }
+    NOT a flat list. Extract data correctly across all known
+    response shapes."""
+    if not payload or not isinstance(payload, dict):
+        return []
+    reviews_obj = payload.get("reviews")
+    # Laravel paginator: reviews is a dict with 'data' key
+    if isinstance(reviews_obj, dict):
+        data = reviews_obj.get("data")
+        if isinstance(data, list):
+            return data
+    # Or reviews is directly a list (some endpoint variants)
+    if isinstance(reviews_obj, list):
+        return reviews_obj
+    # Top-level "data" key fallback
+    if isinstance(payload.get("data"), list):
+        return payload["data"]
+    return []
+
+
+def _extract_paginator_total(payload: dict) -> tuple:
+    """Return (current_page, last_page, total) from Laravel
+    paginator structure. (None, None, None) if missing."""
+    if not isinstance(payload, dict):
+        return (None, None, None)
+    r = payload.get("reviews")
+    if isinstance(r, dict):
+        return (r.get("current_page"),
+                r.get("last_page"),
+                r.get("total"))
+    return (None, None, None)
+
+
 def _sync_one_sku(client: ReviewsIOClient,
                      sku: str,
                      since: Optional[datetime] = None
                      ) -> tuple:
-    """Pull all reviews for one SKU, paginated. Returns
-    (written, skipped) counts."""
+    """Pull all reviews for one SKU, paginated.
+    v2.67.115 — uses _extract_reviews_list to handle Reviews.io's
+    Laravel paginator response shape correctly."""
     page = 1
     per_page = 50
     n_written = 0
@@ -289,15 +330,24 @@ def _sync_one_sku(client: ReviewsIOClient,
             page=page, per_page=per_page, since=since, sku=sku)
         if not payload:
             break
-        reviews = (payload.get("reviews")
-                     or payload.get("data")
-                     or payload.get("review", []))
-        if not reviews and isinstance(payload, list):
-            reviews = payload
+        # v2.67.115 — fast skip when this SKU has 0 reviews.
+        # Reviews.io's `stats.count` tells us instantly. Saves
+        # the full data-parse for the ~95% of SKUs with no
+        # reviews.
+        if page == 1:
+            stats = payload.get("stats") or {}
+            total_count = stats.get("count")
+            if isinstance(total_count, int) and total_count == 0:
+                break
+        reviews = _extract_reviews_list(payload)
         if not reviews:
             break
 
         for rev in reviews:
+            if not isinstance(rev, dict):
+                # defensive: in case API returns IDs instead of objects
+                n_skipped += 1
+                continue
             row = _flatten_review(rev)
             if not row.get("review_id"):
                 n_skipped += 1
@@ -310,6 +360,10 @@ def _sync_one_sku(client: ReviewsIOClient,
                             row.get("review_id"), exc)
                 n_skipped += 1
 
+        # Pagination: prefer paginator metadata if available
+        cur_page, last_page, _total = _extract_paginator_total(payload)
+        if cur_page and last_page and cur_page >= last_page:
+            break
         if len(reviews) < per_page:
             break
         page += 1

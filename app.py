@@ -756,14 +756,15 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.114 — fix SEMrush Error 605 (still firing on "
-        "page 2 even after v2.67.112's offset>0 omission). SEMrush "
-        "requires display_offset < display_limit which makes "
-        "traditional pagination impossible. Switched to single "
-        "big call (limit=500, no offset). SEMrush's Guru tier "
-        "returns up to 10k rows per call so this is well within "
-        "limits. Also: bumped Klaviyo window 7d -> 90d so we "
-        "catch ~13 weeks of campaigns instead of just 1.")
+        "🟢 v2.67.115 — Reviews.io paginator parsing fix. v2.67.112 "
+        "discovered the endpoint shape but had a fatal bug: "
+        "Reviews.io returns a Laravel-style paginator where "
+        "payload['reviews'] is a DICT with 'data' inside, not a "
+        "list. Iterating dict keys gave us strings, crashing "
+        "_flatten_review with AttributeError. Now extracts via "
+        "payload['reviews']['data']. Also: fast-skip when "
+        "stats.count=0 (most of our ~11k SKUs have no reviews, "
+        "saving ~10s/SKU on the iteration).")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
