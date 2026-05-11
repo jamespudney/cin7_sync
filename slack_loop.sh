@@ -205,12 +205,13 @@ while true; do
     # markdown that the listener prepends to the system prompt. Self-
     # healing: if the worker reboots, this runs again on first loop
     # pass so the summary is always fresh.
+    # v2.67.113 — backgrounded. The Anthropic call to summarise
+    # feedback can take 10-30 sec which was blocking listener.
     seconds_since_lessons=$(( now_epoch - last_lessons_epoch ))
     if [ "$seconds_since_lessons" -ge 86400 ]; then
-        echo "[$(stamp)] running bot_self_improvement summarizer" >> "$LOG"
-        python bot_self_improvement.py daily --days 7 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] summarizer FAILED" >> "$LOG"
         last_lessons_epoch=$(date -u +%s)
+        _run_bg "bot_self_improvement" \
+            "python bot_self_improvement.py daily --days 7"
     fi
 
     # v2.67.110 — daily refresh chain runs in BACKGROUND so it
@@ -270,16 +271,18 @@ while true; do
     fi
 
     # v2.67.80 — weekly new-product vision extraction.
-    # Picks up any SKUs added in Shopify since the last run.
+    # v2.67.113 — backgrounded via _run_bg. Was missed by
+    # v2.67.111 refactor and continued to block the main loop
+    # for 5-10 min during its first run after worker restart,
+    # delaying slack_listener.once.
     seconds_since_dim_weekly=$(( now_epoch - last_dim_weekly_epoch ))
     if [ "$seconds_since_dim_weekly" -ge 604800 ]; then
         if [ -n "${SHOPIFY_DOMAIN:-}" ] \
                 && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ] \
                 && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "[$(stamp)] weekly: extracting NEW products" >> "$LOG"
-            python extract_dimensions.py weekly-new-products >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] weekly extract FAILED" >> "$LOG"
             last_dim_weekly_epoch=$(date -u +%s)
+            _run_bg "dim_weekly" \
+                "python extract_dimensions.py weekly-new-products"
         fi
     fi
 

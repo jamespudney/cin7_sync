@@ -756,16 +756,16 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.112 — three data-sync bug fixes from weekend "
-        "diagnostic. (1) Klaviyo: list_campaigns filter used "
-        "'send_time' which isn't filterable per Klaviyo's API "
-        "(400 error). Switched to scheduled_at. Plus metric-id "
-        "lookup now does case-insensitive + fuzzy fallback so "
-        "accounts using 'Order Placed' / 'Purchase' etc. also "
-        "resolve. (2) Reviews.io: /product/review requires "
-        "explicit sku param (other endpoints all 404). Now "
-        "iterates every SKU from products CSV. (3) SEMrush: "
-        "display_offset=0 is invalid; omit when at the top.")
+        "🟢 v2.67.113 — backgrounded the last two synchronous "
+        "cycles missed by v2.67.111: dim_weekly (extract_"
+        "dimensions weekly-new-products, 5-10 min Shopify "
+        "products walk) and bot_self_improvement (daily LLM "
+        "feedback summarizer, 10-30 sec). Both now use _run_bg "
+        "helper. Combined with v2.67.111+112, the main loop now "
+        "ALWAYS reaches slack_listener.once within milliseconds "
+        "of starting an iteration, regardless of what syncs are "
+        "running in background. Bot fully responsive even on "
+        "first iteration after worker restart.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
