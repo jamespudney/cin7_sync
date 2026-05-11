@@ -1729,9 +1729,31 @@ def get_sku_ad_summary(sku: str, days: int = 30) -> dict:
 
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=5)
+    # v2.67.111 — 30s timeout (up from 5s) for write-lock contention
+    # from the many concurrent sync writers we now run.
+    conn = sqlite3.connect(DB_PATH, isolation_level=None,
+                              timeout=30)
     conn.row_factory = sqlite3.Row
     try:
+        # v2.67.111 — WAL (Write-Ahead Logging) journal mode.
+        # Default rollback journal blocks readers during a write.
+        # With 5+ concurrent writers (klaviyo_sync, reviewsio_sync,
+        # google_ads_sync, ga4_sync, slack_listener), we hit
+        # 'database is locked' errors regularly.
+        # WAL lets readers proceed concurrently with writers and
+        # only serialises writer-vs-writer. Dramatic concurrency
+        # improvement on SQLite for this workload.
+        # synchronous=NORMAL is the recommended pairing with WAL —
+        # safe (no corruption risk) and ~50% faster than FULL.
+        # busy_timeout 30s applies when a writer must wait.
+        # All PRAGMAs are idempotent — set every connection but
+        # SQLite no-ops if already set.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+        except sqlite3.Error:
+            pass
         conn.executescript(_SCHEMA)
         _migrate_ui_prefs_widths(conn)
         _migrate_supplier_dropship(conn)

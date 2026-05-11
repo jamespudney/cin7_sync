@@ -49,6 +49,34 @@ DATA_SYNC_INTERVAL_MIN="${WORKER_DATA_SYNC_MINUTES:-30}"
 
 stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
+# v2.67.111 — helper: launch a sync command in BACKGROUND with a
+# PID-file lock so we don't double-run while a previous instance
+# is still going. Each call returns immediately; the work happens
+# in a backgrounded subshell. This keeps slack_listener.once
+# reachable every loop iteration regardless of how long the
+# underlying sync takes.
+#
+# Usage: _run_bg <name> <cmd...>
+#   name: short identifier used for /tmp/<name>.pid lock file
+#   cmd:  the command + args to run (quoted as one arg, eval'd)
+_run_bg() {
+    local name="$1"
+    local cmd="$2"
+    local pidfile="/tmp/${name}.pid"
+    if [ -e "$pidfile" ] \
+            && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        echo "[$(stamp)] [$name] still running (pid=$(cat "$pidfile")); skipping" >> "$LOG"
+        return
+    fi
+    (
+        echo "[$(stamp)] [bg-$name] start" >> "$LOG"
+        eval "$cmd" >> "$LOG" 2>&1 || true
+        echo "[$(stamp)] [bg-$name] done" >> "$LOG"
+        rm -f "$pidfile"
+    ) &
+    echo $! > "$pidfile"
+}
+
 echo "" >> "$LOG"
 echo "============================================================" >> "$LOG"
 echo "[$(stamp)] slack_loop starting" >> "$LOG"
@@ -268,45 +296,38 @@ while true; do
             echo "[$(stamp)] housekeeping_audit FAILED" >> "$LOG"
     fi
 
-    # v2.67.93 — daily Klaviyo email-campaign + per-SKU click sync.
-    # Last 7 days, idempotent on (campaign_id, sku) so safe.
+    # v2.67.111 — all daily/weekly cycles now run in BACKGROUND
+    # via _run_bg helper. Each cycle's epoch is set IMMEDIATELY
+    # (parent shell update), so subsequent loop iterations skip
+    # the cycle for 24h regardless of how long the background
+    # work takes. PID file under /tmp prevents double-runs.
+    # Slack listener is reached on every 60s tick regardless of
+    # sync activity.
     seconds_since_klaviyo=$(( now_epoch - last_klaviyo_epoch ))
     if [ "$seconds_since_klaviyo" -ge 86400 ] \
             && [ -n "${KLAVIYO_API_KEY:-}" ]; then
-        echo "[$(stamp)] klaviyo_sync recent --days 7" >> "$LOG"
-        python klaviyo_sync.py recent --days 7 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] klaviyo_sync FAILED" >> "$LOG"
         last_klaviyo_epoch=$(date -u +%s)
+        _run_bg "klaviyo_sync" \
+            "python klaviyo_sync.py recent --days 7"
     fi
 
-    # v2.67.93 — daily Reviews.io review sync.
     seconds_since_reviewsio=$(( now_epoch - last_reviewsio_epoch ))
     if [ "$seconds_since_reviewsio" -ge 86400 ] \
             && [ -n "${REVIEWSIO_API_KEY:-}" ] \
             && [ -n "${REVIEWSIO_STORE_ID:-}" ]; then
-        echo "[$(stamp)] reviewsio_sync recent --days 30" >> "$LOG"
-        python reviewsio_sync.py recent --days 30 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] reviewsio_sync FAILED" >> "$LOG"
         last_reviewsio_epoch=$(date -u +%s)
+        _run_bg "reviewsio_sync" \
+            "python reviewsio_sync.py recent --days 30"
     fi
 
-    # v2.67.93 — weekly SEMrush position sync. ~5000 units/week,
-    # well within Guru plan's 30k/month allowance.
     seconds_since_semrush=$(( now_epoch - last_semrush_epoch ))
     if [ "$seconds_since_semrush" -ge 604800 ] \
             && [ -n "${SEMRUSH_API_KEY:-}" ]; then
-        echo "[$(stamp)] semrush_sync weekly --limit 500" >> "$LOG"
-        python semrush_sync.py weekly --limit 500 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] semrush_sync FAILED" >> "$LOG"
         last_semrush_epoch=$(date -u +%s)
+        _run_bg "semrush_sync" \
+            "python semrush_sync.py weekly --limit 500"
     fi
 
-    # v2.67.97 — daily Google Ads campaign metrics sync.
-    # v2.67.105 — also pulls per-SKU shopping spend in the same
-    # cycle so the Ad-Umpire / AI tools have current per-SKU
-    # ROAS data.
-    # Gated on the full OAuth env-var stack so unprovisioned setups
-    # silently skip rather than erroring.
     seconds_since_googleads=$(( now_epoch - last_googleads_epoch ))
     if [ "$seconds_since_googleads" -ge 86400 ] \
             && [ -n "${GOOGLE_ADS_DEVELOPER_TOKEN:-}" ] \
@@ -314,27 +335,23 @@ while true; do
             && [ -n "${GOOGLE_ADS_CLIENT_SECRET:-}" ] \
             && [ -n "${GOOGLE_ADS_REFRESH_TOKEN:-}" ] \
             && [ -n "${GOOGLE_ADS_CUSTOMER_ID:-}" ]; then
-        echo "[$(stamp)] google_ads_sync recent --days 7" >> "$LOG"
-        python google_ads_sync.py recent --days 7 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] google_ads_sync FAILED" >> "$LOG"
-        echo "[$(stamp)] google_ads_sync per-sku --days 7" >> "$LOG"
-        python google_ads_sync.py per-sku --days 7 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] google_ads per-sku FAILED" >> "$LOG"
         last_googleads_epoch=$(date -u +%s)
+        # Both Google Ads syncs in one backgrounded subshell so
+        # they run sequentially (sharing OAuth refresh) but the
+        # main loop continues immediately.
+        _run_bg "google_ads_sync" \
+            "python google_ads_sync.py recent --days 7 && python google_ads_sync.py per-sku --days 7"
     fi
 
-    # v2.67.97 — daily GA4 ecommerce sync (campaign-totals + per-SKU).
-    # Shares Google OAuth client with google_ads_sync.
     seconds_since_ga4=$(( now_epoch - last_ga4_epoch ))
     if [ "$seconds_since_ga4" -ge 86400 ] \
             && [ -n "${GA4_PROPERTY_ID:-}" ] \
             && [ -n "${GOOGLE_ADS_CLIENT_ID:-}" ] \
             && [ -n "${GOOGLE_ADS_CLIENT_SECRET:-}" ] \
             && [ -n "${GOOGLE_ADS_REFRESH_TOKEN:-}" ]; then
-        echo "[$(stamp)] ga4_sync recent --days 7" >> "$LOG"
-        python ga4_sync.py recent --days 7 >> "$LOG" 2>&1 || \
-            echo "[$(stamp)] ga4_sync FAILED" >> "$LOG"
         last_ga4_epoch=$(date -u +%s)
+        _run_bg "ga4_sync" \
+            "python ga4_sync.py recent --days 7"
     fi
 
     # Slack ingest → DB
