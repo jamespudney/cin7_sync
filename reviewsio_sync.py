@@ -121,52 +121,29 @@ class ReviewsIOClient:
                        since: Optional[datetime] = None,
                        sku: Optional[str] = None
                        ) -> Optional[dict]:
-        """Pull a page of product reviews. Reviews.io has multiple
-        endpoint generations:
-          - /product/review                   (legacy)
-          - /api/products/                    (v2)
-          - /merchant/v2.6/products/...       (v2.6)
-          - /merchant/v3/reviews              (v3 — current)
-        v2.67.107 — try the merchant v3 endpoint first, fall back
-        through older paths so we work regardless of account
-        provisioning."""
-        # v3 uses store_id in query, not header
-        params_v3: Dict[str, Any] = {
+        """Pull a page of product reviews from /product/review.
+
+        v2.67.112 — Reviews.io account uses the LEGACY endpoint
+        /product/review which REQUIRES a sku parameter. Weekend
+        diagnostic confirmed:
+          /merchant/v3/reviews        -> 404
+          /merchant/v2.6/...          -> 404
+          /api/products/reviews       -> 404
+          /product/review             -> 200 'No SKU\\'s provided'
+          /api/v1/product/review      -> 404
+        So we use /product/review with explicit sku= param.
+        Callers (sync_reviews) must iterate SKUs."""
+        params: Dict[str, Any] = {
             "store": self.store_id,
             "page": page,
             "per_page": per_page,
             "order": "desc",
         }
         if since:
-            params_v3["minDate"] = since.strftime("%Y-%m-%d")
+            params["minDate"] = since.strftime("%Y-%m-%d")
         if sku:
-            params_v3["sku"] = sku
-
-        # Try endpoints in order, return first that returns data
-        # (or last attempted if all empty)
-        endpoints_to_try = [
-            "/merchant/v3/reviews",
-            "/merchant/v2.6/products/reviews",
-            "/api/products/reviews",
-            "/product/review",
-        ]
-        last_payload = None
-        for ep in endpoints_to_try:
-            payload = self._get(ep, params=params_v3)
-            if payload is None:
-                continue
-            last_payload = payload
-            # Heuristic: a response with non-empty review list
-            # means this endpoint works for this account.
-            for k in ("reviews", "data", "review", "items"):
-                v = payload.get(k)
-                if isinstance(v, list) and v:
-                    log.info(
-                        "Using Reviews.io endpoint: %s", ep)
-                    return payload
-                if isinstance(v, list):
-                    last_payload = payload
-        return last_payload
+            params["sku"] = sku
+        return self._get("/product/review", params=params)
 
 
 # ---------------------------------------------------------------------------
@@ -297,32 +274,27 @@ def _flatten_review(rev: dict) -> dict:
     }
 
 
-def sync_reviews(client: ReviewsIOClient,
-                    since: Optional[datetime] = None,
-                    sku: Optional[str] = None
-                    ) -> dict:
-    """Walk Reviews.io paginated review feed, upsert each review."""
+def _sync_one_sku(client: ReviewsIOClient,
+                     sku: str,
+                     since: Optional[datetime] = None
+                     ) -> tuple:
+    """Pull all reviews for one SKU, paginated. Returns
+    (written, skipped) counts."""
     page = 1
     per_page = 50
     n_written = 0
     n_skipped = 0
     while True:
-        log.info("Fetching page %d (per_page=%d, since=%s, sku=%s)",
-                  page, per_page,
-                  since.isoformat() if since else "None", sku)
         payload = client.list_reviews(
             page=page, per_page=per_page, since=since, sku=sku)
         if not payload:
             break
-        # Reviews.io returns reviews under various keys depending on
-        # endpoint. Try common shapes.
         reviews = (payload.get("reviews")
                      or payload.get("data")
                      or payload.get("review", []))
         if not reviews and isinstance(payload, list):
             reviews = payload
         if not reviews:
-            log.info("  empty page → stopping")
             break
 
         for rev in reviews:
@@ -338,19 +310,99 @@ def sync_reviews(client: ReviewsIOClient,
                             row.get("review_id"), exc)
                 n_skipped += 1
 
-        log.info("  page %d -> %d reviews (running %d written, "
-                  "%d skipped)",
-                  page, len(reviews), n_written, n_skipped)
-
-        # Check for end of feed
         if len(reviews) < per_page:
             break
         page += 1
-        if page > 1000:  # safety stop
-            log.warning("page > 1000 — stopping safety guard")
+        if page > 100:  # safety stop per SKU
+            log.warning("sku %s page > 100 — stopping", sku)
             break
 
-    return {"written": n_written, "skipped": n_skipped}
+    return n_written, n_skipped
+
+
+def _get_all_skus_to_check() -> List[str]:
+    """Build the list of SKUs to pull reviews for.
+
+    Reviews.io's /product/review endpoint requires explicit SKU,
+    so we iterate through every variant SKU known to our system.
+    Source: CIN7 products CSV (the freshest list).
+    Falls back to product_dimensions handles if products CSV
+    isn't loadable.
+    """
+    skus: set = set()
+    # Try products CSV first
+    try:
+        import glob
+        from data_paths import OUTPUT_DIR
+        import pandas as pd
+        candidates = sorted(
+            glob.glob(str(OUTPUT_DIR / "products_*.csv")))
+        if candidates:
+            df = pd.read_csv(candidates[-1], low_memory=False,
+                                usecols=["SKU"])
+            for s in df["SKU"].dropna().astype(str):
+                s = s.strip()
+                if s and s != "nan":
+                    skus.add(s)
+            log.info("Loaded %d SKUs from %s",
+                      len(skus), candidates[-1])
+    except Exception as exc:
+        log.warning("Could not load products CSV for SKU list: "
+                      "%s", exc)
+    return sorted(skus)
+
+
+def sync_reviews(client: ReviewsIOClient,
+                    since: Optional[datetime] = None,
+                    sku: Optional[str] = None
+                    ) -> dict:
+    """v2.67.112 — iterate through every known SKU and pull its
+    reviews from /product/review (the endpoint requires explicit
+    SKU). Most SKUs return 0 reviews; the ones with reviews get
+    paginated through.
+
+    If `sku` arg passed, only pulls that one SKU (debug mode)."""
+    if sku:
+        log.info("Pulling reviews for one SKU: %s", sku)
+        nw, ns = _sync_one_sku(client, sku, since=since)
+        log.info("  -> %d written, %d skipped", nw, ns)
+        return {"written": nw, "skipped": ns,
+                "skus_checked": 1, "skus_with_reviews": 1 if nw else 0}
+
+    skus = _get_all_skus_to_check()
+    if not skus:
+        log.warning(
+            "No SKUs to check (products CSV not loadable). "
+            "Run cin7_sync.py quick first to populate.")
+        return {"written": 0, "skipped": 0, "skus_checked": 0,
+                "skus_with_reviews": 0}
+
+    log.info("Iterating %d SKUs looking for reviews...",
+              len(skus))
+    total_written = 0
+    total_skipped = 0
+    skus_with_reviews = 0
+    for i, s in enumerate(skus, start=1):
+        nw, ns = _sync_one_sku(client, s, since=since)
+        total_written += nw
+        total_skipped += ns
+        if nw > 0:
+            skus_with_reviews += 1
+            log.info("  [%d/%d] %s -> %d reviews",
+                      i, len(skus), s, nw)
+        if i % 100 == 0:
+            log.info(
+                "Progress: %d/%d SKUs checked, "
+                "%d with reviews, %d total written",
+                i, len(skus), skus_with_reviews,
+                total_written)
+
+    log.info("DONE: %d SKUs with reviews / %d checked, "
+              "%d reviews total",
+              skus_with_reviews, len(skus), total_written)
+    return {"written": total_written, "skipped": total_skipped,
+              "skus_checked": len(skus),
+              "skus_with_reviews": skus_with_reviews}
 
 
 # ---------------------------------------------------------------------------

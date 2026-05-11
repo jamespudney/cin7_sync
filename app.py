@@ -756,16 +756,16 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.111 — ALL daily/weekly cycles now run in "
-        "background via _run_bg helper. Klaviyo, Reviews.io, "
-        "SEMrush, Google Ads (recent + per-sku), GA4 all use "
-        "PID-file locks at /tmp/<name>.pid. Epoch is set "
-        "IMMEDIATELY in parent shell so subsequent iterations "
-        "skip the cycle. slack_listener.once now fires every "
-        "60s reliably regardless of sync activity. Also: "
-        "SQLite WAL journal mode + 30s busy_timeout to handle "
-        "the ~5 concurrent writers (klaviyo, ga4, listener, "
-        "etc.) without 'database is locked' errors.")
+        "🟢 v2.67.112 — three data-sync bug fixes from weekend "
+        "diagnostic. (1) Klaviyo: list_campaigns filter used "
+        "'send_time' which isn't filterable per Klaviyo's API "
+        "(400 error). Switched to scheduled_at. Plus metric-id "
+        "lookup now does case-insensitive + fuzzy fallback so "
+        "accounts using 'Order Placed' / 'Purchase' etc. also "
+        "resolve. (2) Reviews.io: /product/review requires "
+        "explicit sku param (other endpoints all 404). Now "
+        "iterates every SKU from products CSV. (3) SEMrush: "
+        "display_offset=0 is invalid; omit when at the top.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

@@ -120,18 +120,25 @@ class KlaviyoClient:
 
     def list_campaigns(self, since: datetime
                           ) -> List[dict]:
-        """Pull campaigns sent on/after `since`. Klaviyo's filter
-        syntax: greater-or-equal(send_time, ISO_DATETIME)."""
-        # Klaviyo segments campaigns by channel; we want 'email'.
+        """Pull campaigns sent on/after `since`.
+
+        v2.67.112 — Klaviyo's /campaigns/ endpoint rejected
+        `send_time` filter ('not a filterable field'). The
+        actual filterable fields are: archived, created_at,
+        messages.channel, name, scheduled_at, status, updated_at.
+        Switched to `scheduled_at` (most accurate for 'when was
+        the campaign supposed to go out'). For sent_at on the
+        response, we still read `send_time` from attributes —
+        that field is returned, just not filterable."""
         filter_str = (f"and(equals(messages.channel,'email'),"
-                          f"greater-or-equal(send_time,"
+                          f"greater-or-equal(scheduled_at,"
                           f"{since.isoformat()}))")
         url = f"{self.BASE}/campaigns/"
         params = {
             "filter": filter_str,
             "page[size]": 100,
             "include": "campaign-messages",
-            "sort": "-send_time",
+            "sort": "-scheduled_at",
         }
         out: List[dict] = []
         while url:
@@ -198,9 +205,31 @@ class KlaviyoClient:
             return None
         return r.json()
 
-    def _get_metric_id_by_name(self, name: str) -> Optional[str]:
+    def _get_metric_id_by_name(self, name: str,
+                                    fuzzy: bool = True
+                                    ) -> Optional[str]:
         """v2.67.107 — paginate all metrics and find one by name.
-        Klaviyo doesn't allow API-side filter on 'name'."""
+        Klaviyo doesn't allow API-side filter on 'name'.
+
+        v2.67.112 — wider matching. Klaviyo accounts may name
+        their conversion metric differently:
+          'Placed Order' (default Shopify integration)
+          'Order Placed'
+          'Purchase'
+          'Order Completed'
+          'Checkout Completed'
+          Custom integration names
+        Strategy:
+          1. Exact match on `name` (case-sensitive)
+          2. Case-insensitive exact match
+          3. (if fuzzy) Substring match on lowercase
+          4. (if fuzzy) Match anything with 'order' or 'placed'
+             or 'purchase' in the name
+        First match wins. Returns None only if nothing remotely
+        plausible exists."""
+        target = name.strip()
+        target_lower = target.lower()
+        seen: List[tuple] = []
         url = f"{self.BASE}/metrics/"
         params = {"page[size]": 100}
         first = True
@@ -208,18 +237,65 @@ class KlaviyoClient:
             payload = self._get(url, params=params if first else None)
             first = False
             if not payload:
-                return None
+                break
             for m in (payload.get("data") or []):
                 attrs = m.get("attributes") or {}
-                if attrs.get("name") == name:
-                    return m.get("id")
+                mname = (attrs.get("name") or "").strip()
+                mid = m.get("id")
+                seen.append((mid, mname))
+                if mname == target:
+                    return mid  # exact match wins immediately
             url = (payload.get("links") or {}).get("next")
+
+        if not seen:
+            return None
+
+        # 2. Case-insensitive exact
+        for mid, mname in seen:
+            if mname.lower() == target_lower:
+                log.info(
+                    "Klaviyo: matched '%s' to '%s' "
+                    "(case-insensitive)", target, mname)
+                return mid
+
+        if not fuzzy:
+            return None
+
+        # 3. Substring match either direction
+        for mid, mname in seen:
+            n = mname.lower()
+            if target_lower in n or n in target_lower:
+                log.info(
+                    "Klaviyo: matched '%s' to '%s' "
+                    "(substring)", target, mname)
+                return mid
+
+        # 4. Keyword-presence fallback (for 'Placed Order')
+        if "placed" in target_lower or "order" in target_lower \
+                or "purchase" in target_lower:
+            for mid, mname in seen:
+                n = mname.lower()
+                if "order" in n or "purchase" in n \
+                        or "placed" in n:
+                    log.info(
+                        "Klaviyo: keyword-matched '%s' to '%s' "
+                        "(order/purchase fallback)",
+                        target, mname)
+                    return mid
+
+        log.warning(
+            "Klaviyo: no match for metric '%s'. Tried %d names: %s",
+            target, len(seen),
+            ", ".join(f"'{n}'" for _, n in seen[:10]))
         return None
 
     def get_placed_order_metric_id(self) -> Optional[str]:
         """Find the 'Placed Order' metric (Klaviyo's revenue-
-        attribution conversion). Uses _get_metric_id_by_name."""
-        return self._get_metric_id_by_name("Placed Order")
+        attribution conversion). Uses _get_metric_id_by_name
+        with fuzzy fallback so accounts using 'Order Placed' /
+        'Purchase' / etc. also resolve."""
+        return self._get_metric_id_by_name(
+            "Placed Order", fuzzy=True)
 
     def list_clicked_events_for_campaign(self, campaign_id: str,
                                               limit: int = 5000

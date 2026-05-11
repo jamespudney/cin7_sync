@@ -119,15 +119,23 @@ class SEMrushClient:
                                        offset: int = 0
                                        ) -> Optional[List[dict]]:
         """Top organic positions for our domain. Costs 10 units per
-        result row. Returns parsed list of dicts."""
+        result row. Returns parsed list of dicts.
+
+        v2.67.112 — fix Error 605: 'Invalid display_offset
+        parameter, must be a positive integer number and less
+        than display_limit or it should be skipped'. SEMrush
+        treats 0 as invalid for display_offset; the docs say to
+        OMIT the param when starting from the top. Only include
+        display_offset when > 0."""
         params = {
             "type": "domain_organic",
             "domain": self.domain,
             "database": self.database,
             "display_limit": limit,
-            "display_offset": offset,
             "export_columns": "Ph,Po,Pp,Pd,Nq,Cp,Ur,Tr,Tc,Co,Nr,Td",
         }
+        if offset > 0:
+            params["display_offset"] = offset
         text = self._get(params)
         if not text:
             return None
