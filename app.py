@@ -756,15 +756,13 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.115 — Reviews.io paginator parsing fix. v2.67.112 "
-        "discovered the endpoint shape but had a fatal bug: "
-        "Reviews.io returns a Laravel-style paginator where "
-        "payload['reviews'] is a DICT with 'data' inside, not a "
-        "list. Iterating dict keys gave us strings, crashing "
-        "_flatten_review with AttributeError. Now extracts via "
-        "payload['reviews']['data']. Also: fast-skip when "
-        "stats.count=0 (most of our ~11k SKUs have no reviews, "
-        "saving ~10s/SKU on the iteration).")
+        "🟢 v2.67.116 — Klaviyo `page[size]` removal. Klaviyo's URL "
+        "parser was interpreting page[size]=100 as a non-existent "
+        "'page_size' attribute and returning HTTP 400 on every "
+        "campaigns + metrics call. v2.67.107's paginated fix had "
+        "this bug; v2.67.116 drops the param entirely. Klaviyo "
+        "defaults to a sensible page size; we paginate via the "
+        "cursor-based links.next URL it returns.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of

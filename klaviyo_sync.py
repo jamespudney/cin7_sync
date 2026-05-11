@@ -122,21 +122,23 @@ class KlaviyoClient:
                           ) -> List[dict]:
         """Pull campaigns sent on/after `since`.
 
+        v2.67.116 — dropped the page[size] param. Klaviyo's URL
+        parser was interpreting it as a non-existent 'page_size'
+        attribute and returning 400. Default page size (20-50
+        depending on resource) is fine — we paginate via the
+        cursor-based links.next URL anyway.
+
         v2.67.112 — Klaviyo's /campaigns/ endpoint rejected
         `send_time` filter ('not a filterable field'). The
         actual filterable fields are: archived, created_at,
         messages.channel, name, scheduled_at, status, updated_at.
-        Switched to `scheduled_at` (most accurate for 'when was
-        the campaign supposed to go out'). For sent_at on the
-        response, we still read `send_time` from attributes —
-        that field is returned, just not filterable."""
+        Switched to `scheduled_at`."""
         filter_str = (f"and(equals(messages.channel,'email'),"
                           f"greater-or-equal(scheduled_at,"
                           f"{since.isoformat()}))")
         url = f"{self.BASE}/campaigns/"
         params = {
             "filter": filter_str,
-            "page[size]": 100,
             "include": "campaign-messages",
             "sort": "-scheduled_at",
         }
@@ -207,7 +209,10 @@ class KlaviyoClient:
 
     def _get_metric_id_by_name(self, name: str,
                                     fuzzy: bool = True
-                                    ) -> Optional[str]:
+                                    ) -> Optional[str]:  # noqa
+        # v2.67.116 — dropped page[size] param (was causing 400).
+        # Default page size from Klaviyo is fine; cursor-based
+        # pagination via links.next handles the rest.
         """v2.67.107 — paginate all metrics and find one by name.
         Klaviyo doesn't allow API-side filter on 'name'.
 
@@ -231,11 +236,10 @@ class KlaviyoClient:
         target_lower = target.lower()
         seen: List[tuple] = []
         url = f"{self.BASE}/metrics/"
-        params = {"page[size]": 100}
-        first = True
+        # v2.67.116 — no params; Klaviyo defaults to a sensible
+        # page size and we paginate via cursor link.
         while url:
-            payload = self._get(url, params=params if first else None)
-            first = False
+            payload = self._get(url, params=None)
             if not payload:
                 break
             for m in (payload.get("data") or []):
@@ -311,11 +315,11 @@ class KlaviyoClient:
             return []
 
         # Now query events for this campaign
+        # v2.67.116 — dropped page[size]; default fine.
         url = f"{self.BASE}/events/"
         params = {
             "filter": (f"and(equals(metric_id,'{metric_id}'),"
                           f"contains(properties,'{campaign_id}'))"),
-            "page[size]": 200,
             "sort": "-datetime",
         }
         out: List[dict] = []
