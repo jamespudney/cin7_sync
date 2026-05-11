@@ -185,36 +185,59 @@ while true; do
         last_lessons_epoch=$(date -u +%s)
     fi
 
-    # v2.67.80 — daily dimension-classifications refresh.
-    # Catches collection / metafield / title changes since the last
-    # extraction so bot answers stay in sync with Shopify reality.
-    # No vision API spend.
+    # v2.67.110 — daily refresh chain runs in BACKGROUND so it
+    # never blocks slack_listener.once. cin7_sync salelines takes
+    # ~80 min due to CIN7's 2.5s rate limit on 1800+ sale-detail
+    # calls. Pre-v2.67.110 this blocked the loop for the entire
+    # duration, causing the bot to go silent for hours.
+    #
+    # New shape:
+    #   - last_dim_refresh_epoch is set IMMEDIATELY so subsequent
+    #     loop iterations skip the block until tomorrow.
+    #   - The entire 30d refresh chain runs as a backgrounded
+    #     subshell — the main loop continues to slack_listener
+    #     within milliseconds.
+    #   - A PID file at /tmp/dim_refresh.pid prevents double-runs
+    #     in the unlikely case the timing check misfires.
     seconds_since_dim_refresh=$(( now_epoch - last_dim_refresh_epoch ))
+    DIM_REFRESH_PID_FILE=/tmp/dim_refresh.pid
     if [ "$seconds_since_dim_refresh" -ge 86400 ]; then
-        # v2.67.82 — daily 30-day window refresh on worker. Without
-        # this, slack_listener loads bootstrap-era CSVs that go
-        # stale by ~1 day per day. The 30-min nearsync only
-        # maintains 1d windows, not 30d. Run once per 24h alongside
-        # the dim-refresh cycle.
-        if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
-            echo "[$(stamp)] daily 30d windows: salelines + sales" >> "$LOG"
-            python cin7_sync.py salelines --days 30 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] salelines 30d FAILED" >> "$LOG"
-            python cin7_sync.py sales --days 30 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] sales 30d FAILED" >> "$LOG"
-            python cin7_sync.py purchaselines --days 30 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] purchaselines 30d FAILED" >> "$LOG"
-        fi
-        if [ -n "${SHIPSTATION_API_KEY:-}" ]; then
-            echo "[$(stamp)] daily 30d window: shipments" >> "$LOG"
-            python shipstation_sync.py recent --days 30 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] shipstation 30d FAILED" >> "$LOG"
-        fi
-        if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
-            echo "[$(stamp)] refreshing product_dimensions classifications" >> "$LOG"
-            python extract_dimensions.py refresh-classifications >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] dim refresh FAILED" >> "$LOG"
+        # Skip if a previous backgrounded refresh is still running
+        if [ -e "$DIM_REFRESH_PID_FILE" ] \
+                && kill -0 "$(cat "$DIM_REFRESH_PID_FILE")" \
+                                2>/dev/null; then
+            echo "[$(stamp)] daily refresh still running (pid=$(cat "$DIM_REFRESH_PID_FILE")); skipping" >> "$LOG"
+        else
+            echo "[$(stamp)] launching daily 30d refresh chain in BACKGROUND" >> "$LOG"
             last_dim_refresh_epoch=$(date -u +%s)
+            (
+                if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
+                    echo "[$(stamp)] [bg] cin7 salelines 30d" >> "$LOG"
+                    python cin7_sync.py salelines --days 30 \
+                        >> "$LOG" 2>&1 || true
+                    echo "[$(stamp)] [bg] cin7 sales 30d" >> "$LOG"
+                    python cin7_sync.py sales --days 30 \
+                        >> "$LOG" 2>&1 || true
+                    echo "[$(stamp)] [bg] cin7 purchaselines 30d" >> "$LOG"
+                    python cin7_sync.py purchaselines --days 30 \
+                        >> "$LOG" 2>&1 || true
+                fi
+                if [ -n "${SHIPSTATION_API_KEY:-}" ]; then
+                    echo "[$(stamp)] [bg] shipstation 30d" >> "$LOG"
+                    python shipstation_sync.py recent --days 30 \
+                        >> "$LOG" 2>&1 || true
+                fi
+                if [ -n "${SHOPIFY_DOMAIN:-}" ] \
+                        && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
+                    echo "[$(stamp)] [bg] dim refresh-classifications" >> "$LOG"
+                    python extract_dimensions.py \
+                        refresh-classifications \
+                        >> "$LOG" 2>&1 || true
+                fi
+                rm -f "$DIM_REFRESH_PID_FILE"
+                echo "[$(stamp)] [bg] daily refresh chain DONE" >> "$LOG"
+            ) &
+            echo $! > "$DIM_REFRESH_PID_FILE"
         fi
     fi
 

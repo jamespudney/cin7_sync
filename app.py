@@ -756,14 +756,15 @@ with st.sidebar:
     # the history into a collapsible expander so it's still discover-
     # able but folded by default. For full provenance: `git log`.
     st.caption(
-        "🟢 v2.67.109 — bot responds only when addressed. Users "
-        "complained the bot was responding too eagerly to channel "
-        "chatter. Default is now strict: respond ONLY when "
-        "(a) @-mentioned, (b) DM'd, or (c) replying in a thread "
-        "the bot already posted in. Channels where you DO want "
-        "autonomous question-answering can be added to env var "
-        "SLACK_AUTONOMOUS_CHANNELS (comma-separated channel IDs). "
-        "Empty by default = silent everywhere unless addressed.")
+        "🟢 v2.67.110 — daily refresh chain runs in BACKGROUND. "
+        "cin7_sync salelines --days 30 takes ~80 min due to "
+        "CIN7's 2.5s rate limit on 1800+ sale-detail calls. "
+        "Pre-v2.67.110 this blocked slack_loop.sh's main thread, "
+        "so slack_listener never got polled — bot went silent "
+        "for hours. New: epoch set immediately, whole 30d chain "
+        "runs as backgrounded subshell, loop continues to "
+        "listener within milliseconds. PID file at "
+        "/tmp/dim_refresh.pid guards against double-runs.")
     # v2.67.52's full description is in the Recent versions expander
     # below. Keeping the headline short here per v2.67.4 design.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
