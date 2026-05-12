@@ -2803,6 +2803,66 @@ def find_similar_products(engine_df: pd.DataFrame,
     return result
 
 
+# v2.67.127 — per-foot child SKU suffixes (from worker_engine.py's
+# is_non_master_tube heuristic). When a user asks about a child
+# SKU's POs, we need to look up the parent's POs instead because
+# CIN7 stores purchase lines against the master roll, not the
+# per-foot cut variants.
+_PER_FOOT_SUFFIXES = ("0305", "0610", "0915", "1220", "1525",
+                          "1830", "2135", "2440", "2745", "3050")
+_MASTER_SUFFIX_CANDIDATES = ("100M", "50M", "5M", "10M", "25M",
+                                  "MASTER")
+
+
+def _find_parent_sku(child_sku: str,
+                          engine_df: pd.DataFrame
+                          ) -> Optional[str]:
+    """v2.67.127 — Given a per-foot child SKU, generate candidate
+    parent (master roll) SKUs and return the first one that exists
+    in engine_df. Returns None if the SKU isn't a child or no
+    matching parent is in the catalog.
+
+    Example:
+      Child:  LED-TSWP2835-600-24-RGB-CCT-3200/6200-0305
+      Parent: LED-TSWP2835-600-24-RGB-CCT-3200/6200-100M
+
+    The convention is: strip the per-foot length suffix (-0305,
+    -0610, ...), substitute one of the master-roll suffixes (-100M,
+    -50M, ...). Per-foot SKUs are always cuts FROM a master roll
+    that CIN7 tracks as one inventory item."""
+    if not child_sku:
+        return None
+    s = child_sku.upper()
+    # Find the per-foot suffix
+    suffix_idx = -1
+    matched_suffix = None
+    for suff in _PER_FOOT_SUFFIXES:
+        # Suffix appears either at end ('-0305') or in middle
+        # ('-0305-' followed by more tokens). Match the END pattern
+        # first because that's by far the most common.
+        if s.endswith(f"-{suff}"):
+            suffix_idx = len(s) - len(suff) - 1
+            matched_suffix = suff
+            break
+    if not matched_suffix:
+        return None
+    base = s[:suffix_idx]  # e.g. "LED-TSWP2835-600-24-RGB-CCT-3200/6200"
+
+    if engine_df is None or engine_df.empty or "SKU" not in engine_df.columns:
+        return None
+    catalog = engine_df["SKU"].astype(str).str.upper()
+
+    for master_suff in _MASTER_SUFFIX_CANDIDATES:
+        candidate = f"{base}-{master_suff}"
+        if (catalog == candidate).any():
+            return candidate
+    # Last-ditch: try the bare base (no suffix at all — some product
+    # lines store the master as just the family without a length).
+    if (catalog == base).any():
+        return base
+    return None
+
+
 def get_incoming_stock(engine_df: pd.DataFrame,
                         sale_lines_df: pd.DataFrame,
                         args: dict) -> dict:
@@ -2876,6 +2936,78 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         df = df[sku_match | name_match]
 
     if df.empty:
+        # v2.67.127 — Per-foot child SKU fallback. If the user
+        # asked about a per-foot cut (e.g. ...-0305) and no PO
+        # exists in that exact SKU, CIN7 almost certainly tracks
+        # the master roll instead (...-100M). Auto-look up the
+        # parent and retry the open-PO query, surfacing the
+        # parent-level POs with a note explaining the relationship.
+        parent_result = None
+        if sku:
+            parent_sku = _find_parent_sku(sku, engine_df)
+            if parent_sku and parent_sku.upper() != sku.upper():
+                # Re-run the same query against the parent SKU.
+                # Hand-rolled retry rather than recursion to avoid
+                # surprise behaviour if parent itself also has no
+                # POs.
+                _pdf = purchase_lines.copy()
+                if "Status" in _pdf.columns:
+                    _status_u = (_pdf["Status"].fillna("")
+                                  .astype(str).str.upper())
+                    _keep = ~_status_u.apply(
+                        lambda s: any(
+                            k in s for k in closed_keywords))
+                    _pdf = _pdf[_keep]
+                if "Quantity" in _pdf.columns:
+                    _pdf = _pdf[pd.to_numeric(
+                        _pdf["Quantity"],
+                        errors="coerce").fillna(0) > 0]
+                if "SKU" in _pdf.columns:
+                    _pdf = _pdf[
+                        _pdf["SKU"].astype(str).str.upper()
+                        == parent_sku.upper()]
+                if not _pdf.empty:
+                    parent_result = {
+                        "parent_sku": parent_sku,
+                        "child_sku_queried": sku,
+                        "lines": [],
+                    }
+                    for _, _r in _pdf.head(limit).iterrows():
+                        parent_result["lines"].append({
+                            "sku": _r.get("SKU"),
+                            "name": _r.get("Name"),
+                            "quantity_on_order": _r.get("Quantity"),
+                            "quantity_remaining":
+                                _r.get("QuantityRemaining"),
+                            "expected_date": (_r.get(date_col)
+                                                if date_col
+                                                else None),
+                            "po_status": _r.get("Status"),
+                            "po_id": _r.get("PurchaseID"),
+                            "po_reference": _r.get("Reference"),
+                        })
+        if parent_result:
+            return {
+                "matched": len(parent_result["lines"]),
+                "subject": sku,
+                "child_sku_queried": parent_result["child_sku_queried"],
+                "parent_sku": parent_result["parent_sku"],
+                "is_parent_fallback": True,
+                "date_field_used": date_col,
+                "open_purchase_lines": parent_result["lines"],
+                "note": (
+                    f"No POs found for child SKU {sku}, but the "
+                    f"master roll {parent_result['parent_sku']} has "
+                    f"{len(parent_result['lines'])} open PO line(s). "
+                    f"Per-foot variants are CUT FROM the master roll "
+                    f"so incoming master-roll stock will become "
+                    f"available as cuts of this child once received. "
+                    f"Report these PO lines as the answer to the "
+                    f"user's question, and explicitly mention that "
+                    f"they're against the master roll, not the "
+                    f"per-foot child."),
+            }
+
         # v2.67.51 — cross-check engine_df.OnOrder before declaring
         # "nothing on order". The CIN7 stock-on-hand row carries an
         # OnOrder field that aggregates ALL outstanding PO lines for
