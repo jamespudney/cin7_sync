@@ -121,6 +121,108 @@ FAMILY_NAME_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Viktor (getviktor.com) marketing-AI integration (v2.67.124)
+# ---------------------------------------------------------------------------
+# Viktor is a Slack-native marketing-intelligence AI that connects to
+# Google Ads, GA4, Klaviyo, Shopify etc. directly. They don't expose
+# a public REST API at our $50 tier — instead, Viktor IS a Slack app
+# that lives in the same workspace. We integrate by using Slack
+# itself as the bus:
+#
+#   1. User asks a marketing question in a channel both bots can see.
+#   2. Our bot detects it's marketing-intent and forwards to @viktor.
+#   3. Viktor replies in the thread (its native behaviour).
+#   4. Our slack_sync polls and ingests Viktor's reply.
+#   5. Our bot sees the reply, composes an "ops overlay" with engine
+#      signals (ABC class, trend_flag, stock, supplier) that Viktor
+#      can't see — and posts it as a follow-up in the same thread.
+#
+# The integration is inactive unless VIKTOR_SLACK_USER_ID is set in
+# the worker's environment. Without it, we fall through to the
+# existing behaviour (our bot answers itself).
+
+# Keyword patterns that mark a question as marketing-intent. Curated
+# to avoid false-positives on inventory/ops questions:
+#   - "spend on this PO" (PO context = ops, not marketing)
+#   - "click for more info" (UI click, not ad click)
+# We require at least one MARKETING term AND no STRONG-OPS hint.
+_MARKETING_RE = re.compile(
+    r"\b("
+    r"roas|roi|cpc|cpm|ctr|cpa|"
+    r"ad\s*spend|ad\s*spends|ad\s*budget|ad\s*revenue|"
+    r"google\s*ads?|meta\s*ads?|facebook\s*ads?|"
+    r"instagram\s*ads?|tiktok\s*ads?|youtube\s*ads?|"
+    r"shopping\s*(?:ads?|campaign|feed)|"
+    r"performance\s*max|pmax|p-max|"
+    r"klaviyo|email\s*campaign|email\s*flow|"
+    r"campaign\s*performance|"
+    r"attribution|conversion\s*(?:value|rate)|"
+    r"impressions|"
+    r"merchant\s*center|free\s*listings|"
+    r"organic\s*traffic|paid\s*traffic|"
+    r"bidnamic|"
+    r"semrush|seo\s*rank|keyword\s*rank|"
+    r"reviews\.?io|review\s*rating"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Strong-ops hints that override marketing detection. If any of these
+# appear with a marketing term, the user is asking about inventory/
+# ops, not marketing.
+_STRONG_OPS_RE = re.compile(
+    r"\b("
+    r"PO-?\d+|SO-?\d+|INV-?\d+|"
+    r"bin\s*location|stock\s*on\s*hand|onhand|"
+    r"reorder|backorder|"
+    r"supplier|vendor|"
+    r"slow.?mover|dead\s*stock|excess|dormant|abc\s*class"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_marketing_question(text: str) -> bool:
+    """Return True if the text reads as a marketing/ads question
+    that Viktor would handle better than us. Conservative — we
+    only forward when we're confident."""
+    if not text:
+        return False
+    if not _MARKETING_RE.search(text):
+        return False
+    if _STRONG_OPS_RE.search(text):
+        return False
+    return True
+
+
+def _viktor_user_id() -> str:
+    """Slack user_id (U-prefix) of the Viktor app in our workspace.
+    Empty string disables the integration."""
+    return os.environ.get("VIKTOR_SLACK_USER_ID", "").strip()
+
+
+def _viktor_forwarding_enabled(channel_id: str) -> bool:
+    """v2.67.124 — gate Viktor forwarding by channel. By default we
+    forward in any channel that's in SLACK_AUTONOMOUS_CHANNELS
+    (where the bot already responds without @-mention). If
+    VIKTOR_FORWARDING_CHANNELS is set, that overrides — only
+    forward in the listed channels."""
+    if not _viktor_user_id():
+        return False
+    explicit = os.environ.get(
+        "VIKTOR_FORWARDING_CHANNELS", "").strip()
+    if explicit:
+        allow = {c.strip() for c in explicit.split(",") if c.strip()}
+        return channel_id in allow
+    # Fallback: autonomous channels.
+    autonomous_raw = os.environ.get(
+        "SLACK_AUTONOMOUS_CHANNELS", "").strip()
+    autonomous = {c.strip() for c in autonomous_raw.split(",")
+                    if c.strip()}
+    return channel_id in autonomous
+
+
+# ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
@@ -171,6 +273,27 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     # Direct @-mention of our bot is always an answer-required.
     if bot_self_id and f"<@{bot_self_id}>" in text:
         return "mention"
+
+    # v2.67.124 — Viktor handoff. If this is a marketing-intent
+    # question in a channel where forwarding is enabled, route to
+    # Viktor instead of running our LLM. Cheaper, faster, and
+    # benefits from Viktor's deeper marketing-attribution data.
+    # Only fires for autonomous (non-@-mentioned) messages — if
+    # the user explicitly @s our bot, they want OUR answer.
+    if (_viktor_forwarding_enabled(channel_id)
+            and _is_marketing_question(text)):
+        return "viktor_handoff"
+
+    # v2.67.124 — Viktor overlay. When a new message arrives FROM
+    # Viktor's user_id in a thread we previously handed off to it,
+    # add an engine-signal overlay (ABC class, stock, supplier)
+    # that Viktor can't compute on its own.
+    viktor_uid = _viktor_user_id()
+    if (viktor_uid and msg.get("user_id") == viktor_uid):
+        thread_ts = msg.get("thread_ts")
+        if thread_ts and _did_we_forward_to_viktor(
+                channel_id, thread_ts):
+            return "viktor_overlay"
 
     # v2.67.109 — users complained the bot was responding too
     # eagerly to channel chatter. New default: respond ONLY when
@@ -1107,6 +1230,153 @@ def _already_replied_recently(channel_id: str, thread_ts: str) -> bool:
     return last > cutoff
 
 
+def _did_we_forward_to_viktor(channel_id: str,
+                                    thread_ts: str) -> bool:
+    """v2.67.124 — Check if we previously posted a viktor_handoff
+    in this thread. Used to decide whether a fresh message from
+    Viktor's user_id deserves an ops-overlay reply."""
+    try:
+        with db.connect() as c:
+            r = c.execute(
+                "SELECT 1 FROM slack_bot_responses "
+                "WHERE in_channel = ? "
+                "  AND in_thread_ts = ? "
+                "  AND classification = 'viktor_handoff' "
+                "LIMIT 1",
+                (channel_id, thread_ts)).fetchone()
+        return r is not None
+    except Exception:
+        return False
+
+
+def _compose_viktor_handoff(user_text: str, user_name: str) -> str:
+    """v2.67.124 — Build the message we post to forward a marketing
+    question to @viktor. Mentions Viktor by user_id (so they get
+    notified) and includes a short footer telling the user that
+    we'll add ops context once Viktor answers."""
+    viktor_uid = _viktor_user_id()
+    if not viktor_uid:
+        # Should never happen — classifier gates on this. But
+        # defensively, fall back to literal '@viktor'.
+        viktor_mention = "@viktor"
+    else:
+        viktor_mention = f"<@{viktor_uid}>"
+    # Strip our own bot mention if present (shouldn't be, since
+    # we gate forwarding to non-@-mention paths, but defensive).
+    cleaned = (user_text or "").strip()
+    return (
+        f"{viktor_mention} — {cleaned}\n"
+        f"_(Forwarded from @{user_name}. I'll add ops context "
+        f"— ABC class, stock, supplier — once you answer.)_"
+    )
+
+
+def _compose_viktor_overlay(viktor_reply_text: str) -> tuple:
+    """v2.67.124 — Build an ops-context overlay on top of Viktor's
+    marketing answer. Extract SKUs/families mentioned in Viktor's
+    reply and surface our engine signals for them.
+
+    Returns (overlay_text, tools_used). overlay_text is empty
+    string if we have nothing useful to add (Viktor mentioned no
+    SKUs/families we recognise) — caller should skip posting in
+    that case."""
+    text = viktor_reply_text or ""
+    skus = SKU_RE.findall(text)
+    families = FAMILY_NAME_RE.findall(text)
+    tools_used: List[str] = []
+
+    if not (skus or families):
+        return "", tools_used
+
+    lines: List[str] = []
+    # Deduplicate, preserve order.
+    seen = set()
+    sku_list = []
+    for s in skus:
+        u = s.upper()
+        if u not in seen:
+            seen.add(u)
+            sku_list.append(u)
+    fam_seen = set()
+    fam_list = []
+    for f in families:
+        fl = re.sub(r"\s+", "", f.lower())
+        if fl not in fam_seen:
+            fam_seen.add(fl)
+            fam_list.append(f.strip())
+
+    # For each SKU, surface ABC class + trend + stock + bin.
+    # Use a deferred import — engine/lookup helpers live where the
+    # rest of the bot's tools do, and we want this file lean.
+    try:
+        from bot_engine_lookup import (
+            lookup_sku_signals, lookup_family_signals)
+    except ImportError:
+        # Helper module not present yet — graceful degradation.
+        # The overlay can still be useful with a static intro that
+        # tells the team to check those SKUs in the dashboard.
+        if sku_list:
+            lines.append(
+                "_Ops overlay (engine signals for the SKUs Viktor "
+                "mentioned aren't wired into the bot yet — check "
+                "those SKUs in the dashboard's Ordering page for "
+                "ABC class + stock + supplier context.)_")
+            return "\n".join(lines), tools_used
+        return "", tools_used
+
+    for sku in sku_list[:10]:  # cap to avoid wall-of-signals
+        try:
+            sig = lookup_sku_signals(sku)
+            tools_used.append("lookup_sku_signals")
+        except Exception:
+            continue
+        if not sig:
+            continue
+        parts = []
+        if sig.get("abc"):
+            parts.append(f"{sig['abc']}-class")
+        if sig.get("trend_flag"):
+            parts.append(sig["trend_flag"])
+        if sig.get("is_dormant"):
+            parts.append("dormant")
+        if sig.get("stock") is not None:
+            parts.append(f"{int(sig['stock'])} on hand")
+        if sig.get("bin"):
+            parts.append(f"Bin {sig['bin']}")
+        if parts:
+            lines.append(f"• `{sku}` — {' · '.join(parts)}")
+
+    for fam in fam_list[:5]:
+        try:
+            fsig = lookup_family_signals(fam)
+            tools_used.append("lookup_family_signals")
+        except Exception:
+            continue
+        if not fsig:
+            continue
+        summary_bits = []
+        if fsig.get("n_a_class") is not None:
+            summary_bits.append(
+                f"{fsig['n_a_class']} A-class")
+        if fsig.get("n_b_class") is not None:
+            summary_bits.append(
+                f"{fsig['n_b_class']} B-class")
+        if fsig.get("n_dormant"):
+            summary_bits.append(
+                f"{fsig['n_dormant']} dormant")
+        if summary_bits:
+            lines.append(
+                f"• Family `{fam}` — {' · '.join(summary_bits)}")
+
+    if not lines:
+        return "", tools_used
+
+    return (
+        "_Ops overlay (engine signals Viktor doesn't see):_\n"
+        + "\n".join(lines)
+    ), tools_used
+
+
 def _post_response(session, channel_id: str, thread_ts: str,
                      text: str) -> Optional[str]:
     """Post a threaded reply. Returns the new message's ts on
@@ -1226,6 +1496,70 @@ def process_once(max_messages: int = 25) -> int:
         # Skip non-respondable categories.
         if classification in ("bot_self", "bot_other", "empty",
                                 "too_old", "chatter"):
+            continue
+
+        # v2.67.124 — Viktor handoff: post the forwarding message
+        # in the thread and record it as a viktor_handoff response.
+        # We skip the expensive LLM compose; Viktor will answer.
+        if classification == "viktor_handoff":
+            thread_ts = msg["thread_ts"] or msg["ts"]
+            if _already_replied_recently(
+                    msg["channel_id"], thread_ts):
+                continue
+            handoff_text = _compose_viktor_handoff(
+                msg["text"] or "", msg.get("user_name") or "user")
+            posted_ts = _post_response(
+                session, msg["channel_id"], thread_ts,
+                handoff_text)
+            if posted_ts:
+                with db.connect() as c:
+                    c.execute(
+                        "INSERT INTO slack_bot_responses "
+                        "(in_channel, in_ts, in_thread_ts, "
+                        " user_question, response_text, "
+                        " response_ts, tools_used, classification) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (msg["channel_id"], msg["ts"], thread_ts,
+                         (msg["text"] or "")[:500],
+                         handoff_text, posted_ts,
+                         "viktor_handoff", "viktor_handoff"))
+                posts_made += 1
+                log.info(
+                    "Forwarded marketing q to Viktor in %s/%s",
+                    ch_name, msg["ts"])
+            continue
+
+        # v2.67.124 — Viktor overlay: Viktor has replied in a
+        # thread we previously forwarded. Compose engine-signal
+        # context and post it as a follow-up.
+        if classification == "viktor_overlay":
+            thread_ts = msg["thread_ts"] or msg["ts"]
+            overlay_text, overlay_tools = _compose_viktor_overlay(
+                msg["text"] or "")
+            if not overlay_text:
+                log.info(
+                    "Viktor overlay skipped (no SKUs/families) "
+                    "for %s/%s", ch_name, msg["ts"])
+                continue
+            posted_ts = _post_response(
+                session, msg["channel_id"], thread_ts,
+                overlay_text)
+            if posted_ts:
+                with db.connect() as c:
+                    c.execute(
+                        "INSERT INTO slack_bot_responses "
+                        "(in_channel, in_ts, in_thread_ts, "
+                        " user_question, response_text, "
+                        " response_ts, tools_used, classification) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (msg["channel_id"], msg["ts"], thread_ts,
+                         "(viktor reply)",
+                         overlay_text, posted_ts,
+                         ",".join(overlay_tools),
+                         "viktor_overlay"))
+                posts_made += 1
+                log.info("Posted Viktor overlay in %s/%s",
+                          ch_name, msg["ts"])
             continue
 
         # Self-suppress check.
