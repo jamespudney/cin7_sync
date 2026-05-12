@@ -389,8 +389,15 @@ while true; do
     # notified exactly once via the po_dispatch_reminders table.
     # Gated on SLACK_FULFILLMENT_CHANNEL_ID — silent skip if not
     # provisioned.
+    #
+    # v2.67.135 — interval dropped from 24h to 5 min (300s).
+    # James wants the post within minutes of CIN7 receipt; the real
+    # bottleneck is NearSync's CSV-write cadence (~15 min), not the
+    # reminder cycle. Running every 5 min adds minimal load thanks
+    # to PRIMARY KEY idempotency in po_dispatch_reminders — runs
+    # that find nothing new exit cheaply.
     seconds_since_po_dispatch=$(( now_epoch - last_po_dispatch_epoch ))
-    if [ "$seconds_since_po_dispatch" -ge 86400 ] \
+    if [ "$seconds_since_po_dispatch" -ge 300 ] \
             && [ -n "${SLACK_FULFILLMENT_CHANNEL_ID:-}" ]; then
         last_po_dispatch_epoch=$(date -u +%s)
         _run_bg "po_dispatch_reminder" \
