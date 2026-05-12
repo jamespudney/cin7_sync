@@ -70,6 +70,17 @@ _SO_RE = re.compile(r"\bSO[-]?(\d{4,})\b", re.IGNORECASE)
 _COMMENT_FIELDS = ("Comments", "ShippingNotes", "Memo", "Note",
                       "Reference")
 
+# v2.67.134 — PO HEADER comment fields. The buyer's actual practice
+# (confirmed via James's screenshot of PO-7130) is to write SO refs
+# in the order-level Comments box, NOT per-line. CIN7's CSV export
+# names this column differently across versions/templates; we scan
+# all plausible names.
+_HEADER_COMMENT_FIELDS = (
+    "Comments", "Comment", "Note", "Notes",
+    "OrderMemo", "Memo", "OrderNotes", "OrderComments",
+    "InternalNote", "Reference",
+)
+
 # Statuses we treat as "stock has arrived." CIN7 uses
 # CombinedReceivingStatus to summarise across all lines.
 _RECEIVED_STATUSES = ("FULLY RECEIVED", "PARTIALLY RECEIVED")
@@ -129,6 +140,30 @@ def _extract_sos_from_text(text: str) -> List[str]:
             seen.add(normalised)
             found.append(normalised)
     return found
+
+
+def _extract_sos_from_po_header(po_row,
+                                       purchases_columns) -> List[str]:
+    """v2.67.134 — Scan the PO header's comment-like fields for
+    SO references. CIN7's order-level Comments box is where the
+    buyer actually puts backorder annotations (per the buyer
+    confirmation on PO-7130: 'SO-56024; SO-56098' in Comments).
+
+    `po_row` is a pandas Series for the PO; `purchases_columns`
+    is the list of column names so we can check field existence
+    once rather than per-row.
+    """
+    all_sos: List[str] = []
+    seen: Set[str] = set()
+    for f in _HEADER_COMMENT_FIELDS:
+        if f not in purchases_columns:
+            continue
+        val = po_row.get(f)
+        for so in _extract_sos_from_text(val):
+            if so not in seen:
+                seen.add(so)
+                all_sos.append(so)
+    return all_sos
 
 
 def _extract_sos_from_lines(po_lines: pd.DataFrame
@@ -320,7 +355,28 @@ def scan_and_notify(dryrun: bool = False,
         po_lines = lines_by_po.get(po_number)
         if po_lines is None or po_lines.empty:
             continue
-        all_sos, line_ctx = _extract_sos_from_lines(po_lines)
+        # v2.67.134 — Scan BOTH the PO header (where buyers
+        # actually put SO refs per the PO-7130 example) AND the
+        # individual line comments (older / per-line annotations).
+        # Merge results so we catch both conventions.
+        header_sos = _extract_sos_from_po_header(
+            po, list(purchases.columns))
+        line_sos_list, line_ctx = _extract_sos_from_lines(po_lines)
+        all_sos = sorted(set(header_sos) | set(line_sos_list))
+
+        # If the SOs came from the header, line_ctx is empty —
+        # build one bullet per SO with a generic SKU placeholder
+        # so the reminder message still has content.
+        if header_sos and not line_ctx:
+            line_ctx = [{
+                "sku": "(see PO)",
+                "name": None,
+                "quantity": None,
+                "source_field": "PO header",
+                "source_text": None,
+                "sos": header_sos,
+            }]
+
         if not all_sos:
             n_no_sos += 1
             # v2.67.133 — diagnostic: in dryrun/verbose mode,
@@ -330,10 +386,30 @@ def scan_and_notify(dryrun: bool = False,
             # the SOs are in a field we're not scanning.
             if dryrun or log.isEnabledFor(logging.DEBUG):
                 log.info("PO %s: no SOs found", po_number)
+                # PO header fields (v2.67.134 — primary location).
+                log.info("  -- PO header --")
+                header_scanned = list(_HEADER_COMMENT_FIELDS)
+                header_other = [
+                    c for c in purchases.columns
+                    if c not in header_scanned
+                    and ("comment" in c.lower()
+                          or "note" in c.lower()
+                          or "memo" in c.lower())]
+                for f in header_scanned + header_other:
+                    if f not in purchases.columns:
+                        continue
+                    val = po.get(f)
+                    if pd.notna(val) and str(val).strip():
+                        log.info(
+                            "    %s%s: %s",
+                            f,
+                            (" (unscanned)" if f in header_other
+                              else ""),
+                            str(val).strip()[:200])
+                # Line-level fields.
+                log.info("  -- line items --")
                 sample_fields = [c for c in _COMMENT_FIELDS
                                     if c in po_lines.columns]
-                # All columns that might contain text (catch
-                # custom buyer fields we don't know about).
                 other_text_cols = [
                     c for c in po_lines.columns
                     if c not in sample_fields
@@ -725,11 +801,26 @@ def cmd_one(args: argparse.Namespace) -> int:
     log.info("PO %s: status=%s · %d lines",
               args.po, po.get("CombinedReceivingStatus"),
               len(lines_for))
-    all_sos, line_ctx = _extract_sos_from_lines(lines_for)
+    # v2.67.134 — scan header + lines (header is the real spot)
+    header_sos = _extract_sos_from_po_header(
+        po, list(purchases.columns))
+    line_sos_list, line_ctx = _extract_sos_from_lines(lines_for)
+    all_sos = sorted(set(header_sos) | set(line_sos_list))
+    if header_sos:
+        log.info("  PO-header SOs: %s", header_sos)
+    if line_sos_list:
+        log.info("  Line-level SOs: %s", line_sos_list)
     if not all_sos:
-        log.info("No SO numbers found in line comments. Fields "
-                  "scanned: %s", _COMMENT_FIELDS)
+        log.info("No SO numbers found. Header fields scanned: %s. "
+                  "Line fields scanned: %s",
+                  _HEADER_COMMENT_FIELDS, _COMMENT_FIELDS)
         return 0
+    if header_sos and not line_ctx:
+        line_ctx = [{
+            "sku": "(see PO)",
+            "quantity": None,
+            "sos": header_sos,
+        }]
     msg = _compose_reminder(
         args.po,
         po.get("Supplier"),
