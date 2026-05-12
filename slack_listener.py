@@ -1432,10 +1432,22 @@ def process_once(max_messages: int = 25) -> int:
             continue
 
         # Self-suppress check.
+        # v2.67.128 — bypass suppression for direct @-mentions.
+        # The 5-minute SELF_SUPPRESS_SECONDS window is there to
+        # prevent loops on passive classifications (question /
+        # trigger / *_summary), but a direct @-mention is the
+        # user EXPLICITLY asking for another reply (e.g. 'you
+        # should look up the parent') — silencing the bot in
+        # that case is a bug, not a feature. Real case: James
+        # @-mentioned 60s after the bot's initial reply with
+        # corrective feedback; bot silently dropped it because of
+        # the 5-min window.
         thread_ts = msg["thread_ts"] or msg["ts"]
-        if _already_replied_recently(msg["channel_id"], thread_ts):
-            log.info("Skipping %s/%s — recent reply in thread",
-                       ch_name, msg["ts"])
+        if (classification != "mention"
+                and _already_replied_recently(
+                    msg["channel_id"], thread_ts)):
+            log.info("Skipping %s/%s — recent reply in thread "
+                       "(cls=%s)", ch_name, msg["ts"], classification)
             continue
 
         # Compose. This is the expensive call.

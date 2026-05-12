@@ -2817,47 +2817,53 @@ _MASTER_SUFFIX_CANDIDATES = ("100M", "50M", "5M", "10M", "25M",
 def _find_parent_sku(child_sku: str,
                           engine_df: pd.DataFrame
                           ) -> Optional[str]:
-    """v2.67.127 — Given a per-foot child SKU, generate candidate
-    parent (master roll) SKUs and return the first one that exists
-    in engine_df. Returns None if the SKU isn't a child or no
-    matching parent is in the catalog.
+    """v2.67.128 — Return the parent (master roll) SKU for a child.
 
-    Example:
-      Child:  LED-TSWP2835-600-24-RGB-CCT-3200/6200-0305
-      Parent: LED-TSWP2835-600-24-RGB-CCT-3200/6200-100M
+    PRIMARY source: CIN7 BOM via bom_lookup.parent_sku(). Every per-
+    foot cut is an Assembly built from one Component (the master
+    roll); CIN7 stores this explicitly. cin7_sync writes nightly
+    BOM CSVs into DATA_DIR; bom_lookup caches them in-process.
 
-    The convention is: strip the per-foot length suffix (-0305,
-    -0610, ...), substitute one of the master-roll suffixes (-100M,
-    -50M, ...). Per-foot SKUs are always cuts FROM a master roll
-    that CIN7 tracks as one inventory item."""
+    FALLBACK: if the BOM hasn't been synced yet (fresh DB) or
+    contains no entry for this SKU, fall back to the v2.67.127
+    suffix heuristic — strip per-foot length (-0305, -0610, ...)
+    and substitute master-roll suffix (-100M, -50M, ...). Brittle
+    but better than nothing while waiting for the BOM sync."""
     if not child_sku:
         return None
+
+    # 1. Try the BOM lookup (canonical source).
+    try:
+        from bom_lookup import parent_sku as _bom_parent
+        bom_parent = _bom_parent(child_sku)
+        if bom_parent:
+            return bom_parent
+    except Exception:  # noqa: BLE001
+        # bom_lookup module missing or BOM CSV unreadable — fall
+        # through to the heuristic rather than failing outright.
+        pass
+
+    # 2. Heuristic fallback (kept for resilience when BOM is stale
+    #    / missing). Recognises the standard per-foot suffix
+    #    pattern even when the BOM doesn't know about the SKU yet.
     s = child_sku.upper()
-    # Find the per-foot suffix
     suffix_idx = -1
     matched_suffix = None
     for suff in _PER_FOOT_SUFFIXES:
-        # Suffix appears either at end ('-0305') or in middle
-        # ('-0305-' followed by more tokens). Match the END pattern
-        # first because that's by far the most common.
         if s.endswith(f"-{suff}"):
             suffix_idx = len(s) - len(suff) - 1
             matched_suffix = suff
             break
     if not matched_suffix:
         return None
-    base = s[:suffix_idx]  # e.g. "LED-TSWP2835-600-24-RGB-CCT-3200/6200"
-
+    base = s[:suffix_idx]
     if engine_df is None or engine_df.empty or "SKU" not in engine_df.columns:
         return None
     catalog = engine_df["SKU"].astype(str).str.upper()
-
     for master_suff in _MASTER_SUFFIX_CANDIDATES:
         candidate = f"{base}-{master_suff}"
         if (catalog == candidate).any():
             return candidate
-    # Last-ditch: try the bare base (no suffix at all — some product
-    # lines store the master as just the family without a length).
     if (catalog == base).any():
         return base
     return None
