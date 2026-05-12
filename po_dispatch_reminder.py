@@ -323,6 +323,38 @@ def scan_and_notify(dryrun: bool = False,
         all_sos, line_ctx = _extract_sos_from_lines(po_lines)
         if not all_sos:
             n_no_sos += 1
+            # v2.67.133 — diagnostic: in dryrun/verbose mode,
+            # dump a sample of every comment-like field on this
+            # PO's lines so we can SEE what's actually there.
+            # Tells us whether the buyer didn't write SOs vs.
+            # the SOs are in a field we're not scanning.
+            if dryrun or log.isEnabledFor(logging.DEBUG):
+                log.info("PO %s: no SOs found", po_number)
+                sample_fields = [c for c in _COMMENT_FIELDS
+                                    if c in po_lines.columns]
+                # All columns that might contain text (catch
+                # custom buyer fields we don't know about).
+                other_text_cols = [
+                    c for c in po_lines.columns
+                    if c not in sample_fields
+                    and ("comment" in c.lower()
+                          or "note" in c.lower()
+                          or "memo" in c.lower()
+                          or "reference" in c.lower()
+                          or "description" in c.lower())]
+                for f in sample_fields + other_text_cols:
+                    vals = (po_lines[f].dropna()
+                            .astype(str).str.strip())
+                    non_empty = vals[vals != ""].unique()
+                    if len(non_empty):
+                        sample = " | ".join(
+                            str(v)[:120] for v in non_empty[:3])
+                        log.info("    %s%s: %s",
+                                   f,
+                                   (" (unscanned)"
+                                    if f in other_text_cols
+                                    else ""),
+                                   sample)
             continue
         supplier = po.get("Supplier")
         status = po.get("CombinedReceivingStatus")
