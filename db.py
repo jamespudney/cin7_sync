@@ -924,6 +924,27 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
 
+-- v2.67.130 PO dispatch reminders. When a PO transitions to
+-- RECEIVED status and its line comments contain SO-numbers
+-- (backorders the buyer flagged), we post a reminder to the
+-- #fulfillment channel so the team dispatches as soon as the
+-- stock arrives. PRIMARY KEY on po_number gives us idempotent
+-- deduplication — even if the daily cycle runs multiple times
+-- or the worker restarts mid-flight, we never double-notify.
+CREATE TABLE IF NOT EXISTS po_dispatch_reminders (
+    po_number           TEXT    PRIMARY KEY,
+    supplier            TEXT,
+    received_status     TEXT,
+    so_numbers          TEXT,   -- comma-separated SO-XXXXX list
+    n_sos               INTEGER DEFAULT 0,
+    posted_channel      TEXT,
+    posted_ts           TEXT,
+    posted_at           TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    error_msg           TEXT    -- populated if Slack post failed
+);
+CREATE INDEX IF NOT EXISTS idx_po_dispatch_reminders_recent
+    ON po_dispatch_reminders(posted_at DESC);
+
 -- v2.67.126 Slack OAuth user tokens (for Viktor bridge from
 -- dashboard). Each staff member who wants the dashboard to
 -- forward marketing questions to Viktor on their behalf
@@ -1826,6 +1847,57 @@ def get_feed_status_summary() -> dict:
         out[status] = int(r["n"] or 0)
         out["total"] += out[status]
     return out
+
+
+# ---------------------------------------------------------------------------
+# PO dispatch reminders (v2.67.130)
+# ---------------------------------------------------------------------------
+def has_notified_po_dispatch(po_number: str) -> bool:
+    """Idempotency check — has this PO already triggered a
+    fulfillment reminder? PRIMARY KEY guarantees one row per PO."""
+    if not po_number:
+        return False
+    with connect() as c:
+        r = c.execute(
+            "SELECT 1 FROM po_dispatch_reminders WHERE po_number = ?",
+            (po_number,)).fetchone()
+    return r is not None
+
+
+def record_po_dispatch_reminder(po_number: str,
+                                       supplier: Optional[str],
+                                       received_status: Optional[str],
+                                       so_numbers: List[str],
+                                       posted_channel: Optional[str],
+                                       posted_ts: Optional[str],
+                                       error_msg: Optional[str] = None
+                                       ) -> None:
+    """Persist that we've notified (or attempted to notify) about
+    this PO. Pass error_msg if the post failed — keeps the row in
+    place so we don't retry indefinitely; admins can manually
+    clear it if they want a retry."""
+    so_csv = ",".join(s.strip() for s in so_numbers if s)
+    with connect() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO po_dispatch_reminders "
+            "(po_number, supplier, received_status, so_numbers, "
+            " n_sos, posted_channel, posted_ts, error_msg, "
+            " posted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (po_number, supplier, received_status, so_csv,
+              len(so_numbers), posted_channel, posted_ts, error_msg))
+
+
+def list_recent_po_dispatch_reminders(limit: int = 50) -> list:
+    """For diagnostics — recent reminders we've posted."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT po_number, supplier, received_status, "
+            "       so_numbers, n_sos, posted_channel, posted_at, "
+            "       error_msg "
+            "FROM po_dispatch_reminders "
+            "ORDER BY posted_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------

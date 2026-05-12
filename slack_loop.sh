@@ -179,6 +179,7 @@ last_semrush_epoch=0
 last_googleads_epoch=0
 last_ga4_epoch=0
 last_merchant_epoch=0      # v2.67.118 Google Merchant Center
+last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -379,6 +380,21 @@ while true; do
         last_merchant_epoch=$(date -u +%s)
         _run_bg "merchant_sync" \
             "python merchant_sync.py daily --days 7"
+    fi
+
+    # v2.67.130 PO dispatch reminders — when a PO transitions to
+    # RECEIVED and its line comments contain SO-numbers (backorders
+    # the buyer flagged), post a reminder to #fulfillment so the
+    # team picks those orders first. Idempotent: each PO is
+    # notified exactly once via the po_dispatch_reminders table.
+    # Gated on SLACK_FULFILLMENT_CHANNEL_ID — silent skip if not
+    # provisioned.
+    seconds_since_po_dispatch=$(( now_epoch - last_po_dispatch_epoch ))
+    if [ "$seconds_since_po_dispatch" -ge 86400 ] \
+            && [ -n "${SLACK_FULFILLMENT_CHANNEL_ID:-}" ]; then
+        last_po_dispatch_epoch=$(date -u +%s)
+        _run_bg "po_dispatch_reminder" \
+            "python po_dispatch_reminder.py daily"
     fi
 
     # Slack ingest → DB
