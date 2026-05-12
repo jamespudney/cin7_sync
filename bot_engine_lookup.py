@@ -35,7 +35,10 @@ from typing import Optional
 
 import pandas as pd
 
-from data_paths import DATA_DIR
+# v2.67.132 — engine_output.csv is written into OUTPUT_DIR
+# (= DATA_DIR / "output"), not DATA_DIR directly. Use OUTPUT_DIR or
+# this lookup silently returns None on Render.
+from data_paths import OUTPUT_DIR as DATA_DIR  # back-compat alias
 
 log = logging.getLogger("bot_engine_lookup")
 

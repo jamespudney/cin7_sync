@@ -47,7 +47,10 @@ from typing import List, Optional
 
 import pandas as pd
 
-from data_paths import DATA_DIR
+# v2.67.132 — cin7_sync writes CSVs into OUTPUT_DIR (= DATA_DIR /
+# "output"), not DATA_DIR directly. Use OUTPUT_DIR or this lookup
+# silently fails on Render where /data is the parent.
+from data_paths import OUTPUT_DIR as DATA_DIR  # back-compat alias
 
 log = logging.getLogger("bom_lookup")
 

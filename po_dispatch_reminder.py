@@ -45,13 +45,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import db  # noqa: E402
 
-# data_paths is the project's central DATA_DIR resolver.
+# data_paths is the project's central path resolver.
+# v2.67.132 — cin7_sync writes CSVs into OUTPUT_DIR (= DATA_DIR /
+# "output"), NOT into DATA_DIR directly. Original v2.67.130 search
+# pattern looked in DATA_DIR and silently found nothing on Render.
 try:
-    from data_paths import DATA_DIR
+    from data_paths import OUTPUT_DIR
 except ImportError:
     # Fallback for environments where data_paths isn't on the
     # Python path — shouldn't happen in production.
-    DATA_DIR = SCRIPT_DIR / "output"
+    OUTPUT_DIR = SCRIPT_DIR / "output"
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 log = logging.getLogger("po_dispatch_reminder")
@@ -78,7 +81,7 @@ _RECEIVED_STATUSES = ("FULLY RECEIVED", "PARTIALLY RECEIVED")
 def _find_latest_csv(pattern: str) -> Optional[Path]:
     """Locate the most-recent CSV matching the glob. cin7_sync
     writes timestamped files; we always pick the freshest."""
-    matches = glob.glob(str(DATA_DIR / pattern))
+    matches = glob.glob(str(OUTPUT_DIR /pattern))
     if not matches:
         return None
     return Path(max(matches, key=os.path.getmtime))
@@ -91,12 +94,12 @@ def _load_purchases_and_lines() -> Tuple[Optional[pd.DataFrame],
     cin7_sync may not have run yet on a fresh worker."""
     p_path = _find_latest_csv("purchases_last_*d_*.csv")
     if not p_path:
-        log.error("No purchases_last_*d_*.csv found in %s", DATA_DIR)
+        log.error("No purchases_last_*d_*.csv found in %s", OUTPUT_DIR)
         return None, None
     l_path = _find_latest_csv("purchase_lines_last_*d_*.csv")
     if not l_path:
         log.error("No purchase_lines_last_*d_*.csv found in %s",
-                    DATA_DIR)
+                    OUTPUT_DIR)
         return None, None
     log.info("Loading purchases from %s", p_path)
     log.info("Loading purchase lines from %s", l_path)
@@ -403,12 +406,12 @@ def _load_latest_shipments() -> Optional[pd.DataFrame]:
         "shipments_last_*d_*.csv",  # rolling-window NearSync / Daily
         "shipments_full.csv",        # historical dump (5-year)
     ):
-        for path in glob.glob(str(DATA_DIR / pat)):
+        for path in glob.glob(str(OUTPUT_DIR /pat)):
             candidates.append(Path(path))
     if not candidates:
         log.warning(
             "No shipments CSVs found in %s — can't verify dispatch",
-            DATA_DIR)
+            OUTPUT_DIR)
         return None
     latest = max(candidates, key=os.path.getmtime)
     log.info("Loading shipments from %s", latest)
