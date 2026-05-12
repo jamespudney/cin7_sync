@@ -1250,24 +1250,33 @@ def _did_we_forward_to_viktor(channel_id: str,
 
 
 def _compose_viktor_handoff(user_text: str, user_name: str) -> str:
-    """v2.67.124 — Build the message we post to forward a marketing
-    question to @viktor. Mentions Viktor by user_id (so they get
-    notified) and includes a short footer telling the user that
-    we'll add ops context once Viktor answers."""
+    """v2.67.125 — Slack bots ignore @-mentions from other bots
+    (standard abuse-prevention pattern; Viktor has it on). So
+    instead of trying to @-mention Viktor directly (which Viktor
+    silently drops), we post a 'smart redirect' message:
+
+      - Tells the user this is a marketing question, best handled
+        by Viktor
+      - Pre-formats their question in a code block so they can
+        tap-to-copy and paste it into a fresh @viktor message
+      - Promises the engine-signal overlay once Viktor answers
+
+    We still mark this thread as a viktor_handoff in
+    slack_bot_responses, so when Viktor DOES reply (after the user
+    forwards manually), the overlay logic in _classify fires."""
     viktor_uid = _viktor_user_id()
-    if not viktor_uid:
-        # Should never happen — classifier gates on this. But
-        # defensively, fall back to literal '@viktor'.
-        viktor_mention = "@viktor"
-    else:
-        viktor_mention = f"<@{viktor_uid}>"
-    # Strip our own bot mention if present (shouldn't be, since
-    # we gate forwarding to non-@-mention paths, but defensive).
+    viktor_tag = f"<@{viktor_uid}>" if viktor_uid else "@Viktor"
     cleaned = (user_text or "").strip()
     return (
-        f"{viktor_mention} — {cleaned}\n"
-        f"_(Forwarded from @{user_name}. I'll add ops context "
-        f"— ABC class, stock, supplier — once you answer.)_"
+        f"_Marketing question — best answered by {viktor_tag}._ "
+        f"Slack apps can't ping each other, so could you "
+        f"@-mention Viktor with this question in the same "
+        f"thread?\n\n"
+        f"```\n"
+        f"@Viktor {cleaned}\n"
+        f"```\n"
+        f"_Once Viktor answers, I'll add ops context — ABC "
+        f"class, stock, supplier — for any SKUs they mention._"
     )
 
 
