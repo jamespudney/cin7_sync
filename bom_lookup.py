@@ -94,6 +94,33 @@ def _load() -> None:
     except Exception as exc:
         log.error("Failed to read BOM CSV %s: %s", path, exc)
         return
+
+    # v2.67.129 — Filter to AssemblyBOM rows. CIN7 stores multiple
+    # BOM types in the same export: AssemblyBOM (build assembly
+    # FROM components), DisassemblyBOM (split a parent INTO
+    # children), and various Manufacture types. Only the Assembly
+    # type correctly encodes "this per-foot cut is built from the
+    # master roll" — the others have inverted or unrelated
+    # semantics. We accept any BOMType containing 'Assembly'
+    # (case-insensitive) to be tolerant of casing variations, and
+    # fall back to ALL rows if the filtered set is empty (e.g.
+    # the export was unusually shaped) — better than no lookup.
+    if "BOMType" in df.columns:
+        asm_mask = df["BOMType"].fillna("").astype(str).str.contains(
+            "assembly", case=False, na=False)
+        asm_only = df[asm_mask]
+        if not asm_only.empty:
+            log.info(
+                "Filtering BOM rows: %d AssemblyBOM rows kept "
+                "out of %d total", len(asm_only), len(df))
+            df = asm_only
+        else:
+            log.warning(
+                "No AssemblyBOM rows found in %s (BOMType values: "
+                "%s) — using all rows as fallback",
+                path,
+                sorted(df["BOMType"].dropna().unique().tolist())[:10])
+
     parents_of: dict = {}
     children_of: dict = {}
     for _, row in df.iterrows():
