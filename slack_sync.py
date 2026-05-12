@@ -219,19 +219,36 @@ def _resolve_channel(session: requests.Session,
 
 
 _BOT_SELF_ID: Optional[str] = None
+_BOT_SELF_BOT_ID: Optional[str] = None     # v2.67.120
 
 
 def get_bot_self_id(session: requests.Session) -> str:
-    """Return our own bot user_id. Cached per process. Critical for
-    the 'never reply to self' loop guard in the listener."""
-    global _BOT_SELF_ID
+    """Return our own bot user_id (U-prefix). Cached per process.
+    Critical for the 'never reply to self' loop guard.
+
+    v2.67.120 — also caches the bot_id (B-prefix). Slack's
+    conversations.history returns the bot's own posts with
+    `bot_id` set but `user` often missing, so matching only on
+    user_id produced is_our_bot=0 on every bot post (and the
+    listener's `_is_thread_we_posted_in` check then never found
+    its own threads → bot ignored follow-up questions). We now
+    capture both ids at startup and match either."""
+    global _BOT_SELF_ID, _BOT_SELF_BOT_ID
     if _BOT_SELF_ID is not None:
         return _BOT_SELF_ID
     body = _slack_get(session, "auth.test", {})
     _BOT_SELF_ID = body.get("user_id") or ""
-    log.info("Slack bot self user_id: %s (team: %s)",
-              _BOT_SELF_ID, body.get("team"))
+    _BOT_SELF_BOT_ID = body.get("bot_id") or ""
+    log.info("Slack bot self user_id: %s bot_id: %s (team: %s)",
+              _BOT_SELF_ID, _BOT_SELF_BOT_ID, body.get("team"))
     return _BOT_SELF_ID
+
+
+def get_bot_self_bot_id() -> str:
+    """v2.67.120 — separately exposed bot_id (B-prefix) for callers
+    that need to match bot-message events. Populated as a side
+    effect of get_bot_self_id; returns '' if that hasn't run yet."""
+    return _BOT_SELF_BOT_ID or ""
 
 
 # ---------------------------------------------------------------------------
@@ -394,8 +411,16 @@ def _capture_feedback_from_message(session: requests.Session,
         return 0
     inserted = 0
     msg_ts = m.get("ts")
-    user_id = m.get("user") or m.get("bot_id") or ""
-    is_our_bot = (user_id == bot_self_id)
+    # v2.67.120 — match on either user_id or bot_id (see ingest)
+    raw_user = m.get("user") or ""
+    raw_bot = m.get("bot_id") or ""
+    user_id = raw_user or raw_bot or ""
+    bot_self_bot_id = get_bot_self_bot_id()
+    is_our_bot = (
+        (raw_user and raw_user == bot_self_id)
+        or (raw_bot and bot_self_bot_id
+              and raw_bot == bot_self_bot_id)
+    )
 
     # Case 1: reactions on our bot's posts.
     if is_our_bot and msg_ts:
@@ -494,10 +519,24 @@ def _ingest_channel(session: requests.Session,
                 continue
             if ts > highest_ts:
                 highest_ts = ts
-            user_id = m.get("user") or m.get("bot_id") or ""
-            is_bot = 1 if (m.get("bot_id") or m.get("subtype")
+            # v2.67.120 — match on EITHER user_id (U-prefix) or
+            # bot_id (B-prefix). Slack returns bot-authored
+            # messages with `user` often missing and only `bot_id`
+            # set, so matching only against bot_self_id (the U-id
+            # from auth.test) classified every bot post as
+            # is_our_bot=0 — which then broke the listener's
+            # thread-recognition logic for follow-up questions.
+            raw_user = m.get("user") or ""
+            raw_bot = m.get("bot_id") or ""
+            user_id = raw_user or raw_bot or ""
+            is_bot = 1 if (raw_bot or m.get("subtype")
                             == "bot_message") else 0
-            is_our_bot = 1 if user_id == bot_self_id else 0
+            bot_self_bot_id = get_bot_self_bot_id()
+            is_our_bot = 1 if (
+                (raw_user and raw_user == bot_self_id)
+                or (raw_bot and bot_self_bot_id
+                      and raw_bot == bot_self_bot_id)
+            ) else 0
             user_name = ""
             if user_id and not is_bot:
                 user_name = _resolve_user(session, user_id)

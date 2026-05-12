@@ -608,6 +608,37 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
         "tries, say what you tried and what you found — don't "
         "hallucinate. Format: '_Searched X, Y, Z — none "
         "matched. Try [specific next step in source system]._'\n"
+        # v2.67.120 — three rules to fix the 'we don't carry that'
+        # hallucination pattern. Real example: user asked for
+        # bendable LED channels for an outdoor firepit; bot ran
+        # 2-3 searches, came up empty, and concluded 'we don't
+        # currently stock flexible or bendable LED channels' —
+        # which was wrong (we stock Arc12, Milano Slim, Lille,
+        # etc.). Search misses ≠ product absence; the bot must
+        # default to ENGAGEMENT, not DENIAL.
+        "• **Anti-denial rule:** Do NOT conclude 'we don't stock "
+        "X' or 'we don't carry that category' unless you've run "
+        "at least 3 distinct search phrasings AND tried family-"
+        "name searches (e.g. specific product line names). Search "
+        "misses ≠ catalog gaps — they often mean the user's "
+        "wording doesn't match the product naming. When in doubt, "
+        "list the closest-related products with their constraints "
+        "and let the user judge fit.\n"
+        "• **Constraint-surface rule:** When a product MIGHT or "
+        "MIGHT NOT fit the user's need, list it WITH its limits "
+        "— min bend radius, max strip width, IP rating, voltage, "
+        "max operating temperature. Don't pre-reject on the "
+        "user's behalf; surface options + constraints and let "
+        "them choose. Example: '_Arc12 — bendable along length, "
+        "min radius 500mm, IP65 with cover. Won't curve around a "
+        "small circumference._'\n"
+        "• **Clarify-before-concluding rule:** If the user's "
+        "question is missing key dimensions or constraints "
+        "(size, environment, voltage, strip width, IP rating), "
+        "EITHER ask one clarifying question first, OR surface "
+        "candidates and end your reply with the clarifying "
+        "question. Never conclude absence based on an "
+        "under-specified query.\n"
         "• Surface engine signals when relevant: ABC class, "
         "trend_flag, is_dormant, excess_units. These are facts, "
         "not opinions.\n"
