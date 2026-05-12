@@ -377,6 +377,248 @@ def scan_and_notify(dryrun: bool = False,
 
 
 # ---------------------------------------------------------------------------
+# Escalation: 24h after first reminder, check ShipStation (v2.67.131)
+# ---------------------------------------------------------------------------
+def _normalise_order_id(s) -> str:
+    """Strip 'SO-', 'SO', 'INV-', 'INV' prefixes and leave the
+    numeric core. ShipStation stores INV-XXXXX but our buyer
+    writes SO-XXXXX — CIN7 reuses the numeric ID between them.
+    Mirrors the prefix-stripping in ai_tools.get_shipping_details."""
+    if s is None or pd.isna(s):
+        return ""
+    raw = str(s).strip().upper()
+    for prefix in ("SO-", "INV-", "SO", "INV"):
+        if raw.startswith(prefix):
+            return raw[len(prefix):]
+    return raw
+
+
+def _load_latest_shipments() -> Optional[pd.DataFrame]:
+    """Load the freshest shipments CSV. cin7_sync writes a few
+    rolling-window files; we want the most recent so NearSync's
+    15-min cadence keeps us current. Falls back to the full
+    historical dump if no rolling file exists."""
+    candidates = []
+    for pat in (
+        "shipments_last_*d_*.csv",  # rolling-window NearSync / Daily
+        "shipments_full.csv",        # historical dump (5-year)
+    ):
+        for path in glob.glob(str(DATA_DIR / pat)):
+            candidates.append(Path(path))
+    if not candidates:
+        log.warning(
+            "No shipments CSVs found in %s — can't verify dispatch",
+            DATA_DIR)
+        return None
+    latest = max(candidates, key=os.path.getmtime)
+    log.info("Loading shipments from %s", latest)
+    try:
+        return pd.read_csv(latest)
+    except Exception as exc:
+        log.error("Failed to read shipments CSV %s: %s", latest, exc)
+        return None
+
+
+def _build_shipped_index(
+        shipments: pd.DataFrame) -> Set[str]:
+    """Return a set of normalised order IDs that have a non-empty
+    ShipDate and aren't voided. Used to answer 'has this SO
+    shipped?' with a cheap O(1) lookup."""
+    if shipments is None or shipments.empty:
+        return set()
+    df = shipments
+    if "ShipDate" not in df.columns or "OrderNumber" not in df.columns:
+        log.warning(
+            "Shipments CSV missing ShipDate or OrderNumber columns "
+            "(have: %s) — can't index", list(df.columns)[:15])
+        return set()
+    has_shipdate = df["ShipDate"].notna() & (
+        df["ShipDate"].astype(str).str.strip() != "")
+    not_voided = (~df["Voided"].fillna(False).astype(bool)
+                    if "Voided" in df.columns
+                    else pd.Series(True, index=df.index))
+    eligible = df[has_shipdate & not_voided]
+    return {_normalise_order_id(o)
+              for o in eligible["OrderNumber"].dropna()}
+
+
+def _is_so_shipped(so_number: str,
+                       shipped_index: Set[str]) -> bool:
+    """O(1) lookup — has the SO number's numeric core appeared as
+    a shipped order in ShipStation?"""
+    if not so_number:
+        return False
+    norm = _normalise_order_id(so_number)
+    if not norm:
+        return False
+    return norm in shipped_index
+
+
+def _compose_escalation(po_number: str,
+                            supplier: Optional[str],
+                            unshipped_lines: List[dict],
+                            posted_age_hours: float) -> str:
+    """Build the escalation Slack message. Tone is more urgent
+    than the initial reminder — these orders should already have
+    shipped by now."""
+    header = (f"⚠️ *{po_number} arrived ~{int(posted_age_hours)}h "
+                f"ago — these orders STILL haven't shipped:*")
+    if supplier:
+        header += f"  _({supplier})_"
+    lines: List[str] = [header, ""]
+    for ctx in unshipped_lines:
+        sku = ctx.get("sku") or "?"
+        qty = ctx.get("quantity")
+        sos_str = " · ".join(ctx["sos"])
+        qty_str = (f" × {int(qty)}" if qty is not None
+                     and not pd.isna(qty) else "")
+        lines.append(f"• {sos_str} — `{sku}`{qty_str}")
+    lines.append("")
+    lines.append("_Please prioritise picking these. Customers "
+                  "are waiting._")
+    return "\n".join(lines)
+
+
+def check_and_escalate(dryrun: bool = False,
+                            min_age_hours: int = 24,
+                            max_age_hours: int = 168
+                            ) -> dict:
+    """For each reminder posted >= min_age_hours ago that hasn't
+    been escalated yet: check ShipStation; if any SO is still
+    unshipped, post an escalation message and stamp escalated_at."""
+    channel = os.environ.get(
+        "SLACK_FULFILLMENT_CHANNEL_ID", "").strip()
+    if not dryrun and not channel:
+        return {"escalated": 0, "skipped_no_channel": True}
+
+    pending = db.list_po_reminders_pending_escalation(
+        min_age_hours=min_age_hours,
+        max_age_hours=max_age_hours)
+    if not pending:
+        return {"escalated": 0, "pending": 0}
+
+    shipments = _load_latest_shipments()
+    shipped_idx = _build_shipped_index(shipments) if shipments is not None else set()
+    if not shipped_idx:
+        log.warning(
+            "Shipped index is empty — every SO will look "
+            "unshipped. Refusing to spam escalations; check that "
+            "shipstation_sync is running.")
+        return {"escalated": 0, "no_shipped_index": True}
+
+    # We also need the per-line context (SKU, qty) — pull it on
+    # demand from the latest purchase_lines CSV.
+    _, lines = _load_purchases_and_lines()
+    lines_by_po: Dict[str, pd.DataFrame] = {}
+    if lines is not None and "OrderNumber" in lines.columns:
+        lines_by_po = {po: g for po, g in lines.groupby("OrderNumber")}
+
+    n_escalated = 0
+    n_all_shipped = 0
+    n_errors = 0
+
+    for rem in pending:
+        po_number = rem["po_number"]
+        sos_csv = rem.get("so_numbers") or ""
+        sos = [s.strip() for s in sos_csv.split(",") if s.strip()]
+        if not sos:
+            # Shouldn't happen — we only insert reminders with
+            # at least one SO — but defensive.
+            continue
+        unshipped_sos = [s for s in sos
+                            if not _is_so_shipped(s, shipped_idx)]
+        if not unshipped_sos:
+            log.info("PO %s: all %d SOs shipped — skipping "
+                      "escalation", po_number, len(sos))
+            db.record_po_dispatch_escalation(
+                po_number=po_number,
+                posted_ts=None,
+                reason=(f"all {len(sos)} SOs shipped per "
+                          f"ShipStation; no escalation needed"),
+            )
+            n_all_shipped += 1
+            continue
+
+        # Build per-line context for the unshipped SOs only.
+        po_lines = lines_by_po.get(po_number)
+        unshipped_ctx: List[dict] = []
+        if po_lines is not None and not po_lines.empty:
+            for _, row in po_lines.iterrows():
+                line_sos: List[str] = []
+                for f in _COMMENT_FIELDS:
+                    if f in po_lines.columns:
+                        line_sos.extend(
+                            _extract_sos_from_text(row.get(f)))
+                line_unshipped = [s for s in line_sos
+                                      if s in unshipped_sos]
+                if line_unshipped:
+                    unshipped_ctx.append({
+                        "sku": row.get("SKU"),
+                        "name": row.get("Name"),
+                        "quantity": row.get("Quantity"),
+                        "sos": sorted(set(line_unshipped)),
+                    })
+        if not unshipped_ctx:
+            # Couldn't reconstruct per-line context (probably the
+            # PO is now outside the purchase_lines window). Fall
+            # back to a single bullet per SO.
+            unshipped_ctx = [{
+                "sku": "—",
+                "quantity": None,
+                "sos": [s],
+            } for s in unshipped_sos]
+
+        # Compute age for the message.
+        try:
+            posted_dt = pd.to_datetime(rem["posted_at"])
+            age_hours = (pd.Timestamp.now()
+                            - posted_dt).total_seconds() / 3600.0
+        except Exception:
+            age_hours = float(min_age_hours)
+
+        msg = _compose_escalation(
+            po_number, rem.get("supplier"),
+            unshipped_ctx, age_hours)
+        log.info("PO %s: %d unshipped SOs (%s) — escalating %s",
+                  po_number, len(unshipped_sos),
+                  ", ".join(unshipped_sos[:5]),
+                  "[DRYRUN]" if dryrun else "")
+
+        if dryrun:
+            print(f"\n--- ESCALATION for {po_number} ---\n"
+                    f"{msg}\n")
+            continue
+
+        posted_ts, error = _post_to_slack(channel, msg)
+        if error:
+            log.error(
+                "Failed to post escalation for %s: %s",
+                po_number, error)
+            db.record_po_dispatch_escalation(
+                po_number=po_number,
+                posted_ts=None,
+                reason=f"{len(unshipped_sos)} unshipped SOs",
+                error_msg=error,
+            )
+            n_errors += 1
+            continue
+        db.record_po_dispatch_escalation(
+            po_number=po_number,
+            posted_ts=posted_ts,
+            reason=f"{len(unshipped_sos)} unshipped SOs after "
+                     f"{int(age_hours)}h",
+        )
+        n_escalated += 1
+
+    return {
+        "pending": len(pending),
+        "escalated": n_escalated,
+        "all_shipped_no_escalation_needed": n_all_shipped,
+        "errors": n_errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _setup_log(verbose: bool = False) -> None:
@@ -389,19 +631,43 @@ def _setup_log(verbose: bool = False) -> None:
 
 
 def cmd_daily(args: argparse.Namespace) -> int:
+    """Run BOTH passes in order: initial reminders for newly-
+    received POs, then escalations for 24h-stale reminders whose
+    SOs haven't shipped per ShipStation."""
     _setup_log(args.verbose)
     days = int(os.environ.get(
         "PO_REMINDER_LOOKBACK_DAYS", "7") or 7)
-    result = scan_and_notify(dryrun=False, lookback_days=days)
-    log.info("DONE: %s", result)
+    min_age = int(os.environ.get(
+        "PO_REMINDER_ESCALATION_MIN_HOURS", "24") or 24)
+    initial = scan_and_notify(
+        dryrun=False, lookback_days=days)
+    log.info("INITIAL pass: %s", initial)
+    esc = check_and_escalate(
+        dryrun=False, min_age_hours=min_age)
+    log.info("ESCALATION pass: %s", esc)
     return 0
 
 
 def cmd_dryrun(args: argparse.Namespace) -> int:
+    """Show what would happen on both passes without posting."""
     _setup_log(args.verbose)
     days = int(args.days or 7)
-    result = scan_and_notify(dryrun=True, lookback_days=days)
-    log.info("DONE [DRYRUN]: %s", result)
+    min_age = int(args.min_age or 24)
+    initial = scan_and_notify(dryrun=True, lookback_days=days)
+    log.info("INITIAL pass [DRYRUN]: %s", initial)
+    esc = check_and_escalate(
+        dryrun=True, min_age_hours=min_age)
+    log.info("ESCALATION pass [DRYRUN]: %s", esc)
+    return 0
+
+
+def cmd_escalate(args: argparse.Namespace) -> int:
+    """Run ONLY the escalation pass (debug helper)."""
+    _setup_log(args.verbose)
+    min_age = int(args.min_age or 24)
+    result = check_and_escalate(
+        dryrun=bool(args.dryrun), min_age_hours=min_age)
+    log.info("ESCALATION pass: %s", result)
     return 0
 
 
@@ -448,15 +714,26 @@ def main() -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_d = sub.add_parser(
-        "daily", help="Scan + post (run from slack_loop).")
+        "daily", help="Both passes: initial reminders + 24h "
+                       "escalations (the slack_loop entry point).")
     p_d.add_argument("--verbose", action="store_true")
     p_d.set_defaults(func=cmd_daily)
 
     p_dr = sub.add_parser(
-        "dryrun", help="Scan + print, no Slack post.")
+        "dryrun", help="Both passes, print only — no Slack post.")
     p_dr.add_argument("--days", type=int, default=7)
+    p_dr.add_argument("--min-age", type=int, default=24,
+                          help="Hours since initial reminder before "
+                                "escalating (default 24).")
     p_dr.add_argument("--verbose", action="store_true")
     p_dr.set_defaults(func=cmd_dryrun)
+
+    p_e = sub.add_parser(
+        "escalate", help="ONLY run the escalation pass (debug).")
+    p_e.add_argument("--min-age", type=int, default=24)
+    p_e.add_argument("--dryrun", action="store_true")
+    p_e.add_argument("--verbose", action="store_true")
+    p_e.set_defaults(func=cmd_escalate)
 
     p_o = sub.add_parser(
         "one", help="Inspect one specific PO.")

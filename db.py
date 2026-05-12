@@ -940,7 +940,13 @@ CREATE TABLE IF NOT EXISTS po_dispatch_reminders (
     posted_channel      TEXT,
     posted_ts           TEXT,
     posted_at           TIMESTAMP NOT NULL DEFAULT (datetime('now')),
-    error_msg           TEXT    -- populated if Slack post failed
+    error_msg           TEXT,   -- populated if Slack post failed
+    -- v2.67.131 escalation tracking. If by next day none of the
+    -- SOs have shipped per ShipStation, post a follow-up reminder
+    -- and stamp escalated_at so we don't escalate twice.
+    escalated_at        TIMESTAMP,
+    escalated_ts        TEXT,
+    escalation_reason   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_po_dispatch_reminders_recent
     ON po_dispatch_reminders(posted_at DESC);
@@ -1227,6 +1233,33 @@ def _migrate_ad_campaign_skus_spend(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE ad_campaign_skus ADD COLUMN clicks "
                 "INTEGER")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_po_dispatch_reminders_escalation(
+        conn: sqlite3.Connection) -> None:
+    """v2.67.131 — add escalation columns to existing
+    po_dispatch_reminders tables. Tracks whether we've sent a
+    'STILL not shipped' follow-up message after 24h."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('po_dispatch_reminders')").fetchall()}
+        if not cols:
+            return  # table doesn't exist yet (fresh DB schema
+                      # already includes the columns)
+        if "escalated_at" not in cols:
+            conn.execute(
+                "ALTER TABLE po_dispatch_reminders ADD COLUMN "
+                "escalated_at TIMESTAMP")
+        if "escalated_ts" not in cols:
+            conn.execute(
+                "ALTER TABLE po_dispatch_reminders ADD COLUMN "
+                "escalated_ts TEXT")
+        if "escalation_reason" not in cols:
+            conn.execute(
+                "ALTER TABLE po_dispatch_reminders ADD COLUMN "
+                "escalation_reason TEXT")
     except sqlite3.Error:
         pass
 
@@ -1894,10 +1927,54 @@ def list_recent_po_dispatch_reminders(limit: int = 50) -> list:
         rows = c.execute(
             "SELECT po_number, supplier, received_status, "
             "       so_numbers, n_sos, posted_channel, posted_at, "
+            "       escalated_at, escalated_ts, escalation_reason, "
             "       error_msg "
             "FROM po_dispatch_reminders "
             "ORDER BY posted_at DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_po_reminders_pending_escalation(
+        min_age_hours: int = 24,
+        max_age_hours: int = 168
+        ) -> list:
+    """v2.67.131 — reminders posted >= min_age_hours ago that have
+    not yet been escalated and didn't error on the initial post.
+    max_age_hours bounds how far back we look (default 7 days)
+    so we don't endlessly chase stale reminders if shipments are
+    just slow."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT po_number, supplier, received_status, "
+            "       so_numbers, n_sos, posted_channel, posted_ts, "
+            "       posted_at "
+            "FROM po_dispatch_reminders "
+            "WHERE escalated_at IS NULL "
+            "  AND (error_msg IS NULL OR error_msg = '') "
+            "  AND posted_at <= datetime('now', '-' || ? || ' hours') "
+            "  AND posted_at >= datetime('now', '-' || ? || ' hours') "
+            "ORDER BY posted_at ASC",
+            (min_age_hours, max_age_hours)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_po_dispatch_escalation(po_number: str,
+                                          posted_ts: Optional[str],
+                                          reason: str,
+                                          error_msg: Optional[str] = None
+                                          ) -> None:
+    """v2.67.131 — stamp a reminder as escalated. We never escalate
+    twice; the escalated_at IS NULL filter above guarantees idempotence."""
+    with connect() as c:
+        c.execute(
+            "UPDATE po_dispatch_reminders SET "
+            "escalated_at = datetime('now'), "
+            "escalated_ts = ?, "
+            "escalation_reason = ? "
+            "WHERE po_number = ?",
+            (posted_ts, (reason + (f" | error: {error_msg}"
+                                          if error_msg else "")),
+              po_number))
 
 
 # ---------------------------------------------------------------------------
@@ -2151,6 +2228,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_ad_campaign_skus_spend(conn)  # v2.67.105
         _migrate_ad_campaigns_daily_drop_spend_notnull(conn)  # v2.67.107
         _migrate_ad_campaign_skus_free_listings(conn)  # v2.67.118
+        _migrate_po_dispatch_reminders_escalation(conn)  # v2.67.131
         yield conn
     finally:
         conn.close()
