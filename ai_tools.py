@@ -4950,6 +4950,82 @@ def get_marketing_intelligence(engine_df: pd.DataFrame,
 # v2.67.102 — Campaign-level Moby-replacement handlers
 # ---------------------------------------------------------------------------
 
+def _ad_table_diagnostics(platform: str = "google_ads") -> dict:
+    """v2.67.122 — when a get_ad_overview call returns 0 rows, the
+    bot used to parrot a misleading note ('sync isn't configured').
+    That's wrong — empty can mean (a) the table doesn't exist,
+    (b) the table is empty, (c) data exists but for a different
+    date window than queried, OR (d) data exists for a different
+    platform string. This helper surfaces the truth so the bot can
+    give an accurate answer to the user."""
+    out: dict = {
+        "table_exists": False,
+        "total_rows_all_time": 0,
+        "latest_date": None,
+        "earliest_date": None,
+        "platforms_in_table": [],
+    }
+    try:
+        with db.connect() as c:
+            # Check existence first; a fresh DB on a service that
+            # hasn't run the sync yet won't have the table.
+            t = c.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='ad_campaigns_daily'"
+            ).fetchone()
+            if not t:
+                return out
+            out["table_exists"] = True
+            r = c.execute(
+                "SELECT COUNT(*) AS n, "
+                "       MAX(date) AS latest, "
+                "       MIN(date) AS earliest "
+                "FROM ad_campaigns_daily"
+            ).fetchone()
+            out["total_rows_all_time"] = int((r["n"] or 0))
+            out["latest_date"] = r["latest"]
+            out["earliest_date"] = r["earliest"]
+            plats = c.execute(
+                "SELECT DISTINCT platform FROM ad_campaigns_daily"
+            ).fetchall()
+            out["platforms_in_table"] = sorted(
+                {(p["platform"] or "").strip() for p in plats
+                  if (p["platform"] or "").strip()})
+    except Exception:
+        # Returning the partial dict is still useful — the bot can
+        # at least say 'I can't see the table' instead of 'sync
+        # is not configured'.
+        pass
+    return out
+
+
+def _ad_overview_empty_note(diag: dict, days: int,
+                                  platform: str) -> str:
+    """v2.67.122 — pick the most accurate explanation for an empty
+    result. Replaces the old single-string note."""
+    if not diag.get("table_exists"):
+        return (f"The ad_campaigns_daily table doesn't exist in "
+                  f"this database. Google Ads data is collected on "
+                  f"the worker; if you're querying from the "
+                  f"dashboard, the worker's data may not have "
+                  f"propagated yet (cross-service drift — pending "
+                  f"v2.68 Postgres migration). Try the Slack bot "
+                  f"for ad questions until then.")
+    if diag.get("total_rows_all_time", 0) == 0:
+        return ("Table exists but is empty — google_ads_sync has "
+                "not written any rows yet. Check the worker logs.")
+    latest = diag.get("latest_date")
+    plats = diag.get("platforms_in_table") or []
+    if platform != "all" and platform not in plats:
+        return (f"No rows match platform='{platform}'. Platforms "
+                  f"present in the table: {plats}. Possible name "
+                  f"mismatch (case, underscore vs space, etc.).")
+    return (f"Data exists through {latest} but no rows match the "
+              f"last {days}-day window for platform='{platform}'. "
+              f"Earliest row: {diag.get('earliest_date')}. Sync "
+              f"may have stopped — check worker logs.")
+
+
 def _ad_summary_query(days: int, platform: str = "google_ads") -> dict:
     """Common base aggregator for ad-campaign analytics."""
     p_filter = "" if platform == "all" else "AND platform = ?"
@@ -4983,11 +5059,17 @@ def get_ad_overview(engine_df: pd.DataFrame,
     platform = (args.get("platform") or "google_ads").strip().lower()
     rows = _ad_summary_query(days, platform=platform)
     if not rows:
+        # v2.67.122 — surface table diagnostics instead of a
+        # single misleading note. The bot can now distinguish
+        # 'sync never ran' from 'data exists for a different
+        # window' from 'platform name mismatch'.
+        diag = _ad_table_diagnostics(platform=platform)
         return {
             "matched": 0,
-            "note": ("No ad data for that period. If google_ads "
-                      "data should exist, verify google_ads_sync is "
-                      "running on the worker."),
+            "diagnostics": diag,
+            "queried_window_days": days,
+            "queried_platform": platform,
+            "note": _ad_overview_empty_note(diag, days, platform),
         }
 
     # Compute ROAS and add top campaigns per platform
