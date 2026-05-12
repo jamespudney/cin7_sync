@@ -18286,12 +18286,56 @@ elif page == "AI Assistant":
             except Exception:
                 _lessons_addendum = ""
 
+            # v2.67.123 — Marketing-intelligence response template.
+            # Same constant added to the Slack listener prompt so
+            # both interfaces produce the same depth of answer when
+            # users ask about ad spend, ROAS, campaign perf, etc.
+            # Triple-Whale replacement: thin answers are a regression.
+            _marketing_addendum = (
+                "\n\n=== MARKETING-INTELLIGENCE RESPONSE TEMPLATE ===\n"
+                "When a user asks ANY question that touches ad spend, "
+                "campaign performance, ROAS, attribution, or paid-"
+                "marketing decisions, your reply MUST include ALL of "
+                "these sections when the tool returned data:\n"
+                "1. **Headline** — one line: total spend, period, "
+                "count of SKUs/campaigns covered.\n"
+                "2. **Performance summary** — bulleted block with "
+                "ALL available metrics: Impressions, Clicks, "
+                "Conversions, Conv. value, ROAS (computed if not in "
+                "tool output: conv_value / spend), CPC (spend / "
+                "clicks). Show all of these; don't pick a subset.\n"
+                "3. **Spend-by-campaign breakdown** — code-block "
+                "formatted, sorted high→low, dollar amounts "
+                "aligned.\n"
+                "4. **Attribution insight (Note)** — actively look "
+                "for these patterns: named-campaign vs real-spend "
+                "split (campaigns with the SKU/family name but $0 "
+                "spend — actual traffic came through broader "
+                "campaigns); outlier campaigns spending "
+                "disproportionately; high-spend / low-ROAS vs the "
+                "family average; SKUs with traffic but no "
+                "conversions. Surface any present pattern as a "
+                "'Note:' at the bottom.\n"
+                "5. **Engine-signal overlay (staff-facing ONLY — "
+                "never customer-facing tools):** When spend covers "
+                "multiple SKUs, flag the ABC class / trend_flag of "
+                "the highest-spend SKUs. Money flowing to a B-class "
+                "declining SKU while an A-class trending sibling "
+                "gets less is actionable allocation intelligence.\n"
+                "If the tool returns a non-empty result but you "
+                "produce a one-line reply, you have failed the "
+                "response standard. Triple Whale was cancellable "
+                "BECAUSE the team can now get this depth from you.\n"
+                "=== END MARKETING TEMPLATE ===\n"
+            )
+
             _system_prompt = (_system_prompt
                               + (_alias_addendum or "")
                               + (_similarity_addendum or "")
                               + (_accessory_addendum or "")
                               + _corrections_addendum
                               + _glossary_addendum
+                              + _marketing_addendum
                               + _lessons_addendum)
 
             _tool_calls_log: list = []
