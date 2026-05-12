@@ -1,4 +1,4 @@
-"""merchant_sync.py (v2.67.118)
+"""merchant_sync.py (v2.67.119)
 =================================
 
 Pull Google Merchant Center product feed status + free-listing
@@ -328,20 +328,38 @@ def _build_sku_lookup() -> Dict[str, dict]:
 def _resolve_offer(offer_id: str, title: str = "",
                        link: str = "") -> dict:
     """Try several key shapes to find the SKU for an offer_id.
-    Returns {sku, family, shopify_handle, title}."""
+    Returns {sku, family, shopify_handle, title}.
+
+    v2.67.119 — always carry offer_id forward as the SKU even
+    when we match by handle. product_dimensions is per-product,
+    not per-variant, so its `sku` field is often empty for
+    handle-keyed lookups; without this guard, every variant
+    whose offer_id didn't match a product-level SKU but DID
+    match a handle would be skipped (82% of rows in the first
+    run). We still want the family/handle metadata from that
+    match — just substitute offer_id for the missing SKU."""
     if not offer_id:
         return {}
     lookup = _build_sku_lookup()
+
+    def _normalise(info: dict) -> dict:
+        """Ensure sku is non-empty before returning."""
+        if not info.get("sku"):
+            info = {**info, "sku": offer_id}
+        return info
+
     # Try direct match first
     info = lookup.get(offer_id) or lookup.get(offer_id.lower())
     if info:
-        return info
-    # Sometimes offer_id has shop:variant_id format
+        return _normalise(info)
+    # Sometimes offer_id has shop:variant_id format (no-op here
+    # in practice — caller already strips the prefix — but kept
+    # for safety on direct callers).
     if ":" in offer_id:
         tail = offer_id.split(":")[-1]
         info = lookup.get(tail) or lookup.get(tail.lower())
         if info:
-            return info
+            return _normalise(info)
     # Fallback: try to extract handle from the product link
     if link and "/products/" in link:
         try:
@@ -349,7 +367,7 @@ def _resolve_offer(offer_id: str, title: str = "",
                           .split("/")[0].split("?")[0].strip())
             info = lookup.get(f"handle:{handle}")
             if info:
-                return info
+                return _normalise(info)
         except Exception:
             pass
     return {
