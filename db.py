@@ -924,6 +924,53 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
 
+-- v2.67.126 Slack OAuth user tokens (for Viktor bridge from
+-- dashboard). Each staff member who wants the dashboard to
+-- forward marketing questions to Viktor on their behalf
+-- authorises once via Slack OAuth; we store the user-scoped
+-- access token here (encrypted at rest via Fernet using
+-- SLACK_USER_TOKEN_ENCRYPTION_KEY env var). The dashboard then
+-- posts to Slack AS the user, so Viktor sees a real human
+-- message and responds (Slack apps universally filter bot
+-- messages — see v2.67.125).
+CREATE TABLE IF NOT EXISTS slack_user_tokens (
+    user_id             INTEGER PRIMARY KEY,  -- our users.user_id
+    slack_user_id       TEXT    NOT NULL,     -- their U-prefix
+    slack_team_id       TEXT,
+    -- Encrypted with Fernet. Empty string = revoked / cleared.
+    access_token_enc    TEXT    NOT NULL,
+    scopes              TEXT,                 -- comma-separated
+    authed_at           TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    expires_at          TIMESTAMP,            -- null = no expiry
+    last_used_at        TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_slack_user_tokens_slack_uid
+    ON slack_user_tokens(slack_user_id);
+
+-- v2.67.126 Viktor bridge sessions. When the dashboard's AI
+-- Assistant posts to Slack on a user's behalf to forward a
+-- marketing question to Viktor, we record the post here so we
+-- can poll for Viktor's reply and return it to the dashboard.
+CREATE TABLE IF NOT EXISTS viktor_bridge_sessions (
+    session_id          TEXT PRIMARY KEY,     -- UUID, generated client-side
+    user_id             INTEGER NOT NULL,     -- our user who asked
+    question            TEXT NOT NULL,
+    channel_id          TEXT NOT NULL,        -- where we posted
+    posted_ts           TEXT,                 -- Slack ts of our post
+    thread_ts           TEXT,                 -- thread Viktor will reply in
+    viktor_reply_ts     TEXT,                 -- once detected
+    viktor_reply_text   TEXT,                 -- pulled from slack_messages
+    overlay_text        TEXT,                 -- our engine-signal addendum
+    status              TEXT NOT NULL DEFAULT 'pending',
+                                              -- pending / replied / timeout / error
+    created_at          TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    completed_at        TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_viktor_bridge_pending
+    ON viktor_bridge_sessions(status)
+    WHERE status = 'pending';
+
 -- v2.67.118 Google Merchant Center: per-product feed status.
 -- One row per SKU (offer_id) — overwrites each sync. Tracks
 -- whether the SKU is approved, disapproved, or has warnings on
@@ -1779,6 +1826,159 @@ def get_feed_status_summary() -> dict:
         out[status] = int(r["n"] or 0)
         out["total"] += out[status]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Viktor bridge — Slack user OAuth tokens (v2.67.126)
+# ---------------------------------------------------------------------------
+def upsert_slack_user_token(user_id: int, slack_user_id: str,
+                                  access_token_enc: str,
+                                  slack_team_id: Optional[str] = None,
+                                  scopes: Optional[str] = None,
+                                  expires_at: Optional[str] = None
+                                  ) -> None:
+    """Store / overwrite a user's encrypted Slack token. Used by
+    the OAuth callback in app.py once the user authorises the
+    dashboard to post to Slack on their behalf."""
+    sql = (
+        "INSERT INTO slack_user_tokens "
+        "(user_id, slack_user_id, slack_team_id, access_token_enc, "
+        " scopes, expires_at, authed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "  slack_user_id = excluded.slack_user_id, "
+        "  slack_team_id = excluded.slack_team_id, "
+        "  access_token_enc = excluded.access_token_enc, "
+        "  scopes = excluded.scopes, "
+        "  expires_at = excluded.expires_at, "
+        "  authed_at = datetime('now')")
+    with connect() as c:
+        c.execute(sql, (user_id, slack_user_id, slack_team_id,
+                          access_token_enc, scopes, expires_at))
+
+
+def get_slack_user_token_row(user_id: int) -> Optional[dict]:
+    """Return the encrypted token row for a user (or None).
+    Caller decrypts via slack_oauth.decrypt_token."""
+    with connect() as c:
+        r = c.execute(
+            "SELECT user_id, slack_user_id, slack_team_id, "
+            "       access_token_enc, scopes, expires_at, "
+            "       authed_at, last_used_at "
+            "FROM slack_user_tokens WHERE user_id = ?",
+            (user_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def touch_slack_user_token(user_id: int) -> None:
+    """Bump last_used_at when the token is used. Cheap, no return."""
+    try:
+        with connect() as c:
+            c.execute(
+                "UPDATE slack_user_tokens SET "
+                "last_used_at = datetime('now') WHERE user_id = ?",
+                (user_id,))
+    except sqlite3.Error:
+        pass
+
+
+def delete_slack_user_token(user_id: int) -> None:
+    """Revoke a stored Slack token (user clicked 'Disconnect')."""
+    with connect() as c:
+        c.execute("DELETE FROM slack_user_tokens WHERE user_id = ?",
+                    (user_id,))
+
+
+# ---------------------------------------------------------------------------
+# Viktor bridge sessions (v2.67.126)
+# ---------------------------------------------------------------------------
+def create_viktor_bridge_session(session_id: str, user_id: int,
+                                       question: str, channel_id: str
+                                       ) -> None:
+    """Record that the dashboard is forwarding a marketing question
+    to Viktor on behalf of this user. Polling code looks up by
+    session_id to fetch Viktor's reply when it arrives."""
+    with connect() as c:
+        c.execute(
+            "INSERT INTO viktor_bridge_sessions "
+            "(session_id, user_id, question, channel_id, status) "
+            "VALUES (?, ?, ?, ?, 'pending')",
+            (session_id, user_id, question, channel_id))
+
+
+def update_viktor_bridge_post(session_id: str,
+                                    posted_ts: str,
+                                    thread_ts: str) -> None:
+    """Store the Slack ts of our posted message + the thread_ts
+    Viktor will reply in (Slack's chat.postMessage returns both)."""
+    with connect() as c:
+        c.execute(
+            "UPDATE viktor_bridge_sessions SET "
+            "posted_ts = ?, thread_ts = ? "
+            "WHERE session_id = ?",
+            (posted_ts, thread_ts, session_id))
+
+
+def complete_viktor_bridge_session(session_id: str,
+                                          viktor_reply_ts: str,
+                                          viktor_reply_text: str,
+                                          overlay_text: Optional[str]
+                                          ) -> None:
+    """Mark a bridge session as 'replied' once we've detected
+    Viktor's reply and composed the overlay."""
+    with connect() as c:
+        c.execute(
+            "UPDATE viktor_bridge_sessions SET "
+            "viktor_reply_ts = ?, viktor_reply_text = ?, "
+            "overlay_text = ?, status = 'replied', "
+            "completed_at = datetime('now') "
+            "WHERE session_id = ?",
+            (viktor_reply_ts, viktor_reply_text, overlay_text,
+              session_id))
+
+
+def get_viktor_bridge_session(session_id: str) -> Optional[dict]:
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM viktor_bridge_sessions "
+            "WHERE session_id = ?", (session_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def poll_viktor_bridge_reply(session_id: str,
+                                    viktor_slack_user_id: str
+                                    ) -> Optional[dict]:
+    """v2.67.126 — Check if Viktor has replied in the thread for
+    this bridge session. Looks at slack_messages (populated by
+    slack_sync's poll cycle) for a message from Viktor's user_id
+    in the same thread, posted AFTER our forwarded message.
+
+    Returns None while waiting; returns a dict with the reply
+    fields when Viktor has replied."""
+    sess = get_viktor_bridge_session(session_id)
+    if not sess:
+        return None
+    posted_ts = sess.get("posted_ts")
+    thread_ts = sess.get("thread_ts")
+    channel_id = sess.get("channel_id")
+    if not (posted_ts and thread_ts and channel_id):
+        return None
+    with connect() as c:
+        r = c.execute(
+            "SELECT ts, text FROM slack_messages "
+            "WHERE channel_id = ? "
+            "  AND user_id = ? "
+            "  AND thread_ts = ? "
+            "  AND ts > ? "
+            "ORDER BY ts ASC LIMIT 1",
+            (channel_id, viktor_slack_user_id,
+              thread_ts, posted_ts)).fetchone()
+    if not r:
+        return None
+    return {
+        "ts": r["ts"],
+        "text": r["text"] or "",
+    }
 
 
 def get_ad_attribution_for_sku(sku: str, days: int = 30) -> list:

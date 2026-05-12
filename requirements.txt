@@ -11,3 +11,8 @@ reportlab>=4.0.0
 # to Claude with access to engine_df / sale_lines via local Python
 # tools. Cost: ~$0.50-2/day for typical team usage at this volume.
 anthropic>=0.40.0
+# v2.67.126 — Fernet symmetric encryption for storing Slack user
+# OAuth tokens at rest (Viktor bridge: dashboard posts to Slack
+# on the user's behalf so Viktor sees a real human message, not a
+# bot). See slack_oauth.py for the encryption helpers.
+cryptography>=42.0.0

@@ -2266,6 +2266,55 @@ with st.sidebar:
     current_user_profile = (
         st.session_state.get("current_user_profile") or {})
 
+    # ---- Slack OAuth callback handler (v2.67.126) --------------------
+    # When a user clicks "Connect Slack" on the My Profile page, they
+    # are redirected to Slack to authorise, then Slack redirects back
+    # to this app with ?slack_oauth=callback&code=...&state=... in the
+    # query string. We need to process that BEFORE any page renders so
+    # the token is stored and the URL is cleaned up.
+    try:
+        _qp = dict(st.query_params)
+    except Exception:
+        _qp = {}
+    if _qp.get("slack_oauth") == "callback" and _qp.get("code"):
+        _expected_state = st.session_state.get(
+            "_slack_oauth_state") or ""
+        _received_state = _qp.get("state") or ""
+        if _expected_state and _received_state != _expected_state:
+            st.error(":lock: Slack OAuth state mismatch — possible "
+                       "CSRF. Try connecting again.")
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+        else:
+            try:
+                import slack_oauth as _slack_oauth
+                _oauth_body = _slack_oauth.exchange_code_for_token(
+                    _qp.get("code"))
+                if _oauth_body:
+                    _slack_oauth.store_user_token_from_oauth(
+                        user_id=current_user_profile.get("user_id"),
+                        oauth_response=_oauth_body)
+                    st.success(
+                        ":white_check_mark: Slack connected. The "
+                        "dashboard can now ask Viktor on your "
+                        "behalf for marketing questions.")
+                else:
+                    st.error(
+                        ":x: Slack OAuth exchange failed. Check "
+                        "the worker logs for slack_oauth errors.")
+            except Exception as _exc:  # noqa: BLE001
+                st.error(f":x: Slack OAuth error: {_exc}")
+            finally:
+                # Clear query params so a refresh doesn't re-process
+                # the (now-used) code.
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.session_state.pop("_slack_oauth_state", None)
+
     # ---- Quick-capture demand signal ----------------------------------
     # Available from every page so sales/buyers can log a customer
     # inquiry, quote request, lost sale, etc. in 15 seconds without
@@ -17202,6 +17251,101 @@ elif page == "AI Assistant":
             with st.chat_message("user"):
                 st.markdown(_user_question)
 
+            # ---- Viktor bridge (v2.67.126) ----
+            # If this is a marketing question AND the current user
+            # has authorised the dashboard via Slack OAuth, forward
+            # to Viktor on their behalf and inline-render Viktor's
+            # answer + our engine-signal overlay. Skips the local
+            # tool-use loop entirely for these questions because
+            # Viktor's marketing-attribution depth is what the team
+            # is paying for.
+            _viktor_handled = False
+            try:
+                import viktor_bridge as _vb
+                _vb_user_id = (current_user_profile or {}).get(
+                    "user_id")
+                # Strip our intent hint when feeding to Viktor — it
+                # isn't useful context for marketing-attribution.
+                _q_raw = _user_question.split("\n\n[Intent:")[0].strip()
+                if (_vb_user_id
+                        and _vb.is_marketing_question(_q_raw)):
+                    try:
+                        import slack_oauth as _vb_slack
+                        _has_token = _vb_slack.is_user_connected(
+                            _vb_user_id)
+                    except Exception:
+                        _has_token = False
+                    if _has_token:
+                        with st.chat_message("assistant"):
+                            _vb_placeholder = st.empty()
+                            _vb_placeholder.markdown(
+                                ":satellite_antenna: _Marketing "
+                                "question — asking Viktor on your "
+                                "behalf in Slack…_")
+                            try:
+                                _session_id = _vb.forward_via_dashboard(
+                                    user_id=_vb_user_id,
+                                    question=_q_raw,
+                                )
+                            except Exception as _exc:
+                                _session_id = None
+                                _vb_placeholder.warning(
+                                    f"Couldn't forward to Viktor: "
+                                    f"{_exc}. Falling back to local "
+                                    f"AI assistant.")
+                            if _session_id:
+                                # Poll for Viktor's reply for up to
+                                # 60s. Slack-sync's poll cycle is
+                                # ~1 min, so this should land in time.
+                                import time as _vb_time
+                                _deadline = _vb_time.time() + 90
+                                _reply = None
+                                while _vb_time.time() < _deadline:
+                                    try:
+                                        _reply = _vb.poll_for_viktor_reply(
+                                            _session_id)
+                                    except Exception:
+                                        _reply = None
+                                    if _reply:
+                                        break
+                                    _vb_time.sleep(2)
+                                if _reply:
+                                    _viktor_handled = True
+                                    _combined = (
+                                        ":satellite_antenna: "
+                                        "**Viktor:**\n\n"
+                                        + (_reply["reply_text"] or "")
+                                    )
+                                    if _reply.get("overlay_text"):
+                                        _combined += (
+                                            "\n\n---\n\n"
+                                            + _reply["overlay_text"]
+                                        )
+                                    _vb_placeholder.markdown(_combined)
+                                    st.session_state[
+                                        "_ai_transcript"].append({
+                                            "role": "assistant",
+                                            "content": _combined,
+                                        })
+                                else:
+                                    _vb_placeholder.warning(
+                                        ":hourglass: Viktor didn't "
+                                        "reply within 90s. Check "
+                                        "Slack — if Viktor is "
+                                        "offline, falling back to "
+                                        "the local AI assistant.")
+            except ImportError:
+                # viktor_bridge missing — silently fall through.
+                pass
+            except Exception as _exc:  # noqa: BLE001
+                # Any unexpected error: log to UI subtly, continue.
+                st.caption(f"_(Viktor bridge skipped: {_exc})_")
+
+            if _viktor_handled:
+                # Short-circuit — Viktor answered. Don't run the
+                # local AI tool-use loop on this turn.
+                st.stop()
+
             # ---- Alias check (v2.62 + v2.63 multi-target) ----
             # Before calling the LLM, see if any stored alias phrases
             # appear in the user's question. Hits become a "past
@@ -19007,6 +19151,76 @@ elif page == "My Profile":
                 st.rerun()
             except Exception as _e:
                 st.error(f"Save failed: {_e}")
+
+    # ---- Connect Slack for Viktor bridge (v2.67.126) ----
+    # Slack apps universally filter messages with bot_id set, so
+    # our bot can't @-mention Viktor on the user's behalf. The
+    # workaround: the user authorises the dashboard to post to
+    # Slack AS THEM, then dashboard-initiated marketing questions
+    # get forwarded to Viktor as a real-human message that Viktor
+    # will respond to. Viktor's reply is then pulled back into
+    # the dashboard with our engine-signal overlay.
+    if _me.get("user_id"):
+        st.divider()
+        st.subheader(":satellite_antenna: Connect Slack (for Viktor)")
+        st.caption(
+            "Authorise the dashboard to ask Viktor on your behalf "
+            "when you ask marketing questions here. One-time "
+            "OAuth — no passwords stored, just a scoped Slack "
+            "token (encrypted at rest). Disconnect any time below.")
+        try:
+            import slack_oauth as _slack_oauth_ui
+            _connected = _slack_oauth_ui.is_user_connected(
+                _me["user_id"])
+        except Exception as _exc:  # noqa: BLE001
+            _connected = False
+            st.warning(
+                f"Slack OAuth module not configured: {_exc}")
+        if _connected:
+            try:
+                _slack_uid = _slack_oauth_ui.get_user_slack_id(
+                    _me["user_id"])
+            except Exception:
+                _slack_uid = None
+            st.success(
+                f":white_check_mark: Connected"
+                f"{f' as `<@{_slack_uid}>`' if _slack_uid else ''}. "
+                f"Marketing questions in the AI Assistant will be "
+                f"forwarded to Viktor on your behalf.")
+            if st.button(
+                    ":electric_plug: Disconnect Slack",
+                    key="_disconnect_slack",
+                    help="Revoke the dashboard's permission to post "
+                          "as you. You can reconnect any time."):
+                try:
+                    _slack_oauth_ui.disconnect_user(_me["user_id"])
+                    st.success("Disconnected.")
+                    st.rerun()
+                except Exception as _exc:  # noqa: BLE001
+                    st.error(f"Disconnect failed: {_exc}")
+        else:
+            # Show the connect button. Generate a fresh state token
+            # each render so refreshes don't reuse the same nonce.
+            try:
+                import secrets as _secrets
+                _state = _secrets.token_urlsafe(24)
+                st.session_state["_slack_oauth_state"] = _state
+                _auth_url = _slack_oauth_ui.build_authorize_url(_state)
+                st.markdown(
+                    f"[:link: **Connect Slack** "
+                    f"(opens Slack to authorise)]({_auth_url})")
+                st.caption(
+                    "Required Slack-app config (one-time, see "
+                    "slack_oauth.py docstring): User Token Scopes "
+                    "must include `chat:write`, and the Redirect "
+                    "URL must match this dashboard's URL.")
+            except Exception as _exc:  # noqa: BLE001
+                st.error(
+                    f"Connect button unavailable: {_exc}. The "
+                    f"admin needs to set SLACK_OAUTH_CLIENT_ID, "
+                    f"SLACK_OAUTH_CLIENT_SECRET, "
+                    f"SLACK_OAUTH_REDIRECT_URI, and "
+                    f"SLACK_USER_TOKEN_ENCRYPTION_KEY env vars.")
 
     # ---- Admin: manage other users ----
     if _is_admin:
