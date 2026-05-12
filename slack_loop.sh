@@ -174,9 +174,11 @@ last_semrush_epoch=0
 # v2.67.97 — Google Ads + GA4 syncs (Phase 2 of Moby replacement):
 #   google_ads:   daily (last 7 days of campaign daily metrics)
 #   ga4:          daily (last 7 days, both campaign-totals + per-SKU)
-# Both gated on Google OAuth env vars; silent skip if not provisioned.
+#   merchant:     daily (v2.67.118: feed status + free-listing perf)
+# All gated on Google OAuth env vars; silent skip if not provisioned.
 last_googleads_epoch=0
 last_ga4_epoch=0
+last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -361,6 +363,22 @@ while true; do
         last_ga4_epoch=$(date -u +%s)
         _run_bg "ga4_sync" \
             "python ga4_sync.py recent --days 7"
+    fi
+
+    # v2.67.118 Google Merchant Center — feed status (every SKU
+    # disapproved/warning state) + free-listing performance
+    # (organic Shopping clicks, complementing google_ads_sync's
+    # paid spend). Reuses the same GOOGLE_ADS_* OAuth creds; the
+    # refresh token must carry the `content` scope.
+    seconds_since_merchant=$(( now_epoch - last_merchant_epoch ))
+    if [ "$seconds_since_merchant" -ge 86400 ] \
+            && [ -n "${GOOGLE_MERCHANT_ID:-}" ] \
+            && [ -n "${GOOGLE_ADS_CLIENT_ID:-}" ] \
+            && [ -n "${GOOGLE_ADS_CLIENT_SECRET:-}" ] \
+            && [ -n "${GOOGLE_ADS_REFRESH_TOKEN:-}" ]; then
+        last_merchant_epoch=$(date -u +%s)
+        _run_bg "merchant_sync" \
+            "python merchant_sync.py daily --days 7"
     fi
 
     # Slack ingest → DB

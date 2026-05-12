@@ -923,6 +923,33 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
     ON ad_campaign_skus(sku);
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
+
+-- v2.67.118 Google Merchant Center: per-product feed status.
+-- One row per SKU (offer_id) — overwrites each sync. Tracks
+-- whether the SKU is approved, disapproved, or has warnings on
+-- each destination (Shopping ads, free listings).
+CREATE TABLE IF NOT EXISTS product_feed_status (
+    sku                 TEXT PRIMARY KEY,
+    offer_id            TEXT,
+    family              TEXT,
+    shopify_handle      TEXT,
+    title               TEXT,
+    -- Per-destination roll-ups: 'approved', 'disapproved',
+    -- 'pending', 'eligible', 'not_eligible' or '' if absent.
+    ads_status          TEXT,
+    free_listings_status TEXT,
+    -- JSON array of issue dicts:
+    --   [{code, severity, destination, description, detail, url}]
+    issues_json         TEXT,
+    n_issues            INTEGER DEFAULT 0,
+    n_errors            INTEGER DEFAULT 0,
+    n_warnings          INTEGER DEFAULT 0,
+    last_checked        TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_product_feed_status_family
+    ON product_feed_status(family);
+CREATE INDEX IF NOT EXISTS idx_product_feed_status_ads_status
+    ON product_feed_status(ads_status);
 """
 
 
@@ -1132,6 +1159,31 @@ def _migrate_ad_campaign_skus_spend(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE ad_campaign_skus ADD COLUMN clicks "
                 "INTEGER")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_ad_campaign_skus_free_listings(
+        conn: sqlite3.Connection) -> None:
+    """v2.67.118 — add free-listing performance columns from Google
+    Merchant Center to existing ad_campaign_skus tables. Free
+    listings are Google Shopping's organic (non-paid) surface;
+    Merchant Center reports clicks + impressions on them per
+    offer_id (≈ SKU). google_ads_sync owns paid spend/clicks;
+    merchant_sync owns free_listing_*."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('ad_campaign_skus')").fetchall()}
+        if not cols:
+            return  # table doesn't exist yet (fresh DB)
+        if "free_listing_clicks" not in cols:
+            conn.execute(
+                "ALTER TABLE ad_campaign_skus ADD COLUMN "
+                "free_listing_clicks INTEGER")
+        if "free_listing_impressions" not in cols:
+            conn.execute(
+                "ALTER TABLE ad_campaign_skus ADD COLUMN "
+                "free_listing_impressions INTEGER")
     except sqlite3.Error:
         pass
 
@@ -1640,16 +1692,28 @@ def upsert_ad_campaign_daily(row: dict) -> int:
 
 
 def upsert_ad_campaign_sku(row: dict) -> int:
-    """v2.67.105 — adds spend/impressions/clicks columns + COALESCE
-    so each sync only updates fields it owns:
+    """v2.67.118 — adds free_listing_clicks/free_listing_impressions
+    columns. v2.67.105 — adds spend/impressions/clicks columns +
+    COALESCE so each sync only updates fields it owns:
       ga4_sync owns:        item_views, add_to_carts,
                               purchases, revenue
       google_ads_sync owns: spend, impressions, clicks (per-SKU
                               from shopping_performance_view)
-    Both can write platform / family / captured_at."""
+      merchant_sync owns:   free_listing_clicks,
+                              free_listing_impressions
+    Both can write platform / family / captured_at.
+
+    Merchant Center free-listing data is account-level (not tied
+    to a Google Ads campaign), so merchant_sync writes rows with
+    platform='google_merchant' and campaign_id='free_listings' —
+    a synthetic identifier that keeps the per-SKU/date UNIQUE
+    constraint intact and clearly distinguishes free-listing
+    rows from paid Shopping rows."""
     cols = ("platform", "campaign_id", "date", "sku", "family",
               "item_views", "add_to_carts", "purchases", "revenue",
-              "spend", "impressions", "clicks", "captured_at")
+              "spend", "impressions", "clicks",
+              "free_listing_clicks", "free_listing_impressions",
+              "captured_at")
     values = [row.get(c) for c in cols]
     sql = (
         f"INSERT INTO ad_campaign_skus ({','.join(cols)}) "
@@ -1663,6 +1727,58 @@ def upsert_ad_campaign_sku(row: dict) -> int:
     with connect() as c:
         cur = c.execute(sql, values)
         return int(cur.lastrowid or 0)
+
+
+def upsert_product_feed_status(row: dict) -> int:
+    """v2.67.118 — Google Merchant Center feed status per SKU.
+    Overwrites on every sync; we always want the latest state."""
+    cols = ("sku", "offer_id", "family", "shopify_handle", "title",
+              "ads_status", "free_listings_status", "issues_json",
+              "n_issues", "n_errors", "n_warnings", "last_checked")
+    values = [row.get(c) for c in cols]
+    sql = (
+        f"INSERT INTO product_feed_status ({','.join(cols)}) "
+        f"VALUES ({','.join('?' for _ in cols)}) "
+        f"ON CONFLICT(sku) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in cols if c != "sku"))
+    with connect() as c:
+        cur = c.execute(sql, values)
+        return int(cur.lastrowid or 0)
+
+
+def get_disapproved_skus(limit: int = 100) -> list:
+    """v2.67.118 — SKUs Google rejected from Shopping ads. The
+    high-ROI list: every SKU here is paying $0 but COULD be ranking
+    if the issue is fixed."""
+    sql = (
+        "SELECT sku, family, title, shopify_handle, ads_status, "
+        "       free_listings_status, n_issues, n_errors, "
+        "       issues_json, last_checked "
+        "FROM product_feed_status "
+        "WHERE ads_status = 'disapproved' "
+        "   OR ads_status = 'not_eligible' "
+        "ORDER BY n_errors DESC, sku ASC "
+        "LIMIT ?")
+    with connect() as c:
+        rows = c.execute(sql, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_feed_status_summary() -> dict:
+    """v2.67.118 — counts by ads_status. Used by the Ad-Umpire
+    health header: 'X SKUs approved, Y disapproved, Z pending'."""
+    sql = (
+        "SELECT ads_status, COUNT(*) AS n "
+        "FROM product_feed_status "
+        "GROUP BY ads_status")
+    with connect() as c:
+        rows = c.execute(sql).fetchall()
+    out = {"total": 0}
+    for r in rows:
+        status = (r["ads_status"] or "unknown").lower()
+        out[status] = int(r["n"] or 0)
+        out["total"] += out[status]
+    return out
 
 
 def get_ad_attribution_for_sku(sku: str, days: int = 30) -> list:
@@ -1762,6 +1878,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_product_aliases_multi_target(conn)
         _migrate_ad_campaign_skus_spend(conn)  # v2.67.105
         _migrate_ad_campaigns_daily_drop_spend_notnull(conn)  # v2.67.107
+        _migrate_ad_campaign_skus_free_listings(conn)  # v2.67.118
         yield conn
     finally:
         conn.close()
