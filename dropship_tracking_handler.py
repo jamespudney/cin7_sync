@@ -127,7 +127,7 @@ _TRACKING_RE = re.compile(
 _SERVICE_RE = re.compile(
     r"UPS\s+Service\s*:?\s*([^\n\r]+)", re.IGNORECASE)
 _WEIGHT_RE = re.compile(
-    r"Weight\s*:?\s*([\d.]+)\s*(LBS|LB|KG|G|OZ)",
+    r"(?:Package\s+)?Weight\s*:?\s*([\d.]+)\s*(LBS|LB|KG|G|OZ)",
     re.IGNORECASE)
 _PACKAGES_RE = re.compile(
     r"Number\s+of\s+Packages\s*:?\s*(\d+)",
@@ -143,6 +143,19 @@ _FROM_RE = re.compile(
     r"From\s*:?\s*([^\n\r]+)", re.IGNORECASE)
 
 
+def _strip_markdown_bold(text: str) -> str:
+    """v2.67.157 — Gmail's plain-text view of forwarded emails
+    wraps labels in markdown asterisks: '*Ship To:*', '*UPS
+    Service:*', '*Package Weight:*'. These break field-boundary
+    regexes that expect bare labels. Strip the asterisks before
+    parsing so the rest of the regexes are simple."""
+    if not text:
+        return text
+    # Replace *foo* with foo (single-line spans only — avoid
+    # over-eager removal of legitimate asterisks elsewhere)
+    return re.sub(r"\*([^*\n]+?)\*", r"\1", text)
+
+
 def parse_ups_email(text: str) -> dict:
     """Extract structured fields from a UPS shipment-notification
     email body. Returns dict with whichever fields parsed; missing
@@ -150,6 +163,7 @@ def parse_ups_email(text: str) -> dict:
     out: dict = {}
     if not text:
         return out
+    text = _strip_markdown_bold(text)
 
     m = _TRACKING_RE.search(text)
     if m:
