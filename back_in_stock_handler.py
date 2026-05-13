@@ -579,33 +579,48 @@ def _po_lines_received_recently(lookback_hours: int = 48
         return []
     if "OrderNumber" not in lines.columns:
         return []
-    # v2.67.142 — Build family-by-SKU index from engine_output
-    # (the dashboard's full engine output, which has BOTH SKU and
-    # Family columns merged from CIN7 + AdditionalAttribute1).
-    # product_dimensions doesn't have a `sku` column — it's a
-    # product-level dimension-extraction table keyed by Shopify
-    # handle. Earlier code mistakenly tried `r.get("sku")` against
-    # product_dimensions, which always returned None, making the
-    # family-by-sku map empty and arrival-matching always fail.
+    # v2.67.143 — Build SKU → family index from the CIN7 products
+    # CSV (always available on the worker via cin7_sync). The
+    # canonical Family field is AdditionalAttribute1 — same column
+    # worker_engine.py uses to populate engine_df.Family. Earlier
+    # versions tried engine_output.csv (not on worker — only the
+    # web service runs the full engine) and product_dimensions
+    # (no SKU column — keyed by Shopify handle, holds dimension
+    # data only). Both failed silently and produced empty
+    # family_by_sku, breaking family-level matching.
     family_by_sku: dict = {}
     try:
-        from bot_engine_lookup import _load_engine_df
-        df = _load_engine_df()
-    except Exception:
-        df = None
-    if df is not None and not df.empty:
-        sku_col = next(
-            (c for c in ("Sku", "sku", "SKU")
-              if c in df.columns), None)
-        fam_col = next(
-            (c for c in ("Family", "family", "FAMILY")
-              if c in df.columns), None)
-        if sku_col and fam_col:
-            for _, r in df[[sku_col, fam_col]].dropna().iterrows():
-                sku_u = str(r[sku_col]).strip().upper()
-                fam_v = str(r[fam_col]).strip()
-                if sku_u and fam_v:
-                    family_by_sku[sku_u] = fam_v
+        from po_dispatch_reminder import _find_latest_csv
+        products_path = _find_latest_csv("products_*.csv")
+        if products_path:
+            log.info("Loading products from %s for family map",
+                      products_path)
+            products_df = pd.read_csv(products_path)
+            sku_col = next(
+                (c for c in ("SKU", "Sku", "ProductCode")
+                  if c in products_df.columns), None)
+            fam_col = next(
+                (c for c in ("AdditionalAttribute1", "Family",
+                              "family")
+                  if c in products_df.columns), None)
+            if sku_col and fam_col:
+                for _, r in (products_df[[sku_col, fam_col]]
+                              .dropna().iterrows()):
+                    sku_u = str(r[sku_col]).strip().upper()
+                    fam_v = str(r[fam_col]).strip()
+                    if sku_u and fam_v:
+                        family_by_sku[sku_u] = fam_v
+                log.info("Built family_by_sku map: %d entries",
+                          len(family_by_sku))
+            else:
+                log.warning("products CSV missing sku/family cols; "
+                              "columns: %s",
+                              list(products_df.columns)[:20])
+        else:
+            log.warning("No products CSV found in /data/output")
+    except Exception as exc:
+        log.warning("Failed to build family_by_sku from "
+                      "products CSV: %s", exc)
     # Fallback: derive family from SKU naming convention
     # (LED-FAMILY-...). Used for SKUs not yet in engine_output —
     # better than nothing for matching against family-only
