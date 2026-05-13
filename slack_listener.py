@@ -223,6 +223,22 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     except Exception:
         pass
 
+    # v2.67.153 — UPS shipment email forwarded into the dropship
+    # tracking channel via Slack Email app. Scoped to the
+    # configured channel only, fires before the is_bot bot_other
+    # short-circuit (the email is posted by Slack's own bot).
+    _ds_track_ch = os.environ.get(
+        "SLACK_DROPSHIP_TRACKING_CHANNEL_ID", "").strip()
+    if (_ds_track_ch
+            and msg.get("channel_id") == _ds_track_ch):
+        try:
+            from dropship_tracking_handler import (
+                is_ups_shipment_email)
+            if is_ups_shipment_email(msg):
+                return "dropship_ups_email"
+        except Exception:
+            pass
+
     # v2.67.144 — stock-issues channel queries. Scoped strictly
     # to the configured channel so we don't classify random ops
     # chatter elsewhere as a stock issue. Resolution detection
@@ -1524,6 +1540,45 @@ def process_once(max_messages: int = 25) -> int:
         if classification == "stock_issue_resolution":
             log.info("Tracked stock_issue resolution in %s/%s",
                       ch_name, msg["ts"])
+            continue
+
+        # v2.67.153 — Dropship UPS email handler: parse the UPS
+        # shipment notification, match to the CIN7 sale, post
+        # confirmation + weight-mismatch alert if any.
+        if classification == "dropship_ups_email":
+            thread_ts = msg["thread_ts"] or msg["ts"]
+            if _already_replied_recently(
+                    msg["channel_id"], thread_ts):
+                continue
+            try:
+                from dropship_tracking_handler import (
+                    handle_ups_email as _handle_ups)
+                reply_text, ups_tools = _handle_ups(msg)
+            except Exception as exc:
+                log.error("dropship UPS handler error: %s", exc)
+                continue
+            if not reply_text:
+                continue
+            posted_ts = _post_response(
+                session, msg["channel_id"], thread_ts,
+                reply_text)
+            if posted_ts:
+                with db.connect() as c:
+                    c.execute(
+                        "INSERT INTO slack_bot_responses "
+                        "(in_channel, in_ts, in_thread_ts, "
+                        " user_question, response_text, "
+                        " response_ts, tools_used, classification) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (msg["channel_id"], msg["ts"], thread_ts,
+                         (msg["text"] or "[email]")[:500],
+                         reply_text, posted_ts,
+                         ",".join(ups_tools),
+                         "dropship_ups_email"))
+                posts_made += 1
+                log.info(
+                    "Posted dropship-UPS confirmation in "
+                    "%s/%s", ch_name, msg["ts"])
             continue
 
         # v2.67.136 — Back-in-stock subscription from FlowBot.
