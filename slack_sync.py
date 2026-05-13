@@ -547,7 +547,29 @@ def _ingest_channel(session: requests.Session,
 
             text = m.get("text", "")
             thread_ts = m.get("thread_ts") or None
+            # v2.67.158 — raw_event cap raised 8000 → 200000.
+            # The 8000-char limit truncated email-file messages
+            # mid-JSON (UPS shipment emails are 70KB+ with the
+            # HTML preview), breaking downstream handlers that
+            # need to json.loads(raw_event). 200KB is generous
+            # enough for typical email forwards while still
+            # bounding any single message's DB footprint.
             try:
+                raw_str = json.dumps(m)
+                if len(raw_str) > 200000:
+                    # Strip the heaviest HTML field (preview) if
+                    # present; keep plain_text which is what the
+                    # downstream parsers actually use.
+                    try:
+                        m_lite = dict(m)
+                        for fobj in (m_lite.get("files") or []):
+                            if isinstance(fobj, dict):
+                                fobj.pop("preview", None)
+                        raw_str = json.dumps(m_lite)
+                    except Exception:
+                        pass
+                    if len(raw_str) > 200000:
+                        raw_str = raw_str[:200000]
                 with db.connect() as c:
                     c.execute(
                         "INSERT OR IGNORE INTO slack_messages "
@@ -555,8 +577,7 @@ def _ingest_channel(session: requests.Session,
                         " thread_ts, is_bot, is_our_bot, raw_event) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (channel_id, ts, user_id, user_name, text,
-                         thread_ts, is_bot, is_our_bot,
-                         json.dumps(m)[:8000]))
+                         thread_ts, is_bot, is_our_bot, raw_str))
                     if c.total_changes > 0:
                         new_count += 1
             except Exception as exc:  # noqa: BLE001
