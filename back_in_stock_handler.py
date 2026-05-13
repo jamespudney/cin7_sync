@@ -604,14 +604,35 @@ def _po_lines_received_recently(lookback_hours: int = 48
                               "family")
                   if c in products_df.columns), None)
             if sku_col and fam_col:
+                # v2.67.156 — Filter out sourcing-rule strings
+                # accidentally stored in AdditionalAttribute1.
+                # Some products in CIN7 have values like 'Rule:
+                # SR100 | Logic: Purchased full length...' in the
+                # family slot. These are operational notes, not
+                # family taxonomy — treating them as families
+                # breaks back-in-stock arrival matching and any
+                # other family-based filter.
+                n_skipped_rule = 0
                 for _, r in (products_df[[sku_col, fam_col]]
                               .dropna().iterrows()):
                     sku_u = str(r[sku_col]).strip().upper()
                     fam_v = str(r[fam_col]).strip()
-                    if sku_u and fam_v:
-                        family_by_sku[sku_u] = fam_v
-                log.info("Built family_by_sku map: %d entries",
-                          len(family_by_sku))
+                    if not sku_u or not fam_v:
+                        continue
+                    # Sourcing-rule pattern detection. Real
+                    # families are short single-token codes like
+                    # 'SLIM8' or 'ENOLED'; rules are long
+                    # multi-bar narratives.
+                    if (fam_v.lower().startswith("rule:")
+                            or "| logic:" in fam_v.lower()
+                            or "| auto-assembly:" in fam_v.lower()
+                            or len(fam_v) > 60):
+                        n_skipped_rule += 1
+                        continue
+                    family_by_sku[sku_u] = fam_v
+                log.info("Built family_by_sku map: %d entries "
+                          "(%d sourcing-rule strings skipped)",
+                          len(family_by_sku), n_skipped_rule)
             else:
                 log.warning("products CSV missing sku/family cols; "
                               "columns: %s",
