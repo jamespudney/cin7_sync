@@ -180,6 +180,7 @@ last_googleads_epoch=0
 last_ga4_epoch=0
 last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
+last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -402,6 +403,19 @@ while true; do
         last_po_dispatch_epoch=$(date -u +%s)
         _run_bg "po_dispatch_reminder" \
             "python po_dispatch_reminder.py daily"
+    fi
+
+    # v2.67.138 Drop-ship backorder warnings — when a customer
+    # orders a SKU flagged DropShipMode='Always Drop Ship' in
+    # CIN7, post a warning to #purchase-backorder telling the team
+    # to approve the auto-created draft PO. 5-min cadence; gated
+    # on SLACK_PURCHASE_BACKORDER_CHANNEL_ID.
+    seconds_since_dropship=$(( now_epoch - last_dropship_epoch ))
+    if [ "$seconds_since_dropship" -ge 300 ] \
+            && [ -n "${SLACK_PURCHASE_BACKORDER_CHANNEL_ID:-}" ]; then
+        last_dropship_epoch=$(date -u +%s)
+        _run_bg "dropship_backorder" \
+            "python dropship_backorder.py daily"
     fi
 
     # Slack ingest → DB

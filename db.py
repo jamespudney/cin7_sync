@@ -924,6 +924,32 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
 
+-- v2.67.138 Dropship backorder warnings. When a customer orders
+-- a SKU flagged as DropShipMode='Always Drop Ship' in CIN7, the
+-- system silently auto-creates a draft PO and waits for someone
+-- to approve it. Without a notification, the draft sits idle and
+-- the customer's order is stuck. This table records each warning
+-- we've posted to #purchase-backorder so we don't double-notify.
+-- Keyed by (so_number, sku) — a single SO with multiple dropship
+-- lines generates one row per line. A repeat order from the same
+-- customer for the same SKU is a NEW so_number → new warning.
+CREATE TABLE IF NOT EXISTS dropship_backorder_warnings (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    so_number           TEXT NOT NULL,
+    sku                 TEXT NOT NULL,
+    customer            TEXT,
+    supplier            TEXT,
+    quantity_ordered    REAL,
+    quantity_on_hand    REAL,        -- snapshot at warning time
+    posted_channel      TEXT,
+    posted_ts           TEXT,
+    posted_at           TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    error_msg           TEXT,
+    UNIQUE(so_number, sku)
+);
+CREATE INDEX IF NOT EXISTS idx_dropship_warnings_recent
+    ON dropship_backorder_warnings(posted_at DESC);
+
 -- v2.67.130 PO dispatch reminders. When a PO transitions to
 -- RECEIVED status and its line comments contain SO-numbers
 -- (backorders the buyer flagged), we post a reminder to the
@@ -1880,6 +1906,58 @@ def get_feed_status_summary() -> dict:
         out[status] = int(r["n"] or 0)
         out["total"] += out[status]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Dropship backorder warnings (v2.67.138)
+# ---------------------------------------------------------------------------
+def has_dropship_warning(so_number: str, sku: str) -> bool:
+    """Idempotency check — have we already warned about this
+    (SO, SKU) pair? UNIQUE constraint guarantees one row per pair."""
+    if not so_number or not sku:
+        return False
+    with connect() as c:
+        r = c.execute(
+            "SELECT 1 FROM dropship_backorder_warnings "
+            "WHERE so_number = ? AND sku = ?",
+            (so_number, sku)).fetchone()
+    return r is not None
+
+
+def record_dropship_warning(so_number: str, sku: str,
+                                  customer: Optional[str],
+                                  supplier: Optional[str],
+                                  quantity_ordered: Optional[float],
+                                  quantity_on_hand: Optional[float],
+                                  posted_channel: Optional[str],
+                                  posted_ts: Optional[str],
+                                  error_msg: Optional[str] = None
+                                  ) -> None:
+    """Persist a dropship warning. INSERT OR IGNORE so concurrent
+    workers can't duplicate. error_msg is set if the Slack post
+    failed — row still inserted so we don't retry forever."""
+    with connect() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO dropship_backorder_warnings "
+            "(so_number, sku, customer, supplier, "
+            " quantity_ordered, quantity_on_hand, posted_channel, "
+            " posted_ts, error_msg) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (so_number, sku, customer, supplier,
+              quantity_ordered, quantity_on_hand, posted_channel,
+              posted_ts, error_msg))
+
+
+def list_recent_dropship_warnings(limit: int = 50) -> list:
+    with connect() as c:
+        rows = c.execute(
+            "SELECT so_number, sku, customer, supplier, "
+            "       quantity_ordered, quantity_on_hand, "
+            "       posted_channel, posted_ts, posted_at, "
+            "       error_msg "
+            "FROM dropship_backorder_warnings "
+            "ORDER BY posted_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
