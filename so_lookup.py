@@ -81,11 +81,14 @@ def _load_indexes() -> None:
     by_so: Dict[str, dict] = {}
     by_shop_num: Dict[str, dict] = {}
 
-    # CIN7 sales side — OrderNumber (SO-) + Reference (Shopify #)
+    # CIN7 sales side. v2.67.150 — confirmed actual column names
+    # from production CSV: SaleID (UUID) + OrderNumber (SO-) +
+    # CustomerReference (the Shopify Order # as '#42514').
+    # Earlier code searched 'ID' and 'Reference' which don't exist.
     sales_path = _find_latest_csv("sales_last_*d_*.csv")
     if sales_path:
         try:
-            df = pd.read_csv(sales_path)
+            df = pd.read_csv(sales_path, low_memory=False)
         except Exception as exc:
             log.error("Failed to load %s: %s", sales_path, exc)
             df = None
@@ -94,10 +97,11 @@ def _load_indexes() -> None:
                 (c for c in ("OrderNumber", "SaleNumber")
                   if c in df.columns), None)
             id_col = next(
-                (c for c in ("ID", "Id", "SaleID")
+                (c for c in ("SaleID", "ID", "Id")
                   if c in df.columns), None)
             ref_col = next(
-                (c for c in ("Reference", "ExternalReference")
+                (c for c in ("CustomerReference",
+                              "ExternalReference", "Reference")
                   if c in df.columns), None)
             for _, row in df.iterrows():
                 so = (str(row.get(so_col) or "").strip().upper()
@@ -110,10 +114,14 @@ def _load_indexes() -> None:
                               if ref_col else "")
                 # Reference may be "#42514" — strip to "42514"
                 shop_num = ""
-                if ref_raw:
+                if ref_raw and ref_raw.lower() != "nan":
                     m = _HASH_REF_PATTERNS.search(ref_raw)
                     if m:
                         shop_num = m.group(1)
+                    elif ref_raw.isdigit():
+                        # CustomerReference might be just "42514"
+                        # with no #
+                        shop_num = ref_raw
                 by_so[so] = {
                     "cin7_id": cin7_id,
                     "shopify_order_num": shop_num,
@@ -123,39 +131,45 @@ def _load_indexes() -> None:
         "Loaded SO index from %s (%d entries)",
         sales_path, len(by_so))
 
-    # Shopify orders side — order_number (42514) + id (numeric)
+    # Shopify orders side. v2.67.150 — confirmed columns:
+    # ShopifyOrderID (numeric internal) + OrderNumber + Name.
+    # OrderNumber is the 42514 form; ShopifyOrderID powers the
+    # admin URL.
     shop_path = _find_latest_csv("shopify_orders_*.csv")
     if not shop_path:
-        # Some accounts split into shopify_orders.json or similar;
-        # try shopify_orders.csv (no date suffix) too.
         shop_path = _find_latest_csv("shopify_orders.csv")
     if shop_path:
         try:
-            df = pd.read_csv(shop_path)
+            df = pd.read_csv(shop_path, low_memory=False)
         except Exception as exc:
             log.warning("Failed to load %s: %s", shop_path, exc)
             df = None
         if df is not None and not df.empty:
             num_col = next(
-                (c for c in ("order_number", "OrderNumber",
-                                "Order Number", "number")
+                (c for c in ("OrderNumber", "order_number",
+                              "Order Number", "number")
                   if c in df.columns), None)
             id_col = next(
-                (c for c in ("id", "ID", "OrderId", "Id",
-                                "shopify_id")
+                (c for c in ("ShopifyOrderID", "id", "ID",
+                              "OrderId", "shopify_id")
                   if c in df.columns), None)
             name_col = next(
-                (c for c in ("name", "order_name", "Name")
+                (c for c in ("Name", "name", "order_name")
                   if c in df.columns), None)
             for _, row in df.iterrows():
                 num = (str(row.get(num_col) or "").strip()
                         if num_col else "")
-                # Normalise: strip leading # if present
                 num = num.lstrip("#").strip()
-                if not num:
+                if not num or num.lower() == "nan":
                     continue
                 shop_id = (str(row.get(id_col) or "").strip()
                               if id_col else "")
+                # ShopifyOrderID may be a float (NaN) — guard
+                if shop_id.lower() == "nan":
+                    shop_id = ""
+                # If numeric float like '5891234567890.0', drop .0
+                if shop_id.endswith(".0"):
+                    shop_id = shop_id[:-2]
                 name = (str(row.get(name_col) or "").strip()
                           if name_col else "")
                 by_shop_num[num] = {
@@ -185,6 +199,18 @@ def _shopify_order_url(shopify_id: str) -> str:
     slug = os.environ.get(
         "SHOPIFY_STORE_SLUG", "wired4signs-usa")
     return tpl.format(slug=slug, id=shopify_id)
+
+
+def _shopify_search_url(order_number: str) -> str:
+    """v2.67.150 — fallback URL when we know the order_number but
+    not the internal Shopify ID (e.g. the order is outside the
+    shopify_orders_*.csv sync window). Search URL lands the user
+    on a filtered list — one click extra vs direct URL but still
+    saves manual lookup."""
+    slug = os.environ.get(
+        "SHOPIFY_STORE_SLUG", "wired4signs-usa")
+    return (f"https://admin.shopify.com/store/{slug}/orders"
+              f"?query={order_number}")
 
 
 def find_so_references(text: str) -> List[str]:
@@ -232,6 +258,11 @@ def lookup_so(so_number: str) -> Optional[dict]:
         shopify_id = shop_rec.get("shopify_id") or ""
         if shopify_id:
             shopify_url = _shopify_order_url(shopify_id)
+        else:
+            # v2.67.150 — fallback: use the search URL when the
+            # internal Shopify ID isn't in our sync window. Still
+            # gives the user a clickable jump to the right place.
+            shopify_url = _shopify_search_url(shop_num)
     return {
         "so_number": so_u,
         "cin7_id": cin7_id,
