@@ -186,9 +186,14 @@ def _load_indexes() -> None:
 
 
 def _cin7_sale_url(cin7_id: str) -> str:
+    """v2.67.151 — Cin7 Core uses SPA fragment routing for sale
+    pages. The actual URL looks like:
+      inventory.dearsystems.com/Sale#<uuid>~<uuid>~tabOrder
+    The earlier template (/Sale/Index/{id}) opened the 'new sale'
+    form, not the existing sale."""
     tpl = os.environ.get(
         "CIN7_SALE_URL_TEMPLATE",
-        "https://inventory.dearsystems.com/Sale/Index/{id}")
+        "https://inventory.dearsystems.com/Sale#{id}~{id}~tabOrder")
     return tpl.format(id=cin7_id)
 
 
