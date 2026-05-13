@@ -92,6 +92,15 @@ _PRODUCT_LINK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# v2.67.139 — Plain URL fallback. Manual paste-tests and some
+# notification sources omit the Slack hyperlink wrapper. Without
+# this fallback, the handle never got extracted and SKU resolution
+# silently produced 'unknown product'.
+_PRODUCT_URL_PLAIN_RE = re.compile(
+    r"https?://[^\s<>|]*?/products/[^\s<>|?#]+",
+    re.IGNORECASE,
+)
+
 # Shopify handle from a product URL: ...wired4signsusa.com/products/
 # slim-led-channel-slim8-ac2-z?...  -> 'slim-led-channel-slim8-ac2-z'
 _HANDLE_FROM_URL_RE = re.compile(
@@ -131,6 +140,13 @@ def parse_subscription(text: str) -> dict:
                 {"url": m[0], "title": m[1].strip()}
                 for m in matches[1:]
             ]
+    else:
+        # v2.67.139 — fallback to plain URL (no Slack hyperlink
+        # wrapper). Manual paste-tests and some integrations
+        # post raw URLs without the <URL|title> markup.
+        plain = _PRODUCT_URL_PLAIN_RE.search(text)
+        if plain:
+            out["product_url"] = plain.group(0).strip()
     # Handle from URL.
     if out.get("product_url"):
         hm = _HANDLE_FROM_URL_RE.search(out["product_url"])
@@ -143,26 +159,61 @@ def parse_subscription(text: str) -> dict:
 # SKU resolution
 # ---------------------------------------------------------------------------
 def _resolve_sku_from_handle(handle: str) -> Optional[dict]:
-    """Use product_dimensions to map a Shopify handle to a SKU /
-    family. Returns {sku, family, title} or None if no match.
+    """Map a Shopify handle to {sku, family, title}. Tries two
+    sources in order:
 
-    product_dimensions is per-product (not per-variant), so the
-    SKU we return is the product-level identifier — the buyer can
-    drill down to a specific variant in the dashboard."""
+      1. product_dimensions table (CIN7 sync side; per-product
+         metadata with shopify_handle column)
+      2. v2.67.139 — Shopify .md product files (storefront source
+         of truth; one .md per handle, with parsed title / family
+         / variant SKUs)
+
+    Returns None only if NEITHER source has a match — at that
+    point the handle truly isn't in our catalog."""
     if not handle:
         return None
+    handle_norm = handle.strip()
+
+    # Source 1: product_dimensions
     try:
         rows = db.all_product_dimensions()
+        for r in rows:
+            if (r.get("shopify_handle") or "").strip() == handle_norm:
+                return {
+                    "sku": r.get("sku") or "",
+                    "family": r.get("family") or "",
+                    "title": r.get("title") or "",
+                    "shopify_handle": handle_norm,
+                }
     except Exception:
-        return None
-    for r in rows:
-        if (r.get("shopify_handle") or "").strip() == handle:
-            return {
-                "sku": r.get("sku") or "",
-                "family": r.get("family") or "",
-                "title": r.get("title") or "",
-                "shopify_handle": handle,
-            }
+        pass
+
+    # Source 2: Shopify .md (filename = handle)
+    try:
+        from product_search import (
+            SHOPIFY_PRODUCTS_DIR, _parse_shopify_product_md)
+        md_path = SHOPIFY_PRODUCTS_DIR / f"{handle_norm}.md"
+        if md_path.exists():
+            sp = _parse_shopify_product_md(md_path)
+            if sp is not None:
+                # ShopifyProduct.skus is a list (variants). For
+                # demand-signal purposes the family + title is
+                # what matters; we leave sku empty when there are
+                # multiple variants since we don't know which the
+                # customer chose.
+                primary_sku = (sp.skus[0]
+                                  if (sp.skus
+                                        and len(sp.skus) == 1)
+                                  else "")
+                return {
+                    "sku": primary_sku,
+                    "family": sp.family or "",
+                    "title": sp.title or "",
+                    "shopify_handle": handle_norm,
+                    "n_variants": len(sp.skus or []),
+                }
+    except Exception:
+        pass
     return None
 
 
