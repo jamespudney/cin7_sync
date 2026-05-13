@@ -223,6 +223,31 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     except Exception:
         pass
 
+    # v2.67.144 — stock-issues channel queries. Scoped strictly
+    # to the configured channel so we don't classify random ops
+    # chatter elsewhere as a stock issue. Resolution detection
+    # (human reply 'fixed' / 'adjusted') handled in process_once.
+    _stock_issues_channel = os.environ.get(
+        "SLACK_STOCK_ISSUES_CHANNEL_ID", "").strip()
+    if (_stock_issues_channel
+            and channel_id == _stock_issues_channel
+            and not msg.get("is_bot")):
+        try:
+            from stock_issues_handler import (
+                classify_message as _classify_stock_issue,
+                maybe_resolve_from_thread_reply)
+            # First — does this look like a resolution reply in
+            # an open issue's thread? If yes, mark resolved and
+            # return a special classification so process_once
+            # doesn't double-handle.
+            if maybe_resolve_from_thread_reply(msg):
+                return "stock_issue_resolution"
+            # Otherwise — is it a NEW stock issue raise?
+            if _classify_stock_issue(msg.get("text") or ""):
+                return "stock_issue_raise"
+        except Exception:
+            pass
+
     if msg["is_bot"]:
         return "bot_other"
     text = (msg["text"] or "").strip()
@@ -1378,6 +1403,49 @@ def process_once(max_messages: int = 25) -> int:
         # Skip non-respondable categories.
         if classification in ("bot_self", "bot_other", "empty",
                                 "too_old", "chatter"):
+            continue
+
+        # v2.67.144 — Stock-issue raise: post brief querier reply
+        # + structured intelligence block (the handler posts the
+        # intel block directly, we post the querier reply via
+        # _post_response below for slack_bot_responses auditing).
+        if classification == "stock_issue_raise":
+            thread_ts = msg["thread_ts"] or msg["ts"]
+            try:
+                from stock_issues_handler import (
+                    handle_stock_issue as _handle_si)
+                reply_text, si_tools = _handle_si(msg)
+            except Exception as exc:
+                log.error("stock_issue handler error: %s", exc)
+                continue
+            if not reply_text:
+                continue
+            posted_ts = _post_response(
+                session, msg["channel_id"], thread_ts, reply_text)
+            if posted_ts:
+                with db.connect() as c:
+                    c.execute(
+                        "INSERT INTO slack_bot_responses "
+                        "(in_channel, in_ts, in_thread_ts, "
+                        " user_question, response_text, "
+                        " response_ts, tools_used, classification) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (msg["channel_id"], msg["ts"], thread_ts,
+                         (msg["text"] or "")[:500],
+                         reply_text, posted_ts,
+                         ",".join(si_tools),
+                         "stock_issue_raise"))
+                posts_made += 1
+                log.info("Posted stock_issue querier reply in "
+                          "%s/%s", ch_name, msg["ts"])
+            continue
+
+        # v2.67.144 — stock-issue resolution reply (human said
+        # 'fixed'/'adjusted'/etc in a tracked thread). Just log
+        # — the resolution write already happened in _classify.
+        if classification == "stock_issue_resolution":
+            log.info("Tracked stock_issue resolution in %s/%s",
+                      ch_name, msg["ts"])
             continue
 
         # v2.67.136 — Back-in-stock subscription from FlowBot.

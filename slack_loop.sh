@@ -182,6 +182,9 @@ last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
+last_si_escalate_epoch=0   # v2.67.144 stock-issue DM escalation
+last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
+last_si_morning_date=""    # one-summary-per-day idempotency
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -417,6 +420,38 @@ while true; do
         last_dropship_epoch=$(date -u +%s)
         _run_bg "dropship_backorder" \
             "python dropship_backorder.py daily"
+    fi
+
+    # v2.67.144 Stock-issue DM escalation. When a stock_issue
+    # has been awaiting_response for 4+ hours, DM the configured
+    # stockkeeper with the full intelligence block. Gated on
+    # SLACK_STOCKKEEPER_DM_CHANNEL_ID.
+    seconds_since_si_escalate=$(( now_epoch - last_si_escalate_epoch ))
+    if [ "$seconds_since_si_escalate" -ge 600 ] \
+            && [ -n "${SLACK_STOCKKEEPER_DM_CHANNEL_ID:-}" ]; then
+        last_si_escalate_epoch=$(date -u +%s)
+        _run_bg "stock_issues_escalate" \
+            "python stock_issues_handler.py escalate"
+    fi
+
+    # v2.67.144 Stock-issue morning summary. Fires once per day
+    # at the configured hour (default 8:30 ET). Idempotency via
+    # last_si_morning_date — we only post if today's date hasn't
+    # been seen yet. ET = UTC-4/5 depending on DST; we treat it
+    # as UTC-4 (EDT) for the 8:30 trigger and accept that the
+    # post arrives at 9:30 ET during EST. Good enough.
+    si_morning_hour="${STOCK_ISSUE_MORNING_HOUR_ET:-8}"
+    now_utc_hour=$(date -u +%H)
+    now_utc_minute=$(date -u +%M)
+    today_utc=$(date -u +%Y-%m-%d)
+    si_morning_utc_hour=$(( si_morning_hour + 4 ))
+    if [ "${now_utc_hour#0}" -ge "$si_morning_utc_hour" ] \
+            && [ "${now_utc_minute#0}" -ge 30 ] \
+            && [ "$today_utc" != "$last_si_morning_date" ] \
+            && [ -n "${SLACK_STOCK_ISSUES_CHANNEL_ID:-}" ]; then
+        last_si_morning_date="$today_utc"
+        _run_bg "stock_issues_morning" \
+            "python stock_issues_handler.py morning-summary"
     fi
 
     # v2.67.140 Back-in-stock arrival notifications — when a PO is

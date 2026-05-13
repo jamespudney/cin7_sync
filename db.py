@@ -924,6 +924,51 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
 
+-- v2.67.144 Stock issues tracker. When a query about stock
+-- accuracy / supply lands in #stock-issues-queries, the bot
+-- builds a structured intelligence block for the stock controller
+-- to confirm/reject — NOT an answer to dispatch. Each issue has
+-- a lifecycle: open → awaiting_response → resolved.
+--
+-- Two patterns we classify:
+--   supply_query  — pre-dispatch question 'can we supply SO-X?'
+--                   evidence sought: SO shipped via ShipStation
+--   count_wrong   — discrepancy claim 'should be N, found M'
+--                   evidence sought: stock_adjustments entry
+--
+-- Identity is the original Slack message (channel, ts) — the
+-- raise. Per-SKU/per-SO detail is in stock_issue_items so a
+-- single raise can track multiple items.
+CREATE TABLE IF NOT EXISTS stock_issues (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    raise_channel       TEXT NOT NULL,
+    raise_ts            TEXT NOT NULL,
+    raise_thread_ts     TEXT,             -- the thread the bot replied into
+    raised_by           TEXT,             -- Slack user_name of the raiser
+    raised_text         TEXT,             -- truncated copy of the original message
+    issue_type          TEXT NOT NULL,    -- 'supply_query' | 'count_wrong' | 'mixed'
+    so_numbers          TEXT,             -- comma-separated SO-XXXXX
+    skus                TEXT,             -- comma-separated SKUs mentioned
+    families            TEXT,             -- comma-separated families
+    status              TEXT NOT NULL DEFAULT 'open',
+                                            -- open | awaiting_response | escalated | resolved | wont_fix
+    awaiting_user       TEXT,             -- 'stockkeeper' | 'buyer' (who we DM'd)
+    bot_thread_reply_ts TEXT,             -- ts of our intelligence-block reply
+    dm_channel          TEXT,             -- where we DM'd for escalation
+    dm_posted_ts        TEXT,
+    dm_posted_at        TIMESTAMP,
+    resolved_at         TIMESTAMP,
+    resolved_by         TEXT,
+    resolution_text     TEXT,
+    created_at          TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(raise_channel, raise_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_issues_open
+    ON stock_issues(status, created_at DESC)
+    WHERE status NOT IN ('resolved', 'wont_fix');
+CREATE INDEX IF NOT EXISTS idx_stock_issues_thread
+    ON stock_issues(raise_channel, raise_thread_ts);
+
 -- v2.67.140 Back-in-stock ARRIVAL notifications. When a PO is
 -- received and its line items match pending 'notify_me' demand
 -- signals, the bot posts a reminder in #back-in-stock listing
@@ -1928,6 +1973,139 @@ def get_feed_status_summary() -> dict:
         out[status] = int(r["n"] or 0)
         out["total"] += out[status]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Stock issues tracker (v2.67.144)
+# ---------------------------------------------------------------------------
+def upsert_stock_issue(*, raise_channel: str, raise_ts: str,
+                            raise_thread_ts: Optional[str] = None,
+                            raised_by: Optional[str] = None,
+                            raised_text: Optional[str] = None,
+                            issue_type: str = "supply_query",
+                            so_numbers: Optional[List[str]] = None,
+                            skus: Optional[List[str]] = None,
+                            families: Optional[List[str]] = None,
+                            ) -> int:
+    """Create a new stock_issues row or return the existing id if
+    one already exists for this (raise_channel, raise_ts) pair.
+    Idempotent — listener can re-process the same message safely."""
+    with connect() as c:
+        existing = c.execute(
+            "SELECT id FROM stock_issues "
+            "WHERE raise_channel = ? AND raise_ts = ?",
+            (raise_channel, raise_ts)).fetchone()
+        if existing:
+            return int(existing["id"])
+        cur = c.execute(
+            "INSERT INTO stock_issues "
+            "(raise_channel, raise_ts, raise_thread_ts, raised_by, "
+            " raised_text, issue_type, so_numbers, skus, families, "
+            " status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')",
+            (raise_channel, raise_ts, raise_thread_ts, raised_by,
+              (raised_text or "")[:1000], issue_type,
+              ",".join(so_numbers or []),
+              ",".join(skus or []),
+              ",".join(families or [])))
+        return int(cur.lastrowid)
+
+
+def update_stock_issue_bot_reply(issue_id: int,
+                                          bot_thread_reply_ts: str
+                                          ) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE stock_issues SET "
+            "  bot_thread_reply_ts = ?, "
+            "  status = 'awaiting_response' "
+            "WHERE id = ?",
+            (bot_thread_reply_ts, issue_id))
+
+
+def update_stock_issue_dm(issue_id: int,
+                                 dm_channel: str, dm_posted_ts: str,
+                                 awaiting_user: str = "stockkeeper"
+                                 ) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE stock_issues SET "
+            "  dm_channel = ?, dm_posted_ts = ?, "
+            "  dm_posted_at = datetime('now'), "
+            "  awaiting_user = ?, status = 'escalated' "
+            "WHERE id = ?",
+            (dm_channel, dm_posted_ts, awaiting_user, issue_id))
+
+
+def resolve_stock_issue(issue_id: int, resolved_by: str,
+                              resolution_text: str) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE stock_issues SET "
+            "  status = 'resolved', "
+            "  resolved_at = datetime('now'), "
+            "  resolved_by = ?, resolution_text = ? "
+            "WHERE id = ?",
+            (resolved_by, (resolution_text or "")[:500], issue_id))
+
+
+def list_open_stock_issues(limit: int = 100,
+                                max_age_days: int = 30) -> list:
+    """Open + escalated, ordered oldest first."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT id, raise_channel, raise_ts, raise_thread_ts, "
+            "       raised_by, raised_text, issue_type, "
+            "       so_numbers, skus, families, status, "
+            "       awaiting_user, dm_channel, dm_posted_at, "
+            "       created_at "
+            "FROM stock_issues "
+            "WHERE status IN ('open', 'awaiting_response', "
+            "                  'escalated') "
+            "  AND created_at >= "
+            "      datetime('now', '-' || ? || ' days') "
+            "ORDER BY created_at ASC LIMIT ?",
+            (max_age_days, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_stock_issue_by_thread(raise_channel: str,
+                                       thread_ts: str) -> Optional[dict]:
+    """Used when a reply lands in a thread — find the parent issue
+    so we can pick up the staff's confirmation/resolution text."""
+    if not raise_channel or not thread_ts:
+        return None
+    with connect() as c:
+        r = c.execute(
+            "SELECT id, raise_channel, raise_ts, "
+            "       raise_thread_ts, status "
+            "FROM stock_issues "
+            "WHERE raise_channel = ? "
+            "  AND raise_thread_ts = ? "
+            "  AND status IN ('open', 'awaiting_response', "
+            "                  'escalated') "
+            "LIMIT 1",
+            (raise_channel, thread_ts)).fetchone()
+    return dict(r) if r else None
+
+
+def list_stock_issues_pending_escalation(
+        min_age_hours: int = 4) -> list:
+    """awaiting_response issues older than min_age_hours that
+    haven't been DM'd yet. Used by the escalation cycle."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT id, raise_channel, raise_ts, raise_thread_ts, "
+            "       raised_by, raised_text, issue_type, "
+            "       so_numbers, skus, families, created_at "
+            "FROM stock_issues "
+            "WHERE status = 'awaiting_response' "
+            "  AND dm_posted_ts IS NULL "
+            "  AND created_at <= "
+            "      datetime('now', '-' || ? || ' hours') "
+            "ORDER BY created_at ASC",
+            (min_age_hours,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
