@@ -436,6 +436,313 @@ def compose_triage_reply(parsed: dict, sku_info: dict) -> str:
 # ---------------------------------------------------------------------------
 # Top-level handler (called from slack_listener.process_once)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Arrival notifications (v2.67.140) — closing the loop
+# ---------------------------------------------------------------------------
+# When a PO is received in CIN7, scan demand_signals for pending
+# 'notify_me' rows whose SKU/family matches any line of the
+# received PO. Post a summary in #back-in-stock listing the
+# waiting customers so staff can reach out.
+def _format_age(created_at_iso: str) -> str:
+    """Pretty-print 'subscribed 22 days ago' from an ISO ts."""
+    if not created_at_iso:
+        return ""
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.fromisoformat(
+            created_at_iso.replace("Z", "+00:00"))
+        # SQLite datetime() returns naive UTC; normalise.
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_dt.timezone.utc)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        days = (now - ts).days
+        if days <= 0:
+            hours = int((now - ts).total_seconds() / 3600)
+            return f"{hours}h ago" if hours > 0 else "just now"
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    except Exception:
+        return ""
+
+
+def _channel_from_source_ref(source_ref: str) -> Optional[str]:
+    """Extract the Slack channel_id from a demand_signal's
+    source_ref. We persisted these as 'channel:CXXX/ts:NNN.MMM' so
+    the arrival notification can be posted back in the same
+    channel that captured the subscription."""
+    if not source_ref or not source_ref.startswith("channel:"):
+        return None
+    try:
+        # Format: "channel:C09A29STYDU/ts:1234567890.123456"
+        body = source_ref[len("channel:"):]
+        return body.split("/", 1)[0] or None
+    except Exception:
+        return None
+
+
+def _po_lines_received_recently(lookback_hours: int = 48
+                                       ) -> list:
+    """Return a list of {po_number, sku, family, supplier, qty}
+    for lines on POs that transitioned to RECEIVED recently.
+    Reuses po_dispatch_reminder's CSV loading + status filtering
+    so behaviour stays consistent."""
+    try:
+        from po_dispatch_reminder import (
+            _load_purchases_and_lines,
+            _newly_received_pos)
+    except Exception:
+        return []
+    purchases, lines = _load_purchases_and_lines()
+    if purchases is None or lines is None:
+        return []
+    days = max(1, int(lookback_hours / 24) + 1)
+    eligible = _newly_received_pos(purchases, lookback_days=days)
+    if eligible.empty:
+        return []
+    if "OrderNumber" not in lines.columns:
+        return []
+    # Build family index from product_dimensions for SKU → family
+    # lookup so we can match family-only demand signals.
+    try:
+        pd_rows = db.all_product_dimensions()
+    except Exception:
+        pd_rows = []
+    family_by_sku: dict = {}
+    for r in pd_rows:
+        sku = (r.get("sku") or "").strip().upper()
+        fam = (r.get("family") or "").strip()
+        if sku and fam:
+            family_by_sku[sku] = fam
+
+    out: List[dict] = []
+    lines_by_po = {po: g for po, g in lines.groupby("OrderNumber")}
+    for _, po in eligible.iterrows():
+        po_number = str(po.get("OrderNumber") or "").strip()
+        if not po_number:
+            continue
+        supplier = po.get("Supplier")
+        po_lines = lines_by_po.get(po_number)
+        if po_lines is None or po_lines.empty:
+            continue
+        for _, line in po_lines.iterrows():
+            sku = str(line.get("SKU") or "").strip().upper()
+            if not sku:
+                continue
+            out.append({
+                "po_number": po_number,
+                "sku": sku,
+                "family": family_by_sku.get(sku, ""),
+                "supplier": supplier,
+                "quantity": line.get("Quantity"),
+            })
+    return out
+
+
+def _compose_arrival_message(po_number: str,
+                                   family_or_sku: str,
+                                   supplier: Optional[str],
+                                   total_qty: Optional[float],
+                                   customers: List[dict]) -> str:
+    """Build the Slack message body. Customers list is dicts of
+    {customer, age_text, signal_id}."""
+    header = f"🟢 *Stock arrived for {family_or_sku}*"
+    bits = [f"PO-{po_number}" if not po_number.startswith("PO-")
+              else po_number]
+    if supplier:
+        bits.append(str(supplier))
+    if total_qty is not None:
+        try:
+            bits.append(f"{int(total_qty)} units")
+        except Exception:
+            pass
+    header += f"  _({' · '.join(bits)})_"
+    lines: List[str] = [header, ""]
+    lines.append(
+        f"*{len(customers)} customer"
+        f"{'s' if len(customers) != 1 else ''} "
+        f"{'were' if len(customers) != 1 else 'was'} waiting:*")
+    for c in customers:
+        email = c.get("customer") or "(unknown)"
+        age = c.get("age_text") or ""
+        if age:
+            lines.append(f"• `{email}` (subscribed {age})")
+        else:
+            lines.append(f"• `{email}`")
+    lines.append("")
+    lines.append(
+        "_Please notify these customers — their back-in-stock "
+        "subscriptions are still pending._")
+    return "\n".join(lines)
+
+
+def _post_to_slack(channel_id: str, text: str
+                      ) -> Tuple[Optional[str], Optional[str]]:
+    """Reuse the same posting helper used by po_dispatch_reminder
+    (bot token, simple chat.postMessage)."""
+    try:
+        import slack_sync
+    except ImportError as exc:
+        return None, f"slack_sync import failed: {exc}"
+    import os as _os
+    token = _os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        return None, "SLACK_BOT_TOKEN not set"
+    try:
+        session = slack_sync._build_session(token)
+        body = slack_sync._slack_post(session, "chat.postMessage", {
+            "channel": channel_id,
+            "text": text,
+            "unfurl_links": False,
+            "unfurl_media": False,
+        })
+        if not body.get("ok"):
+            return None, f"slack returned ok=false: {body}"
+        return body.get("ts"), None
+    except Exception as exc:
+        return None, f"post error: {exc}"
+
+
+def check_arrivals(dryrun: bool = False,
+                       lookback_hours: int = 48,
+                       max_subscription_age_days: int = 365
+                       ) -> dict:
+    """For each PO that just transitioned to RECEIVED, find pending
+    notify_me demand_signals whose SKU or family matches any line.
+    Post a summary listing the waiting customers; idempotent per
+    (PO, demand_signal_id) pair."""
+    po_lines = _po_lines_received_recently(lookback_hours)
+    if not po_lines:
+        return {"posted": 0, "received_lines": 0}
+
+    # Group lines by family AND collect all skus/families seen.
+    # For each (po_number, family), we'll find one set of waiting
+    # customers and post one message — not one per individual line.
+    grouped: dict = {}  # key = (po_number, family_or_sku)
+    for ln in po_lines:
+        po = ln["po_number"]
+        fam = (ln["family"] or "").strip()
+        sku = (ln["sku"] or "").strip()
+        # Group by family when known, fall back to SKU
+        key = (po, fam if fam else sku)
+        grp = grouped.setdefault(key, {
+            "po_number": po,
+            "family": fam,
+            "skus": set(),
+            "supplier": ln.get("supplier"),
+            "total_qty": 0.0,
+        })
+        if sku:
+            grp["skus"].add(sku)
+        try:
+            q = float(ln.get("quantity") or 0)
+            grp["total_qty"] += q
+        except (TypeError, ValueError):
+            pass
+
+    n_posted = 0
+    n_customers = 0
+    n_already = 0
+    n_errors = 0
+
+    for (po_number, family_or_sku), grp in grouped.items():
+        skus_list = list(grp["skus"])
+        family = grp["family"]
+        signals = db.find_pending_back_in_stock_signals(
+            skus=skus_list,
+            families=[family] if family else None,
+            days=max_subscription_age_days,
+        )
+        if not signals:
+            continue
+        # Filter out already-notified.
+        fresh = [s for s in signals
+                  if not db.has_back_in_stock_arrival_notification(
+                       po_number, int(s["id"]))]
+        if not fresh:
+            n_already += len(signals)
+            continue
+        # Compose customer list.
+        customers = []
+        for s in fresh:
+            customers.append({
+                "customer": s.get("customer_name") or "",
+                "age_text": _format_age(s.get("created_at") or ""),
+                "signal_id": int(s["id"]),
+                "source_ref": s.get("source_ref") or "",
+            })
+        # Decide channel — use the channel from the FIRST
+        # customer's original subscription source_ref. Falls back
+        # to SLACK_BACK_IN_STOCK_CHANNEL_ID env if not parseable.
+        import os as _os
+        channel = None
+        for c in customers:
+            ch = _channel_from_source_ref(c["source_ref"])
+            if ch:
+                channel = ch
+                break
+        if not channel:
+            channel = _os.environ.get(
+                "SLACK_BACK_IN_STOCK_CHANNEL_ID", "").strip() or None
+        if not channel:
+            log.warning(
+                "No channel resolvable for arrival notification "
+                "(po=%s family=%s, %d customers) — skipping.",
+                po_number, family_or_sku, len(customers))
+            continue
+
+        msg = _compose_arrival_message(
+            po_number=po_number,
+            family_or_sku=family or family_or_sku,
+            supplier=grp.get("supplier"),
+            total_qty=grp.get("total_qty"),
+            customers=customers,
+        )
+        log.info(
+            "Arrival notification for %s/%s — %d customers %s",
+            po_number, family_or_sku, len(customers),
+            "[DRYRUN]" if dryrun else "")
+        if dryrun:
+            print(f"\n--- ARRIVAL: {po_number} / "
+                    f"{family_or_sku} ---\n{msg}\n")
+            continue
+        posted_ts, error = _post_to_slack(channel, msg)
+        if error:
+            log.error(
+                "Failed to post arrival for %s/%s: %s",
+                po_number, family_or_sku, error)
+            for c in customers:
+                db.record_back_in_stock_arrival_notification(
+                    po_number=po_number,
+                    sku=(skus_list[0] if skus_list else None),
+                    family=family,
+                    demand_signal_id=c["signal_id"],
+                    posted_channel=channel,
+                    posted_ts=None,
+                    error_msg=error,
+                )
+            n_errors += 1
+            continue
+        for c in customers:
+            db.record_back_in_stock_arrival_notification(
+                po_number=po_number,
+                sku=(skus_list[0] if skus_list else None),
+                family=family,
+                demand_signal_id=c["signal_id"],
+                posted_channel=channel,
+                posted_ts=posted_ts,
+            )
+        n_posted += 1
+        n_customers += len(customers)
+
+    return {
+        "received_lines": len(po_lines),
+        "groups": len(grouped),
+        "posted": n_posted,
+        "customers_notified": n_customers,
+        "skipped_already_notified": n_already,
+        "errors": n_errors,
+    }
+
+
 def handle_subscription(msg: dict) -> Tuple[str, List[str]]:
     """Parse the FlowBot message, write a demand_signals row,
     and return (reply_text, tools_used) for the caller to post
@@ -516,3 +823,42 @@ def handle_subscription(msg: dict) -> Tuple[str, List[str]]:
 
     reply = compose_triage_reply(parsed, sku_info)
     return reply, tools_used
+
+
+# ---------------------------------------------------------------------------
+# CLI — exposed so slack_loop can fire `check_arrivals` on its
+# own cadence rather than embedding python -c calls.
+# ---------------------------------------------------------------------------
+def _cli_main() -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Back-in-stock arrival notifications.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_a = sub.add_parser(
+        "check-arrivals",
+        help="Scan recent RECEIVED POs for matching pending "
+              "demand signals; post arrival reminders to the "
+              "channel that captured each subscription.")
+    p_a.add_argument("--hours", type=int, default=48)
+    p_a.add_argument("--max-age-days", type=int, default=365)
+    p_a.add_argument("--dryrun", action="store_true")
+    p_a.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True)
+    if args.cmd == "check-arrivals":
+        result = check_arrivals(
+            dryrun=args.dryrun,
+            lookback_hours=args.hours,
+            max_subscription_age_days=args.max_age_days,
+        )
+        log.info("DONE: %s", result)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli_main())

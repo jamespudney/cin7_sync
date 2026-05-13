@@ -181,6 +181,7 @@ last_ga4_epoch=0
 last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
+last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -416,6 +417,19 @@ while true; do
         last_dropship_epoch=$(date -u +%s)
         _run_bg "dropship_backorder" \
             "python dropship_backorder.py daily"
+    fi
+
+    # v2.67.140 Back-in-stock arrival notifications — when a PO is
+    # received, check demand_signals for pending notify_me rows
+    # matching the PO's SKUs/families and post a reminder to the
+    # original #back-in-stock channel. No env var gate: the channel
+    # is derived from the demand_signal's source_ref. Idempotent
+    # via the back_in_stock_arrival_notifications table.
+    seconds_since_bis_arrivals=$(( now_epoch - last_bis_arrivals_epoch ))
+    if [ "$seconds_since_bis_arrivals" -ge 300 ]; then
+        last_bis_arrivals_epoch=$(date -u +%s)
+        _run_bg "bis_arrivals" \
+            "python back_in_stock_handler.py check-arrivals"
     fi
 
     # Slack ingest → DB

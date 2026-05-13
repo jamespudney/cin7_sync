@@ -924,6 +924,28 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
 
+-- v2.67.140 Back-in-stock ARRIVAL notifications. When a PO is
+-- received and its line items match pending 'notify_me' demand
+-- signals, the bot posts a reminder in #back-in-stock listing
+-- the waiting customers. This table tracks which (PO, SKU/family,
+-- demand_signal_id) combinations have already been notified
+-- about so we don't spam the channel on subsequent polls.
+CREATE TABLE IF NOT EXISTS back_in_stock_arrival_notifications (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    po_number           TEXT NOT NULL,
+    sku                 TEXT,
+    family              TEXT,
+    demand_signal_id    INTEGER NOT NULL,
+    posted_channel      TEXT,
+    posted_ts           TEXT,
+    posted_at           TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    error_msg           TEXT,
+    UNIQUE(po_number, demand_signal_id),
+    FOREIGN KEY (demand_signal_id) REFERENCES demand_signals(id)
+);
+CREATE INDEX IF NOT EXISTS idx_bis_arrivals_recent
+    ON back_in_stock_arrival_notifications(posted_at DESC);
+
 -- v2.67.138 Dropship backorder warnings. When a customer orders
 -- a SKU flagged as DropShipMode='Always Drop Ship' in CIN7, the
 -- system silently auto-creates a draft PO and waits for someone
@@ -1906,6 +1928,90 @@ def get_feed_status_summary() -> dict:
         out[status] = int(r["n"] or 0)
         out["total"] += out[status]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Back-in-stock arrival notifications (v2.67.140)
+# ---------------------------------------------------------------------------
+def find_pending_back_in_stock_signals(
+        skus: list = None,
+        families: list = None,
+        days: int = 365,
+        ) -> list:
+    """Return demand_signals where signal_type='notify_me' and
+    outcome is NULL or 'pending', and the SKU OR family matches
+    one of the lists provided. Used by check_arrivals to find
+    customers waiting for stock that's about to land.
+
+    Either `skus` or `families` (or both) must be provided.
+    `days` bounds the lookback window — old subscriptions get
+    aged out by the caller, not here."""
+    if not skus and not families:
+        return []
+    parts = ["signal_type = 'notify_me'",
+              "(outcome IS NULL OR outcome IN ('pending', 'open'))",
+              ("created_at >= "
+                "datetime('now', '-' || ? || ' days')"),
+              ]
+    params: list = [days]
+    or_terms = []
+    if skus:
+        placeholders = ",".join("?" for _ in skus)
+        or_terms.append(f"UPPER(sku) IN ({placeholders})")
+        params.extend(s.upper() for s in skus)
+    if families:
+        placeholders = ",".join("?" for _ in families)
+        or_terms.append(
+            f"UPPER(product_family) IN ({placeholders})")
+        params.extend(f.upper() for f in families)
+    parts.append("(" + " OR ".join(or_terms) + ")")
+    sql = (
+        "SELECT id, sku, product_family, customer_name, "
+        "       customer_id, raw_text, note, created_at, "
+        "       source_ref "
+        "FROM demand_signals "
+        "WHERE " + " AND ".join(parts) + " "
+        "ORDER BY created_at DESC")
+    with connect() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def has_back_in_stock_arrival_notification(
+        po_number: str, demand_signal_id: int) -> bool:
+    """Idempotency check — already posted an arrival reminder for
+    this (PO, demand_signal) pair?"""
+    if not po_number or not demand_signal_id:
+        return False
+    with connect() as c:
+        r = c.execute(
+            "SELECT 1 FROM back_in_stock_arrival_notifications "
+            "WHERE po_number = ? AND demand_signal_id = ?",
+            (po_number, demand_signal_id)).fetchone()
+    return r is not None
+
+
+def record_back_in_stock_arrival_notification(
+        po_number: str,
+        sku: Optional[str],
+        family: Optional[str],
+        demand_signal_id: int,
+        posted_channel: Optional[str],
+        posted_ts: Optional[str],
+        error_msg: Optional[str] = None) -> None:
+    """Persist one (PO, demand_signal) notification. Multiple
+    demand_signal IDs from the same PO each get their own row
+    (one per customer notified). INSERT OR IGNORE handles
+    concurrent writers."""
+    with connect() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO "
+            "back_in_stock_arrival_notifications "
+            "(po_number, sku, family, demand_signal_id, "
+            " posted_channel, posted_ts, error_msg) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (po_number, sku, family, demand_signal_id,
+              posted_channel, posted_ts, error_msg))
 
 
 # ---------------------------------------------------------------------------
