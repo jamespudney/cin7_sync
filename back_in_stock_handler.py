@@ -55,15 +55,14 @@ _SUBSCRIPTION_PHRASES = (
 
 
 def is_flowbot_subscription(msg: dict) -> bool:
-    """Return True if this looks like FlowBot's structured
-    back-in-stock notification. Conservative — we only classify
-    when at least one of the canonical phrases appears.
+    """Return True if this looks like a back-in-stock subscription
+    notification. The phrase pattern is specific enough that we
+    don't need to gate on is_bot or user_name — humans testing
+    the integration with a paste-test should also trigger the
+    handler so we know the path works end-to-end.
 
-    We deliberately DON'T gate on user_name == 'FlowBot' because
-    Slack apps sometimes change display names; the text pattern
-    is more stable."""
-    if not msg.get("is_bot"):
-        return False
+    v2.67.137 — removed is_bot gate (was blocking manual tests).
+    """
     text = (msg.get("text") or "").lower()
     if not text:
         return False

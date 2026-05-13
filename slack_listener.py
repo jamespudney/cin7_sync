@@ -210,17 +210,20 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     calls. The composer is what's expensive; this just gates it."""
     if msg["is_our_bot"]:
         return "bot_self"
+
+    # v2.67.137 — back-in-stock subscription detection runs BEFORE
+    # the is_bot branch so the pattern fires whether the message
+    # came from FlowBot OR a human paste-test in the same channel.
+    # The phrase pattern is specific enough that false-positives
+    # in normal conversation are vanishingly unlikely.
+    try:
+        from back_in_stock_handler import is_flowbot_subscription
+        if is_flowbot_subscription(msg):
+            return "back_in_stock_subscription"
+    except Exception:
+        pass
+
     if msg["is_bot"]:
-        # v2.67.136 — special-case FlowBot back-in-stock
-        # subscriptions BEFORE the generic bot_other skip. These
-        # are structured demand-signal feeds from Shopify; we
-        # auto-log them and post a threaded triage reply.
-        try:
-            from back_in_stock_handler import is_flowbot_subscription
-            if is_flowbot_subscription(msg):
-                return "back_in_stock_subscription"
-        except Exception:
-            pass
         return "bot_other"
     text = (msg["text"] or "").strip()
     if not text:
