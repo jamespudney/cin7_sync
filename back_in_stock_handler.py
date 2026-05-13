@@ -54,6 +54,78 @@ _SUBSCRIPTION_PHRASES = (
 )
 
 
+def _extract_attachment_text(msg: dict) -> str:
+    """v2.67.141 — Slack's 'share message' wraps the original
+    post inside attachments[].message_blocks[].message.blocks[].
+    elements[]. The top-level `text` field is empty in that case
+    and the actual FlowBot content (email, URL, title) only
+    appears nested. This walker pulls every text/link element out
+    of the attachment tree and joins it into a single string the
+    classifier and parser can scan.
+
+    Reads from msg['raw_event'] which is the JSON-encoded Slack
+    payload stored by slack_sync."""
+    raw = msg.get("raw_event")
+    if not raw:
+        return ""
+    import json as _json
+    try:
+        if isinstance(raw, str):
+            payload = _json.loads(raw)
+        elif isinstance(raw, dict):
+            payload = raw
+        else:
+            return ""
+    except (ValueError, TypeError):
+        return ""
+
+    pieces: List[str] = []
+
+    def _walk(node):
+        if isinstance(node, dict):
+            t = node.get("type")
+            # Text element: collect literal text.
+            if t == "text" and node.get("text"):
+                pieces.append(str(node["text"]))
+            # Link element: collect both display text AND url.
+            # FlowBot's product titles are link elements; the URL
+            # tells us the storefront/admin handle, and the
+            # display text is the customer-facing product title.
+            elif t == "link":
+                if node.get("url"):
+                    pieces.append(f"<{node['url']}|"
+                                    f"{node.get('text') or node['url']}>")
+                elif node.get("text"):
+                    pieces.append(str(node["text"]))
+            # Generic 'text' attribute on a non-text element type
+            # (e.g. a button label or section header). Captured
+            # for completeness — no harm if duplicated.
+            elif node.get("text") and isinstance(
+                    node["text"], str):
+                pieces.append(node["text"])
+            # Recurse into common container keys.
+            for k in ("attachments", "message_blocks", "message",
+                        "blocks", "elements", "fields"):
+                if k in node:
+                    _walk(node[k])
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(payload)
+    return "\n".join(p for p in pieces if p)
+
+
+def _effective_text(msg: dict) -> str:
+    """Return the most-useful text for classification/parsing:
+    msg.text when populated, falling back to the walked
+    attachment text for share-message payloads."""
+    t = (msg.get("text") or "").strip()
+    if t:
+        return t
+    return _extract_attachment_text(msg)
+
+
 def is_flowbot_subscription(msg: dict) -> bool:
     """Return True if this looks like a back-in-stock subscription
     notification. The phrase pattern is specific enough that we
@@ -61,9 +133,11 @@ def is_flowbot_subscription(msg: dict) -> bool:
     the integration with a paste-test should also trigger the
     handler so we know the path works end-to-end.
 
-    v2.67.137 — removed is_bot gate (was blocking manual tests).
+    v2.67.137 — removed is_bot gate.
+    v2.67.141 — also scans attachment blocks via _effective_text
+    so Slack 'share message' forwards are detected.
     """
-    text = (msg.get("text") or "").lower()
+    text = _effective_text(msg).lower()
     if not text:
         return False
     return any(p in text for p in _SUBSCRIPTION_PHRASES)
@@ -751,7 +825,10 @@ def handle_subscription(msg: dict) -> Tuple[str, List[str]]:
     Returns ("", []) if parsing fails — caller should skip posting
     rather than reply with a confusing partial answer.
     """
-    text = msg.get("text") or ""
+    # v2.67.141 — fall back to attachment text for share-message
+    # forwards (Slack 'share to channel' wraps the original post
+    # inside attachments[]; msg.text is empty in that case).
+    text = _effective_text(msg)
     parsed = parse_subscription(text)
     if not parsed:
         return "", []

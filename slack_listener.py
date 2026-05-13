@@ -1328,7 +1328,7 @@ def process_once(max_messages: int = 25) -> int:
     with db.connect() as c:
         rows = c.execute(
             "SELECT channel_id, ts, user_id, user_name, text, "
-            "       thread_ts, is_bot, is_our_bot "
+            "       thread_ts, is_bot, is_our_bot, raw_event "
             "FROM slack_messages "
             "WHERE classification IS NULL "
             "ORDER BY ts ASC "
