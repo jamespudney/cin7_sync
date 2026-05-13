@@ -157,6 +157,56 @@ _PSEUDO_SKU_PATTERNS = (
     "INSURANCE",
 )
 
+# v2.67.148 — Dropship SKU index. Per-process cache built lazily
+# from products_*.csv (the CIN7 product master). For dropship
+# items, the fulfillment-shortage logic doesn't apply (we never
+# warehouse them); the right intelligence is supplier + draft-PO
+# status instead.
+_DROPSHIP_SKU_SET_CACHE: Optional[set] = None
+
+
+def _load_dropship_sku_set() -> set:
+    """Return the set of SKUs flagged 'Always Drop Ship' in CIN7.
+    Cached per-process. Defers to po_dispatch_reminder's helper
+    for the actual CSV load so we don't duplicate path logic."""
+    global _DROPSHIP_SKU_SET_CACHE
+    if _DROPSHIP_SKU_SET_CACHE is not None:
+        return _DROPSHIP_SKU_SET_CACHE
+    out: set = set()
+    try:
+        from po_dispatch_reminder import _find_latest_csv
+        path = _find_latest_csv("products_*.csv")
+        if not path:
+            _DROPSHIP_SKU_SET_CACHE = out
+            return out
+        products_df = pd.read_csv(path)
+        mode_col = next(
+            (c for c in ("DropShipMode", "DropshipMode",
+                          "Drop Ship Mode")
+              if c in products_df.columns), None)
+        sku_col = next(
+            (c for c in ("SKU", "Sku", "ProductCode")
+              if c in products_df.columns), None)
+        if mode_col and sku_col:
+            mode_u = (products_df[mode_col].fillna("")
+                          .astype(str).str.upper().str.strip())
+            mask = mode_u == "ALWAYS DROP SHIP"
+            for sku in products_df[mask][sku_col].dropna():
+                s = str(sku).strip().upper()
+                if s:
+                    out.add(s)
+        log.info("Loaded %d dropship SKUs into cache", len(out))
+    except Exception as exc:
+        log.warning("Failed to load dropship SKU set: %s", exc)
+    _DROPSHIP_SKU_SET_CACHE = out
+    return out
+
+
+def _is_dropship_sku(sku: str) -> bool:
+    if not sku:
+        return False
+    return sku.upper() in _load_dropship_sku_set()
+
 
 def _is_pseudo_sku(sku: str) -> bool:
     if not sku:
@@ -209,7 +259,12 @@ def _so_line_skus(sale_lines: pd.DataFrame,
 
 def _sku_intel(sku: str, sale_lines: pd.DataFrame) -> dict:
     """Aggregate everything we know about a SKU into the format
-    the stock-controller intelligence block expects."""
+    the stock-controller intelligence block expects.
+
+    v2.67.148 — also flags `is_dropship` based on CIN7's
+    DropShipMode. Dropship items get a completely different
+    intelligence template (no warehouse-OnHand check, focus on
+    supplier + draft-PO status)."""
     out = {
         "sku": sku,
         "name": None,
@@ -221,6 +276,7 @@ def _sku_intel(sku: str, sale_lines: pd.DataFrame) -> dict:
         "on_order": None,
         "open_sos": [],
         "next_po": None,
+        "is_dropship": _is_dropship_sku(sku),
     }
     # bot_engine_lookup for ABC / trend / OnHand / bin
     try:
@@ -323,6 +379,11 @@ def _compose_intelligence_block(items: List[dict],
         head = f"*`{sku}`*"
         if name:
             head += f" — _{name}_"
+        # v2.67.148 — dropship badge so the stock controller
+        # immediately sees this is a supplier-ship-direct item
+        # and OnHand=0 is expected, not a counting error.
+        if item.get("is_dropship"):
+            head += "  📦 *DROPSHIP*"
         lines.append(head)
         parts = []
         if item.get("bin"):
@@ -333,17 +394,24 @@ def _compose_intelligence_block(items: List[dict],
             parts.append(item["trend"])
         if parts:
             lines.append(f"• {' · '.join(parts)}")
-        on_hand_str = (f"{int(item['on_hand'])}"
-                        if item.get("on_hand") is not None
-                        else "?")
-        alloc_str = (f"{int(item['allocated'])}"
-                      if item.get("allocated") is not None
-                      else "0")
-        lines.append(
-            f"• CIN7 OnHand: *{on_hand_str}* · "
-            f"Allocated: *{alloc_str}*"
-            + (f" (across {len(item['open_sos'])} open SOs)"
-                if item.get("open_sos") else ""))
+        # For dropship items, the OnHand line carries little
+        # information (always 0/unknown); skip it.
+        if not item.get("is_dropship"):
+            on_hand_str = (f"{int(item['on_hand'])}"
+                            if item.get("on_hand") is not None
+                            else "?")
+            alloc_str = (f"{int(item['allocated'])}"
+                          if item.get("allocated") is not None
+                          else "0")
+            lines.append(
+                f"• CIN7 OnHand: *{on_hand_str}* · "
+                f"Allocated: *{alloc_str}*"
+                + (f" (across {len(item['open_sos'])} open SOs)"
+                    if item.get("open_sos") else ""))
+        else:
+            lines.append(
+                "• _No warehouse stock (dropship) — "
+                "supplier ships direct on PO approval_")
         if item.get("open_sos"):
             sos_str = ", ".join(
                 f"{so}×{int(q)}" for so, q in item["open_sos"])
@@ -379,14 +447,17 @@ def _compose_intelligence_block(items: List[dict],
 
 
 def _fulfillment_status(item: dict) -> str:
-    """Return 'yes' / 'no' / 'unknown' for can-we-fulfill-this-line.
-    'yes' = OnHand >= requested qty. 'no' = OnHand < requested qty.
-    'unknown' = either value is missing.
+    """Return 'yes' / 'no' / 'unknown' / 'dropship' for
+    can-we-fulfill-this-line.
 
-    Note: we use OnHand directly rather than (OnHand - allocated)
-    because the allocation count INCLUDES this line's qty. The
-    buyer reading the message can subtract for themselves; the
-    bot's job is to surface the raw signals."""
+    v2.67.148 — Dropship items return 'dropship' regardless of
+    OnHand. We never warehouse them, so the OnHand-vs-qty check
+    is meaningless; the relevant question is whether the
+    auto-created draft PO has been approved + supplier ETA.
+    Both _needs_buyer_ping and _needs_reorder_flag treat
+    'dropship' as a no-op (no fulfillment status to warn on)."""
+    if item.get("is_dropship"):
+        return "dropship"
     on_hand = item.get("on_hand")
     req = item.get("requested_qty")
     if on_hand is None or req is None:
@@ -449,6 +520,24 @@ def _compose_querier_reply(items: List[dict],
         next_eta = (item.get("next_po") or {}).get("eta")
         status = _fulfillment_status(item)
 
+        # v2.67.148 — dropship items get their own row format.
+        # They never carry warehouse stock; the relevant info is
+        # "supplier ships direct + ETA from auto-PO".
+        if status == "dropship":
+            bit = f"📦 `{sku}` — *DROPSHIP*"
+            if req is not None:
+                try:
+                    bit += f", ordered {int(req)}"
+                except (TypeError, ValueError):
+                    pass
+            po = item.get("next_po") or {}
+            if po.get("eta"):
+                bit += f" · supplier ETA *{po['eta']}*"
+            else:
+                bit += " · _no draft PO visible — verify in CIN7_"
+            summary_bits.append(bit)
+            continue
+
         oh = (int(on_hand) if on_hand is not None else "?")
         bit_prefix = (
             "✅" if status == "yes"
@@ -474,6 +563,24 @@ def _compose_querier_reply(items: List[dict],
     body = snapshot
     needs_buyer = _needs_buyer_ping(items)
     needs_reorder = _needs_reorder_flag(items)
+    has_dropship = any(
+        _fulfillment_status(it) == "dropship" for it in items)
+    dropship_without_po = any(
+        _fulfillment_status(it) == "dropship"
+        and not (it.get("next_po") or {}).get("eta")
+        for it in items)
+
+    # v2.67.148 — dropship-specific notes. These items don't go
+    # through the normal stock-shortage logic; the action is
+    # 'approve the draft PO' or 'check supplier ETA'.
+    if dropship_without_po:
+        body += (f"\n\n📦 Dropship item with no visible draft "
+                  f"PO — verify in CIN7 that the auto-PO was "
+                  f"created. May need {buyer_text} to action.")
+    elif has_dropship:
+        body += (f"\n\n📦 Dropship items ship direct from supplier. "
+                  f"Confirm ETA accuracy with {buyer_text} if "
+                  f"customer is waiting.")
 
     if needs_buyer:
         body += (f"\n\n⚠️ Stock is short on the items above with "
@@ -482,7 +589,7 @@ def _compose_querier_reply(items: List[dict],
     if needs_reorder:
         body += (f"\n\n🔴 No incoming PO for items marked above. "
                   f"Stockkeeper / buyer to decide on reorder.")
-    if not needs_buyer and not needs_reorder:
+    if not (needs_buyer or needs_reorder or has_dropship):
         all_yes = all(
             _fulfillment_status(it) == "yes" for it in items)
         if all_yes:
