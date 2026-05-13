@@ -349,47 +349,129 @@ def _compose_intelligence_block(items: List[dict],
     return "\n".join(lines)
 
 
+def _fulfillment_status(item: dict) -> str:
+    """Return 'yes' / 'no' / 'unknown' for can-we-fulfill-this-line.
+    'yes' = OnHand >= requested qty. 'no' = OnHand < requested qty.
+    'unknown' = either value is missing.
+
+    Note: we use OnHand directly rather than (OnHand - allocated)
+    because the allocation count INCLUDES this line's qty. The
+    buyer reading the message can subtract for themselves; the
+    bot's job is to surface the raw signals."""
+    on_hand = item.get("on_hand")
+    req = item.get("requested_qty")
+    if on_hand is None or req is None:
+        return "unknown"
+    try:
+        return "yes" if float(on_hand) >= float(req) else "no"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _needs_buyer_ping(items: List[dict]) -> bool:
+    """v2.67.145 — Only ping the buyer when:
+      (a) at least one item cannot be fulfilled from on-hand
+          (status 'no' or 'unknown'), AND
+      (b) that same item has an incoming PO with a known ETA
+          that's worth confirming.
+    If status is 'yes' for everything, the bot just answers
+    without involving the buyer. If status is 'no' but no PO is
+    on the way, the buyer can't confirm an ETA that doesn't
+    exist — different escalation (reorder decision) which we
+    leave to the stockkeeper."""
+    for item in items:
+        status = _fulfillment_status(item)
+        if status == "yes":
+            continue
+        po = item.get("next_po") or {}
+        if po.get("eta"):
+            return True
+    return False
+
+
+def _needs_reorder_flag(items: List[dict]) -> bool:
+    """True if at least one item cannot be fulfilled AND has NO
+    incoming PO. Surface as a 'consider reorder' note — distinct
+    from the buyer ETA-confirmation case."""
+    for item in items:
+        status = _fulfillment_status(item)
+        if status == "yes":
+            continue
+        po = item.get("next_po") or {}
+        if not po.get("eta"):
+            return True
+    return False
+
+
 def _compose_querier_reply(items: List[dict],
                                 so_numbers: List[str],
                                 buyer_dm_channel: Optional[str]
                                 ) -> str:
-    """Brief reply to the querier — high-level snapshot + which
-    person to ping if PO ETA is in doubt. Per James: 'looks like
-    no more coming on PO-XYZ but confirm with Andrew Tunley on
-    accuracy of expected arrival time'."""
-    # Buyer mention — if we have a DM channel, we know the bot
-    # can reach Andrew but for in-thread mention we use plain
-    # text (his user_id wasn't provided; DM channel is D-prefix).
+    """Brief reply to the querier — high-level snapshot + the
+    SPECIFIC follow-up the bot is recommending.
+
+    Per James (v2.67.145 refinement): only ask the querier to
+    confirm with the buyer when (a) we can't fulfill from on-hand
+    and (b) there's an incoming PO with an ETA to verify. Don't
+    fire the buyer ping when stock is fine OR when no PO exists."""
     buyer_text = ("@AndrewTunley"
                     if buyer_dm_channel else "the buyer")
 
     summary_bits = []
+    any_unknown_qty = False
     for item in items:
         sku = item.get("sku") or "?"
         on_hand = item.get("on_hand")
         alloc = item.get("allocated") or 0
+        req = item.get("requested_qty")
         next_eta = (item.get("next_po") or {}).get("eta")
+        status = _fulfillment_status(item)
+
         oh = (int(on_hand) if on_hand is not None else "?")
-        bit = f"`{sku}` — OnHand {oh}"
-        if alloc:
-            bit += f", {int(alloc)} allocated"
-        if next_eta:
-            bit += f", next PO ETA {next_eta}"
+        bit_prefix = (
+            "✅" if status == "yes"
+            else "🟥" if status == "no"
+            else "❔")
+        bit = f"{bit_prefix} `{sku}` — OnHand {oh}"
+        if req is not None:
+            try:
+                bit += f", needs {int(req)}"
+            except (TypeError, ValueError):
+                pass
+        else:
+            any_unknown_qty = True
+        if alloc and not req:
+            bit += f", {int(alloc)} allocated total"
+        if status == "no" and next_eta:
+            bit += f" · next PO ETA *{next_eta}*"
+        elif status == "no":
+            bit += f" · *no incoming PO*"
         summary_bits.append(bit)
-    snapshot = "\n".join(f"• {b}" for b in summary_bits[:5])
+    snapshot = "\n".join(summary_bits[:5])
 
-    # Need-buyer-confirmation flag: any item where there's NO
-    # next PO OR ETA is missing.
-    needs_eta_check = any(
-        not (it.get("next_po") and it["next_po"].get("eta"))
-        for it in items
-    )
+    body = snapshot
+    needs_buyer = _needs_buyer_ping(items)
+    needs_reorder = _needs_reorder_flag(items)
 
-    body = f"Quick snapshot:\n{snapshot}"
-    if needs_eta_check:
-        body += (f"\n\n⚠️ Some items have no confirmed PO ETA "
-                  f"— please confirm with {buyer_text}.")
-    body += "\n\n_I've posted full detail for the stock controller below._"
+    if needs_buyer:
+        body += (f"\n\n⚠️ Stock is short on the items above with "
+                  f"an incoming PO. Please confirm with "
+                  f"{buyer_text} that the listed ETA is accurate.")
+    if needs_reorder:
+        body += (f"\n\n🔴 No incoming PO for items marked above. "
+                  f"Stockkeeper / buyer to decide on reorder.")
+    if not needs_buyer and not needs_reorder:
+        all_yes = all(
+            _fulfillment_status(it) == "yes" for it in items)
+        if all_yes:
+            body += "\n\n✅ All items appear to have stock on hand."
+        elif any_unknown_qty:
+            body += ("\n\n_Requested quantity wasn't extractable "
+                      "from the message — verify the SO/SKU "
+                      "details before quoting._")
+
+    body += ("\n\n_Full detail for the stock controller posted "
+              "in the next message._")
     return body
 
 
@@ -451,7 +533,9 @@ def handle_stock_issue(msg: dict) -> Tuple[Optional[str], List[str]]:
     seen_skus: set = set()
     families: List[str] = []
 
-    # Expand SOs → SKUs from sale_lines.
+    # Expand SOs → SKUs from sale_lines. v2.67.145 — also capture
+    # the line's requested quantity so the fulfillment-status
+    # check (can we ship?) can reason about OnHand vs needs.
     for so in so_numbers + inv_numbers:
         for line in _so_line_skus(sale_lines, so):
             sku = line.get("sku") or ""
@@ -459,7 +543,15 @@ def handle_stock_issue(msg: dict) -> Tuple[Optional[str], List[str]]:
                 continue
             seen_skus.add(sku)
             intel = _sku_intel(sku, sale_lines)
-            intel["name"] = intel.get("name")  # placeholder
+            try:
+                intel["requested_qty"] = (
+                    float(line.get("qty"))
+                    if line.get("qty") is not None
+                    else None)
+            except (TypeError, ValueError):
+                intel["requested_qty"] = None
+            intel["from_so"] = so
+            intel["customer"] = line.get("customer")
             items.append(intel)
         tools_used.append("so_line_skus")
 
