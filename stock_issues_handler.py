@@ -147,9 +147,29 @@ def _load_sale_lines() -> Optional[pd.DataFrame]:
         return None
 
 
+# v2.67.147 — pseudo-SKUs that appear in CIN7 sale_lines but
+# aren't real products. Filter these out before any intelligence
+# lookup so we don't treat 'SHIPPING - UPS® GROUND' as a stockable
+# SKU. Match is case-insensitive substring on the SKU itself.
+_PSEUDO_SKU_PATTERNS = (
+    "SHIPPING", "FREIGHT", "DELIVERY", "POSTAGE", "COURIER",
+    "TAX", "DISCOUNT", "ADJUSTMENT", "ROUNDING", "HANDLING",
+    "INSURANCE",
+)
+
+
+def _is_pseudo_sku(sku: str) -> bool:
+    if not sku:
+        return True
+    su = sku.upper()
+    return any(p in su for p in _PSEUDO_SKU_PATTERNS)
+
+
 def _so_line_skus(sale_lines: pd.DataFrame,
                        so_number: str) -> List[dict]:
-    """Return list of {sku, qty, customer} for one SO."""
+    """Return list of {sku, qty, customer} for one SO. Filters out
+    pseudo-SKUs (shipping, freight, tax etc) that CIN7 stores as
+    line items but aren't stockable products."""
     if sale_lines is None or sale_lines.empty:
         return []
     so_col = next(
@@ -175,8 +195,11 @@ def _so_line_skus(sale_lines: pd.DataFrame,
         .str.replace("INV-", "", regex=False) == norm]
     out = []
     for _, row in match.iterrows():
+        sku = str(row.get(sku_col) or "").strip().upper()
+        if _is_pseudo_sku(sku):
+            continue
         out.append({
-            "sku": str(row.get(sku_col) or "").strip().upper(),
+            "sku": sku,
             "qty": row.get(qty_col),
             "customer": (str(row.get(cust_col))
                           if cust_col else None),
@@ -329,7 +352,13 @@ def _compose_intelligence_block(items: List[dict],
         if po:
             po_bits = []
             if po.get("po_number"):
-                po_bits.append(f"PO-{po['po_number']}")
+                # v2.67.147 — po_number may or may not already
+                # include the 'PO-' prefix depending on which CSV
+                # field it came from. Don't double-prefix.
+                pn = str(po["po_number"]).strip()
+                if not pn.upper().startswith("PO-"):
+                    pn = f"PO-{pn}"
+                po_bits.append(pn)
             if po.get("qty") is not None:
                 try:
                     po_bits.append(f"{int(po['qty'])} units")
@@ -369,19 +398,13 @@ def _fulfillment_status(item: dict) -> str:
 
 
 def _needs_buyer_ping(items: List[dict]) -> bool:
-    """v2.67.145 — Only ping the buyer when:
-      (a) at least one item cannot be fulfilled from on-hand
-          (status 'no' or 'unknown'), AND
-      (b) that same item has an incoming PO with a known ETA
-          that's worth confirming.
-    If status is 'yes' for everything, the bot just answers
-    without involving the buyer. If status is 'no' but no PO is
-    on the way, the buyer can't confirm an ETA that doesn't
-    exist — different escalation (reorder decision) which we
-    leave to the stockkeeper."""
+    """v2.67.147 — Only ping the buyer when we DEFINITELY can't
+    fulfill (status == 'no', not 'unknown') AND there's an
+    incoming PO with an ETA worth confirming. 'Unknown' status
+    means we couldn't determine OnHand/qty — surfacing a
+    speculative buyer ping in that case is noise, not signal."""
     for item in items:
-        status = _fulfillment_status(item)
-        if status == "yes":
+        if _fulfillment_status(item) != "no":
             continue
         po = item.get("next_po") or {}
         if po.get("eta"):
@@ -390,12 +413,11 @@ def _needs_buyer_ping(items: List[dict]) -> bool:
 
 
 def _needs_reorder_flag(items: List[dict]) -> bool:
-    """True if at least one item cannot be fulfilled AND has NO
-    incoming PO. Surface as a 'consider reorder' note — distinct
-    from the buyer ETA-confirmation case."""
+    """v2.67.147 — Only fire the reorder flag on DEFINITE
+    shortage with no PO. 'Unknown' status doesn't trigger; that's
+    the stockkeeper's call once they verify the actual counts."""
     for item in items:
-        status = _fulfillment_status(item)
-        if status == "yes":
+        if _fulfillment_status(item) != "no":
             continue
         po = item.get("next_po") or {}
         if not po.get("eta"):
@@ -590,11 +612,42 @@ def handle_stock_issue(msg: dict) -> Tuple[Optional[str], List[str]]:
     intel_block = _compose_intelligence_block(
         items, so_numbers, cls["issue_type"])
 
-    # Post the intelligence block as a separate thread reply.
-    # The querier reply is returned to the caller so they post it
-    # via the standard listener post pathway (and record in
-    # slack_bot_responses), keeping the auditing consistent.
+    # v2.67.147 — post BOTH messages in the right order from the
+    # handler so Slack shows querier reply first, then intel
+    # block. Previously the listener posted the querier reply
+    # AFTER the handler posted the intel block, reversing the
+    # intended order. We return ('', tools_used) so the listener
+    # skips its own post (the return-empty-string contract is
+    # already in place to handle parse failures).
     thread_ts = msg.get("thread_ts") or msg["ts"]
+    q_posted_ts, q_err = _post_to_slack(
+        msg["channel_id"], querier_reply, thread_ts=thread_ts)
+    if q_err:
+        log.error("Querier reply post failed for issue %d: %s",
+                    issue_id, q_err)
+    else:
+        tools_used.append("querier_reply_posted")
+        # Record the querier-reply in slack_bot_responses for
+        # audit-mirror compatibility with the rest of the bot's
+        # responses table.
+        try:
+            with db.connect() as c:
+                c.execute(
+                    "INSERT INTO slack_bot_responses "
+                    "(in_channel, in_ts, in_thread_ts, "
+                    " user_question, response_text, "
+                    " response_ts, tools_used, classification) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (msg["channel_id"], msg["ts"], thread_ts,
+                      (msg.get("text") or "")[:500],
+                      querier_reply, q_posted_ts,
+                      ",".join(tools_used),
+                      "stock_issue_raise"))
+        except Exception as exc:
+            log.warning(
+                "Failed to record querier reply in "
+                "slack_bot_responses: %s", exc)
+
     posted_ts, err = _post_to_slack(
         msg["channel_id"], intel_block, thread_ts=thread_ts)
     if posted_ts:
@@ -604,7 +657,9 @@ def handle_stock_issue(msg: dict) -> Tuple[Optional[str], List[str]]:
         log.error("Intel block post failed for issue %d: %s",
                     issue_id, err)
 
-    return querier_reply, tools_used
+    # Return empty string so listener doesn't try to post the
+    # querier reply again (we already posted both).
+    return "", tools_used
 
 
 # ---------------------------------------------------------------------------
