@@ -436,20 +436,25 @@ while true; do
     fi
 
     # v2.67.144 Stock-issue morning summary. Fires once per day
-    # at the configured hour (default 8:30 ET). Idempotency via
-    # last_si_morning_date — we only post if today's date hasn't
-    # been seen yet. ET = UTC-4/5 depending on DST; we treat it
-    # as UTC-4 (EDT) for the 8:30 trigger and accept that the
-    # post arrives at 9:30 ET during EST. Good enough.
+    # at the configured hour (default 8:30 ET).
+    # v2.67.154 — date marker persisted to /data so worker
+    # restarts (env var changes, deploys) don't cause repeat
+    # posts. Earlier shell-variable approach reset on every
+    # restart and re-fired in the same time window.
     si_morning_hour="${STOCK_ISSUE_MORNING_HOUR_ET:-8}"
     now_utc_hour=$(date -u +%H)
     now_utc_minute=$(date -u +%M)
     today_utc=$(date -u +%Y-%m-%d)
     si_morning_utc_hour=$(( si_morning_hour + 4 ))
+    si_morning_marker="/data/.last_si_morning_date"
+    if [ -f "$si_morning_marker" ]; then
+        last_si_morning_date=$(cat "$si_morning_marker" 2>/dev/null)
+    fi
     if [ "${now_utc_hour#0}" -ge "$si_morning_utc_hour" ] \
             && [ "${now_utc_minute#0}" -ge 30 ] \
             && [ "$today_utc" != "$last_si_morning_date" ] \
             && [ -n "${SLACK_STOCK_ISSUES_CHANNEL_ID:-}" ]; then
+        echo "$today_utc" > "$si_morning_marker"
         last_si_morning_date="$today_utc"
         _run_bg "stock_issues_morning" \
             "python stock_issues_handler.py morning-summary"
