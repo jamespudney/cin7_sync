@@ -211,6 +211,16 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     if msg["is_our_bot"]:
         return "bot_self"
     if msg["is_bot"]:
+        # v2.67.136 — special-case FlowBot back-in-stock
+        # subscriptions BEFORE the generic bot_other skip. These
+        # are structured demand-signal feeds from Shopify; we
+        # auto-log them and post a threaded triage reply.
+        try:
+            from back_in_stock_handler import is_flowbot_subscription
+            if is_flowbot_subscription(msg):
+                return "back_in_stock_subscription"
+        except Exception:
+            pass
         return "bot_other"
     text = (msg["text"] or "").strip()
     if not text:
@@ -1365,6 +1375,47 @@ def process_once(max_messages: int = 25) -> int:
         # Skip non-respondable categories.
         if classification in ("bot_self", "bot_other", "empty",
                                 "too_old", "chatter"):
+            continue
+
+        # v2.67.136 — Back-in-stock subscription from FlowBot.
+        # Parse, log to demand_signals, post threaded triage reply.
+        if classification == "back_in_stock_subscription":
+            thread_ts = msg["thread_ts"] or msg["ts"]
+            if _already_replied_recently(
+                    msg["channel_id"], thread_ts):
+                continue
+            try:
+                from back_in_stock_handler import (
+                    handle_subscription as _handle_bis)
+                reply_text, bis_tools = _handle_bis(msg)
+            except Exception as exc:
+                log.error("back_in_stock handler error: %s", exc)
+                continue
+            if not reply_text:
+                # Parsing failed — silently log the message but
+                # don't reply with garbage. Mark classified so we
+                # don't retry.
+                continue
+            posted_ts = _post_response(
+                session, msg["channel_id"], thread_ts,
+                reply_text)
+            if posted_ts:
+                with db.connect() as c:
+                    c.execute(
+                        "INSERT INTO slack_bot_responses "
+                        "(in_channel, in_ts, in_thread_ts, "
+                        " user_question, response_text, "
+                        " response_ts, tools_used, classification) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (msg["channel_id"], msg["ts"], thread_ts,
+                         (msg["text"] or "")[:500],
+                         reply_text, posted_ts,
+                         ",".join(bis_tools),
+                         "back_in_stock_subscription"))
+                posts_made += 1
+                log.info(
+                    "Posted back-in-stock triage in %s/%s",
+                    ch_name, msg["ts"])
             continue
 
         # v2.67.124 — Viktor handoff: post the forwarding message
