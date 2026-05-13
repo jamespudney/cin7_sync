@@ -892,15 +892,299 @@ def run_escalation_cycle(dryrun: bool = False,
 
 
 # ---------------------------------------------------------------------------
+# Auto-resolution from CIN7 evidence (v2.67.155)
+# ---------------------------------------------------------------------------
+# Two evidence paths to auto-close an open issue without a Slack
+# 'fixed' reply:
+#
+#   1. count_wrong issue → scan stock_adjustments CSV for a
+#      matching SKU adjustment dated AFTER the issue was raised.
+#      If found, close with citation '<date> · <qty> · <ref>'.
+#
+#   2. supply_query issue → check the latest shipments CSV for a
+#      shipment of any SO listed in the issue. If shipped after
+#      raise date, close with tracking citation.
+#
+# Both run BEFORE the morning summary so resolved issues drop
+# from the outstanding list. Audit trail preserved via the
+# resolution_text field.
+def _load_latest_adjustments() -> Optional[pd.DataFrame]:
+    import glob
+    matches = sorted(glob.glob(
+        str(OUTPUT_DIR / "stock_adjustments_last_*d_*.csv")),
+        key=os.path.getmtime, reverse=True)
+    if not matches:
+        return None
+    try:
+        return pd.read_csv(matches[0], low_memory=False)
+    except Exception as exc:
+        log.warning("Failed to load adjustments CSV: %s", exc)
+        return None
+
+
+def _load_latest_shipments() -> Optional[pd.DataFrame]:
+    import glob
+    matches = sorted(glob.glob(
+        str(OUTPUT_DIR / "shipments_last_*d_*.csv")),
+        key=os.path.getmtime, reverse=True)
+    if not matches:
+        # Fall back to full dump if rolling-window CSVs missing
+        full = sorted(glob.glob(
+            str(OUTPUT_DIR / "shipments_full.csv")))
+        if not full:
+            return None
+        matches = full
+    try:
+        return pd.read_csv(matches[0], low_memory=False)
+    except Exception as exc:
+        log.warning("Failed to load shipments CSV: %s", exc)
+        return None
+
+
+def _normalise_order_id(s) -> str:
+    if s is None or pd.isna(s):
+        return ""
+    raw = str(s).strip().upper().lstrip("#")
+    for prefix in ("SO-", "INV-", "SO", "INV"):
+        if raw.startswith(prefix):
+            return raw[len(prefix):]
+    return raw
+
+
+def _find_adjustment_for_sku(adjustments: pd.DataFrame,
+                                  sku: str,
+                                  after_iso: str) -> Optional[dict]:
+    """Find the FIRST stock-adjustment row matching `sku` dated
+    after `after_iso`. Returns dict with date/qty/ref for the
+    citation, or None if no match."""
+    if adjustments is None or adjustments.empty or not sku:
+        return None
+    sku_col = next(
+        (c for c in ("SKU", "ProductCode") if c in adjustments.columns),
+        None)
+    if not sku_col:
+        return None
+    date_col = next(
+        (c for c in ("AdjustmentDate", "Date", "EffectiveDate",
+                        "LastUpdatedDate")
+          if c in adjustments.columns), None)
+    qty_col = next(
+        (c for c in ("Quantity", "Qty", "AdjustQty",
+                        "QuantityAdjustment")
+          if c in adjustments.columns), None)
+    ref_col = next(
+        (c for c in ("Reference", "AdjustmentNumber", "Note",
+                        "Memo", "Reason")
+          if c in adjustments.columns), None)
+    df = adjustments[
+        adjustments[sku_col].astype(str).str.upper().str.strip()
+        == sku.upper()]
+    if df.empty:
+        return None
+    # Filter by date
+    if date_col and after_iso:
+        try:
+            cutoff = pd.to_datetime(after_iso, utc=True)
+            dates = pd.to_datetime(
+                df[date_col], errors="coerce", utc=True)
+            df = df[dates >= cutoff]
+        except Exception:
+            pass
+    if df.empty:
+        return None
+    if date_col:
+        df = df.copy()
+        df["__d"] = pd.to_datetime(
+            df[date_col], errors="coerce", utc=True)
+        df = df.sort_values("__d", na_position="last")
+    row = df.iloc[0]
+    return {
+        "date": (str(row.get(date_col))[:10]
+                  if date_col and pd.notna(row.get(date_col))
+                  else None),
+        "qty": row.get(qty_col) if qty_col else None,
+        "reference": row.get(ref_col) if ref_col else None,
+    }
+
+
+def _find_shipment_for_so(shipments: pd.DataFrame,
+                               so_number: str,
+                               after_iso: str) -> Optional[dict]:
+    """Find a shipment matching the SO number with a non-empty
+    ShipDate after `after_iso`. Mirrors prefix-stripping pattern
+    from ai_tools.get_shipping_details."""
+    if shipments is None or shipments.empty or not so_number:
+        return None
+    order_col = next(
+        (c for c in ("OrderNumber", "Order Number",
+                        "SaleNumber", "InvoiceNumber")
+          if c in shipments.columns), None)
+    date_col = next(
+        (c for c in ("ShipDate", "ShipmentDate")
+          if c in shipments.columns), None)
+    track_col = next(
+        (c for c in ("TrackingNumber", "Tracking")
+          if c in shipments.columns), None)
+    voided_col = next(
+        (c for c in ("Voided", "IsVoided")
+          if c in shipments.columns), None)
+    if not order_col or not date_col:
+        return None
+    norm = _normalise_order_id(so_number)
+    if not norm:
+        return None
+    df = shipments[
+        shipments[order_col].astype(str).apply(_normalise_order_id)
+        == norm]
+    if df.empty:
+        return None
+    # Has ship date + not voided
+    df = df[df[date_col].notna()
+              & (df[date_col].astype(str).str.strip() != "")]
+    if voided_col and voided_col in df.columns:
+        df = df[~df[voided_col].fillna(False).astype(bool)]
+    if df.empty:
+        return None
+    if after_iso:
+        try:
+            cutoff = pd.to_datetime(after_iso, utc=True)
+            dates = pd.to_datetime(
+                df[date_col], errors="coerce", utc=True)
+            df = df[dates >= cutoff]
+        except Exception:
+            pass
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {
+        "ship_date": str(row.get(date_col))[:10],
+        "tracking": (str(row.get(track_col) or "").strip()
+                      if track_col else None),
+    }
+
+
+def run_auto_resolution(dryrun: bool = False) -> dict:
+    """For each open stock_issue, attempt to find CIN7 evidence
+    that it's already been handled and auto-resolve. Posts a
+    quiet confirmation in the original thread when it closes one
+    so the team sees the citation. Returns summary dict.
+
+    Logic:
+      - count_wrong issues: scan stock_adjustments for matching
+        SKU dated after issue creation
+      - supply_query issues: scan shipments for matching SO with
+        ShipDate after issue creation
+    """
+    open_issues = db.list_open_stock_issues(
+        limit=200, max_age_days=60)
+    if not open_issues:
+        return {"resolved": 0, "pending": 0}
+
+    adjustments = _load_latest_adjustments()
+    shipments = _load_latest_shipments()
+
+    n_resolved_adj = 0
+    n_resolved_ship = 0
+    n_unresolved = 0
+    for iss in open_issues:
+        skus_csv = iss.get("skus") or ""
+        sos_csv = iss.get("so_numbers") or ""
+        skus = [s for s in skus_csv.split(",") if s]
+        sos = [s for s in sos_csv.split(",") if s]
+        issue_type = (iss.get("issue_type") or "").lower()
+        created_at = iss.get("created_at") or ""
+        resolved = False
+        citation = None
+
+        # Try adjustment evidence for count_wrong (or mixed)
+        if not resolved and issue_type in (
+                "count_wrong", "mixed") and adjustments is not None:
+            for sku in skus:
+                ev = _find_adjustment_for_sku(
+                    adjustments, sku, created_at)
+                if ev:
+                    qty = ev.get("qty")
+                    qty_s = (f"{qty:+g}"
+                              if qty is not None
+                              and not pd.isna(qty) else "?")
+                    citation = (
+                        f"Auto-resolved: stock adjustment for "
+                        f"{sku} on {ev.get('date') or '?'} "
+                        f"(qty {qty_s})")
+                    if ev.get("reference"):
+                        citation += f" — ref {ev['reference']}"
+                    resolved = True
+                    n_resolved_adj += 1
+                    break
+
+        # Try shipment evidence for supply_query (or mixed)
+        if not resolved and issue_type in (
+                "supply_query", "mixed") and shipments is not None:
+            for so in sos:
+                ev = _find_shipment_for_so(
+                    shipments, so, created_at)
+                if ev:
+                    citation = (
+                        f"Auto-resolved: {so} shipped "
+                        f"{ev.get('ship_date') or '?'}")
+                    if ev.get("tracking"):
+                        citation += (
+                            f" — tracking {ev['tracking']}")
+                    resolved = True
+                    n_resolved_ship += 1
+                    break
+
+        if not resolved:
+            n_unresolved += 1
+            continue
+
+        if dryrun:
+            log.info("[DRYRUN] Would resolve issue %s — %s",
+                      iss["id"], citation)
+            continue
+
+        try:
+            db.resolve_stock_issue(
+                int(iss["id"]),
+                resolved_by="auto",
+                resolution_text=citation)
+            # Post citation as a thread reply for audit trail
+            thread_ts = iss.get("raise_thread_ts")
+            channel = iss.get("raise_channel")
+            if thread_ts and channel:
+                _post_to_slack(
+                    channel,
+                    f"✅ _{citation}_",
+                    thread_ts=thread_ts)
+        except Exception as exc:
+            log.error("Failed to auto-resolve issue %s: %s",
+                        iss["id"], exc)
+    return {
+        "open_scanned": len(open_issues),
+        "resolved_via_adjustment": n_resolved_adj,
+        "resolved_via_shipment": n_resolved_ship,
+        "still_unresolved": n_unresolved,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Morning summary
 # ---------------------------------------------------------------------------
 def run_morning_summary(dryrun: bool = False) -> dict:
     """Post a daily summary of outstanding stock issues to the
-    #stock-issues-queries channel."""
+    #stock-issues-queries channel.
+
+    v2.67.155 — runs auto-resolution FIRST so issues that have
+    evidence of being handled in CIN7 (stock adjustments / SO
+    shipments) drop off the list automatically and only the
+    genuinely-unresolved ones get reported."""
     channel = os.environ.get(
         "SLACK_STOCK_ISSUES_CHANNEL_ID", "").strip()
     if not dryrun and not channel:
         return {"posted": 0, "skipped_no_channel": True}
+    # v2.67.155 — auto-resolve before listing
+    auto_result = run_auto_resolution(dryrun=dryrun)
+    log.info("Auto-resolution: %s", auto_result)
     issues = db.list_open_stock_issues(limit=50, max_age_days=30)
     if not issues:
         return {"posted": 0, "open_count": 0}
@@ -966,6 +1250,13 @@ def cmd_morning(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_auto_resolve(args: argparse.Namespace) -> int:
+    _setup_log(args.verbose)
+    result = run_auto_resolution(dryrun=bool(args.dryrun))
+    log.info("DONE: %s", result)
+    return 0
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     _setup_log(args.verbose)
     with db.connect() as c:
@@ -993,6 +1284,14 @@ def main() -> int:
     p_m.add_argument("--dryrun", action="store_true")
     p_m.add_argument("--verbose", action="store_true")
     p_m.set_defaults(func=cmd_morning)
+    p_a = sub.add_parser("auto-resolve",
+        help="Run auto-resolution pass (debug). Standalone — "
+              "scans open issues, checks CIN7 evidence, closes "
+              "matched ones.")
+    p_a.add_argument("--dryrun", action="store_true")
+    p_a.add_argument("--verbose", action="store_true")
+    p_a.set_defaults(func=cmd_auto_resolve)
+
     p_i = sub.add_parser("inspect")
     p_i.add_argument("--issue-id", type=int, required=True)
     p_i.add_argument("--verbose", action="store_true")
