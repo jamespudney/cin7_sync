@@ -227,10 +227,16 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     # to the configured channel so we don't classify random ops
     # chatter elsewhere as a stock issue. Resolution detection
     # (human reply 'fixed' / 'adjusted') handled in process_once.
+    # v2.67.146 — read channel_id directly from msg here; the
+    # local variable `channel_id` isn't bound until later in
+    # this function. Previous version crashed with
+    # UnboundLocalError on every non-back-in-stock message,
+    # leaving classification NULL forever.
     _stock_issues_channel = os.environ.get(
         "SLACK_STOCK_ISSUES_CHANNEL_ID", "").strip()
+    _msg_channel_id = msg.get("channel_id", "")
     if (_stock_issues_channel
-            and channel_id == _stock_issues_channel
+            and _msg_channel_id == _stock_issues_channel
             and not msg.get("is_bot")):
         try:
             from stock_issues_handler import (
