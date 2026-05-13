@@ -1406,6 +1406,78 @@ def process_once(max_messages: int = 25) -> int:
                 "WHERE channel_id = ? AND ts = ?",
                 (classification, msg["channel_id"], msg["ts"]))
 
+        # v2.67.149 — SO cross-reference auto-reply. Fires
+        # ALONGSIDE whatever classification was set, as a
+        # supplementary one-liner with hyperlinks to both the
+        # CIN7 sale and the Shopify order. Dedup per
+        # (channel, thread_ts, set of SOs) so the same mapping
+        # doesn't get reposted on every reference within the
+        # thread. Skipped for bot-self / empty / too_old messages.
+        if classification not in (
+                "bot_self", "bot_other", "empty", "too_old"):
+            try:
+                from so_lookup import (
+                    find_so_references, lookup_so,
+                    compose_reply as _so_compose)
+                _so_text = (msg["text"] or "")
+                _sos_in_msg = find_so_references(_so_text)
+                if _sos_in_msg:
+                    _so_thread = msg["thread_ts"] or msg["ts"]
+                    # Dedup: have we ALREADY posted a
+                    # so_cross_reference reply in this thread for
+                    # ANY of these SOs? If yes, skip — one
+                    # cross-ref per thread is enough.
+                    with db.connect() as c:
+                        _existing = c.execute(
+                            "SELECT 1 FROM slack_bot_responses "
+                            "WHERE in_channel = ? "
+                            "  AND in_thread_ts = ? "
+                            "  AND classification = "
+                            "      'so_cross_reference' "
+                            "LIMIT 1",
+                            (msg["channel_id"], _so_thread)
+                        ).fetchone()
+                    if not _existing:
+                        _records = []
+                        for _so in _sos_in_msg[:5]:
+                            _r = lookup_so(_so)
+                            if _r:
+                                _records.append(_r)
+                        if _records:
+                            _xr_text = _so_compose(_records)
+                            _xr_ts = _post_response(
+                                session, msg["channel_id"],
+                                _so_thread, _xr_text)
+                            if _xr_ts:
+                                with db.connect() as c:
+                                    c.execute(
+                                        "INSERT INTO "
+                                        "slack_bot_responses "
+                                        "(in_channel, in_ts, "
+                                        " in_thread_ts, "
+                                        " user_question, "
+                                        " response_text, "
+                                        " response_ts, "
+                                        " tools_used, "
+                                        " classification) "
+                                        "VALUES (?, ?, ?, ?, ?, "
+                                        "        ?, ?, ?)",
+                                        (msg["channel_id"],
+                                          msg["ts"], _so_thread,
+                                          _so_text[:300],
+                                          _xr_text, _xr_ts,
+                                          "so_lookup",
+                                          "so_cross_reference"))
+                                posts_made += 1
+                                log.info(
+                                    "Posted SO cross-reference "
+                                    "in %s/%s (%d SO refs)",
+                                    ch_name, msg["ts"],
+                                    len(_records))
+            except Exception as _exc:
+                log.warning("SO cross-reference skipped: %s",
+                              _exc)
+
         # Skip non-respondable categories.
         if classification in ("bot_self", "bot_other", "empty",
                                 "too_old", "chatter"):
