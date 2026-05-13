@@ -248,13 +248,18 @@ def _resolve_sku_from_handle(handle: str) -> Optional[dict]:
         return None
     handle_norm = handle.strip()
 
-    # Source 1: product_dimensions
+    # Source 1: product_dimensions (per-product handle / family /
+    # title lookup; v2.67.142 — note this table has NO sku column,
+    # only product-level metadata. SKU stays empty here; resolution
+    # of a specific variant SKU happens via Source 2 when there's
+    # a single-variant product, otherwise we rely on family-level
+    # signal matching downstream.)
     try:
         rows = db.all_product_dimensions()
         for r in rows:
             if (r.get("shopify_handle") or "").strip() == handle_norm:
                 return {
-                    "sku": r.get("sku") or "",
+                    "sku": "",  # product_dimensions has no sku col
                     "family": r.get("family") or "",
                     "title": r.get("title") or "",
                     "shopify_handle": handle_norm,
@@ -574,18 +579,42 @@ def _po_lines_received_recently(lookback_hours: int = 48
         return []
     if "OrderNumber" not in lines.columns:
         return []
-    # Build family index from product_dimensions for SKU → family
-    # lookup so we can match family-only demand signals.
-    try:
-        pd_rows = db.all_product_dimensions()
-    except Exception:
-        pd_rows = []
+    # v2.67.142 — Build family-by-SKU index from engine_output
+    # (the dashboard's full engine output, which has BOTH SKU and
+    # Family columns merged from CIN7 + AdditionalAttribute1).
+    # product_dimensions doesn't have a `sku` column — it's a
+    # product-level dimension-extraction table keyed by Shopify
+    # handle. Earlier code mistakenly tried `r.get("sku")` against
+    # product_dimensions, which always returned None, making the
+    # family-by-sku map empty and arrival-matching always fail.
     family_by_sku: dict = {}
-    for r in pd_rows:
-        sku = (r.get("sku") or "").strip().upper()
-        fam = (r.get("family") or "").strip()
-        if sku and fam:
-            family_by_sku[sku] = fam
+    try:
+        from bot_engine_lookup import _load_engine_df
+        df = _load_engine_df()
+    except Exception:
+        df = None
+    if df is not None and not df.empty:
+        sku_col = next(
+            (c for c in ("Sku", "sku", "SKU")
+              if c in df.columns), None)
+        fam_col = next(
+            (c for c in ("Family", "family", "FAMILY")
+              if c in df.columns), None)
+        if sku_col and fam_col:
+            for _, r in df[[sku_col, fam_col]].dropna().iterrows():
+                sku_u = str(r[sku_col]).strip().upper()
+                fam_v = str(r[fam_col]).strip()
+                if sku_u and fam_v:
+                    family_by_sku[sku_u] = fam_v
+    # Fallback: derive family from SKU naming convention
+    # (LED-FAMILY-...). Used for SKUs not yet in engine_output —
+    # better than nothing for matching against family-only
+    # demand signals.
+    def _family_from_sku_prefix(sku_upper: str) -> str:
+        if not sku_upper.startswith("LED-"):
+            return ""
+        parts = sku_upper.split("-")
+        return parts[1] if len(parts) >= 2 else ""
 
     out: List[dict] = []
     lines_by_po = {po: g for po, g in lines.groupby("OrderNumber")}
@@ -601,10 +630,13 @@ def _po_lines_received_recently(lookback_hours: int = 48
             sku = str(line.get("SKU") or "").strip().upper()
             if not sku:
                 continue
+            fam = family_by_sku.get(sku)
+            if not fam:
+                fam = _family_from_sku_prefix(sku)
             out.append({
                 "po_number": po_number,
                 "sku": sku,
-                "family": family_by_sku.get(sku, ""),
+                "family": fam or "",
                 "supplier": supplier,
                 "quantity": line.get("Quantity"),
             })
