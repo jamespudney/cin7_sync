@@ -185,6 +185,7 @@ last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
 last_si_escalate_epoch=0   # v2.67.144 stock-issue DM escalation
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
+last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -452,6 +453,18 @@ while true; do
         last_si_morning_date="$today_utc"
         _run_bg "stock_issues_morning" \
             "python stock_issues_handler.py morning-summary"
+    fi
+
+    # v2.67.152 Shipping margin monitor. Every 30 min, scan
+    # ShipStation shipments for margin events outside ±5% of cost
+    # (with a $5 floor) and post to #shipping-issues. Gated on
+    # SLACK_SHIPPING_ISSUES_CHANNEL_ID — silent skip if unset.
+    seconds_since_ship_margin=$(( now_epoch - last_ship_margin_epoch ))
+    if [ "$seconds_since_ship_margin" -ge 1800 ] \
+            && [ -n "${SLACK_SHIPPING_ISSUES_CHANNEL_ID:-}" ]; then
+        last_ship_margin_epoch=$(date -u +%s)
+        _run_bg "shipping_margin_monitor" \
+            "python shipping_margin_monitor.py daily"
     fi
 
     # v2.67.140 Back-in-stock arrival notifications — when a PO is

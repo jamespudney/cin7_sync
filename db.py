@@ -924,6 +924,38 @@ CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_sku
 CREATE INDEX IF NOT EXISTS idx_ad_camp_sku_family
     ON ad_campaign_skus(family);
 
+-- v2.67.152 Shipping margin alerts. When a shipment's
+-- (customer-charge - actual-carrier-cost) is outside ±5% of cost
+-- (with a $5 floor to ignore cheap items), the bot posts to
+-- #shipping-issues asking the team to review. UNIQUE on
+-- shipment_id ensures one alert per shipment regardless of how
+-- many polling cycles re-scan it.
+CREATE TABLE IF NOT EXISTS shipping_margin_alerts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    shipment_id         TEXT NOT NULL,    -- ShipmentID / OrderNumber
+    order_number        TEXT,             -- INV-NNNN / SO-NNNN
+    customer            TEXT,
+    ship_date           TEXT,
+    customer_charge     REAL,
+    shipment_cost       REAL,
+    margin_amount       REAL,             -- charge - cost (signed)
+    margin_pct          REAL,             -- (charge-cost)/cost
+    direction           TEXT,             -- 'under' | 'over'
+    posted_channel      TEXT,
+    posted_ts           TEXT,
+    posted_at           TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    error_msg           TEXT,
+    status              TEXT NOT NULL DEFAULT 'open',
+                                              -- open | reviewed | resolved
+    reviewed_by         TEXT,
+    reviewed_at         TIMESTAMP,
+    review_note         TEXT,
+    UNIQUE(shipment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_shipping_alerts_open
+    ON shipping_margin_alerts(status, posted_at DESC)
+    WHERE status = 'open';
+
 -- v2.67.144 Stock issues tracker. When a query about stock
 -- accuracy / supply lands in #stock-issues-queries, the bot
 -- builds a structured intelligence block for the stock controller
@@ -1973,6 +2005,76 @@ def get_feed_status_summary() -> dict:
         out[status] = int(r["n"] or 0)
         out["total"] += out[status]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Shipping margin alerts (v2.67.152)
+# ---------------------------------------------------------------------------
+def has_shipping_margin_alert(shipment_id: str) -> bool:
+    """Idempotency check — UNIQUE constraint guarantees one row
+    per shipment but this avoids the round-trip on duplicates."""
+    if not shipment_id:
+        return False
+    with connect() as c:
+        r = c.execute(
+            "SELECT 1 FROM shipping_margin_alerts "
+            "WHERE shipment_id = ?", (shipment_id,)).fetchone()
+    return r is not None
+
+
+def record_shipping_margin_alert(*,
+                                          shipment_id: str,
+                                          order_number: Optional[str],
+                                          customer: Optional[str],
+                                          ship_date: Optional[str],
+                                          customer_charge: Optional[float],
+                                          shipment_cost: Optional[float],
+                                          margin_amount: Optional[float],
+                                          margin_pct: Optional[float],
+                                          direction: str,
+                                          posted_channel: Optional[str],
+                                          posted_ts: Optional[str],
+                                          error_msg: Optional[str] = None
+                                          ) -> None:
+    with connect() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO shipping_margin_alerts "
+            "(shipment_id, order_number, customer, ship_date, "
+            " customer_charge, shipment_cost, margin_amount, "
+            " margin_pct, direction, posted_channel, posted_ts, "
+            " error_msg) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (shipment_id, order_number, customer, ship_date,
+              customer_charge, shipment_cost, margin_amount,
+              margin_pct, direction, posted_channel, posted_ts,
+              error_msg))
+
+
+def list_open_shipping_margin_alerts(limit: int = 50) -> list:
+    with connect() as c:
+        rows = c.execute(
+            "SELECT id, shipment_id, order_number, customer, "
+            "       ship_date, customer_charge, shipment_cost, "
+            "       margin_amount, margin_pct, direction, "
+            "       posted_at, status "
+            "FROM shipping_margin_alerts "
+            "WHERE status = 'open' "
+            "ORDER BY ABS(margin_amount) DESC, posted_at DESC "
+            "LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_shipping_margin_alert(alert_id: int,
+                                          reviewed_by: str,
+                                          review_note: str) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE shipping_margin_alerts SET "
+            "  status = 'reviewed', "
+            "  reviewed_at = datetime('now'), "
+            "  reviewed_by = ?, review_note = ? "
+            "WHERE id = ?",
+            (reviewed_by, (review_note or "")[:300], alert_id))
 
 
 # ---------------------------------------------------------------------------
