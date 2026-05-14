@@ -4715,14 +4715,15 @@ DEFAULT_NEW_USER_ROLE = "sales"
 
 def get_user_by_name(display_name: str) -> Optional[sqlite3.Row]:
     """Look up a user profile by display_name (case-insensitive). Returns
-    None if no row matches. The unique UPPER-COLLATE-NOCASE index on
-    display_name guarantees at most one match."""
+    None if no row matches. v2.67.168 — LOWER() on both sides works
+    on SQLite and Postgres; the original `COLLATE NOCASE` is
+    SQLite-only and breaks on Postgres."""
     name = (display_name or "").strip()
     if not name:
         return None
     with connect() as c:
         return c.execute(
-            "SELECT * FROM users WHERE display_name = ? COLLATE NOCASE",
+            "SELECT * FROM users WHERE LOWER(display_name) = LOWER(?)",
             (name,),
         ).fetchone()
 
@@ -4730,11 +4731,12 @@ def get_user_by_name(display_name: str) -> Optional[sqlite3.Row]:
 def list_users(active_only: bool = True) -> List[sqlite3.Row]:
     """All users in the system, ordered by display_name. Set
     active_only=False to include soft-deactivated rows (rare — used by
-    the admin profile page)."""
+    the admin profile page). v2.67.168 — LOWER(col) ORDER BY works
+    on both backends; COLLATE NOCASE is SQLite-only."""
     sql = "SELECT * FROM users"
     if active_only:
         sql += " WHERE active = 1"
-    sql += " ORDER BY display_name COLLATE NOCASE"
+    sql += " ORDER BY LOWER(display_name)"
     with connect() as c:
         return c.execute(sql).fetchall()
 
@@ -4766,9 +4768,12 @@ def upsert_user(*,
     actor_eff = (actor or name).strip()
 
     with connect() as c:
+        # v2.67.168 — LOWER() works on both backends; COLLATE
+        # NOCASE is SQLite-only and Postgres has no equivalent
+        # built-in collation.
         existing = c.execute(
             "SELECT user_id FROM users "
-            "WHERE display_name = ? COLLATE NOCASE",
+            "WHERE LOWER(display_name) = LOWER(?)",
             (name,),
         ).fetchone()
         if existing:
