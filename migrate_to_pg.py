@@ -420,9 +420,16 @@ def main() -> int:
         log.error("SQLite source not found: %s", src_path)
         return 2
 
-    pg_url = os.environ.get("DATABASE_URL", "").strip()
+    # v2.67.164 — Accept either DATABASE_URL (the 12-factor
+    # convention) or INTERNAL_DATABASE_URL (the prefix Render
+    # uses when you save the internal URL with its dashboard
+    # label). DATABASE_URL wins if both are set.
+    pg_url = (os.environ.get("DATABASE_URL", "").strip()
+                or os.environ.get(
+                    "INTERNAL_DATABASE_URL", "").strip())
     if not pg_url and not args.dry_run:
-        log.error("DATABASE_URL not set — refusing to proceed.")
+        log.error("DATABASE_URL / INTERNAL_DATABASE_URL not set "
+                      "— refusing to proceed.")
         log.error("Set the Render Postgres internal URL and retry.")
         return 2
 

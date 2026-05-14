@@ -382,10 +382,17 @@ def connect() -> Iterator[Any]:
     interface is sqlite3-compatible in both cases so the rest of
     db.py is backend-agnostic."""
     if is_postgres():
-        url = os.environ.get("DATABASE_URL", "").strip()
+        # v2.67.164 — Accept either DATABASE_URL (12-factor
+        # convention) or INTERNAL_DATABASE_URL (Render's prefixed
+        # form when the env var was saved with its dashboard
+        # label).
+        url = (os.environ.get("DATABASE_URL", "").strip()
+                or os.environ.get(
+                    "INTERNAL_DATABASE_URL", "").strip())
         if not url:
             raise RuntimeError(
-                "DB_BACKEND=postgres but DATABASE_URL is not set")
+                "DB_BACKEND=postgres but neither DATABASE_URL "
+                "nor INTERNAL_DATABASE_URL is set")
         try:
             import psycopg
             from psycopg.rows import dict_row
