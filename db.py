@@ -2240,10 +2240,20 @@ def find_pending_back_in_stock_signals(
         or_terms.append(f"UPPER(sku) IN ({placeholders})")
         params.extend(s.upper() for s in skus)
     if families:
-        placeholders = ",".join("?" for _ in families)
-        or_terms.append(
-            f"UPPER(product_family) IN ({placeholders})")
-        params.extend(f.upper() for f in families)
+        # v2.67.161 — Whole-token LIKE match (instead of strict
+        # IN) so an arrival family like 'SLIM8' matches a stored
+        # subscription family like 'SLIM8 12V' or 'WHITE SLIM8'.
+        # We wrap the stored value in spaces and convert dashes
+        # to spaces so the LIKE pattern '% TOKEN %' captures
+        # the family as a whole word — 'SLIM80' won't match
+        # 'SLIM8'.
+        fam_terms = []
+        for f in families:
+            fam_terms.append(
+                "(' ' || UPPER(REPLACE(product_family, '-', "
+                "' ')) || ' ') LIKE ('% ' || ? || ' %')")
+            params.append(f.upper())
+        or_terms.append("(" + " OR ".join(fam_terms) + ")")
     parts.append("(" + " OR ".join(or_terms) + ")")
     sql = (
         "SELECT id, sku, product_family, customer_name, "

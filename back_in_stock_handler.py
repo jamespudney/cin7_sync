@@ -612,27 +612,64 @@ def _po_lines_received_recently(lookback_hours: int = 48
                 # family taxonomy — treating them as families
                 # breaks back-in-stock arrival matching and any
                 # other family-based filter.
-                n_skipped_rule = 0
+                #
+                # v2.67.161 — Flipped to a positive allowlist
+                # because purely-negative pattern matching kept
+                # missing variants (Note:, Mode:, ASSEMBLY
+                # REQUIRED, fullwidth colons, leading whitespace,
+                # etc.). Real families are short alphanumeric
+                # codes (SLIM8, ENOLED, ECT, PCB). The allowlist
+                # rejects anything that doesn't match that shape.
+                # Negative patterns kept as a defensive layer.
+                #
+                # Valid family pattern:
+                #   - 2-20 chars total
+                #   - Only A-Z, a-z, 0-9, hyphen, underscore
+                #   - Must contain at least one letter (pure
+                #     numbers like "100" aren't family codes)
+                _FAMILY_OK_RE = re.compile(
+                    r"^(?=[A-Za-z0-9_\-]{2,20}$)[A-Za-z0-9_\-]*"
+                    r"[A-Za-z][A-Za-z0-9_\-]*$")
+                # Negative patterns — caught BEFORE the positive
+                # check so we get accurate skip-reason logging.
+                _NEG_PREFIXES = (
+                    "rule:", "note:", "notes:", "mode:",
+                    "logic:", "auto-assembly:", "auto assembly:",
+                    "assembly:",
+                )
+                _NEG_SUBSTRINGS = (
+                    "| logic:", "| auto-assembly:", "| note:",
+                    "| mode:", "| assembly:",
+                )
+                n_skipped_neg = 0
+                n_skipped_shape = 0
                 for _, r in (products_df[[sku_col, fam_col]]
                               .dropna().iterrows()):
                     sku_u = str(r[sku_col]).strip().upper()
                     fam_v = str(r[fam_col]).strip()
                     if not sku_u or not fam_v:
                         continue
-                    # Sourcing-rule pattern detection. Real
-                    # families are short single-token codes like
-                    # 'SLIM8' or 'ENOLED'; rules are long
-                    # multi-bar narratives.
-                    if (fam_v.lower().startswith("rule:")
-                            or "| logic:" in fam_v.lower()
-                            or "| auto-assembly:" in fam_v.lower()
+                    fam_lower = fam_v.lower()
+                    # Defensive negative-pattern check first
+                    if (any(fam_lower.startswith(p)
+                              for p in _NEG_PREFIXES)
+                            or any(s in fam_lower
+                                    for s in _NEG_SUBSTRINGS)
                             or len(fam_v) > 60):
-                        n_skipped_rule += 1
+                        n_skipped_neg += 1
+                        continue
+                    # Positive allowlist — real families are
+                    # short alphanumeric codes only
+                    if not _FAMILY_OK_RE.match(fam_v):
+                        n_skipped_shape += 1
                         continue
                     family_by_sku[sku_u] = fam_v
-                log.info("Built family_by_sku map: %d entries "
-                          "(%d sourcing-rule strings skipped)",
-                          len(family_by_sku), n_skipped_rule)
+                log.info(
+                    "Built family_by_sku map: %d entries "
+                    "(%d neg-pattern skipped, %d shape-fail "
+                    "skipped)",
+                    len(family_by_sku),
+                    n_skipped_neg, n_skipped_shape)
             else:
                 log.warning("products CSV missing sku/family cols; "
                               "columns: %s",
