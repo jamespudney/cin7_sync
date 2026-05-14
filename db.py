@@ -2666,8 +2666,44 @@ def get_sku_ad_summary(sku: str, days: int = 30) -> dict:
 # Connection
 # ---------------------------------------------------------------------------
 
+# v2.67.163 — backend routing. By default this is a no-op pass-
+# through to the existing SQLite logic below. When DB_BACKEND=
+# 'postgres' is set on the Render service, db_dialect.connect()
+# returns a Postgres connection wrapper that rewrites SQLite-
+# flavored SQL on the fly so the rest of db.py needs no changes.
+import os as _os_for_backend  # noqa: E402
+
+def _backend_is_postgres() -> bool:
+    return (_os_for_backend.environ.get("DB_BACKEND", "sqlite")
+              .strip().lower() == "postgres")
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
+    # v2.67.163 — Postgres path delegates entirely to db_dialect
+    # so the SQLite path below stays unchanged. The dialect
+    # wrapper exposes the sqlite3-compatible interface db.py
+    # expects (.execute/.executemany/.executescript/.commit/
+    # row dict access/lastrowid).
+    if _backend_is_postgres():
+        from db_dialect import connect as _pg_connect
+        with _pg_connect() as conn:
+            # Schema + migrations work via executescript on the
+            # wrapper (which splits + rewrites each statement).
+            conn.executescript(_SCHEMA)
+            _migrate_ui_prefs_widths(conn)
+            _migrate_supplier_dropship(conn)
+            _migrate_supplier_stockout_recovery(conn)
+            _migrate_demand_signal_match_columns(conn)
+            _migrate_product_aliases_multi_target(conn)
+            _migrate_ad_campaign_skus_spend(conn)
+            _migrate_ad_campaigns_daily_drop_spend_notnull(conn)
+            _migrate_ad_campaign_skus_free_listings(conn)
+            _migrate_po_dispatch_reminders_escalation(conn)
+            yield conn
+        return
+
+    # SQLite path — unchanged from prior versions.
     # v2.67.111 — 30s timeout (up from 5s) for write-lock contention
     # from the many concurrent sync writers we now run.
     conn = sqlite3.connect(DB_PATH, isolation_level=None,
