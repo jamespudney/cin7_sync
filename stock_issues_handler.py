@@ -348,6 +348,37 @@ def _sku_intel(sku: str, sale_lines: pd.DataFrame) -> dict:
             out["trend"] = sig.get("trend_flag")
     except Exception:
         pass
+
+    # v2.67.182 — Parent-SKU fallback for child variants. Per-foot
+    # cuts and other child SKUs (e.g. LED-Z1V-…-100, the 100ft cut
+    # of a master roll) often have no bin / OnHand of their own
+    # because warehouse stock is held on the master. When the
+    # child lookup returns nothing useful, resolve the parent via
+    # CIN7 BOM and inherit its signals. The parent_sku field is
+    # surfaced to the composer so the reply can flag the
+    # provenance ("via parent LED-…-100M").
+    needs_parent_fallback = (
+        out.get("bin") in (None, "", "?")
+        or out.get("on_hand") is None)
+    if needs_parent_fallback:
+        try:
+            from bom_lookup import parent_sku as _bom_parent
+            parent = _bom_parent(sku)
+            if parent and parent.upper() != sku:
+                from bot_engine_lookup import lookup_sku_signals
+                sig_p = lookup_sku_signals(parent)
+                if sig_p:
+                    out["parent_sku"] = parent
+                    if out.get("on_hand") is None:
+                        out["on_hand"] = sig_p.get("stock")
+                    if out.get("bin") in (None, "", "?"):
+                        out["bin"] = sig_p.get("bin")
+                    if not out.get("abc"):
+                        out["abc"] = sig_p.get("abc")
+                    if not out.get("trend"):
+                        out["trend"] = sig_p.get("trend_flag")
+        except Exception:
+            pass
     # Open SOs allocated against this SKU (count from sale_lines)
     if sale_lines is not None and not sale_lines.empty:
         sku_col = next(
@@ -386,12 +417,20 @@ def _sku_intel(sku: str, sale_lines: pd.DataFrame) -> dict:
                 out["allocated"] = total_alloc
                 out["open_sos"] = sorted(so_qty.items())[:5]
     # Next incoming PO via po_dispatch_reminder helpers.
+    # v2.67.182 — Also check the parent SKU when the child has
+    # nothing on order. Master rolls are what suppliers actually
+    # ship; the cut SKU never has its own PO.
+    skus_to_check = [sku]
+    if out.get("parent_sku"):
+        skus_to_check.append(str(out["parent_sku"]).upper())
     try:
         from po_dispatch_reminder import _load_purchases_and_lines
         purchases, lines = _load_purchases_and_lines()
         if lines is not None and not lines.empty:
             if "SKU" in lines.columns:
-                m = lines[lines["SKU"].astype(str).str.upper() == sku]
+                m = lines[
+                    lines["SKU"].astype(str).str.upper()
+                    .isin(skus_to_check)]
                 if "Status" in m.columns:
                     sc = (m["Status"].fillna("").astype(str)
                             .str.upper())
@@ -444,6 +483,15 @@ def _compose_intelligence_block(items: List[dict],
         if item.get("is_dropship"):
             head += "  📦 *DROPSHIP*"
         lines.append(head)
+        # v2.67.182 — surface parent-SKU provenance when the child
+        # has no warehouse data of its own and we resolved to the
+        # master roll. Helps the stock controller know the figures
+        # below are about the master, not the cut.
+        parent_sku = item.get("parent_sku")
+        if parent_sku:
+            lines.append(
+                f"  ↳ _stock/bin shown for master roll "
+                f"`{parent_sku}` (child is cut from it)_")
         parts = []
         # v2.67.175 — always include bin (per James). For warehouse
         # items: show the bin, or `Bin: ?` if the engine lookup
@@ -610,9 +658,15 @@ def _compose_querier_reply(items: List[dict],
         # v2.67.175 — bin always present in the brief snapshot
         # so the warehouse can verify location at a glance.
         # `?` flags 'engine didn't find one — check CIN7'.
+        # v2.67.182 — append parent-SKU note when the child's
+        # bin/stock came from the master roll.
         bin_v = item.get("bin") or "?"
+        parent_marker = ""
+        if item.get("parent_sku"):
+            parent_marker = (
+                f" _(via master `{item['parent_sku']}`)_")
         bit = (f"{bit_prefix} `{sku}` — Bin *{bin_v}* · "
-                f"OnHand {oh}")
+                f"OnHand {oh}{parent_marker}")
         if req is not None:
             try:
                 bit += f", needs {int(req)}"
