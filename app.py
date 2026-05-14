@@ -14379,11 +14379,20 @@ elif page == "Ad-Umpire":
         camp_df = camp_df.sort_values(
             _sort_key, ascending=_sort_asc, na_position="last")
 
-        # Format for display
+        # Format for display.
+        # v2.67.177 — pd.to_numeric(..., errors='coerce') because
+        # the computed ROAS/inflation columns introduce pd.NA via
+        # the `.replace(0, pd.NA)` divisor guard above. pd.NA
+        # doesn't support __round__, so .round() crashes with
+        # "TypeError: type NAType doesn't define __round__".
+        # to_numeric converts pd.NA → NaN (float64 NaN, which
+        # .round() handles natively).
         for _c in ("spend", "ga4_revenue", "platform_revenue"):
-            camp_df[_c] = camp_df[_c].round(2)
+            camp_df[_c] = pd.to_numeric(
+                camp_df[_c], errors="coerce").round(2)
         for _c in ("ga4_roas", "platform_roas", "inflation"):
-            camp_df[_c] = camp_df[_c].round(2)
+            camp_df[_c] = pd.to_numeric(
+                camp_df[_c], errors="coerce").round(2)
 
         st.dataframe(camp_df, use_container_width=True,
                        hide_index=True)
