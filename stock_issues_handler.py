@@ -445,8 +445,13 @@ def _compose_intelligence_block(items: List[dict],
             head += "  📦 *DROPSHIP*"
         lines.append(head)
         parts = []
-        if item.get("bin"):
-            parts.append(f"Bin {item['bin']}")
+        # v2.67.175 — always include bin (per James). For warehouse
+        # items: show the bin, or `Bin: ?` if the engine lookup
+        # didn't find one (so the controller sees we tried).
+        # Dropship items skip bin since they're never warehoused.
+        if not item.get("is_dropship"):
+            bin_v = item.get("bin")
+            parts.append(f"Bin {bin_v}" if bin_v else "Bin: *?*")
         if item.get("abc"):
             parts.append(f"{item['abc']}-class")
         if item.get("trend"):
@@ -602,7 +607,12 @@ def _compose_querier_reply(items: List[dict],
             "✅" if status == "yes"
             else "🟥" if status == "no"
             else "❔")
-        bit = f"{bit_prefix} `{sku}` — OnHand {oh}"
+        # v2.67.175 — bin always present in the brief snapshot
+        # so the warehouse can verify location at a glance.
+        # `?` flags 'engine didn't find one — check CIN7'.
+        bin_v = item.get("bin") or "?"
+        bit = (f"{bit_prefix} `{sku}` — Bin *{bin_v}* · "
+                f"OnHand {oh}")
         if req is not None:
             try:
                 bit += f", needs {int(req)}"
