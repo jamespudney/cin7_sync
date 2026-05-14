@@ -1,27 +1,27 @@
-"""dropship_tracking_handler.py (v2.67.153)
+"""dropship_tracking_handler.py (v2.67.159)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
 Slack channel via Gmail → Slack Email-app, match to the
-corresponding CIN7 sale, and post a confirmation reply with a
-direct link to the CIN7 sale's ship tab.
+corresponding CIN7 sale, AUTO-WRITE the tracking into the sale
+via the CIN7 PUT /sale API, and post a confirmation reply.
 
-In the current iteration the bot:
+Flow:
   1. Detects the email message in the configured channel
   2. Parses tracking number, ship-to name+address, carrier
      service, weight from the email body (Slack-Email puts the
      plaintext in `files[0].plain_text`)
   3. Matches to the most recent dropship sale with that ship-to
      name + address combo
-  4. Posts confirmation in the same thread: "Match: SO-XXXXX.
-     Click here to add tracking" — staff still pastes manually
-     for now
-  5. Compares supplier's actual weight to Shopify's quoted weight
+  4. v2.67.159 — Auto-writes the tracking into the matched sale's
+     Fulfilments[0].Ship.Lines via the CIN7 PUT /sale API.
+     Idempotent: re-runs detect that the tracking is already
+     present and skip the write. CIN7 then auto-pushes the
+     fulfillment to Shopify, replacing Cheran's manual paste step.
+  5. Posts confirmation in the same thread with the auto-write
+     outcome (✅ written / ℹ️ already present / ❌ failed).
+  6. Compares supplier's actual weight to Shopify's quoted weight
      and flags discrepancies > threshold
-
-A follow-up version (v2.67.154+) will add the CIN7 PUT call to
-write the tracking automatically once we've validated matching
-accuracy.
 
 Env vars:
   SLACK_BOT_TOKEN
@@ -48,6 +48,7 @@ import logging
 import os
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -427,11 +428,14 @@ def _cin7_sale_url(sale_id: str) -> str:
 
 
 def _compose_confirmation(parsed: dict, sale_match: dict,
-                                weight_alert: Optional[str]
+                                weight_alert: Optional[str],
+                                write_result: Optional[dict] = None
                                 ) -> str:
     """Build the Slack confirmation reply. Always shows the
     parsed tracking + matched SO + click-through. Adds the
-    weight-mismatch warning when applicable."""
+    weight-mismatch warning when applicable. Reflects the auto-
+    write outcome at the bottom so staff can tell at a glance
+    whether they need to do anything."""
     sale_no = sale_match.get("sale_number") or "?"
     sale_id = sale_match.get("sale_id") or ""
     cust = sale_match.get("customer") or ""
@@ -464,11 +468,31 @@ def _compose_confirmation(parsed: dict, sale_match: dict,
         lines.append("")
         lines.append(weight_alert)
 
+    # Auto-write outcome footer (v2.67.159)
     lines.append("")
-    lines.append(
-        f"_Next: open the sale and paste the tracking in CIN7's "
-        f"Ship tab — that auto-pushes fulfillment to Shopify. "
-        f"Auto-write coming in a future bot release._")
+    if write_result:
+        status = write_result.get("status")
+        if status == "written":
+            lines.append(
+                "✅ *Tracking auto-written to CIN7* — fulfillment "
+                "will push to Shopify automatically. No manual "
+                "step needed.")
+        elif status == "already_present":
+            lines.append(
+                "ℹ️ Tracking was already on this sale — no change "
+                "made.")
+        else:
+            detail = (write_result.get("detail")
+                        or "unknown failure")
+            lines.append(
+                f"❌ *Auto-write failed* — {detail}. Cheran: open "
+                f"the sale and paste the tracking manually in "
+                f"CIN7's Ship tab.")
+    else:
+        lines.append(
+            "_Auto-write skipped (no sale_id). Cheran: open the "
+            "sale and paste the tracking manually in CIN7's Ship "
+            "tab._")
     return "\n".join(lines)
 
 
@@ -498,6 +522,173 @@ def _weight_mismatch_text(supplier_lbs: float,
 
 
 # ---------------------------------------------------------------------------
+# Carrier mapping — UPS email service text → CIN7 Carrier field
+# ---------------------------------------------------------------------------
+# CIN7 expects carrier names with their trademark glyph + title
+# case (e.g. 'UPS® 2nd Day Air'). The UPS email uses ALL CAPS
+# without ®. Map to canonical CIN7 strings.
+_UPS_SERVICE_MAP = {
+    "UPS GROUND": "UPS® Ground",
+    "UPS 2ND DAY AIR": "UPS® 2nd Day Air",
+    "UPS 2ND DAY AIR A.M.": "UPS® 2nd Day Air A.M.",
+    "UPS 3 DAY SELECT": "UPS® 3 Day Select",
+    "UPS NEXT DAY AIR": "UPS® Next Day Air",
+    "UPS NEXT DAY AIR SAVER": "UPS® Next Day Air Saver",
+    "UPS NEXT DAY AIR EARLY": "UPS® Next Day Air® Early",
+    "UPS WORLDWIDE EXPRESS": "UPS Worldwide Express®",
+    "UPS WORLDWIDE EXPEDITED": "UPS Worldwide Expedited®",
+    "UPS STANDARD": "UPS Standard®",
+    "UPS SUREPOST": "UPS SurePost®",
+}
+
+
+def _map_carrier(ups_service: str) -> str:
+    """Map a parsed UPS service string to CIN7's canonical
+    carrier field value. Falls back to the original string if
+    no mapping is known (better than an empty Carrier)."""
+    if not ups_service:
+        return ""
+    key = ups_service.strip().upper()
+    return _UPS_SERVICE_MAP.get(key, ups_service.strip())
+
+
+# ---------------------------------------------------------------------------
+# CIN7 write — push tracking into the sale's Fulfilments[].Ship.Lines
+# ---------------------------------------------------------------------------
+def _tracking_already_on_sale(sale: dict,
+                                    tracking_number: str) -> bool:
+    """True if `tracking_number` is already in any Fulfilment's
+    Ship.Lines on this sale. Idempotency guard — without it the
+    bot would add a duplicate row on every retry."""
+    if not tracking_number:
+        return False
+    for fulf in (sale.get("Fulfilments") or []):
+        ship = (fulf.get("Ship") or {})
+        for line in (ship.get("Lines") or []):
+            existing = (line.get("TrackingNumber") or "").strip()
+            if existing == tracking_number.strip():
+                return True
+    return False
+
+
+def write_tracking_to_sale(sale_id: str,
+                                 tracking_number: str,
+                                 carrier: str,
+                                 boxes: int = 1,
+                                 shipment_date: Optional[str] = None,
+                                 tracking_url: str = ""
+                                 ) -> dict:
+    """v2.67.159 — Auto-write a new shipment row to a CIN7 sale's
+    Fulfilment.Ship.Lines via the API. CIN7 then auto-syncs
+    CombinedTrackingNumbers and pushes fulfillment to Shopify.
+
+    Steps:
+      1. GET the sale
+      2. Verify tracking isn't already on the sale (idempotent)
+      3. Append a new Lines entry to Fulfilments[0].Ship.Lines
+         with IsShipped=true so CIN7 marks the shipment shipped
+      4. PUT the modified sale back
+
+    Returns: {"status": "written"|"already_present"|"error",
+              "detail": str, "tracking": str}
+    """
+    if not sale_id or not tracking_number:
+        return {"status": "error",
+                  "detail": "missing sale_id or tracking_number"}
+
+    # Lazy import — heavy
+    try:
+        from cin7_sync import Cin7Client
+    except ImportError as exc:
+        return {"status": "error",
+                  "detail": f"cin7_sync import failed: {exc}"}
+    account_id = os.environ.get("CIN7_ACCOUNT_ID", "").strip()
+    app_key = os.environ.get("CIN7_APPLICATION_KEY", "").strip()
+    if not account_id or not app_key:
+        return {"status": "error",
+                  "detail": "CIN7 credentials missing"}
+    try:
+        client = Cin7Client(account_id, app_key)
+    except Exception as exc:
+        return {"status": "error",
+                  "detail": f"client init failed: {exc}"}
+
+    # 1. GET the sale
+    sale = client.get_sale(sale_id)
+    if not sale or not isinstance(sale, dict):
+        return {"status": "error",
+                  "detail": "sale GET returned empty"}
+    if not sale.get("ID"):
+        return {"status": "error",
+                  "detail": "sale GET response missing ID"}
+
+    # 2. Idempotency check
+    if _tracking_already_on_sale(sale, tracking_number):
+        return {
+            "status": "already_present",
+            "detail": (f"Tracking {tracking_number} already "
+                          f"on sale; no change."),
+            "tracking": tracking_number,
+        }
+
+    # 3. Construct the new Ship line + inject into Fulfilment[0]
+    new_line = {
+        "ShipmentDate": (shipment_date
+                          or datetime.now(timezone.utc)
+                              .strftime("%Y-%m-%dT%H:%M:%S")),
+        "Carrier": carrier or "UPS® Ground",
+        "Boxes": str(int(boxes) if boxes else 1),
+        "TrackingNumber": tracking_number,
+        "TrackingURL": tracking_url or "",
+        "IsShipped": True,
+    }
+    fulfilments = sale.get("Fulfilments") or []
+    if not fulfilments:
+        # No existing fulfilment — extremely rare for a
+        # dropship sale because CIN7 auto-creates one with the
+        # draft PO. Bail rather than guess.
+        return {
+            "status": "error",
+            "detail": ("Sale has no Fulfilments — can't add "
+                          "tracking. Investigate the sale state."),
+        }
+    # Append to the first fulfilment's Ship.Lines
+    first = fulfilments[0]
+    ship = first.setdefault("Ship", {})
+    lines = ship.setdefault("Lines", [])
+    lines.append(new_line)
+    # Make sure Ship.Status is at least AUTHORISED so CIN7
+    # processes the new line.
+    ship.setdefault("Status", "AUTHORISED")
+
+    # 4. PUT the modified sale back
+    try:
+        resp = client.update_sale(sale)
+    except Exception as exc:
+        return {"status": "error",
+                  "detail": f"PUT /sale failed: {exc}",
+                  "tracking": tracking_number}
+
+    # CIN7 returns various shapes on PUT. Treat presence of an
+    # error / non-2xx text as failure.
+    if isinstance(resp, dict) and resp.get("status"):
+        status_code = resp.get("status")
+        if isinstance(status_code, int) and status_code >= 400:
+            return {
+                "status": "error",
+                "detail": (f"CIN7 returned HTTP {status_code}: "
+                              f"{str(resp.get('text'))[:200]}"),
+                "tracking": tracking_number,
+            }
+    return {
+        "status": "written",
+        "detail": (f"Tracking {tracking_number} written to "
+                      f"sale {sale.get('OrderNumber') or sale_id}"),
+        "tracking": tracking_number,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Top-level handler
 # ---------------------------------------------------------------------------
 def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
@@ -522,6 +713,28 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
         return _compose_no_match(parsed), tools_used
     tools_used.append("matched_sale")
 
+    # v2.67.159 — Auto-write tracking to CIN7 sale. We do this
+    # BEFORE weight comparison so the Slack reply reflects the
+    # write outcome even if weight lookup errors out.
+    write_result: Optional[dict] = None
+    sale_id = sale_match.get("sale_id") or ""
+    if sale_id and parsed.get("tracking_number"):
+        try:
+            write_result = write_tracking_to_sale(
+                sale_id=sale_id,
+                tracking_number=parsed["tracking_number"],
+                carrier=_map_carrier(
+                    parsed.get("ups_service") or ""),
+                boxes=parsed.get("package_count") or 1,
+            )
+            tools_used.append(
+                f"write_tracking:{write_result.get('status')}")
+        except Exception as exc:
+            log.error("write_tracking_to_sale crashed: %s", exc)
+            write_result = {"status": "error",
+                              "detail": f"unexpected: {exc}"}
+            tools_used.append("write_tracking:crashed")
+
     # Weight check
     weight_alert = None
     try:
@@ -542,7 +755,8 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
         log.warning("Weight comparison error: %s", exc)
 
     reply = _compose_confirmation(parsed, sale_match,
-                                          weight_alert)
+                                          weight_alert,
+                                          write_result)
     return reply, tools_used
 
 

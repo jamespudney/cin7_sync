@@ -238,6 +238,31 @@ class Cin7Client:
         body = {"ID": product_id, **fields}
         return self.put("product", body)
 
+    def get_sale(self, sale_id: str
+                  ) -> Optional[Dict[str, Any]]:
+        """v2.67.159 — Fetch the full Sale object by ID (UUID).
+        Returns the parsed JSON or None on failure. Used by the
+        dropship-tracking auto-writer: GET the sale → modify
+        Fulfilments[0].Ship.Lines → PUT the modified sale."""
+        try:
+            return self.get(f"sale", params={"ID": sale_id})
+        except Exception as exc:
+            log.error("CIN7 get_sale(%s) failed: %s",
+                        sale_id, exc)
+            return None
+
+    def update_sale(self, sale_body: Dict[str, Any]
+                      ) -> Dict[str, Any]:
+        """v2.67.159 — PUT a full Sale object back to CIN7. The
+        body MUST include "ID"; otherwise CIN7 treats it as a
+        new sale (which fails validation). Used by the dropship
+        tracking writer to push tracking back to the sale's
+        Fulfilment.Ship.Lines."""
+        if not sale_body.get("ID"):
+            raise ValueError(
+                "update_sale: sale_body must include 'ID'")
+        return self.put("sale", sale_body)
+
 
     def paginate(
         self,
