@@ -261,6 +261,15 @@ class _PgCursor:
     def close(self):
         self._cur.close()
 
+    # v2.67.170 — iteration protocol. sqlite3 cursors are
+    # iterable: `for row in c.execute(sql):` walks the result.
+    # psycopg cursors are too, but the wrapper has to forward.
+    def __iter__(self):
+        return iter(self._cur)
+
+    def __next__(self):
+        return next(self._cur)
+
 
 class _PgConnection:
     """Wraps a psycopg connection to expose the sqlite3.Connection
