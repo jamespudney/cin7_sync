@@ -685,12 +685,29 @@ def _compute_slow_stock_holding(engine_df: pd.DataFrame,
         return {"sku_count": 0, "units_held": 0.0, "value_held": 0.0,
                 "filter_summary": "engine_df missing SKU column"}
     df = df[df["SKU"].astype(str).isin(slow_set)]
-    # parents/standalones only — drop child SKUs that roll up.
-    if "is_non_master_tube" in df.columns:
-        df = df[~df["is_non_master_tube"].fillna(False).astype(bool)]
     # OnHand > 0 only — nothing to clear if it's already gone.
     if "OnHand" in df.columns:
         df = df[_to_num(df["OnHand"]).fillna(0) > 0]
+    # v2.67.183 — drop CHILDREN that have NO direct OnHand. Their
+    # availability comes from BOM-deconstructing the parent, so
+    # counting their derived value here would double-count.
+    # KEEP children with OnHand>0 — that's stock someone booked
+    # directly against the child SKU (e.g. profile cut, end-cap
+    # pack). CIN7 fulfils child orders from direct child OnHand
+    # FIRST, then falls back to BOM deconstruction — so direct
+    # child stock is real, separate inventory with real value
+    # that belongs in the holding total.
+    #
+    # Previously: dropped ALL is_non_master_tube rows. That
+    # silently excluded directly-booked child stock from the
+    # slow-stock total, under-reporting tied-up capital.
+    if "is_non_master_tube" in df.columns:
+        non_master = df["is_non_master_tube"].fillna(False).astype(bool)
+        on_hand_n = (_to_num(df["OnHand"]).fillna(0)
+                          if "OnHand" in df.columns
+                          else pd.Series(0, index=df.index))
+        # Drop only the non-masters WITHOUT direct stock.
+        df = df[~(non_master & (on_hand_n <= 0))]
     units_held = (float(_to_num(df["OnHand"]).fillna(0).sum())
                    if "OnHand" in df.columns else 0.0)
     value_held = (float(_to_num(df["OnHandValue"]).fillna(0).sum())
@@ -699,8 +716,9 @@ def _compute_slow_stock_holding(engine_df: pd.DataFrame,
         "sku_count": int(len(df)),
         "units_held": units_held,
         "value_held": value_held,
-        "filter_summary": "parents/standalones, OnHand>0, "
-                            "engine OnHandValue cost chain",
+        "filter_summary": "parents/standalones + children with "
+                            "direct OnHand>0; engine OnHandValue "
+                            "cost chain",
     }
 
 
