@@ -304,9 +304,26 @@ class _PgConnection:
         """v2.67.171 — DB-API cursor() factory. pandas's
         read_sql_query and similar libs call `conn.cursor()` and
         then `cur.execute(sql, params)` rather than going through
-        the convenience `conn.execute()` shorthand. Without this,
-        pandas would raise AttributeError on the wrapper."""
-        return _PgCursor(self._conn.cursor())
+        the convenience `conn.execute()` shorthand.
+
+        v2.67.176 — Use tuple_row factory here (instead of the
+        connection-level dict_row). pandas's DataFrame.from_records
+        treats each row as a positional sequence; iterating dict
+        rows yields KEYS instead of values, which corrupts every
+        column with the column-name string repeated N times
+        (caused ValueError: could not convert string to float:
+        'spendspendspend…' in Ad-Umpire).
+
+        db.py callers go through _PgConnection.execute() which
+        keeps the connection's default dict_row — those callers
+        rely on row["col"] dict-style access so we don't touch
+        them."""
+        try:
+            from psycopg.rows import tuple_row
+            return _PgCursor(
+                self._conn.cursor(row_factory=tuple_row))
+        except ImportError:
+            return _PgCursor(self._conn.cursor())
 
     def executescript(self, multi_sql: str) -> None:
         """psycopg has no executescript. Split on `;` (naïvely —
