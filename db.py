@@ -2384,13 +2384,25 @@ def record_po_dispatch_reminder(po_number: str,
     place so we don't retry indefinitely; admins can manually
     clear it if they want a retry."""
     so_csv = ",".join(s.strip() for s in so_numbers if s)
+    # v2.67.166 — ON CONFLICT DO UPDATE works on both SQLite
+    # (>= 3.24) and Postgres. Previous INSERT OR REPLACE was
+    # SQLite-only and crashed on the Postgres backend.
     with connect() as c:
         c.execute(
-            "INSERT OR REPLACE INTO po_dispatch_reminders "
+            "INSERT INTO po_dispatch_reminders "
             "(po_number, supplier, received_status, so_numbers, "
             " n_sos, posted_channel, posted_ts, error_msg, "
             " posted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(po_number) DO UPDATE SET "
+            "  supplier=excluded.supplier, "
+            "  received_status=excluded.received_status, "
+            "  so_numbers=excluded.so_numbers, "
+            "  n_sos=excluded.n_sos, "
+            "  posted_channel=excluded.posted_channel, "
+            "  posted_ts=excluded.posted_ts, "
+            "  error_msg=excluded.error_msg, "
+            "  posted_at=excluded.posted_at",
             (po_number, supplier, received_status, so_csv,
               len(so_numbers), posted_channel, posted_ts, error_msg))
 

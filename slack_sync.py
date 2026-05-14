@@ -604,13 +604,19 @@ def _ingest_channel(session: requests.Session,
                           channel_id)
             break
 
-    # Update cursor.
+    # Update cursor. v2.67.166 — ON CONFLICT DO UPDATE works on
+    # both SQLite (>=3.24) and Postgres; the previous INSERT OR
+    # REPLACE was SQLite-only.
     channel_name = _resolve_channel(session, channel_id)
     with db.connect() as c:
         c.execute(
-            "INSERT OR REPLACE INTO slack_channel_cursors "
+            "INSERT INTO slack_channel_cursors "
             "(channel_id, channel_name, last_ts, last_pulled_at) "
-            "VALUES (?, ?, ?, datetime('now'))",
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(channel_id) DO UPDATE SET "
+            "  channel_name=excluded.channel_name, "
+            "  last_ts=excluded.last_ts, "
+            "  last_pulled_at=excluded.last_pulled_at",
             (channel_id, channel_name, highest_ts))
     return new_count
 
