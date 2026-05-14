@@ -5629,14 +5629,22 @@ def record_dormancy_snapshot(dormant_skus: set,
                     -- Re-dormancy clears any prior auto-lift so the
                     -- warning re-engages. Manual dismissals stay
                     -- (buyer's intent persists across re-dormancy).
+                    -- v2.67.173 — qualify references to the
+                    -- existing row's columns with the table name;
+                    -- Postgres rejects unqualified ones in
+                    -- ON CONFLICT DO UPDATE because both the
+                    -- target row and EXCLUDED share the same
+                    -- column names → ambiguous.
                     warning_lifted_at = CASE
-                        WHEN warning_lift_reason = 'manual_dismiss'
-                        THEN warning_lifted_at
+                        WHEN sku_dormancy_log.warning_lift_reason
+                             = 'manual_dismiss'
+                        THEN sku_dormancy_log.warning_lifted_at
                         ELSE NULL
                     END,
                     warning_lift_reason = CASE
-                        WHEN warning_lift_reason = 'manual_dismiss'
-                        THEN warning_lift_reason
+                        WHEN sku_dormancy_log.warning_lift_reason
+                             = 'manual_dismiss'
+                        THEN sku_dormancy_log.warning_lift_reason
                         ELSE NULL
                     END
                 """,

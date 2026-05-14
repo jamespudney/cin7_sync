@@ -208,6 +208,65 @@ def _is_dropship_sku(sku: str) -> bool:
     return sku.upper() in _load_dropship_sku_set()
 
 
+# v2.67.173 — Stock-item SKU index. Per-process cache built lazily
+# from products_*.csv. CIN7 products have a Type column with
+# values 'Stock' or 'Service'. Non-stock items (services like
+# 'INSTALL', 'CONSULTING', 'FREIGHT', shipping pseudo-SKUs etc.)
+# should not trigger stock-issue intelligence in the
+# #stock-issues-queries channel — those messages should be
+# silently skipped.
+_STOCK_ITEM_SKU_SET_CACHE: Optional[set] = None
+
+
+def _load_stock_item_sku_set() -> set:
+    """Return the set of SKUs flagged as Type='Stock' in CIN7.
+    Anything not in this set is a service / non-stock product
+    and shouldn't generate a stock-queries response."""
+    global _STOCK_ITEM_SKU_SET_CACHE
+    if _STOCK_ITEM_SKU_SET_CACHE is not None:
+        return _STOCK_ITEM_SKU_SET_CACHE
+    out: set = set()
+    try:
+        from po_dispatch_reminder import _find_latest_csv
+        path = _find_latest_csv("products_*.csv")
+        if not path:
+            _STOCK_ITEM_SKU_SET_CACHE = out
+            return out
+        products_df = pd.read_csv(path)
+        type_col = next(
+            (c for c in ("Type", "ProductType")
+              if c in products_df.columns), None)
+        sku_col = next(
+            (c for c in ("SKU", "Sku", "ProductCode")
+              if c in products_df.columns), None)
+        if type_col and sku_col:
+            type_u = (products_df[type_col].fillna("")
+                          .astype(str).str.upper().str.strip())
+            mask = type_u == "STOCK"
+            for sku in products_df[mask][sku_col].dropna():
+                s = str(sku).strip().upper()
+                if s:
+                    out.add(s)
+        log.info("Loaded %d stock-item SKUs into cache", len(out))
+    except Exception as exc:
+        log.warning("Failed to load stock-item SKU set: %s", exc)
+    _STOCK_ITEM_SKU_SET_CACHE = out
+    return out
+
+
+def _is_stock_item(sku: str) -> bool:
+    """True if SKU is a CIN7 stock-type product. If the cache is
+    empty (products CSV missing, all loads failed), return True
+    so we don't silently drop every message — better to over-
+    respond than to disappear."""
+    if not sku:
+        return False
+    cache = _load_stock_item_sku_set()
+    if not cache:
+        return True  # fail-open: empty cache means CSV unavailable
+    return sku.upper() in cache
+
+
 def _is_pseudo_sku(sku: str) -> bool:
     if not sku:
         return True
@@ -695,6 +754,23 @@ def handle_stock_issue(msg: dict) -> Tuple[Optional[str], List[str]]:
     if not items:
         # We classified it but couldn't expand to any SKU
         # intelligence — log + skip.
+        return None, tools_used
+
+    # v2.67.173 — Stock-items-only filter for the
+    # #stock-issues-queries channel. Drop any SKU that isn't
+    # Type='Stock' in CIN7 (services, freight, install fees,
+    # consulting line items, etc.). If nothing stock-typed
+    # remains after the filter, silently skip the message
+    # entirely — the channel is for warehouse-stock queries.
+    n_before = len(items)
+    items = [i for i in items if _is_stock_item(i.get("sku") or "")]
+    n_after = len(items)
+    if n_after < n_before:
+        tools_used.append(
+            f"stock_item_filter:{n_before}->{n_after}")
+    if not items:
+        log.info("All %d SKUs in stock-query message were "
+                  "non-stock items — skipping reply.", n_before)
         return None, tools_used
 
     # Persist the issue (idempotent on channel/ts).
