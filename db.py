@@ -1905,13 +1905,20 @@ def upsert_ad_campaign_daily(row: dict) -> int:
               "conv_platform", "conv_ga4",
               "revenue_platform", "revenue_ga4", "captured_at")
     values = [row.get(c) for c in cols]
+    # v2.67.172 — Qualify the existing-row column with the table
+    # name (ad_campaigns_daily.col). Postgres rejects an
+    # unqualified column reference in DO UPDATE SET because both
+    # EXCLUDED.col and the target row's col share the same name
+    # → ambiguous. SQLite tolerated it. Works in both backends
+    # when qualified.
     sql = (
         f"INSERT INTO ad_campaigns_daily ({','.join(cols)}) "
         f"VALUES ({','.join('?' for _ in cols)}) "
         f"ON CONFLICT(platform, campaign_id, date) DO UPDATE SET "
-        + ",".join(f"{c}=COALESCE(excluded.{c}, {c})"
-                     for c in cols
-                     if c not in ("platform", "campaign_id", "date")))
+        + ",".join(
+            f"{c}=COALESCE(excluded.{c}, ad_campaigns_daily.{c})"
+            for c in cols
+            if c not in ("platform", "campaign_id", "date")))
     with connect() as c:
         cur = c.execute(sql, values)
         return int(cur.lastrowid or 0)
@@ -1941,15 +1948,18 @@ def upsert_ad_campaign_sku(row: dict) -> int:
               "free_listing_clicks", "free_listing_impressions",
               "captured_at")
     values = [row.get(c) for c in cols]
+    # v2.67.172 — see upsert_ad_campaign_daily; same Postgres
+    # ambiguity rule applies here.
     sql = (
         f"INSERT INTO ad_campaign_skus ({','.join(cols)}) "
         f"VALUES ({','.join('?' for _ in cols)}) "
         f"ON CONFLICT(platform, campaign_id, date, sku) "
         f"DO UPDATE SET "
-        + ",".join(f"{c}=COALESCE(excluded.{c}, {c})"
-                     for c in cols
-                     if c not in ("platform", "campaign_id",
-                                    "date", "sku")))
+        + ",".join(
+            f"{c}=COALESCE(excluded.{c}, ad_campaign_skus.{c})"
+            for c in cols
+            if c not in ("platform", "campaign_id",
+                            "date", "sku")))
     with connect() as c:
         cur = c.execute(sql, values)
         return int(cur.lastrowid or 0)
