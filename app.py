@@ -14241,38 +14241,38 @@ elif page == "Ad-Umpire":
     @st.cache_data(ttl=300)
     def _load_ad_campaigns(start_iso: str, end_iso: str
                               ) -> pd.DataFrame:
-        # v2.67.106 — local imports so the function works even
-        # when Streamlit's cache decorator pickles and rehydrates
-        # it across reruns (the enclosing elif block's import
-        # may not be in scope at that point).
-        import sqlite3 as _sq3
-        from data_paths import DB_PATH as _DB_AD
-        conn = _sq3.connect(_DB_AD, timeout=5)
+        # v2.67.171 — Route through db.connect() so this reads
+        # from the shared Postgres instance when DB_BACKEND=
+        # postgres, not the now-stale per-service SQLite file.
+        # Previous version opened SQLite directly via sqlite3.
+        # connect(DB_PATH), which after the Postgres cutover
+        # would return a frozen snapshot from before the
+        # migration (empty ad_campaigns_daily on the worker, or
+        # the pre-cutover view on web — neither reflects current
+        # state).
+        import db as _db_ad
         try:
-            return pd.read_sql_query(
-                "SELECT * FROM ad_campaigns_daily "
-                "WHERE date >= ? AND date <= ? "
-                "ORDER BY date ASC, platform, campaign_id",
-                conn, params=(start_iso, end_iso))
+            with _db_ad.connect() as conn:
+                return pd.read_sql_query(
+                    "SELECT * FROM ad_campaigns_daily "
+                    "WHERE date >= ? AND date <= ? "
+                    "ORDER BY date ASC, platform, campaign_id",
+                    conn, params=(start_iso, end_iso))
         except Exception:
             return pd.DataFrame()
-        finally:
-            conn.close()
 
     @st.cache_data(ttl=300)
     def _load_ad_skus(start_iso: str, end_iso: str) -> pd.DataFrame:
-        import sqlite3 as _sq3
-        from data_paths import DB_PATH as _DB_AD
-        conn = _sq3.connect(_DB_AD, timeout=5)
+        # v2.67.171 — see _load_ad_campaigns rationale.
+        import db as _db_ad
         try:
-            return pd.read_sql_query(
-                "SELECT * FROM ad_campaign_skus "
-                "WHERE date >= ? AND date <= ?",
-                conn, params=(start_iso, end_iso))
+            with _db_ad.connect() as conn:
+                return pd.read_sql_query(
+                    "SELECT * FROM ad_campaign_skus "
+                    "WHERE date >= ? AND date <= ?",
+                    conn, params=(start_iso, end_iso))
         except Exception:
             return pd.DataFrame()
-        finally:
-            conn.close()
 
     ad_df = _load_ad_campaigns(_ad_start.isoformat(),
                                   _ad_end.isoformat())

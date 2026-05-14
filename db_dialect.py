@@ -300,6 +300,14 @@ class _PgConnection:
         cur.executemany(sql, rows)
         return cur
 
+    def cursor(self) -> _PgCursor:
+        """v2.67.171 — DB-API cursor() factory. pandas's
+        read_sql_query and similar libs call `conn.cursor()` and
+        then `cur.execute(sql, params)` rather than going through
+        the convenience `conn.execute()` shorthand. Without this,
+        pandas would raise AttributeError on the wrapper."""
+        return _PgCursor(self._conn.cursor())
+
     def executescript(self, multi_sql: str) -> None:
         """psycopg has no executescript. Split on `;` (naïvely —
         fine for our schema which has no procedural blocks) and
