@@ -1,4 +1,4 @@
-"""intelligence_glossary.py (v2.67.70)
+"""intelligence_glossary.py (v2.67.180)
 =========================================
 
 Single source of truth for the engine's intelligence rules.
@@ -26,6 +26,31 @@ Usage:
 When updating: edit ONLY this file. Both services pick up the
 change at next deploy / restart. Don't copy text into other
 files.
+
+====================================================================
+KEEP-THIS-UPDATED RULE (v2.67.180)
+====================================================================
+
+This glossary is shown to:
+  1. Every staff user on the Ordering / Slow Movers / Overview
+     pages (via the in-page expander).
+  2. Claude (the AI Assistant + the Slack bot) on EVERY query as
+     part of the system prompt — it's how the AI knows what
+     'A-class grace' or 'EffectiveUnitCost' actually mean.
+
+So if you ship a commit that:
+  • Adds, renames, or changes the meaning of an engine column
+    (e.g. new `excess_units` definition, new `is_dormant` rule)
+  • Adds a new engine-derived metric the user will see
+    (e.g. v2.67.178's "Slow Stock Cleared")
+  • Changes a threshold or grace rule (e.g. A-class grace days)
+  • Adds a new fly-wheel signal (📦, 🪫, etc.)
+
+…YOU MUST update GLOSSARY_MARKDOWN below in the same commit.
+
+Don't worry about over-documenting. The cost of out-of-date
+glossary is the bot gives wrong-but-confident answers to staff
+and customers. The cost of an extra paragraph is nothing.
 """
 
 GLOSSARY_MARKDOWN = """
@@ -339,4 +364,105 @@ drops:
   refreshed every NearSync (15-min). When `get_incoming_stock`
   returns no PO lines but `OnOrder>0`, the tool flags this as a
   data gap rather than claiming "no PO exists".
+
+#### Cost basis chain — how the engine values stock (v2.67.180)
+The engine values inventory at `OnHand × EffectiveUnitCost`.
+EffectiveUnitCost is resolved per SKU via a fall-back chain — the
+first hit wins:
+
+1. **Direct CIN7 cost** — CIN7's FIFO `AverageCost` if it has
+   shipped enough product to publish one. Most accurate.
+2. **Family-median fallback** — median AverageCost across all
+   SKUs in the same product family. Used when direct is missing
+   but siblings have cost data.
+3. **Category-median fallback** — median across the broader
+   category. Wider net, less precise.
+4. **Unknown** — no cost basis available. Contributes $0 to
+   Optimum and excess calculations (rather than blowing them up
+   with a phantom valuation).
+
+`CostBasisDetail` column on engine_df marks which path was used
+per SKU. The Ordering page surfaces a "Cost basis coverage"
+caption showing how many SKUs hit each tier — the more 'direct',
+the more trustworthy the totals.
+
+#### OnHandValue (engine column)
+`OnHand × EffectiveUnitCost` per SKU. The engine's per-row
+inventory valuation. Used by every page that sums
+"slow-stock value", "excess value", etc., so the figures tie
+out. Distinct from CIN7's headline `StockOnHand` value which
+uses CIN7's own FIFO (the Overview headline tile reports both
+and a delta caption when they diverge significantly).
+
+#### TargetValue (engine column)
+`target_stock × EffectiveUnitCost` per SKU. The dollar value of
+the engine's recommended on-hand level. Summed across masters,
+this is the **Optimum stock value** tile on the Ordering page
+and the target the glide-path projects toward (v2.67.178 — no
+more hardcoded $600k constant).
+
+#### Optimum stock value (the glide-path target, v2.67.178)
+**`sum(target_stock × EffectiveUnitCost across masters only)`**
+
+What working capital SHOULD be tied up at, per the engine. The
+Ordering page's "Optimum" tile + glide-path strip below the
+tiles both source from here. If current stock > optimum, the
+glide path shows the gap + an **ETA** based on the trailing-90d
+slow-mover clearance rate (`gap / monthly_clearance`). If
+under, it just shows % of optimum so the buyer knows to keep
+ordering.
+
+The optimum is masters-only because non-master variants
+(per-foot cuts) roll their demand up to the master; counting
+them would double-count.
+
+#### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
+Two new rows in Monthly Metrics → Inventory:
+
+- **Slow Stock Cleared ($)** — sum of `Quantity × AverageCost`
+  on sale_lines for SKUs in the current dormancy_warnings set,
+  grouped by month. The **flow** metric: how much slow stock the
+  team moved each month. Going UP = team is winning. Note: uses
+  the current dormancy set (snapshot), not the
+  was-dormant-at-that-time set — good enough for trend, slight
+  imprecision for very old months.
+- **Slow Stock Value (EOM)** — month-end value of slow stock on
+  shelf, sourced from `slow_mover_value_snapshots` (engine
+  writes daily). Current month uses the live
+  `_compute_slow_stock_holding`. The **state** metric: how much
+  slow stock is left to clear. Going DOWN = team is winning.
+  Sparse for months before v2.67.36 (when the writer was added)
+  — that's expected; the row fills out forward.
+
+Both rows tie to the same dormancy set the Slow Movers page
+uses, so the figures across pages stay aligned.
+
+#### is_non_master_tube (engine column)
+True for SKUs that are children of a bulk-roll master (per-foot
+cuts, BOM derivatives). Their stock and demand roll up to the
+master. Most calculations filter `~is_non_master_tube` so they
+operate on parents + standalones only — avoids double-counting.
+You'll see this filter on the Ordering page (parents_only
+toggle), the Slow Movers page (auto-applied unless 'show all
+flagged' is on), and the Optimum / Excess / Dead-stock math on
+the headline tiles.
+
+#### Engine-snapshot writers (provenance, v2.67.36+)
+The engine writes two persistence tables during each recompute:
+- **`sku_dormancy_log`** — one row per SKU that's ever been
+  dormant. Tracks first_seen_dormant_at, last_seen_dormant_at,
+  recovered_at, warning_lifted_at, warning_lift_reason. Powers
+  the once-slow warning + auto-lift + manual dismiss flow.
+- **`slow_mover_value_snapshots`** — one row per
+  snapshot_date with (skus_count, units_on_hand, value_on_shelf)
+  across the filtered slow-stock universe. Powers the
+  "Slow Stock Value (EOM)" Monthly Metrics row and the MoM
+  caption on the Overview slow-mover tile.
+
+Both tables are write-through from the engine — the dashboard
+runs the engine (typically on Ordering or Overview page load),
+the engine writes these tables, and downstream pages read from
+them. After the v2.67.163 Postgres cutover both live in the
+shared Postgres DB so the worker (Slack bot) and web service
+read the same provenance.
 """
