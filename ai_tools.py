@@ -3093,8 +3093,36 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                       "cancelled. Per spec we don't return those."),
         }
 
+    # v2.67.181 — build a SKU → OnHand map from engine_df once, so
+    # we can enrich each line with current stock on the shelf.
+    # Lets the AI answer "are these incoming on top of what we
+    # already have?" without a second tool call.
+    _on_hand_map: dict = {}
+    if engine_df is not None and not engine_df.empty:
+        if ("SKU" in engine_df.columns
+                and "OnHand" in engine_df.columns):
+            _on_hand_map = {
+                str(k).upper(): float(v or 0)
+                for k, v in engine_df.set_index(
+                    "SKU")["OnHand"].dropna().items()}
+
     out_rows = []
     for _, r in df.head(limit).iterrows():
+        # v2.67.181 — line dollar value (Quantity × Price OR the
+        # CIN7 Total field if it carries the post-discount/tax
+        # subtotal). Prefer Total when present and >0 (it's the
+        # canonical line value).
+        qty_n = pd.to_numeric(r.get("Quantity"), errors="coerce")
+        price_n = pd.to_numeric(r.get("Price"), errors="coerce")
+        total_n = pd.to_numeric(r.get("Total"), errors="coerce")
+        if pd.notna(total_n) and total_n > 0:
+            line_total = float(total_n)
+        elif pd.notna(qty_n) and pd.notna(price_n):
+            line_total = float(qty_n * price_n)
+        else:
+            line_total = None
+        sku_u = str(r.get("SKU") or "").upper()
+        on_hand_now = _on_hand_map.get(sku_u)
         rec = {
             "sku": r.get("SKU"),
             "name": r.get("Name"),
@@ -3103,10 +3131,28 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                 r.get("QuantityRemaining")
                 if "QuantityRemaining" in df.columns
                 else None),
+            # v2.67.181 — per-line dollar value so the AI can
+            # report "$3,702" rather than just unit counts.
+            "unit_price": (float(price_n)
+                              if pd.notna(price_n) else None),
+            "line_total_value": line_total,
+            "uom": (r.get("UOM")
+                       if "UOM" in df.columns else None),
+            # v2.67.181 — current OnHand for the same SKU. Helps
+            # the AI compose "75 incoming + 49 already on shelf
+            # = 124 total" style answers.
+            "on_hand_now": on_hand_now,
             "expected_date": (
                 str(r.get(date_col)) if (date_col
                                          and pd.notna(r.get(date_col)))
                 else "not available"),
+            # v2.67.181 — order_date so the AI can report
+            # "Ordered Apr 29" alongside the ETA.
+            "order_date": (
+                str(r.get("OrderDate"))
+                if "OrderDate" in df.columns
+                and pd.notna(r.get("OrderDate"))
+                else None),
             "supplier": r.get("Supplier"),
             "po_number": r.get("OrderNumber"),
             "status": r.get("Status"),
@@ -3161,11 +3207,97 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         }
         out_rows.append(_serialise_row(rec))
 
+    # v2.67.181 — supplier history. For each unique supplier in
+    # the open POs, find the most recent FULLY-RECEIVED PO and
+    # compute its lead time (received_date − order_date). Lets
+    # the AI add an "ETA expectation" line like "previous Reeves
+    # PO took 24 days; air freight on this one may be faster".
+    suppliers_in_result = {
+        str(r.get("supplier") or "").strip()
+        for r in out_rows
+        if r.get("supplier")}
+    supplier_history: dict = {}
+    if suppliers_in_result:
+        try:
+            pl_all = purchase_lines  # full window, not pre-filter
+            for supplier_name in suppliers_in_result:
+                if not supplier_name:
+                    continue
+                recv_mask = (
+                    pl_all["Supplier"].astype(str)
+                    == supplier_name)
+                if "Status" in pl_all.columns:
+                    recv_mask = recv_mask & (
+                        pl_all["Status"].astype(str)
+                        .str.upper().str.contains(
+                            "RECEIVED", na=False))
+                recv = pl_all[recv_mask]
+                if recv.empty:
+                    continue
+                # Best record per PO — most recent ReceivedDate
+                if ("ReceivedDate" not in recv.columns
+                        or "OrderDate" not in recv.columns):
+                    continue
+                _rec = recv.copy()
+                _rec["_rd"] = pd.to_datetime(
+                    _rec["ReceivedDate"], errors="coerce")
+                _rec["_od"] = pd.to_datetime(
+                    _rec["OrderDate"], errors="coerce")
+                _rec = _rec.dropna(subset=["_rd", "_od"])
+                if _rec.empty:
+                    continue
+                # Group by PO; one row per PO with first ordered +
+                # last received.
+                grp = (_rec.groupby("OrderNumber")
+                            .agg(order_date=("_od", "min"),
+                                  received_date=("_rd", "max"))
+                            .reset_index())
+                grp = grp.sort_values(
+                    "received_date", ascending=False).head(1)
+                if grp.empty:
+                    continue
+                row = grp.iloc[0]
+                lead_days = int(
+                    (row["received_date"]
+                      - row["order_date"]).days)
+                supplier_history[supplier_name] = {
+                    "previous_po": str(row["OrderNumber"]),
+                    "previous_ordered": row["order_date"]
+                        .strftime("%Y-%m-%d"),
+                    "previous_received": row["received_date"]
+                        .strftime("%Y-%m-%d"),
+                    "lead_time_days": lead_days,
+                }
+        except Exception:
+            # Supplier history is enrichment only — never block
+            # the main result on a lookup failure.
+            supplier_history = {}
+
+    # v2.67.181 — explicit formatting guidance so the AI surfaces
+    # the rich fields well (matches the quality bar Viktor sets).
+    formatting_guidance = (
+        "When composing the reply: (1) Lead with the PO header "
+        "(PO-NNNN, supplier, status, ordered date). (2) Format "
+        "each line as `<qty>× <friendly Name>` (NOT the raw SKU "
+        "code) `— $<line_total_value>`. (3) After the lines, "
+        "show current OnHand per SKU using `on_hand_now` so the "
+        "user sees what's already on the shelf. (4) If "
+        "`supplier_history` is present, add a sentence like "
+        "'Previous PO from <supplier> took ~<lead_time_days> "
+        "days, ordered <prev_ordered> → received "
+        "<prev_received>' so the user has an ETA reference. "
+        "(5) Be terse with internal notes (Memo/Note/Comments) — "
+        "show only the freight mode and any progress detail; "
+        "skip 'Draft', 'test', 'Generated by' style internal "
+        "metadata.")
+
     return {
         "matched": len(out_rows),
         "subject": sku or family,
         "date_field_used": date_col,
         "lines": out_rows,
+        "supplier_history": supplier_history or None,
+        "formatting_guidance": formatting_guidance,
         "note": (
             f"Showing first {limit} of potentially many open POs."
             if len(out_rows) == limit else None),
