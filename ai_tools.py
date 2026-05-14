@@ -699,6 +699,34 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        # v2.67.179 — Live CIN7 fallback when get_sale_order
+        # misses. Fixes the SO-56331-style case where a sale was
+        # just created but isn't in the 30-day cache yet.
+        "name": "get_sale_live",
+        "description": (
+            "Fetch a sale's line items LIVE from CIN7 via the "
+            "API (bypasses the 30-day local sync window). Use "
+            "this when get_sale_order returns matched=0 for a "
+            "recent order — the sale was likely created in the "
+            "last few hours and hasn't synced yet. Returns each "
+            "line's SKU, name, qty, current OnHand, and an "
+            "'available' yes/no flag for fulfillment checks. "
+            "Slower than get_sale_order (one CIN7 API call) so "
+            "ONLY call this when the cached lookup misses."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "order_number": {
+                    "type": "string",
+                    "description": (
+                        "Sale order number (e.g. SO-56331 or "
+                        "56331). Case-insensitive. Required."),
+                },
+            },
+            "required": ["order_number"],
+        },
+    },
+    {
         # v2.67.54 — ShipStation lookup. Lets the AI answer
         # "where's order SO-12345 / tracking 1Z123...", "what
         # carrier did we use", "what's the shipping cost on this
@@ -3469,10 +3497,12 @@ def get_sale_order(engine_df: pd.DataFrame,
                 "date_to": date_to or None,
             },
             "note": ("No sale matches in the local sync window. "
-                     "Sale-line detail covers the last ~30 days "
-                     "(longer if a manual full sync ran more "
-                     "recently). For older sales, the user should "
-                     "check CIN7 directly."),
+                     "Sale-line detail covers the last ~30 days. "
+                     "v2.67.179 — if an order_number was provided "
+                     "and you suspect the sale was created in the "
+                     "last few hours, call get_sale_live with the "
+                     "same order_number to bypass the cache via a "
+                     "live CIN7 API fetch."),
         }
 
     # Group by sale (SaleID preferred — order_number can be reused
@@ -3562,6 +3592,134 @@ def get_sale_order(engine_df: pd.DataFrame,
             "(customer's own PO# referencing this sale). Surface "
             "EVERY non-null one — sales reps use each for different "
             "purposes."),
+    }
+
+
+def get_sale_live(engine_df: pd.DataFrame,
+                    sale_lines_df: pd.DataFrame,
+                    args: dict) -> dict:
+    """v2.67.179 — Live CIN7 fallback when get_sale_order misses.
+
+    Use case: a sale was just created in CIN7 (e.g. SO-56331) and
+    isn't in the local 30-day sale_lines cache yet. The local
+    SO→Shopify lookup may still find the sale header (from a
+    different CSV with a longer window) but the line items aren't
+    available. This tool hits CIN7's GET /sale endpoint directly
+    via Cin7Client.get_sale() and returns the live lines + header,
+    so the AI can answer 'what SKUs are on SO-56331' even when
+    sync hasn't caught up.
+
+    Two-step resolution:
+      1. Find SaleID (UUID) from local sales_last_*d_*.csv via
+         so_lookup.lookup_so()
+      2. GET /sale?ID={uuid} via Cin7Client
+    """
+    order_number = (args.get("order_number") or "").strip()
+    if not order_number:
+        return {"error": "order_number is required"}
+
+    # 1. Resolve order_number → SaleID
+    try:
+        from so_lookup import lookup_so
+        info = lookup_so(order_number)
+    except Exception as exc:
+        return {"error": f"so_lookup failed: {exc}"}
+    # so_lookup stores the SaleID UUID under the key "cin7_id".
+    sale_id = (info or {}).get("cin7_id") or ""
+    if not sale_id:
+        return {
+            "matched": 0,
+            "note": (f"Couldn't resolve {order_number} to a CIN7 "
+                      f"SaleID in the local sales CSV. The sale "
+                      f"may pre-date even the longest local sync "
+                      f"window. Direct the user to check CIN7."),
+        }
+
+    # 2. Live CIN7 GET /sale
+    import os
+    try:
+        from cin7_sync import Cin7Client
+    except Exception as exc:
+        return {"error": f"cin7_sync import failed: {exc}"}
+    account_id = os.environ.get("CIN7_ACCOUNT_ID", "").strip()
+    app_key = os.environ.get("CIN7_APPLICATION_KEY", "").strip()
+    if not (account_id and app_key):
+        return {
+            "error": ("CIN7 credentials not in env on this "
+                          "service — can't do a live fetch."),
+        }
+    try:
+        client = Cin7Client(account_id, app_key)
+        sale = client.get_sale(sale_id)
+    except Exception as exc:
+        return {"error": f"CIN7 GET /sale failed: {exc}"}
+    if not isinstance(sale, dict) or not sale:
+        return {
+            "matched": 0,
+            "note": "CIN7 returned an empty sale object.",
+        }
+
+    # Extract line items and enrich with current OnHand from
+    # engine_df so the AI can immediately answer
+    # "are all SKUs available".
+    order_obj = sale.get("Order") or {}
+    lines = order_obj.get("Lines") or sale.get("Lines") or []
+    on_hand_map: dict = {}
+    if engine_df is not None and not engine_df.empty:
+        if "SKU" in engine_df.columns and "OnHand" in engine_df.columns:
+            on_hand_map = (
+                engine_df.set_index(
+                    engine_df["SKU"].astype(str).str.upper())[
+                    "OnHand"].apply(
+                    lambda v: float(v or 0)).to_dict())
+    line_rows = []
+    for line in lines:
+        sku = str(line.get("SKU") or "").strip()
+        qty = line.get("Quantity")
+        try:
+            qty_n = float(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty_n = None
+        oh = on_hand_map.get(sku.upper())
+        available = (
+            None if oh is None or qty_n is None
+            else "yes" if oh >= qty_n
+            else "no" if oh < qty_n
+            else None)
+        line_rows.append({
+            "sku": sku,
+            "name": line.get("Name") or "",
+            "quantity": qty_n,
+            "on_hand": oh,
+            "available": available,
+            "price": line.get("Price"),
+            "discount": line.get("Discount"),
+            "total": line.get("Total"),
+            "tax": line.get("Tax"),
+            "comment": line.get("Comment") or "",
+        })
+    return {
+        "matched": 1,
+        "source": "cin7_live_api",
+        "sale_id": sale_id,
+        "order_number": sale.get("OrderNumber"),
+        "invoice_number": sale.get("InvoiceNumber"),
+        "customer": sale.get("Customer"),
+        "customer_reference": sale.get("CustomerReference"),
+        "status": sale.get("Status"),
+        "order_date": sale.get("OrderDate"),
+        "invoice_date": sale.get("InvoiceDate"),
+        "memo": sale.get("Memo"),
+        "shipping_notes": sale.get("ShippingNotes"),
+        "note": sale.get("Note"),
+        "terms": sale.get("Terms"),
+        "lines": line_rows,
+        "guidance": (
+            "Data fetched LIVE from CIN7 (bypasses the 30-day "
+            "local sync window). For each line, "
+            "`available` = yes/no based on current OnHand vs "
+            "requested qty. Surface every line with availability "
+            "status so the user gets a per-SKU answer."),
     }
 
 
@@ -5603,6 +5761,8 @@ TOOL_HANDLERS = {
     # v2.67.51 — transaction-lookup tools.
     "get_purchase_order": get_purchase_order,
     "get_sale_order": get_sale_order,
+    # v2.67.179 — live CIN7 fallback for fresh orders.
+    "get_sale_live": get_sale_live,
     "get_stock_adjustment": get_stock_adjustment,
     # v2.67.54 — ShipStation lookup.
     "get_shipping_details": get_shipping_details,
