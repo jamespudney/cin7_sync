@@ -197,27 +197,40 @@ class _PgCursor:
                   params: Sequence[Any] = ()) -> "_PgCursor":
         rewritten = _rewrite_pg(sql)
         # Detect simple-INSERT statements where the caller will
-        # use .lastrowid afterwards. We inject `RETURNING id` so
-        # the wrapper can capture and stash the new row id. db.py
-        # has 17 lastrowid sites all of which insert into tables
-        # with a BIGSERIAL id column.
+        # use .lastrowid afterwards. We look up the table's PK
+        # column (cached after first lookup) and inject
+        # `RETURNING <pkcol>` so the wrapper can capture and
+        # stash the new row id. db.py has tables with PK columns
+        # named id, user_id, session_id, etc. — introspection
+        # picks the right one per table.
+        self._last_rowid = None
         if _is_simple_insert_with_id(rewritten):
-            rewritten = _append_returning_id(rewritten)
-            self._cur.execute(rewritten, params or ())
-            row = self._cur.fetchone()
-            if row is not None:
-                # psycopg dict-row returns a dict; positional row
-                # returns a tuple. Handle both.
-                if isinstance(row, dict):
-                    self._last_rowid = row.get("id")
-                else:
-                    try:
-                        self._last_rowid = row[0]
-                    except (KeyError, IndexError):
-                        self._last_rowid = None
-        else:
-            self._cur.execute(rewritten, params or ())
-            self._last_rowid = None
+            table = _table_name_from_insert(rewritten)
+            pkcol = (_get_pk_col(self._cur, table)
+                          if table else None)
+            if pkcol:
+                rewritten = _append_returning(rewritten, pkcol)
+                self._cur.execute(rewritten, params or ())
+                row = self._cur.fetchone()
+                if row is not None:
+                    # dict_row returns a dict; positional rows
+                    # return a tuple. Take the only column we
+                    # asked for.
+                    if isinstance(row, dict):
+                        # First (and only) value regardless of
+                        # key name.
+                        vals = list(row.values())
+                        self._last_rowid = (vals[0] if vals
+                                                  else None)
+                    else:
+                        try:
+                            self._last_rowid = row[0]
+                        except (KeyError, IndexError):
+                            self._last_rowid = None
+                return self
+        # Either not an INSERT, or table has no single-col PK —
+        # just execute, no RETURNING, lastrowid stays None.
+        self._cur.execute(rewritten, params or ())
         return self
 
     def executemany(self, sql: str,
@@ -338,16 +351,15 @@ _RETURNING_RE = re.compile(
     r"\bRETURNING\b", re.IGNORECASE)
 _ON_CONFLICT_RE = re.compile(
     r"\bON\s+CONFLICT\b", re.IGNORECASE)
+# Match the table name in `INSERT INTO foo` or `INSERT INTO "foo"`.
+_INSERT_TABLE_RE = re.compile(
+    r'^\s*INSERT\s+INTO\s+["`]?([A-Za-z_][A-Za-z0-9_]*)["`]?',
+    re.IGNORECASE)
 
 
 def _is_simple_insert_with_id(sql: str) -> bool:
-    """True if this is an INSERT we should append RETURNING id to.
-    Skips INSERTs that already have a RETURNING clause. ON
-    CONFLICT INSERTs are skipped because they may not produce a
-    new row, in which case RETURNING returns 0 rows and
-    fetchone() returns None — the caller's lastrowid will be
-    None which matches SQLite's behaviour on conflict-skipped
-    inserts."""
+    """True if this is an INSERT we should attempt to append a
+    RETURNING clause to. Skips INSERTs that already have one."""
     if not sql:
         return False
     if not _SIMPLE_INSERT_RE.match(sql):
@@ -357,17 +369,59 @@ def _is_simple_insert_with_id(sql: str) -> bool:
     return True
 
 
-def _append_returning_id(sql: str) -> str:
-    """Append `RETURNING id` to an INSERT. If the table doesn't
-    have an `id` column, Postgres raises a column-not-found
-    error; the caller in db.py must use a different idiom for
-    such tables (most tables in our schema use `id` BIGSERIAL).
+def _table_name_from_insert(sql: str) -> Optional[str]:
+    """Extract the target table name from an INSERT statement."""
+    m = _INSERT_TABLE_RE.match(sql)
+    return m.group(1) if m else None
 
-    Inserts the RETURNING clause BEFORE any trailing semicolon."""
+
+# Module-level cache: maps table name → PK column name (or None
+# if no single-column PK).  Populated lazily on first INSERT to a
+# given table.  Persists for the lifetime of the worker process.
+_pk_col_cache: dict = {}
+
+
+def _get_pk_col(pg_cur, table: str) -> Optional[str]:
+    """Introspect Postgres for the table's primary-key column.
+    Returns the column name for single-col PKs; None for
+    composite-PK tables or tables without a PK (caller skips
+    RETURNING in those cases — lastrowid stays None which is the
+    correct equivalent for INSERTs that don't generate a serial
+    id). Cached after first lookup so we pay the metadata query
+    cost once per table per process."""
+    if table in _pk_col_cache:
+        return _pk_col_cache[table]
+    try:
+        pg_cur.execute(
+            "SELECT a.attname FROM pg_index i "
+            "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+            "  AND a.attnum = ANY(i.indkey) "
+            "WHERE i.indrelid = %s::regclass "
+            "  AND i.indisprimary",
+            (table,))
+        rows = pg_cur.fetchall()
+    except Exception as exc:
+        log.debug("PK lookup failed for %s: %s", table, exc)
+        _pk_col_cache[table] = None
+        return None
+    if len(rows) == 1:
+        row = rows[0]
+        col = (row.get("attname") if isinstance(row, dict)
+                else row[0])
+        _pk_col_cache[table] = col
+        return col
+    # 0 rows (no PK) or 2+ rows (composite PK)
+    _pk_col_cache[table] = None
+    return None
+
+
+def _append_returning(sql: str, pkcol: str) -> str:
+    """Append `RETURNING <pkcol>` to an INSERT, before any
+    trailing semicolon."""
     s = sql.rstrip()
     if s.endswith(";"):
-        return s[:-1] + " RETURNING id;"
-    return s + " RETURNING id"
+        return s[:-1] + f' RETURNING "{pkcol}";'
+    return s + f' RETURNING "{pkcol}"'
 
 
 # ---------------------------------------------------------------------------
