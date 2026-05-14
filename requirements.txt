@@ -16,3 +16,8 @@ anthropic>=0.40.0
 # on the user's behalf so Viktor sees a real human message, not a
 # bot). See slack_oauth.py for the encryption helpers.
 cryptography>=42.0.0
+# v2.67.162 — Postgres driver. Used by migrate_to_pg.py for the
+# cross-service drift fix (single shared DB instead of two SQLite
+# copies on isolated Render disks). psycopg[binary] ships the
+# precompiled libpq so no system-level apt install is needed.
+psycopg[binary]>=3.1.0
