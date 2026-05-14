@@ -400,19 +400,32 @@ _pk_col_cache: dict = {}
 
 def _get_pk_col(pg_cur, table: str) -> Optional[str]:
     """Introspect Postgres for the table's primary-key column.
-    Returns the column name for single-col PKs; None for
-    composite-PK tables or tables without a PK (caller skips
-    RETURNING in those cases — lastrowid stays None which is the
-    correct equivalent for INSERTs that don't generate a serial
-    id). Cached after first lookup so we pay the metadata query
-    cost once per table per process."""
+    Returns the column name ONLY for single-col integer PKs;
+    None for composite PKs, no-PK tables, OR text/uuid/date PKs.
+
+    v2.67.174 — restricted to integer PKs because the caller uses
+    the returned value as `cursor.lastrowid` which mirrors
+    sqlite3's int-only contract. Tables like product_feed_status
+    (sku TEXT PRIMARY KEY) and supplier_config (supplier_name
+    TEXT PRIMARY KEY) return None so the cursor doesn't append
+    RETURNING; callers that do `int(cur.lastrowid or 0)` after
+    such inserts get 0 (matching SQLite where lastrowid is
+    typically the implicit rowid, not the text PK).
+
+    Cached after first lookup so we pay the metadata query cost
+    once per table per process."""
     if table in _pk_col_cache:
         return _pk_col_cache[table]
     try:
+        # Join pg_attribute → pg_type to read the column type.
+        # Integer type families: int2, int4, int8 (smallint,
+        # integer, bigint). SERIAL/BIGSERIAL become int4/int8
+        # under the hood.
         pg_cur.execute(
-            "SELECT a.attname FROM pg_index i "
+            "SELECT a.attname, t.typname FROM pg_index i "
             "JOIN pg_attribute a ON a.attrelid = i.indrelid "
             "  AND a.attnum = ANY(i.indkey) "
+            "JOIN pg_type t ON t.oid = a.atttypid "
             "WHERE i.indrelid = %s::regclass "
             "  AND i.indisprimary",
             (table,))
@@ -423,10 +436,19 @@ def _get_pk_col(pg_cur, table: str) -> Optional[str]:
         return None
     if len(rows) == 1:
         row = rows[0]
-        col = (row.get("attname") if isinstance(row, dict)
-                else row[0])
-        _pk_col_cache[table] = col
-        return col
+        if isinstance(row, dict):
+            col = row.get("attname")
+            typname = row.get("typname")
+        else:
+            col, typname = row[0], row[1]
+        if typname in ("int2", "int4", "int8"):
+            _pk_col_cache[table] = col
+            return col
+        # Single-col non-integer PK (sku TEXT, session_id TEXT,
+        # etc.) — skip RETURNING; lastrowid stays None to mirror
+        # sqlite3.
+        _pk_col_cache[table] = None
+        return None
     # 0 rows (no PK) or 2+ rows (composite PK)
     _pk_col_cache[table] = None
     return None
