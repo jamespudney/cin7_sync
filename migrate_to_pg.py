@@ -377,15 +377,24 @@ def _copy_rows(sconn: sqlite3.Connection,
 def _conflict_cols_for(sconn: sqlite3.Connection,
                               table: str) -> Optional[List[str]]:
     """Prefer the first composite UNIQUE constraint declared.
-    Else fall back to the primary key (single-col) — but only if
-    it's the AUTOINCREMENT row id. Returns None if no suitable
-    key (caller decides whether to overwrite/skip)."""
+    Else fall back to the primary key columns (whether single-col
+    or composite). v2.67.165 — earlier version only returned PK
+    when len==1, which broke composite-PK tables like
+    slack_messages (channel_id, ts) and ui_prefs (user, view):
+    ON CONFLICT (channel_id) didn't match any actual constraint
+    in Postgres. Now we use PRAGMA's pk-position values to
+    reassemble the full PK in declared order."""
     uniqs = _unique_constraints(sconn, table)
     if uniqs:
         return uniqs[0]
-    pks = [c[0] for c in _table_columns(sconn, table) if c[4] == 1]
-    if len(pks) == 1:
-        return pks
+    # Collect every column with pk>0, sort by pk position so
+    # composite PKs come out in the order Postgres expects.
+    pk_entries = [(c[4], c[0])
+                      for c in _table_columns(sconn, table)
+                      if c[4] > 0]
+    if pk_entries:
+        pk_entries.sort(key=lambda x: x[0])
+        return [name for _, name in pk_entries]
     return None
 
 
