@@ -1,4 +1,4 @@
-"""dropship_tracking_handler.py (v2.67.159)
+"""dropship_tracking_handler.py (v2.67.160)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
@@ -525,30 +525,78 @@ def _weight_mismatch_text(supplier_lbs: float,
 # Carrier mapping — UPS email service text → CIN7 Carrier field
 # ---------------------------------------------------------------------------
 # CIN7 expects carrier names with their trademark glyph + title
-# case (e.g. 'UPS® 2nd Day Air'). The UPS email uses ALL CAPS
-# without ®. Map to canonical CIN7 strings.
+# case (e.g. 'UPS® 2nd Day Air'). UPS emails arrive in ALL CAPS
+# without ® and with inconsistent punctuation ("A.M." vs "AM",
+# "EARLY" vs "EARLY AM"). v2.67.160 — covers every standard UPS
+# service variant: domestic ground/air, SurePost tiers, full
+# international (Express/Express Plus/Saver/Expedited/Standard/
+# Express Freight), freight LTL, and hundredweight. Alias keys
+# fall through to the same canonical CIN7 value so we don't care
+# which surface form the email uses.
 _UPS_SERVICE_MAP = {
+    # ── Domestic Ground ─────────────────────────────────────────
     "UPS GROUND": "UPS® Ground",
-    "UPS 2ND DAY AIR": "UPS® 2nd Day Air",
-    "UPS 2ND DAY AIR A.M.": "UPS® 2nd Day Air A.M.",
-    "UPS 3 DAY SELECT": "UPS® 3 Day Select",
+    "UPS GROUND SAVER": "UPS® Ground Saver",
+    "UPS GROUND WITH FREIGHT PRICING":
+        "UPS® Ground with Freight Pricing",
+
+    # ── SurePost ────────────────────────────────────────────────
+    "UPS SUREPOST": "UPS SurePost®",
+    "UPS SUREPOST LESS THAN 1 LB": "UPS SurePost® Less than 1 lb",
+    "UPS SUREPOST 1 LB OR GREATER":
+        "UPS SurePost® 1 lb or Greater",
+    "UPS SUREPOST BPM": "UPS SurePost® BPM",
+
+    # ── Domestic Air ────────────────────────────────────────────
     "UPS NEXT DAY AIR": "UPS® Next Day Air",
     "UPS NEXT DAY AIR SAVER": "UPS® Next Day Air Saver",
     "UPS NEXT DAY AIR EARLY": "UPS® Next Day Air® Early",
+    "UPS NEXT DAY AIR EARLY AM": "UPS® Next Day Air® Early",
+    "UPS NEXT DAY AIR EARLY A.M.": "UPS® Next Day Air® Early",
+    "UPS 2ND DAY AIR": "UPS® 2nd Day Air",
+    "UPS 2ND DAY AIR A.M.": "UPS® 2nd Day Air A.M.",
+    "UPS 2ND DAY AIR AM": "UPS® 2nd Day Air A.M.",
+    "UPS 3 DAY SELECT": "UPS® 3 Day Select",
+
+    # ── International ───────────────────────────────────────────
     "UPS WORLDWIDE EXPRESS": "UPS Worldwide Express®",
+    "UPS WORLDWIDE EXPRESS PLUS": "UPS Worldwide Express Plus®",
+    "UPS WORLDWIDE SAVER": "UPS Worldwide Saver®",
     "UPS WORLDWIDE EXPEDITED": "UPS Worldwide Expedited®",
     "UPS STANDARD": "UPS Standard®",
-    "UPS SUREPOST": "UPS SurePost®",
+    "UPS WORLDWIDE EXPRESS FREIGHT":
+        "UPS Worldwide Express Freight®",
+    "UPS WORLDWIDE EXPRESS FREIGHT MIDDAY":
+        "UPS Worldwide Express Freight® Midday",
+
+    # ── Freight LTL ─────────────────────────────────────────────
+    "UPS FREIGHT LTL": "UPS Freight® LTL",
+    "UPS FREIGHT LTL GUARANTEED": "UPS Freight® LTL — Guaranteed",
+    "UPS FREIGHT LTL GUARANTEED A.M.":
+        "UPS Freight® LTL — Guaranteed A.M.",
+    "UPS FREIGHT LTL GUARANTEED AM":
+        "UPS Freight® LTL — Guaranteed A.M.",
+
+    # ── Hundredweight ───────────────────────────────────────────
+    "UPS HUNDREDWEIGHT SERVICE GROUND":
+        "UPS Hundredweight Service® Ground",
+    "UPS HUNDREDWEIGHT SERVICE AIR":
+        "UPS Hundredweight Service® Air",
 }
 
 
 def _map_carrier(ups_service: str) -> str:
     """Map a parsed UPS service string to CIN7's canonical
-    carrier field value. Falls back to the original string if
-    no mapping is known (better than an empty Carrier)."""
+    carrier field value. Normalises whitespace (multiple spaces
+    collapse to one) before lookup so that 'UPS  Ground' and
+    'UPS Ground' both hit the same key. Falls back to the
+    original string title-cased if no mapping is known — better
+    than an empty Carrier."""
     if not ups_service:
         return ""
-    key = ups_service.strip().upper()
+    # Collapse any internal whitespace runs to a single space
+    # before the dictionary lookup.
+    key = re.sub(r"\s+", " ", ups_service.strip()).upper()
     return _UPS_SERVICE_MAP.get(key, ups_service.strip())
 
 
