@@ -2700,18 +2700,16 @@ def connect() -> Iterator[sqlite3.Connection]:
     if _backend_is_postgres():
         from db_dialect import connect as _pg_connect
         with _pg_connect() as conn:
-            # Schema + migrations work via executescript on the
-            # wrapper (which splits + rewrites each statement).
-            conn.executescript(_SCHEMA)
-            _migrate_ui_prefs_widths(conn)
-            _migrate_supplier_dropship(conn)
-            _migrate_supplier_stockout_recovery(conn)
-            _migrate_demand_signal_match_columns(conn)
-            _migrate_product_aliases_multi_target(conn)
-            _migrate_ad_campaign_skus_spend(conn)
-            _migrate_ad_campaigns_daily_drop_spend_notnull(conn)
-            _migrate_ad_campaign_skus_free_listings(conn)
-            _migrate_po_dispatch_reminders_escalation(conn)
+            # v2.67.167 — Postgres path does NOT re-apply the
+            # SQLite-flavored _SCHEMA on every connection.
+            # migrate_to_pg.py introspects + translates and is
+            # the source of truth for the Postgres schema.
+            # Likewise the SQLite _migrate_* helpers — they
+            # use ALTER TABLE try/except patterns specific to
+            # sqlite3 exceptions and would crash or no-op on
+            # Postgres. When we need a new column or migration
+            # on Postgres, add it to migrate_to_pg.py and re-run
+            # (it's idempotent on existing rows).
             yield conn
         return
 
