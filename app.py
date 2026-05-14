@@ -10726,21 +10726,60 @@ elif page == "Ordering":
                     "Non-masters that HAVE direct sales are treated as "
                     "working inventory, not dead.")
 
-    # Glide path toward $600k target
-    target_600k = 600_000
-    pct_of_goal = (total_onhand_value / target_600k * 100
-                   if total_onhand_value else 0)
-    excess_over_600k = max(0, total_onhand_value - target_600k)
-    if total_onhand_value > target_600k:
-        st.progress(min(1.0, target_600k / total_onhand_value),
-                     text=f"Current stock is "
-                          f"${excess_over_600k:,.0f} above "
-                          f"your $600k target "
-                          f"({pct_of_goal:.0f}% of $600k)")
+    # v2.67.178 — Glide path to engine-derived optimum (replaces
+    # the old hard-coded $600k target). The engine's Optimum tile
+    # above is the goal; this strip shows the gap + projection.
+    #
+    # Projection: at the trailing-90-day rate of slow-mover
+    # clearance, how many months until current → optimum?
+    # Anchors on the "Slow movers cleared" math used by the
+    # Slow Movers page so the figures are tied together.
+    _optimum = max(1.0, float(total_target_value))
+    _gap = total_onhand_value - _optimum
+    _pct_of_optimum = (total_onhand_value / _optimum * 100
+                          if _optimum else 0)
+    if _gap > 0:
+        # Above target — show projection-to-optimum based on
+        # recent slow-mover clearance velocity.
+        try:
+            _warns_proj = db.get_dormancy_warnings() or {}
+        except Exception:
+            _warns_proj = {}
+        try:
+            _today = pd.Timestamp(datetime.now().date())
+            _ninety = _today - pd.Timedelta(days=90)
+            _clr = _compute_slow_mover_clearance(
+                stock, sale_lines, products, _warns_proj,
+                _ninety, _today)
+            _monthly_clearance = float(
+                _clr.get("cost_value") or 0) / 3.0
+        except Exception:
+            _monthly_clearance = 0.0
+        if _monthly_clearance > 0:
+            _months_to_optimum = _gap / _monthly_clearance
+            _eta_text = (
+                f" · at trailing-90d clearance rate of "
+                f"${_monthly_clearance:,.0f}/mo, gap closes in "
+                f"~**{_months_to_optimum:.1f} months**")
+        else:
+            _eta_text = (
+                " · no slow-mover sales in trailing 90d — "
+                "ETA can't be computed; lean on AI-Assistant + "
+                "promotions to drive clearance")
+        st.progress(min(1.0, _optimum / total_onhand_value),
+                     text=(f"Current stock is "
+                              f"${_gap:,.0f} **above optimum** "
+                              f"(${_optimum:,.0f}) "
+                              f"— {_pct_of_optimum:.0f}% of "
+                              f"optimum{_eta_text}"))
     else:
-        st.progress(pct_of_goal / 100,
-                     text=f"Current stock is {pct_of_goal:.0f}% of "
-                          f"your $600k target — you're under.")
+        st.progress(min(1.0, _pct_of_optimum / 100),
+                     text=(f"Current stock is "
+                              f"{_pct_of_optimum:.0f}% of "
+                              f"optimum (${_optimum:,.0f}) "
+                              f"— you're **under** by "
+                              f"${-_gap:,.0f}. Keep ordering "
+                              f"per the recommendations above."))
 
     # --- Supplier configuration ----------------------------------------
     st.markdown("### :gear: Supplier configuration")
@@ -14927,6 +14966,81 @@ elif page == "Monthly Metrics":
                  (_get(cogs_per_month, m) * 12) / _avg_inv(m)
                  if _avg_inv(m) else 0.0)),
              fmt="num1")
+
+        # v2.67.178 — Slow-mover progress rows (management
+        # dashboard signal). Two complementary metrics:
+        #   1. "Slow Stock SOLD" — clearance per month (the
+        #      flow). Going UP = team is moving slow stock.
+        #      Computed: sale_lines for SKUs currently in the
+        #      dormancy_warnings set, qty × AverageCost,
+        #      grouped by month. Note: "currently flagged" —
+        #      historical "was-flagged-at-that-time" would be
+        #      cleaner but requires keying on
+        #      sku_dormancy_log.first_seen_dormant_at vs the
+        #      sale's date; current set is a good-enough proxy
+        #      for trend monitoring.
+        #   2. "Slow Stock Value (snapshot)" — end-of-period
+        #      level (the stock). Going DOWN = team is winning.
+        #      Read from slow_mover_value_snapshots which is
+        #      written by the engine on each recompute. May be
+        #      sparse for months before v2.67.36 (when the
+        #      writer was added). Current-month value uses the
+        #      live _compute_slow_stock_holding for accuracy.
+        try:
+            _warns_mm = db.get_dormancy_warnings() or {}
+        except Exception:
+            _warns_mm = {}
+        _slow_skus = set(_warns_mm.keys())
+        if _slow_skus and not sl_prod.empty:
+            _slow_mask = sl_prod["SKU"].astype(str).isin(
+                _slow_skus)
+            _slow_sold_per_month = (
+                (sl_prod.loc[_slow_mask, "Quantity"]
+                 * sl_prod.loc[_slow_mask, "AverageCost"])
+                .groupby(sl_prod.loc[_slow_mask, "MonthKey"])
+                .sum())
+        else:
+            _slow_sold_per_month = pd.Series(dtype=float)
+        _row("Inventory", "Slow Stock Cleared ($)",
+             _per_month(lambda m: _get(
+                 _slow_sold_per_month, m)))
+
+        # Slow Stock Value snapshot per month. We use the
+        # latest snapshot within each month from
+        # slow_mover_value_snapshots; for the current month we
+        # use the live helper (more accurate than the latest
+        # snapshot since the engine may not have run today).
+        try:
+            _snap_rows = db.list_slow_mover_snapshots(
+                limit=365 * 2) or []
+        except Exception:
+            _snap_rows = []
+        _snap_by_month: dict = {}
+        for _sr in _snap_rows:
+            try:
+                _sd = pd.to_datetime(
+                    _sr.get("snapshot_date"), errors="coerce")
+                if pd.isna(_sd):
+                    continue
+                _mk = pd.Period(_sd, freq="M")
+                _val = float(_sr.get("value_on_shelf") or 0)
+                # Keep the LATEST snapshot per month.
+                _prev = _snap_by_month.get(_mk)
+                if _prev is None or _val > 0:
+                    _snap_by_month[_mk] = _val
+            except Exception:
+                continue
+        # Override current month with live value if engine
+        # signals available right now.
+        try:
+            _live_holding = _compute_slow_stock_holding(
+                engine_df, _warns_mm)
+            _snap_by_month[current_month] = float(
+                _live_holding.get("value_held") or 0)
+        except Exception:
+            pass
+        _row("Inventory", "Slow Stock Value (EOM)",
+             _per_month(lambda m: _snap_by_month.get(m, 0.0)))
 
         # --- Render as a DataFrame -----------------------------------
         # Build output table: metric label + one col per month label.

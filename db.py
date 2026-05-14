@@ -5811,24 +5811,55 @@ def get_previous_month_slow_mover_value() -> dict:
 
     'Previous month' is defined as the calendar month preceding
     today's calendar month. So on 2026-05-15 we look at the
-    latest snapshot dated between 2026-04-01 and 2026-04-30."""
+    latest snapshot dated between 2026-04-01 and 2026-04-30.
+
+    v2.67.178 — compute the date boundaries in Python rather than
+    using SQLite's `date('now', 'start of month', '-1 month')`
+    function (which doesn't exist in Postgres). Portable both
+    ways."""
+    from datetime import date as _date
+    today = _date.today()
+    first_of_this_month = today.replace(day=1)
+    if first_of_this_month.month == 1:
+        first_of_prev_month = first_of_this_month.replace(
+            year=first_of_this_month.year - 1, month=12)
+    else:
+        first_of_prev_month = first_of_this_month.replace(
+            month=first_of_this_month.month - 1)
     with connect() as c:
         row = c.execute(
             """
             SELECT snapshot_date, skus_count, units_on_hand,
                    value_on_shelf
               FROM slow_mover_value_snapshots
-             WHERE snapshot_date >=
-                   date('now', 'start of month', '-1 month')
-               AND snapshot_date <
-                   date('now', 'start of month')
+             WHERE snapshot_date >= ?
+               AND snapshot_date < ?
              ORDER BY snapshot_date DESC
              LIMIT 1
             """,
+            (first_of_prev_month.isoformat(),
+              first_of_this_month.isoformat()),
         ).fetchone()
     if not row:
         return {}
     return dict(row)
+
+
+def list_slow_mover_snapshots(limit: int = 730) -> list:
+    """v2.67.178 — return all rows from slow_mover_value_snapshots
+    ordered oldest first, limited to `limit` rows (default 730 ≈
+    two years of daily snapshots). Used by the Monthly Metrics
+    page to plot EOM slow-stock value over the rolling window."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT snapshot_date, skus_count, units_on_hand, "
+            "       value_on_shelf "
+            "FROM slow_mover_value_snapshots "
+            "ORDER BY snapshot_date ASC "
+            "LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def flag_sku_as_slow_mover(sku: str, user_id: str = "") -> None:
