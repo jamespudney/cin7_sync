@@ -98,6 +98,83 @@ def _find_latest_csv(pattern: str) -> Optional[Path]:
     return Path(max(matches, key=os.path.getmtime))
 
 
+# v2.67.186 — terminal sale statuses. A SO in any of these
+# states is closed; an SO-NNNNN annotation in a PO comment
+# pointing to one of them is STALE and should not generate a
+# "pick this on arrival" reminder.
+_TERMINAL_SALE_STATUSES = (
+    "FULFILLED", "SHIPPED", "RECEIVED",
+    "INVOICED-RECEIVED", "INVOICED_RECEIVED",
+    "CLOSED", "COMPLETED",
+    "VOIDED", "CANCELLED", "CANCELED",
+    "CREDITED", "REFUNDED",
+)
+
+
+def _load_open_so_set() -> set:
+    """v2.67.186 — Return the set of SO numbers currently NOT in a
+    terminal/closed state. Used to filter out stale backorder
+    annotations: when a buyer typed 'SO-54007' into a PO line
+    Comments months ago, the SO may have since been shipped
+    from other stock. Without this filter, the bot dutifully
+    announces it as a backorder when the PO finally arrives —
+    confusing the warehouse team (Cheran flagged exactly this
+    case for PO-6947).
+
+    Returns an empty set when the sales CSV isn't available;
+    callers should fall back to NOT filtering in that case so a
+    sync hiccup doesn't suppress legitimate reminders."""
+    sales_path = _find_latest_csv("sales_last_*d_*.csv")
+    if not sales_path:
+        log.warning("No sales_last_*d_*.csv found — open-SO "
+                      "filter disabled this run.")
+        return set()
+    try:
+        df = pd.read_csv(sales_path, low_memory=False)
+    except Exception as exc:
+        log.warning("Failed to read %s: %s — filter disabled.",
+                      sales_path, exc)
+        return set()
+    so_col = next(
+        (c for c in ("OrderNumber", "SaleNumber", "InvoiceNumber")
+          if c in df.columns), None)
+    if not so_col:
+        log.warning("Sales CSV missing OrderNumber/SaleNumber — "
+                      "filter disabled.")
+        return set()
+    # Prefer combined status if present (header rolls up across
+    # lines); fall back to InvoiceStatus / Status.
+    status_col = next(
+        (c for c in ("CombinedInvoiceStatus",
+                        "Status",
+                        "InvoiceStatus",
+                        "SaleStatus")
+          if c in df.columns), None)
+    open_set: set = set()
+    for _, row in df.iterrows():
+        so_raw = str(row.get(so_col) or "").strip().upper()
+        if not so_raw:
+            continue
+        if not so_raw.startswith("SO-"):
+            # Normalise '56168' → 'SO-56168'.
+            if so_raw.isdigit():
+                so_raw = f"SO-{so_raw}"
+            else:
+                continue
+        if status_col:
+            status_u = str(
+                row.get(status_col) or "").upper().strip()
+            # Terminal = closed. Anything else (AUTHORISED,
+            # ORDERED, PARTIAL, IN_PROGRESS, etc.) counts as open.
+            if any(t in status_u
+                      for t in _TERMINAL_SALE_STATUSES):
+                continue
+        open_set.add(so_raw)
+    log.info("Loaded open-SO set: %d open SOs from %s",
+              len(open_set), sales_path.name)
+    return open_set
+
+
 def _load_purchases_and_lines() -> Tuple[Optional[pd.DataFrame],
                                                 Optional[pd.DataFrame]]:
     """Load the latest purchases + purchase_lines CSVs into
@@ -345,6 +422,12 @@ def scan_and_notify(dryrun: bool = False,
     lines_by_po: Dict[str, pd.DataFrame] = {
         po: g for po, g in lines.groupby("OrderNumber")}
 
+    # v2.67.186 — Load the open-SO set once per run. Used to
+    # filter out stale backorder annotations (SOs the buyer
+    # typed into PO comments months ago that have since been
+    # shipped from other stock).
+    open_so_set = _load_open_so_set()
+
     for _, po in eligible.iterrows():
         po_number = str(po.get("OrderNumber") or "").strip()
         if not po_number:
@@ -364,18 +447,53 @@ def scan_and_notify(dryrun: bool = False,
         line_sos_list, line_ctx = _extract_sos_from_lines(po_lines)
         all_sos = sorted(set(header_sos) | set(line_sos_list))
 
+        # v2.67.186 — Filter out SOs that have already been
+        # shipped/closed since the buyer typed the annotation.
+        # Stale annotations were generating false-positive
+        # backorder reminders (Cheran on PO-6947: 'this Sale was
+        # shipped on 03/25 — not sure why it's picking up a
+        # backorder?'). open_so_set is computed once before the
+        # PO loop. Empty set = filter disabled (sales CSV not
+        # available); preserve old behaviour in that case.
+        if open_so_set:
+            all_sos_kept = [s for s in all_sos if s in open_so_set]
+            dropped_sos = [s for s in all_sos
+                              if s not in open_so_set]
+            if dropped_sos:
+                log.info(
+                    "PO %s: dropping %d stale SO refs "
+                    "(already shipped/closed): %s",
+                    po_number, len(dropped_sos), dropped_sos)
+            all_sos = all_sos_kept
+            # Filter line_ctx similarly — drop lines whose only
+            # SO refs are stale.
+            line_ctx = [
+                {**c,
+                  "sos": [s for s in (c.get("sos") or [])
+                          if s in open_so_set]}
+                for c in line_ctx
+                if any(s in open_so_set
+                          for s in (c.get("sos") or []))
+            ]
+
         # If the SOs came from the header, line_ctx is empty —
         # build one bullet per SO with a generic SKU placeholder
         # so the reminder message still has content.
         if header_sos and not line_ctx:
-            line_ctx = [{
-                "sku": "(see PO)",
-                "name": None,
-                "quantity": None,
-                "source_field": "PO header",
-                "source_text": None,
-                "sos": header_sos,
-            }]
+            # Use the FILTERED header_sos so we don't rebuild a
+            # stale line_ctx after the v2.67.186 filter.
+            header_sos_kept = [s for s in header_sos
+                                  if s in open_so_set or
+                                  not open_so_set]
+            if header_sos_kept:
+                line_ctx = [{
+                    "sku": "(see PO)",
+                    "name": None,
+                    "quantity": None,
+                    "source_field": "PO header",
+                    "source_text": None,
+                    "sos": header_sos_kept,
+                }]
 
         if not all_sos:
             n_no_sos += 1
@@ -810,6 +928,16 @@ def cmd_one(args: argparse.Namespace) -> int:
         log.info("  PO-header SOs: %s", header_sos)
     if line_sos_list:
         log.info("  Line-level SOs: %s", line_sos_list)
+    # v2.67.186 — same open-SO filter as the main scan loop.
+    # Cmd-one is mainly a debug helper but should behave
+    # identically to the production flow.
+    open_so_set = _load_open_so_set()
+    if open_so_set:
+        dropped = [s for s in all_sos if s not in open_so_set]
+        if dropped:
+            log.info("  Dropping stale SO refs (already "
+                      "shipped/closed): %s", dropped)
+        all_sos = [s for s in all_sos if s in open_so_set]
     if not all_sos:
         log.info("No SO numbers found. Header fields scanned: %s. "
                   "Line fields scanned: %s",
