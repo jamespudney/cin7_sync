@@ -10001,19 +10001,77 @@ elif page == "Sales Recent":
         st.warning("No sale line data. Run `python cin7_sync.py "
                    "salelines --days 30`.")
     else:
-        window = "30 days" if not sale_lines_30d.empty else "3 days"
-        st.caption(f"Showing sale lines for the last {window}")
-
+        # v2.67.205 — three correctness fixes so the figures here
+        # correlate with Monthly Metrics and the rest of the app:
+        #   1. The `sale_lines` variable is the LONGEST window
+        #      available (up to 5 years), not 30 days. The
+        #      previous caption ("Showing for the last 30 days")
+        #      lied — the metrics were summing the whole window.
+        #      Now we actually filter to the user-selected window.
+        #   2. Exclude VOIDED / CREDITED / CANCELLED rows. Matches
+        #      Monthly Metrics (Status filter on line 14524) so
+        #      sales-team commissions and Recent Sales agree.
+        #   3. Exclude shipping/freight line items. Real revenue
+        #      is product revenue; shipping charges are separately
+        #      reported on Monthly Metrics → Margins.
         df = sale_lines.copy()
         df["Total"] = _to_num(df["Total"]).fillna(0)
         df["Quantity"] = _to_num(df["Quantity"]).fillna(0)
         df["InvoiceDate"] = _to_date(df["InvoiceDate"]).dt.tz_localize(None)
 
+        # Window selector — user picks how many days back.
+        col_w, col_status = st.columns([1, 3])
+        with col_w:
+            _window_days = st.selectbox(
+                "Window", [30, 7, 90, 365, 1825],
+                index=0, key="sr_window_days",
+                format_func=lambda d: f"Last {d} days"
+                    if d <= 365 else "Last 5 years (all)")
+
+        # Filter to window.
+        _cutoff = (pd.Timestamp(datetime.now().date())
+                      - pd.Timedelta(days=int(_window_days)))
+        df = df[df["InvoiceDate"] >= _cutoff]
+
+        # Filter out booked-but-not-kept sales.
+        n_before_status = len(df)
+        if "Status" in df.columns:
+            bad_statuses = ("VOIDED", "CREDITED", "CANCELLED",
+                              "CANCELED")
+            df = df[~df["Status"].astype(str).str.upper().isin(
+                bad_statuses)]
+        n_dropped_status = n_before_status - len(df)
+
+        # Exclude shipping-charge line items (matches the way
+        # Monthly Metrics splits sl_prod vs sl_ship).
+        _ship_sku_pats = (
+            "SHIPPING", "FREIGHT", "DELIVERY", "POSTAGE",
+            "COURIER", "HANDLING")
+        sku_str = df["SKU"].fillna("").astype(str).str.upper()
+        name_str = df["Name"].fillna("").astype(str).str.upper()
+        is_ship = pd.Series(False, index=df.index)
+        for pat in _ship_sku_pats:
+            is_ship = is_ship | sku_str.str.startswith(pat)
+            is_ship = is_ship | name_str.str.contains(
+                pat, regex=False, na=False)
+        n_ship = int(is_ship.sum())
+        df = df[~is_ship]
+
+        st.caption(
+            f"Showing **product** sale lines for the last "
+            f"{_window_days} days · "
+            f"excludes voided/credited/cancelled "
+            f"({n_dropped_status:,} dropped) · "
+            f"excludes shipping/freight line items "
+            f"({n_ship:,} dropped). "
+            "These filters match the Monthly Metrics sales "
+            "row so the figures correlate.")
+
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Line items", _fmt_number(len(df)))
         c2.metric("Distinct sales", _fmt_number(df["SaleID"].nunique()))
         c3.metric("Distinct SKUs", _fmt_number(df["SKU"].nunique()))
-        c4.metric("Total revenue", _fmt_money(df["Total"].sum()))
+        c4.metric("Product revenue", _fmt_money(df["Total"].sum()))
 
         # Optional filter by SaleType if present
         if "SaleType" in df.columns:
