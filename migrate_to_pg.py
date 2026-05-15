@@ -238,13 +238,24 @@ def _emit_create_table(sconn: sqlite3.Connection,
         pk_count == 1
         and any(c[4] == 1 and _is_autoinc_pk(c[1], c[4], c[0])
                 for c in cols))
+    # v2.67.199 — Emit column names in LOWERCASE always.
+    # Postgres folds unquoted identifiers to lowercase, but
+    # PRESERVES case when identifiers are quoted. SQLite is
+    # case-insensitive so it never mattered. If we quote a
+    # mixed-case name ("safety_pct_A"), Postgres stores it
+    # literally, then the app's unquoted SQL ("safety_pct_A
+    # = ...") gets folded by Postgres to safety_pct_a → column
+    # not found. Lowercase-on-emit avoids the trap for fresh
+    # deploys; the existing data was fixed via post-cutover
+    # ALTER COLUMN RENAME migrations in db.py.
     for name, typ, notnull, dflt, pk, _cid in cols:
+        name_lc = name.lower()
         if has_single_autoinc_pk and pk == 1 \
                 and _is_autoinc_pk(typ, pk, name):
-            col_defs.append(f'"{name}" BIGSERIAL PRIMARY KEY')
+            col_defs.append(f'"{name_lc}" BIGSERIAL PRIMARY KEY')
             autoinc_emitted = True
             continue
-        parts = [f'"{name}"', _pg_type(typ)]
+        parts = [f'"{name_lc}"', _pg_type(typ)]
         if notnull:
             parts.append("NOT NULL")
         d = _translate_default(dflt)
@@ -252,7 +263,7 @@ def _emit_create_table(sconn: sqlite3.Connection,
             parts.append(f"DEFAULT {d}")
         col_defs.append(" ".join(parts))
         if pk > 0:
-            pk_entries.append((pk, name))
+            pk_entries.append((pk, name_lc))
     if pk_entries and not autoinc_emitted:
         ordered = [f'"{n}"'
                       for _, n in sorted(pk_entries,
@@ -304,7 +315,13 @@ def _copy_rows(sconn: sqlite3.Connection,
       - If force_overwrite is set, TRUNCATE the PG table first.
       - Otherwise, skip the table entirely if PG already has
         rows (safer default for re-runs)."""
-    cols = [c[0] for c in _table_columns(sconn, table)]
+    # v2.67.199 — lowercase column names to match the DDL emitted
+    # by _emit_create_table. SQLite source names are read as-is
+    # (so we can SELECT from SQLite), but the INSERT into Postgres
+    # uses the lowercased form because that's how the PG table
+    # was defined.
+    sqlite_cols = [c[0] for c in _table_columns(sconn, table)]
+    cols = [c.lower() for c in sqlite_cols]
     if not cols:
         return (0, 0)
 
@@ -334,7 +351,8 @@ def _copy_rows(sconn: sqlite3.Connection,
     base_sql = (f'INSERT INTO "{table}" ({col_list}) '
                   f"VALUES ({placeholders})")
     if conflict_cols:
-        conflict = ", ".join(f'"{c}"' for c in conflict_cols)
+        # v2.67.199 — same lowercase rule applies to conflict cols
+        conflict = ", ".join(f'"{c.lower()}"' for c in conflict_cols)
         base_sql += f" ON CONFLICT ({conflict}) DO NOTHING"
 
     written = 0

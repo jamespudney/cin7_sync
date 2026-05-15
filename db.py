@@ -2752,6 +2752,40 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS ix_user_page_permissions_user
           ON user_page_permissions(user_id);
       """),
+    # v2.67.199 — supplier_config mixed-case columns. The
+    # original SQLite schema declared `safety_pct_A`, `_B`, `_C`
+    # and `review_days_A`/`_B`/`_C` (mixed case for buyer
+    # readability). SQLite is case-insensitive; Postgres is
+    # case-folding-to-lowercase when identifiers are UNQUOTED
+    # but case-preserving when QUOTED. My migrator quoted
+    # column names, so Postgres now has columns literally
+    # named `safety_pct_A` etc. with the capital letter
+    # preserved. But the app's queries use the bare unquoted
+    # form, which Postgres lowercases → "column safety_pct_a
+    # does not exist". Rename to lowercase to match how the
+    # app accesses them.
+    #
+    # Each rename runs in its own statement so a failure
+    # (column already renamed on a re-run) doesn't poison the
+    # rest. autocommit=True means each is its own transaction.
+    ("supplier_config_rename_safety_pct_A",
+      'ALTER TABLE supplier_config RENAME COLUMN '
+      '"safety_pct_A" TO safety_pct_a;'),
+    ("supplier_config_rename_safety_pct_B",
+      'ALTER TABLE supplier_config RENAME COLUMN '
+      '"safety_pct_B" TO safety_pct_b;'),
+    ("supplier_config_rename_safety_pct_C",
+      'ALTER TABLE supplier_config RENAME COLUMN '
+      '"safety_pct_C" TO safety_pct_c;'),
+    ("supplier_config_rename_review_days_A",
+      'ALTER TABLE supplier_config RENAME COLUMN '
+      '"review_days_A" TO review_days_a;'),
+    ("supplier_config_rename_review_days_B",
+      'ALTER TABLE supplier_config RENAME COLUMN '
+      '"review_days_B" TO review_days_b;'),
+    ("supplier_config_rename_review_days_C",
+      'ALTER TABLE supplier_config RENAME COLUMN '
+      '"review_days_C" TO review_days_c;'),
 ]
 
 
