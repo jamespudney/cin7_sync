@@ -20504,6 +20504,90 @@ elif page == "User Permissions":
             "page.")
         st.stop()
 
+    # ---- v2.67.189 — Add new user expander ---------------------
+    # Single-place user management: admins can create profiles
+    # here instead of having to bounce to My Profile or wait for
+    # self-signin. Sign-in flow elsewhere will pick the row up
+    # automatically (get_or_create_user reads existing rows when
+    # a name is typed at the gate).
+    with st.expander(":heavy_plus_sign: Add new user",
+                      expanded=False):
+        st.caption(
+            "Creates a profile so the user can sign in by typing "
+            "their name at the gate. They'll start with the "
+            "see-everything default until you tick / save their "
+            "permissions below.")
+        nu_col1, nu_col2, nu_col3 = st.columns([2, 2, 1])
+        with nu_col1:
+            _nu_name = st.text_input(
+                "Display name",
+                key="up_new_name",
+                placeholder="e.g. Cheran")
+        with nu_col2:
+            _nu_email = st.text_input(
+                "Email (optional)",
+                key="up_new_email",
+                placeholder="cheran@wired4signsusa.com")
+        with nu_col3:
+            _nu_role = st.selectbox(
+                "Role",
+                list(db.USER_ROLES),
+                index=list(db.USER_ROLES).index(
+                    db.DEFAULT_NEW_USER_ROLE),
+                key="up_new_role")
+        nu_btn_col, nu_msg_col = st.columns([1, 4])
+        with nu_btn_col:
+            _nu_submit = st.button(
+                ":sparkles: Create user", key="up_new_submit",
+                type="primary",
+                disabled=not _nu_name.strip())
+        if _nu_submit:
+            name_norm = _nu_name.strip()
+            if not name_norm:
+                with nu_msg_col:
+                    st.error("Display name is required.")
+            else:
+                # Reject duplicates by checking via the case-
+                # insensitive name lookup that upsert_user uses.
+                try:
+                    _existing = db.get_user_by_name(name_norm)
+                except Exception:
+                    _existing = None
+                if _existing:
+                    with nu_msg_col:
+                        st.warning(
+                            f"User **{name_norm}** already exists "
+                            "(case-insensitive match). Pick them "
+                            "from the dropdown below to edit "
+                            "permissions.")
+                else:
+                    try:
+                        new_uid = db.upsert_user(
+                            display_name=name_norm,
+                            role=_nu_role,
+                            email=(_nu_email.strip() or None),
+                            active=True,
+                            actor=st.session_state.get(
+                                "current_user", "") or "admin")
+                        with nu_msg_col:
+                            st.success(
+                                f"Created **{name_norm}** "
+                                f"(user_id={new_uid}, role="
+                                f"{_nu_role}). They'll appear in "
+                                "the dropdown below; their "
+                                "permissions start at the see-"
+                                "everything default until you "
+                                "tick and save.")
+                        # Clear the form so the admin can add
+                        # another without manually wiping fields.
+                        for k in ("up_new_name", "up_new_email"):
+                            if k in st.session_state:
+                                st.session_state[k] = ""
+                        st.rerun()
+                    except Exception as _exc:
+                        with nu_msg_col:
+                            st.error(f"Create failed: {_exc}")
+
     # ---- Pick a user to edit ------------------------------------
     try:
         _all_users = db.list_users(active_only=False)
