@@ -218,8 +218,16 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     # (C0B42QDKX9Q — #po-commentary). Fires BEFORE the muted-
     # channels check below so we can keep the source channel
     # muted for everything ELSE while letting this specific
-    # cross-channel analysis through. Triggers on ≥2 SKUs in
-    # the message body (matches the existing po_review heuristic).
+    # cross-channel analysis through.
+    #
+    # v2.67.193 — Trigger expanded from "≥2 SKUs in text" to
+    # ALSO fire on:
+    #   • PO-NNNN reference (e.g. "Bigdog PO-7159 send")
+    #   • CIN7 PurchaseAdvanced URL (link shared from CIN7)
+    # Both signal the buyer wants commentary on a specific
+    # purchase order, even when no SKUs are pasted inline.
+    # The AI's get_purchase_order tool fetches the lines from
+    # the local CSV so the commentary still works.
     _po_src = os.environ.get(
         "SLACK_PO_COMMENTARY_SOURCE_CHANNEL_ID", "").strip()
     _po_tgt = os.environ.get(
@@ -228,7 +236,16 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
             and msg.get("channel_id") == _po_src):
         _text = msg.get("text") or ""
         _skus_found = SKU_RE.findall(_text)
-        if len(_skus_found) >= 2:
+        _po_found = PO_RE.search(_text)
+        # CIN7 PO URL: https://inventory.dearsystems.com/
+        # PurchaseAdvanced#<uuid> (or the older /Purchase/
+        # path). Slack may show it with a |display label.
+        _cin7_po_url = (
+            "dearsystems.com/PurchaseAdvanced" in _text
+            or "dearsystems.com/Purchase" in _text)
+        if (len(_skus_found) >= 2
+                or _po_found is not None
+                or _cin7_po_url):
             return "po_commentary_crosspost"
 
     # v2.67.187 — SLACK_MUTED_CHANNELS hard mute. Comma-separated
@@ -952,17 +969,24 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
     if channel_intent == "po_review":
         base += (
             "PO REVIEW + BACKORDER MODE: this channel "
-            "(#purchase-backorders or similar) handles three "
+            "(#purchase-backorders or similar) handles FOUR "
             "intertwined things:\n"
             "  (a) Andrew submits POs for staff review — message "
             "      contains supplier name + multiple SKUs with "
             "      quantities.\n"
             "  (b) Sales-order backorders — staff flag a sale "
             "      whose stock is short.\n"
-            "  (c) Stock orders / replenishment discussions.\n\n"
+            "  (c) Stock orders / replenishment discussions.\n"
+            "  (d) BARE PO reference (v2.67.193) — buyer pastes "
+            "      a PO number (PO-NNNN) or a CIN7 "
+            "      PurchaseAdvanced URL with no inline SKUs. "
+            "      Same response as case (a) but you fetch the "
+            "      line items yourself via get_purchase_order "
+            "      first.\n\n"
             "Detect which case it is from the message shape, then "
             "run the appropriate commentary:\n\n"
-            "**Case (a) — PO submission:** for EACH SKU listed:\n"
+            "**Case (a) — PO submission with inline SKUs:** "
+            "for EACH SKU listed:\n"
             "1. Call get_sku_details / search_products_by_text "
             "for engine signals (ABC, OnHand, OnOrder, "
             "is_dormant, excess_units, trend_flag, 12mo demand).\n"
@@ -976,6 +1000,22 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
             "<one-line analysis>`. End with a one-line summary: "
             "supplier total, last PO from that supplier, days "
             "since.\n\n"
+            "**Case (d) — bare PO reference (v2.67.193):** when "
+            "the message mentions PO-NNNN or contains a CIN7 "
+            "URL like dearsystems.com/PurchaseAdvanced#<uuid> "
+            "but has no inline SKU list:\n"
+            "1. FIRST call get_purchase_order with the PO number "
+            "(extract from the text, e.g. 'PO-7159' → "
+            "po_number='PO-7159'). This returns supplier + all "
+            "line items + status + Comments / ShippingNotes / "
+            "Memo / Note / Terms.\n"
+            "2. THEN run the same per-SKU analysis as case (a) "
+            "for each line item returned.\n"
+            "3. If get_purchase_order returns matched=0 with a "
+            "note about the local sync window, surface the gap "
+            "honestly: 'PO-NNNN is outside my local sync; "
+            "ask an admin to widen the purchase-lines sync OR "
+            "paste the line items inline'.\n\n"
             "**Case (b) — backorder mention:** if a SO/INV "
             "number is referenced, call get_sale_order to surface "
             "what's on it, get_incoming_stock for any open POs "
