@@ -460,6 +460,39 @@ while true; do
             "python stock_issues_handler.py morning-summary"
     fi
 
+    # v2.67.194 Stock-locator audit morning post. Once per day at
+    # the configured hour (default 7 ET → 11 UTC), run the BOM
+    # parent/child bin-mismatch audit and post the summary to
+    # SLACK_STOCK_ISSUES_CHANNEL_ID (or override via
+    # SLACK_LOCATOR_AUDIT_CHANNEL_ID). Read-only — no CIN7 writes
+    # in this version. Idempotent via /data marker so worker
+    # restarts in the same day don't repeat.
+    locator_audit_hour="${LOCATOR_AUDIT_MORNING_HOUR_ET:-7}"
+    locator_audit_utc_hour=$(( locator_audit_hour + 4 ))
+    locator_audit_marker="/data/.last_locator_audit_date"
+    last_locator_audit_date=""
+    if [ -f "$locator_audit_marker" ]; then
+        last_locator_audit_date=$(cat "$locator_audit_marker" 2>/dev/null)
+    fi
+    if [ "${now_utc_hour#0}" -ge "$locator_audit_utc_hour" ] \
+            && [ "${now_utc_minute#0}" -ge 30 ] \
+            && [ "$today_utc" != "$last_locator_audit_date" ] \
+            && ( [ -n "${SLACK_LOCATOR_AUDIT_CHANNEL_ID:-}" ] \
+                  || [ -n "${SLACK_STOCK_ISSUES_CHANNEL_ID:-}" ] ); then
+        echo "$today_utc" > "$locator_audit_marker"
+        # Prefer the dedicated channel env var; fall back to
+        # stock-issues if not set. The Python script reads
+        # SLACK_STOCK_ISSUES_CHANNEL_ID by default — override
+        # via --channel-id when LOCATOR_AUDIT_CHANNEL_ID is set.
+        if [ -n "${SLACK_LOCATOR_AUDIT_CHANNEL_ID:-}" ]; then
+            _run_bg "stock_locator_audit" \
+                "python stock_locator_audit.py post-summary --channel-id \"$SLACK_LOCATOR_AUDIT_CHANNEL_ID\""
+        else
+            _run_bg "stock_locator_audit" \
+                "python stock_locator_audit.py post-summary"
+        fi
+    fi
+
     # v2.67.152 Shipping margin monitor. Every 30 min, scan
     # ShipStation shipments for margin events outside ±5% of cost
     # (with a $5 floor) and post to #shipping-issues. Gated on
