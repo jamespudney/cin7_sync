@@ -20535,12 +20535,26 @@ elif page == "User Permissions":
                 index=list(db.USER_ROLES).index(
                     db.DEFAULT_NEW_USER_ROLE),
                 key="up_new_role")
+        # v2.67.191 — Slack DM invite toggle. When checked, after
+        # the user is created we look them up in Slack by email
+        # and DM them a welcome message with the dashboard URL +
+        # their display name. Email becomes required when ticked.
+        _nu_send_invite = st.checkbox(
+            ":envelope: Send Slack DM invite",
+            key="up_new_send_invite", value=False,
+            help=("Looks the user up in Slack by email, opens a "
+                    "DM, and posts a welcome with the dashboard "
+                    "URL + their display name. The shared app "
+                    "password is NOT included — share that 1:1. "
+                    "Email is required when this is ticked."))
         nu_btn_col, nu_msg_col = st.columns([1, 4])
         with nu_btn_col:
             _nu_submit = st.button(
                 ":sparkles: Create user", key="up_new_submit",
                 type="primary",
-                disabled=not _nu_name.strip())
+                disabled=not _nu_name.strip()
+                            or (_nu_send_invite
+                                  and not _nu_email.strip()))
         if _nu_submit:
             name_norm = _nu_name.strip()
             if not name_norm:
@@ -20569,15 +20583,51 @@ elif page == "User Permissions":
                             active=True,
                             actor=st.session_state.get(
                                 "current_user", "") or "admin")
+                        success_msg = (
+                            f"Created **{name_norm}** "
+                            f"(user_id={new_uid}, role="
+                            f"{_nu_role}). They'll appear in "
+                            "the dropdown below; their "
+                            "permissions start at the see-"
+                            "everything default until you "
+                            "tick and save.")
+                        # v2.67.191 — send the Slack DM invite if
+                        # the admin opted in. Email already
+                        # required by the disable-gate, but be
+                        # defensive.
+                        if _nu_send_invite and _nu_email.strip():
+                            try:
+                                from slack_invite import (
+                                    send_invite as _slack_inv)
+                                _inv_ok, _inv_detail = _slack_inv(
+                                    email=_nu_email.strip(),
+                                    display_name=name_norm,
+                                    role=_nu_role)
+                            except Exception as _inv_exc:
+                                _inv_ok = False
+                                _inv_detail = (
+                                    f"import/runtime error: "
+                                    f"{_inv_exc}")
+                            if _inv_ok:
+                                success_msg += (
+                                    f"\n\n:white_check_mark: "
+                                    f"Slack DM invite sent to "
+                                    f"`{_nu_email.strip()}` "
+                                    f"(ts {_inv_detail}).")
+                            else:
+                                success_msg += (
+                                    f"\n\n:warning: User created "
+                                    f"but Slack invite FAILED: "
+                                    f"_{_inv_detail}_. Common "
+                                    f"causes: email not in your "
+                                    f"Slack workspace, bot is "
+                                    f"missing `users:read.email` "
+                                    f"scope, or the user has a "
+                                    f"different email on Slack. "
+                                    f"DM them manually with the "
+                                    f"dashboard URL.")
                         with nu_msg_col:
-                            st.success(
-                                f"Created **{name_norm}** "
-                                f"(user_id={new_uid}, role="
-                                f"{_nu_role}). They'll appear in "
-                                "the dropdown below; their "
-                                "permissions start at the see-"
-                                "everything default until you "
-                                "tick and save.")
+                            st.success(success_msg)
                         # Clear the form so the admin can add
                         # another without manually wiping fields.
                         for k in ("up_new_name", "up_new_email"):
@@ -20608,6 +20658,38 @@ elif page == "User Permissions":
     _sel_uid = int(_sel_user["user_id"])
     _sel_name = _sel_user["display_name"]
     _sel_role = _sel_user["role"]
+    _sel_email = (_sel_user["email"] or "").strip()
+
+    # v2.67.191 — Resend Slack DM invite for an existing user.
+    # Useful when the original invite missed (Slack lookup failed
+    # at creation time) or you want to nudge them again.
+    if _sel_email:
+        rs_col, _ = st.columns([1, 4])
+        if rs_col.button(
+                ":envelope: Resend Slack DM invite",
+                key=f"up_resend_{_sel_uid}",
+                help=(f"Sends the welcome DM again to "
+                        f"`{_sel_email}`. Same message as the "
+                        f"create-user invite. Useful if they "
+                        f"missed the first one or you didn't "
+                        f"send it then.")):
+            try:
+                from slack_invite import send_invite as _slack_inv
+                _r_ok, _r_detail = _slack_inv(
+                    email=_sel_email,
+                    display_name=_sel_name,
+                    role=_sel_role)
+            except Exception as _r_exc:
+                _r_ok = False
+                _r_detail = f"runtime error: {_r_exc}"
+            if _r_ok:
+                st.success(
+                    f"Resent invite to `{_sel_email}` "
+                    f"(ts {_r_detail}).")
+            else:
+                st.error(
+                    f"Resend FAILED: _{_r_detail}_. Common "
+                    "causes listed in the create-user tooltip.")
 
     # ---- Current permission state -------------------------------
     try:
