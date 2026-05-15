@@ -2721,6 +2721,7 @@ with st.sidebar:
             "Purchase Analysis",
             "Sales Recent",
             "Data Health",
+            "User Permissions",  # v2.67.185 — admin-only
     ]
     # v2.67.41 — one-line per-page descriptions, rendered as
     # captions under each radio option. Order MUST match
@@ -2749,22 +2750,49 @@ with st.sidebar:
         "PO-side analytics: spend by supplier, lead-time variance.",
         "Recent sales feed + filters.",
         "Sync freshness, CSV row counts, data integrity flags.",
+        "Admin: assign which pages each user can access.",
     ]
+    # v2.67.185 — filter _page_options by per-user permissions.
+    # Unconfigured users (no rows in user_page_permissions) see
+    # everything (backwards compat). Admins always see everything.
+    # The "User Permissions" page itself is admin-only.
+    _user_role = (current_user_profile or {}).get("role") or "sales"
+    _user_id = (current_user_profile or {}).get("user_id") or 0
+    if (_user_role or "").strip().lower() == "admin":
+        _visible_pages = list(_page_options)
+    else:
+        try:
+            _visible_pages = [
+                p for p in _page_options
+                if (p != "User Permissions"
+                    and db.can_user_access_page(
+                        _user_id, p, _user_role))]
+        except Exception:
+            # Defensive — never break the sidebar over a DB hiccup.
+            _visible_pages = [
+                p for p in _page_options
+                if p != "User Permissions"]
+    # Pair the visible options with their captions in lockstep.
+    _visible_captions = [
+        _page_captions[i]
+        for i, opt in enumerate(_page_options)
+        if opt in _visible_pages]
+
     # v2.66: if the user has a default_page in their profile, jump
     # straight to it on first sign-in. We only honour it once per
     # session so the user can navigate freely afterwards.
     _default_page = (current_user_profile or {}).get("default_page")
     if (_default_page
-            and _default_page in _page_options
+            and _default_page in _visible_pages
             and not st.session_state.get("_default_page_consumed")):
-        _start_idx = _page_options.index(_default_page)
+        _start_idx = _visible_pages.index(_default_page)
         st.session_state["_default_page_consumed"] = True
     else:
         _start_idx = 0
     page = st.radio(
         "View",
-        _page_options,
-        index=_start_idx,
+        _visible_pages,
+        index=_start_idx if _visible_pages else 0,
         label_visibility="collapsed",
     )
     # v2.67.45 — collapsible "what does each section do" expander
@@ -2775,7 +2803,7 @@ with st.sidebar:
     # screen.
     with st.expander("ⓘ What does each section do?",
                        expanded=False):
-        for _opt, _cap in zip(_page_options, _page_captions):
+        for _opt, _cap in zip(_visible_pages, _visible_captions):
             st.markdown(f"**{_opt}** — <small>{_cap}</small>",
                           unsafe_allow_html=True)
 
@@ -14477,9 +14505,16 @@ elif page == "Ad-Umpire":
             sku_agg["roas"] = (
                 sku_agg["revenue"] / sku_agg["spend"].replace(
                     0, pd.NA))
-            sku_agg["spend"] = sku_agg["spend"].round(2)
-            sku_agg["revenue"] = sku_agg["revenue"].round(2)
-            sku_agg["roas"] = sku_agg["roas"].round(2)
+            # v2.67.185 — same pd.NA → NaN coerce as v2.67.177 (the
+            # campaign-level ROAS round). pd.NA doesn't support
+            # __round__; pd.to_numeric(errors='coerce') turns it
+            # into float NaN which .round() handles natively.
+            sku_agg["spend"] = pd.to_numeric(
+                sku_agg["spend"], errors="coerce").round(2)
+            sku_agg["revenue"] = pd.to_numeric(
+                sku_agg["revenue"], errors="coerce").round(2)
+            sku_agg["roas"] = pd.to_numeric(
+                sku_agg["roas"], errors="coerce").round(2)
 
             _sku_sort = st.selectbox(
                 "Sort by",
@@ -20447,3 +20482,145 @@ elif page == "Data Health":
         "- **Team Actions** — flags, notes, approvals shared across users (SQLite).\n"
         "- **Auth + hosted URL** — public link with login for remote team members.\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# v2.67.185 — User Permissions admin page
+# ---------------------------------------------------------------------------
+elif page == "User Permissions":
+    st.header(":lock: User Permissions")
+    st.caption(
+        "Per-user page-access control. Tick the pages each user "
+        "is allowed to see. Users with NO permissions configured "
+        "see everything (backwards-compat default). Admins always "
+        "see everything regardless of these settings.")
+
+    _admin_role = (
+        (current_user_profile or {}).get("role") or "").strip().lower()
+    if _admin_role != "admin":
+        st.error(
+            "This page is admin-only. Ask an existing admin to "
+            "grant your profile the 'admin' role on the My Profile "
+            "page.")
+        st.stop()
+
+    # ---- Pick a user to edit ------------------------------------
+    try:
+        _all_users = db.list_users(active_only=False)
+    except Exception as _exc:
+        st.error(f"Could not list users: {_exc}")
+        _all_users = []
+    if not _all_users:
+        st.info("No users in the system yet.")
+        st.stop()
+    _user_options = {
+        f"{u['display_name']} ({u['role']})"
+        + (" — inactive" if not u.get("active") else ""): u
+        for u in _all_users
+    }
+    _sel_label = st.selectbox(
+        "User", list(_user_options.keys()), key="up_sel_user")
+    _sel_user = _user_options[_sel_label]
+    _sel_uid = int(_sel_user["user_id"])
+    _sel_name = _sel_user["display_name"]
+    _sel_role = _sel_user["role"]
+
+    # ---- Current permission state -------------------------------
+    try:
+        _current_perms = db.get_user_page_permissions(_sel_uid)
+    except Exception as _exc:
+        st.error(f"Could not load permissions: {_exc}")
+        _current_perms = {}
+    _is_unconfigured = (len(_current_perms) == 0)
+    if _sel_role == "admin":
+        st.info(
+            f"**{_sel_name}** is an admin — sees every page "
+            "regardless of the checkboxes below. Adjust their "
+            "role on the My Profile page if needed.")
+    elif _is_unconfigured:
+        st.warning(
+            f"**{_sel_name}** has no permissions configured yet. "
+            "By default they see every page. Tick boxes below + "
+            "Save to lock down their view.")
+    else:
+        _n_allowed = sum(1 for v in _current_perms.values() if v)
+        st.success(
+            f"**{_sel_name}** currently sees {_n_allowed} of "
+            f"{len(_page_options) - 1} pages "
+            "(the User Permissions page itself is admin-only).")
+
+    # ---- Select-All / Clear-All / Reset to default --------------
+    _editable_pages = [p for p in _page_options
+                          if p != "User Permissions"]
+    _state_key = f"up_state_{_sel_uid}"
+    if (_state_key not in st.session_state
+            or st.session_state.get(
+                "up_last_uid") != _sel_uid):
+        # Initialise checkbox state from DB on user switch.
+        st.session_state[_state_key] = {
+            p: (True if _is_unconfigured
+                  else bool(_current_perms.get(p, False)))
+            for p in _editable_pages
+        }
+        st.session_state["up_last_uid"] = _sel_uid
+
+    bc1, bc2, bc3 = st.columns([1, 1, 1])
+    if bc1.button(":white_check_mark: Select all",
+                       key=f"up_all_{_sel_uid}"):
+        for p in _editable_pages:
+            st.session_state[_state_key][p] = True
+        st.rerun()
+    if bc2.button(":x: Clear all", key=f"up_none_{_sel_uid}"):
+        for p in _editable_pages:
+            st.session_state[_state_key][p] = False
+        st.rerun()
+    if bc3.button(":arrows_counterclockwise: Reset to default "
+                       "(see everything)",
+                       key=f"up_reset_{_sel_uid}",
+                       help=("Deletes this user's permission "
+                                "rows entirely. They fall back "
+                                "to the unconfigured default.")):
+        try:
+            db.clear_user_page_permissions(
+                _sel_uid,
+                set_by=st.session_state.get("current_user", ""))
+            st.success(f"Reset {_sel_name} to default.")
+            del st.session_state[_state_key]
+            st.rerun()
+        except Exception as _exc:
+            st.error(f"Reset failed: {_exc}")
+
+    # ---- Checkbox grid ------------------------------------------
+    st.markdown("##### Allow access to:")
+    _ncols = 3
+    _cols = st.columns(_ncols)
+    for idx, p in enumerate(_editable_pages):
+        target = _cols[idx % _ncols]
+        with target:
+            new_v = st.checkbox(
+                p,
+                value=st.session_state[_state_key].get(p, False),
+                key=f"up_chk_{_sel_uid}_{p}")
+            st.session_state[_state_key][p] = new_v
+
+    # ---- Save ----------------------------------------------------
+    st.markdown("---")
+    if st.button(":floppy_disk: Save permissions",
+                       key=f"up_save_{_sel_uid}", type="primary"):
+        allowed_pages = [
+            p for p, v in
+            st.session_state[_state_key].items() if v]
+        try:
+            db.set_user_page_permissions(
+                _sel_uid,
+                allowed_pages=allowed_pages,
+                all_pages=_editable_pages,
+                set_by=st.session_state.get(
+                    "current_user", "") or "unknown")
+            st.success(
+                f"Saved — {_sel_name} can now see "
+                f"{len(allowed_pages)} of {len(_editable_pages)} "
+                "pages. They'll see the updated list on their "
+                "next page reload.")
+        except Exception as _exc:
+            st.error(f"Save failed: {_exc}")

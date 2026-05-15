@@ -85,6 +85,25 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS ix_audit_at ON audit_log(at);
 
+-- v2.67.185 — per-user page permissions.
+-- One row per (user_id, page_name). If a user has NO rows at all,
+-- they see every page (backwards-compat — existing users don't
+-- lose access until permissions are explicitly configured for
+-- them). Once at least one row exists for a user, only pages
+-- with allowed=1 are visible.
+-- Admins (users.role='admin') always see every page regardless
+-- of rows here. Set via the "User Permissions" admin page.
+CREATE TABLE IF NOT EXISTS user_page_permissions (
+    user_id     INTEGER NOT NULL,
+    page_name   TEXT    NOT NULL,
+    allowed     INTEGER NOT NULL DEFAULT 0,
+    set_by      TEXT,
+    set_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, page_name)
+);
+CREATE INDEX IF NOT EXISTS ix_user_page_permissions_user
+    ON user_page_permissions(user_id);
+
 -- Migration map: retiring SKU -> successor SKU. Used when we're phasing
 -- out a product line and want its historical demand rolled up under the
 -- new line for forecasting.
@@ -4837,6 +4856,100 @@ def get_or_create_user(display_name: str) -> sqlite3.Row:
     new_row = get_user_by_name(name)
     assert new_row is not None  # just inserted
     return new_row
+
+
+# ---------------------------------------------------------------------------
+# v2.67.185 — Per-user page permissions
+# ---------------------------------------------------------------------------
+def get_user_page_permissions(user_id: int) -> dict:
+    """Return {page_name: bool} of explicit permission rows for
+    this user. Empty dict if no rows exist (= backwards-compat
+    'see everything' mode)."""
+    if not user_id:
+        return {}
+    with connect() as c:
+        rows = c.execute(
+            "SELECT page_name, allowed "
+            "FROM user_page_permissions WHERE user_id = ?",
+            (int(user_id),)).fetchall()
+    return {r["page_name"]: bool(r["allowed"]) for r in rows}
+
+
+def set_user_page_permissions(user_id: int,
+                                 allowed_pages: list,
+                                 all_pages: list,
+                                 set_by: str) -> None:
+    """Bulk-replace a user's page permissions. `allowed_pages` is
+    the list of pages the user CAN access; everything else in
+    `all_pages` gets stored with allowed=0.
+
+    Storing the explicit-deny rows (rather than just absences) is
+    deliberate: it disambiguates 'never configured' (no rows =
+    see-everything default) from 'configured to see nothing' (all
+    rows allowed=0). The admin UI shows checkboxes for every
+    page; pressing Save writes rows for all of them.
+
+    Audit-logged on every save."""
+    allowed_set = {str(p).strip()
+                      for p in (allowed_pages or [])
+                      if str(p).strip()}
+    all_set = {str(p).strip()
+                  for p in (all_pages or [])
+                  if str(p).strip()}
+    if not all_set:
+        return
+    actor = (set_by or "").strip() or "system"
+    with connect() as c:
+        for page in sorted(all_set):
+            allowed = 1 if page in allowed_set else 0
+            c.execute(
+                "INSERT INTO user_page_permissions "
+                "(user_id, page_name, allowed, set_by) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id, page_name) DO UPDATE SET "
+                "  allowed = excluded.allowed, "
+                "  set_by  = excluded.set_by, "
+                "  set_at  = datetime('now')",
+                (int(user_id), page, allowed, actor))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("user_permissions.set", actor, str(user_id),
+              f"{len(allowed_set)} of {len(all_set)} pages "
+              "allowed"))
+
+
+def can_user_access_page(user_id: int, page_name: str,
+                              role: str = "sales") -> bool:
+    """Permission gate. Returns True when:
+      • role == 'admin' (always — admins bypass the table)
+      • OR the user has zero permission rows (= unconfigured,
+        backwards-compat see-everything default)
+      • OR the row for this page has allowed=1
+    Returns False only when the row exists AND allowed=0."""
+    if (role or "").strip().lower() == "admin":
+        return True
+    perms = get_user_page_permissions(user_id)
+    if not perms:
+        # Never configured — see everything (backwards compat).
+        return True
+    return bool(perms.get(page_name, False))
+
+
+def clear_user_page_permissions(user_id: int,
+                                       set_by: str) -> None:
+    """Reset a user's permissions to 'unconfigured' (deletes all
+    rows). They'll fall back to the see-everything default."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM user_page_permissions WHERE user_id = ?",
+            (int(user_id),))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("user_permissions.clear",
+              (set_by or "").strip() or "system",
+              str(user_id), "reset to unconfigured"))
 
 
 # ---------------------------------------------------------------------------
