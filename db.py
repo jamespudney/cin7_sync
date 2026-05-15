@@ -2719,6 +2719,60 @@ def _backend_is_postgres() -> bool:
               .strip().lower() == "postgres")
 
 
+# v2.67.187 — Post-cutover Postgres migrations.
+# The original migrate_to_pg.py introspected SQLite and built
+# the Postgres schema from that snapshot. Tables ADDED to
+# db.py's _SCHEMA after the cutover never make it to Postgres
+# unless we ship dialect-correct DDL here.
+#
+# Each tuple is (table_name, postgres_ddl). The DDL must be
+# IDEMPOTENT (use IF NOT EXISTS). _apply_pg_post_cutover()
+# runs once per connect on the Postgres path; cheap because
+# CREATE TABLE IF NOT EXISTS is a no-op when the table exists.
+#
+# Add a new entry every time db.py's _SCHEMA gets a new table.
+# The keep-this-updated rule in intelligence_glossary.py covers
+# engine columns; this is the equivalent rule for Postgres
+# schema additions.
+_PG_POST_CUTOVER_TABLES = [
+    # v2.67.185 — User Permissions portal.
+    ("user_page_permissions",
+      """
+      CREATE TABLE IF NOT EXISTS user_page_permissions (
+          user_id   BIGINT NOT NULL,
+          page_name TEXT   NOT NULL,
+          allowed   BIGINT NOT NULL DEFAULT 0,
+          set_by    TEXT,
+          set_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (user_id, page_name)
+      );
+      """),
+    ("user_page_permissions_index",
+      """
+      CREATE INDEX IF NOT EXISTS ix_user_page_permissions_user
+          ON user_page_permissions(user_id);
+      """),
+]
+
+
+def _apply_pg_post_cutover(conn) -> None:
+    """Apply post-cutover schema migrations on Postgres. Called
+    once per `connect()` on the Postgres path. Each DDL uses
+    IF NOT EXISTS so re-runs are no-ops. Safe to extend the
+    _PG_POST_CUTOVER_TABLES list at any time."""
+    for label, ddl in _PG_POST_CUTOVER_TABLES:
+        try:
+            conn.execute(ddl)
+        except Exception as exc:
+            # Don't fail the connection over a migration hiccup
+            # — log and let the caller see the missing-table
+            # error on the actual query. Helpful for debugging.
+            import logging as _lg
+            _lg.getLogger("db").warning(
+                "PG post-cutover migration %s failed: %s",
+                label, exc)
+
+
 @contextmanager
 def connect() -> Iterator[sqlite3.Connection]:
     # v2.67.163 — Postgres path delegates entirely to db_dialect
@@ -2732,13 +2786,12 @@ def connect() -> Iterator[sqlite3.Connection]:
             # v2.67.167 — Postgres path does NOT re-apply the
             # SQLite-flavored _SCHEMA on every connection.
             # migrate_to_pg.py introspects + translates and is
-            # the source of truth for the Postgres schema.
-            # Likewise the SQLite _migrate_* helpers — they
-            # use ALTER TABLE try/except patterns specific to
-            # sqlite3 exceptions and would crash or no-op on
-            # Postgres. When we need a new column or migration
-            # on Postgres, add it to migrate_to_pg.py and re-run
-            # (it's idempotent on existing rows).
+            # the source of truth for the Postgres schema as of
+            # the cutover.
+            # v2.67.187 — Apply post-cutover schema migrations
+            # for tables added AFTER the initial cutover.
+            # Idempotent (CREATE TABLE IF NOT EXISTS).
+            _apply_pg_post_cutover(conn)
             yield conn
         return
 

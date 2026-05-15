@@ -211,6 +211,20 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     if msg["is_our_bot"]:
         return "bot_self"
 
+    # v2.67.187 — SLACK_MUTED_CHANNELS hard mute. Comma-separated
+    # list of channel IDs where the bot should NEVER respond — not
+    # to mentions, not to triggers, not to FlowBot patterns,
+    # nothing. Useful when a channel has been re-purposed and we
+    # want to silence the bot there without ripping out env vars
+    # one handler at a time. Add a channel ID, redeploy, done.
+    _muted_raw = os.environ.get(
+        "SLACK_MUTED_CHANNELS", "").strip()
+    if _muted_raw:
+        muted = {c.strip() for c in _muted_raw.split(",")
+                    if c.strip()}
+        if msg.get("channel_id") in muted:
+            return "chatter"  # silent — no handler fires
+
     # v2.67.137 — back-in-stock subscription detection runs BEFORE
     # the is_bot branch so the pattern fires whether the message
     # came from FlowBot OR a human paste-test in the same channel.
