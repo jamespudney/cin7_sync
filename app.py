@@ -6730,7 +6730,57 @@ if page == "Overview":
                     "Optimisation overview and the Monthly Metrics "
                     "report (your commissions reference). v2.67.37 "
                     "unified the three sources so they tie to the "
-                    "cent.")
+                    "cent. SKUs without a FIFO basis contribute "
+                    "$0 — see the diagnostic caption beneath for "
+                    "the fallback-cost total.")
+
+    # v2.67.206 — diagnostic so the user can see WHY this tile
+    # may look understated: SKUs without CIN7 FIFO data
+    # contribute $0 to the FIFO total but DO have stock on shelf.
+    # The cost-chain (OnHand × AverageCost / family-median / etc.)
+    # gives a fuller picture. Render as a small caption rather
+    # than a second tile because the headline must stay
+    # commissions-canonical.
+    try:
+        if (not stock.empty and "OnHand" in stock.columns
+                and not products.empty
+                and "SKU" in products.columns
+                and "AverageCost" in products.columns):
+            _s = stock.copy()
+            _s["OnHand"] = _to_num(_s["OnHand"]).fillna(0)
+            _p_cost = (products.set_index("SKU")["AverageCost"]
+                          .apply(lambda v: float(v or 0))
+                          .to_dict())
+            _s["__cost"] = _s["SKU"].map(
+                lambda s: _p_cost.get(s, 0.0))
+            _s["__row_val"] = _s["OnHand"] * _s["__cost"]
+            _fallback_total = float(_s["__row_val"].sum())
+            # SKUs where StockOnHand is zero/missing but OnHand>0
+            # = the gap.
+            if "StockOnHand" in _s.columns:
+                _no_fifo = _s[
+                    (_to_num(_s["StockOnHand"]).fillna(0) == 0)
+                    & (_s["OnHand"] > 0)]
+                _gap_skus = int(_no_fifo["SKU"].nunique())
+                _gap_value = float(
+                    _no_fifo["__row_val"].sum())
+            else:
+                _gap_skus = 0
+                _gap_value = 0.0
+            _delta = _fallback_total - stock_value
+            if _delta > 100:  # only show when material
+                st.caption(
+                    f":mag: *Diagnostic:* CIN7 FIFO above = "
+                    f"**{_fmt_money(stock_value)}**. The "
+                    f"`OnHand × AverageCost` fallback for SKUs "
+                    f"missing FIFO basis would add "
+                    f"**{_fmt_money(_delta)}** "
+                    f"({_gap_skus:,} SKUs · estimated value "
+                    f"{_fmt_money(_gap_value)}). Headline stays "
+                    f"FIFO-only for commissions consistency.")
+    except Exception:
+        # Diagnostic must never break the tile.
+        pass
 
     # Sales invoiced in the last 30 days.
     #
@@ -9930,16 +9980,49 @@ elif page == "Product Master":
 # ---------------------------------------------------------------------------
 
 elif page == "Purchase Analysis":
-    st.header(":truck: Purchase Analysis (last 90 days)")
+    st.header(":truck: Purchase Analysis")
 
     if purchase_lines.empty:
         st.warning("No purchase line data. Run `python cin7_sync.py "
                    "purchaselines --days 90`.")
     else:
+        # v2.67.206 — same correctness fixes as Recent Sales
+        # (v2.67.205). `purchase_lines` is the longest window
+        # available (up to 5 years), NOT 90 days as the header
+        # implied. Filters: user-selected window + exclude
+        # VOIDED/CANCELLED so the figures represent real spend.
         df = purchase_lines.copy()
         df["Total"] = _to_num(df["Total"]).fillna(0)
         df["Quantity"] = _to_num(df["Quantity"]).fillna(0)
         df["OrderDate"] = _to_date(df["OrderDate"]).dt.tz_localize(None)
+
+        col_w, _ = st.columns([1, 3])
+        with col_w:
+            _window_days = st.selectbox(
+                "Window", [90, 30, 7, 365, 1825],
+                index=0, key="pa_window_days",
+                format_func=lambda d: f"Last {d} days"
+                    if d <= 365 else "Last 5 years (all)")
+
+        # Filter to window.
+        _cutoff = (pd.Timestamp(datetime.now().date())
+                      - pd.Timedelta(days=int(_window_days)))
+        df = df[df["OrderDate"] >= _cutoff]
+
+        # Exclude voided / cancelled / draft.
+        n_before_status = len(df)
+        if "Status" in df.columns:
+            bad_statuses = ("VOIDED", "CANCELLED", "CANCELED",
+                              "DRAFT")
+            df = df[~df["Status"].astype(str).str.upper().isin(
+                bad_statuses)]
+        n_dropped_status = n_before_status - len(df)
+
+        st.caption(
+            f"Showing purchase lines for the last "
+            f"{_window_days} days · excludes voided/"
+            f"cancelled/draft ({n_dropped_status:,} dropped). "
+            "Window selector above changes the period.")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Line items", _fmt_number(len(df)))
