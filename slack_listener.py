@@ -211,6 +211,26 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
     if msg["is_our_bot"]:
         return "bot_self"
 
+    # v2.67.188 — PO commentary crosspost. When a PO draft is
+    # pasted into the source channel (typically C08KKG0RQCA —
+    # the buyer-review channel), analyse it with our engine
+    # signals and post the commentary to a SEPARATE channel
+    # (C0B42QDKX9Q — #po-commentary). Fires BEFORE the muted-
+    # channels check below so we can keep the source channel
+    # muted for everything ELSE while letting this specific
+    # cross-channel analysis through. Triggers on ≥2 SKUs in
+    # the message body (matches the existing po_review heuristic).
+    _po_src = os.environ.get(
+        "SLACK_PO_COMMENTARY_SOURCE_CHANNEL_ID", "").strip()
+    _po_tgt = os.environ.get(
+        "SLACK_PO_COMMENTARY_TARGET_CHANNEL_ID", "").strip()
+    if (_po_src and _po_tgt
+            and msg.get("channel_id") == _po_src):
+        _text = msg.get("text") or ""
+        _skus_found = SKU_RE.findall(_text)
+        if len(_skus_found) >= 2:
+            return "po_commentary_crosspost"
+
     # v2.67.187 — SLACK_MUTED_CHANNELS hard mute. Comma-separated
     # list of channel IDs where the bot should NEVER respond — not
     # to mentions, not to triggers, not to FlowBot patterns,
@@ -1698,6 +1718,100 @@ def process_once(max_messages: int = 25) -> int:
                 posts_made += 1
                 log.info("Posted Viktor overlay in %s/%s",
                           ch_name, msg["ts"])
+            continue
+
+        # v2.67.188 — PO commentary crosspost. Source message lives
+        # in the buyer-review channel (typically muted); we run the
+        # po_review composer against it and post the commentary to
+        # a SEPARATE channel (the dedicated #po-commentary). Posts
+        # exactly once per source-message ts (idempotency via the
+        # slack_bot_responses table — we look up by in_ts).
+        if classification == "po_commentary_crosspost":
+            tgt_channel = os.environ.get(
+                "SLACK_PO_COMMENTARY_TARGET_CHANNEL_ID",
+                "").strip()
+            if not tgt_channel:
+                log.warning(
+                    "po_commentary_crosspost classified but "
+                    "SLACK_PO_COMMENTARY_TARGET_CHANNEL_ID not "
+                    "set — skipping post.")
+                continue
+            # Idempotency — have we already posted commentary for
+            # this exact source message?
+            with db.connect() as c:
+                already = c.execute(
+                    "SELECT 1 FROM slack_bot_responses "
+                    "WHERE in_channel = ? AND in_ts = ? "
+                    "  AND classification = "
+                    "      'po_commentary_crosspost' LIMIT 1",
+                    (msg["channel_id"], msg["ts"])).fetchone()
+            if already:
+                log.info(
+                    "po_commentary_crosspost: already posted "
+                    "for %s/%s — skipping.",
+                    ch_name, msg["ts"])
+                continue
+            # Use the po_review intent to drive the composer's
+            # prompt — that branch (line 932+) already has the
+            # right system-prompt copy for analysing PO drafts.
+            log.info(
+                "Composing po_commentary_crosspost for %s/%s "
+                "→ posting to %s",
+                ch_name, msg["ts"], tgt_channel)
+            try:
+                text, tools = _compose_response(
+                    msg, "po_review", "po_review")
+            except Exception as exc:
+                log.error("po_commentary compose failed: %s", exc)
+                continue
+            if not text or not text.strip():
+                log.info(
+                    "po_commentary_crosspost: AI returned empty "
+                    "for %s/%s", ch_name, msg["ts"])
+                continue
+            # Permalink to the source message so reviewers can
+            # jump back. Slack permalink format:
+            #   https://<workspace>.slack.com/archives/<CH>/p<ts*1e6>
+            _src_ts_id = "p" + str(msg["ts"]).replace(".", "")
+            workspace = os.environ.get(
+                "SLACK_WORKSPACE_SUBDOMAIN",
+                "wired4signs-usa").strip()
+            permalink = (
+                f"https://{workspace}.slack.com/archives/"
+                f"{msg['channel_id']}/{_src_ts_id}")
+            header = (
+                f":bar_chart: *PO commentary* "
+                f"— source: <{permalink}|message in #"
+                f"{ch_name or msg['channel_id']}>\n\n")
+            body = header + text
+            try:
+                posted_ts = _post_response(
+                    session, tgt_channel, None, body)
+            except Exception as exc:
+                log.error(
+                    "po_commentary_crosspost post failed: %s",
+                    exc)
+                continue
+            if posted_ts:
+                with db.connect() as c:
+                    c.execute(
+                        "INSERT INTO slack_bot_responses "
+                        "(in_channel, in_ts, in_thread_ts, "
+                        " user_question, response_text, "
+                        " response_ts, tools_used, "
+                        " classification) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (msg["channel_id"], msg["ts"],
+                          msg["thread_ts"] or msg["ts"],
+                          (msg["text"] or "")[:500],
+                          body, posted_ts,
+                          ",".join(tools),
+                          "po_commentary_crosspost"))
+                posts_made += 1
+                log.info(
+                    "Posted po_commentary_crosspost to %s for "
+                    "source %s/%s",
+                    tgt_channel, ch_name, msg["ts"])
             continue
 
         # Self-suppress check.
