@@ -181,15 +181,34 @@ def send_invite(email: str,
 
     user_id, reason = _lookup_user_by_email(email)
     if not user_id:
+        # v2.67.192 — be explicit about which scope each step
+        # needs so the admin's UI message points at the right
+        # OAuth setting.
+        if "missing_scope" in reason:
+            reason += (
+                " (needed: users:read.email — add it in "
+                "api.slack.com → your app → OAuth & "
+                "Permissions → Bot Token Scopes, then "
+                "re-install the app)")
         return False, f"Slack user not found: {reason}"
 
     dm_id, reason = _open_dm(user_id)
     if not dm_id:
+        if "missing_scope" in reason:
+            reason += (
+                " (needed: im:write — add it in "
+                "api.slack.com → your app → OAuth & "
+                "Permissions → Bot Token Scopes, then "
+                "re-install the app)")
         return False, f"Couldn't open DM: {reason}"
 
     text = _compose_invite(display_name, role)
     ok, detail = _post_message(dm_id, text)
     if not ok:
+        if "missing_scope" in detail:
+            detail += (
+                " (needed: chat:write — should already be "
+                "granted; if missing, re-install the app)")
         return False, f"DM post failed: {detail}"
 
     log.info(

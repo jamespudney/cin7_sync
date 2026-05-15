@@ -20510,8 +20510,16 @@ elif page == "User Permissions":
     # self-signin. Sign-in flow elsewhere will pick the row up
     # automatically (get_or_create_user reads existing rows when
     # a name is typed at the gate).
-    with st.expander(":heavy_plus_sign: Add new user",
-                      expanded=False):
+    # v2.67.192 — emoji shortcodes (e.g. `:envelope:`) DON'T
+    # render inside button/checkbox/expander labels in Streamlit;
+    # use literal Unicode characters instead. Same goes for the
+    # form-reset pattern: clearing st.session_state[widget_key]
+    # after the widget has rendered is forbidden. Use a counter
+    # appended to the widget key to force a fresh instance on
+    # next render.
+    _form_iteration = st.session_state.get(
+        "up_new_form_iter", 0)
+    with st.expander("➕  Add new user", expanded=False):
         st.caption(
             "Creates a profile so the user can sign in by typing "
             "their name at the gate. They'll start with the "
@@ -20521,12 +20529,12 @@ elif page == "User Permissions":
         with nu_col1:
             _nu_name = st.text_input(
                 "Display name",
-                key="up_new_name",
+                key=f"up_new_name_{_form_iteration}",
                 placeholder="e.g. Cheran")
         with nu_col2:
             _nu_email = st.text_input(
                 "Email (optional)",
-                key="up_new_email",
+                key=f"up_new_email_{_form_iteration}",
                 placeholder="cheran@wired4signsusa.com")
         with nu_col3:
             _nu_role = st.selectbox(
@@ -20534,14 +20542,15 @@ elif page == "User Permissions":
                 list(db.USER_ROLES),
                 index=list(db.USER_ROLES).index(
                     db.DEFAULT_NEW_USER_ROLE),
-                key="up_new_role")
+                key=f"up_new_role_{_form_iteration}")
         # v2.67.191 — Slack DM invite toggle. When checked, after
         # the user is created we look them up in Slack by email
         # and DM them a welcome message with the dashboard URL +
         # their display name. Email becomes required when ticked.
         _nu_send_invite = st.checkbox(
-            ":envelope: Send Slack DM invite",
-            key="up_new_send_invite", value=False,
+            "📩 Send Slack DM invite",
+            key=f"up_new_send_invite_{_form_iteration}",
+            value=False,
             help=("Looks the user up in Slack by email, opens a "
                     "DM, and posts a welcome with the dashboard "
                     "URL + their display name. The shared app "
@@ -20550,7 +20559,8 @@ elif page == "User Permissions":
         nu_btn_col, nu_msg_col = st.columns([1, 4])
         with nu_btn_col:
             _nu_submit = st.button(
-                ":sparkles: Create user", key="up_new_submit",
+                "✨ Create user",
+                key=f"up_new_submit_{_form_iteration}",
                 type="primary",
                 disabled=not _nu_name.strip()
                             or (_nu_send_invite
@@ -20628,11 +20638,14 @@ elif page == "User Permissions":
                                     f"dashboard URL.")
                         with nu_msg_col:
                             st.success(success_msg)
-                        # Clear the form so the admin can add
-                        # another without manually wiping fields.
-                        for k in ("up_new_name", "up_new_email"):
-                            if k in st.session_state:
-                                st.session_state[k] = ""
+                        # v2.67.192 — bump the form-iteration
+                        # counter so the next render mounts fresh
+                        # widgets (different keys) — gives us a
+                        # clean form without violating Streamlit's
+                        # "can't modify session state after widget
+                        # instantiation" rule.
+                        st.session_state["up_new_form_iter"] = (
+                            _form_iteration + 1)
                         st.rerun()
                     except Exception as _exc:
                         with nu_msg_col:
@@ -20666,7 +20679,7 @@ elif page == "User Permissions":
     if _sel_email:
         rs_col, _ = st.columns([1, 4])
         if rs_col.button(
-                ":envelope: Resend Slack DM invite",
+                "📩 Resend Slack DM invite",
                 key=f"up_resend_{_sel_uid}",
                 help=(f"Sends the welcome DM again to "
                         f"`{_sel_email}`. Same message as the "
@@ -20731,17 +20744,16 @@ elif page == "User Permissions":
         st.session_state["up_last_uid"] = _sel_uid
 
     bc1, bc2, bc3 = st.columns([1, 1, 1])
-    if bc1.button(":white_check_mark: Select all",
+    if bc1.button("✅ Select all",
                        key=f"up_all_{_sel_uid}"):
         for p in _editable_pages:
             st.session_state[_state_key][p] = True
         st.rerun()
-    if bc2.button(":x: Clear all", key=f"up_none_{_sel_uid}"):
+    if bc2.button("❌ Clear all", key=f"up_none_{_sel_uid}"):
         for p in _editable_pages:
             st.session_state[_state_key][p] = False
         st.rerun()
-    if bc3.button(":arrows_counterclockwise: Reset to default "
-                       "(see everything)",
+    if bc3.button("🔄 Reset to default (see everything)",
                        key=f"up_reset_{_sel_uid}",
                        help=("Deletes this user's permission "
                                 "rows entirely. They fall back "
@@ -20771,7 +20783,7 @@ elif page == "User Permissions":
 
     # ---- Save ----------------------------------------------------
     st.markdown("---")
-    if st.button(":floppy_disk: Save permissions",
+    if st.button("💾 Save permissions",
                        key=f"up_save_{_sel_uid}", type="primary"):
         allowed_pages = [
             p for p, v in
