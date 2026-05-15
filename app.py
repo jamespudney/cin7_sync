@@ -19052,16 +19052,23 @@ elif page == "Slow Movers":
                 "(includes children + zero-stock entries).")
         st.stop()
 
-    # Merge in dormancy metadata.
+    # Merge in dormancy metadata. v2.67.198 — coerce to string
+    # before slicing. Pre-Postgres these columns came back from
+    # SQLite as ISO strings; psycopg returns them as Python
+    # datetime objects, which don't support [:10] slicing. str()
+    # gives the ISO format on datetimes ("2026-05-15 10:23:00"),
+    # so [:10] still yields the date portion.
+    def _date_slice(sku, field):
+        v = _warnings.get(str(sku), {}).get(field)
+        if v is None or v == "":
+            return ""
+        return str(v)[:10]
     _slow_df["dormancy_first_seen"] = _slow_df["SKU"].map(
-        lambda s: (_warnings.get(str(s), {}).get(
-            "first_seen_dormant_at") or "")[:10])
+        lambda s: _date_slice(s, "first_seen_dormant_at"))
     _slow_df["dormancy_last_seen"] = _slow_df["SKU"].map(
-        lambda s: (_warnings.get(str(s), {}).get(
-            "last_seen_dormant_at") or "")[:10])
+        lambda s: _date_slice(s, "last_seen_dormant_at"))
     _slow_df["recovered_at"] = _slow_df["SKU"].map(
-        lambda s: (_warnings.get(str(s), {}).get(
-            "recovered_at") or "")[:10])
+        lambda s: _date_slice(s, "recovered_at"))
 
     _today_ts = pd.Timestamp(datetime.now().date())
     def _days_since(d_str: str) -> int:
