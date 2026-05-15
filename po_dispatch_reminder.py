@@ -735,6 +735,18 @@ def check_and_escalate(dryrun: bool = False,
             "shipstation_sync is running.")
         return {"escalated": 0, "no_shipped_index": True}
 
+    # v2.67.203 — also load the CIN7 "open SO" set. SOs that
+    # CIN7 has marked FULFILLED/INVOICED/CLOSED count as
+    # shipped even if ShipStation doesn't have a record (e.g.
+    # Amazon-fulfilled orders, dropships, manual shipments).
+    # Real example from James — PO-7139 was for Amazon vendor
+    # supply, the customer order went via Amazon Marketplace,
+    # ShipStation has no record but CIN7 status was FULFILLED
+    # → bot escalated wrongly. Belt-and-braces: a SO is
+    # "shipped/done" if EITHER ShipStation has it OR CIN7 has
+    # it in a terminal status.
+    open_so_set = _load_open_so_set()
+
     # We also need the per-line context (SKU, qty) — pull it on
     # demand from the latest purchase_lines CSV.
     _, lines = _load_purchases_and_lines()
@@ -754,16 +766,30 @@ def check_and_escalate(dryrun: bool = False,
             # Shouldn't happen — we only insert reminders with
             # at least one SO — but defensive.
             continue
-        unshipped_sos = [s for s in sos
-                            if not _is_so_shipped(s, shipped_idx)]
+        # v2.67.203 — a SO is "still unshipped" only if BOTH:
+        #   - ShipStation has no shipment record
+        #   - CIN7 still considers the SO open (not FULFILLED /
+        #     CLOSED / VOIDED / etc.)
+        # open_so_set may be empty (sales CSV not loaded) — in
+        # that case the CIN7 check no-ops and we fall back to
+        # ShipStation-only behaviour (pre-v2.67.203).
+        unshipped_sos = []
+        for s in sos:
+            in_shipstation = _is_so_shipped(s, shipped_idx)
+            cin7_open = (not open_so_set
+                              or s.upper() in open_so_set)
+            if not in_shipstation and cin7_open:
+                unshipped_sos.append(s)
         if not unshipped_sos:
-            log.info("PO %s: all %d SOs shipped — skipping "
-                      "escalation", po_number, len(sos))
+            log.info("PO %s: all %d SOs accounted for (shipped "
+                      "per ShipStation OR closed per CIN7) — "
+                      "skipping escalation",
+                      po_number, len(sos))
             db.record_po_dispatch_escalation(
                 po_number=po_number,
                 posted_ts=None,
-                reason=(f"all {len(sos)} SOs shipped per "
-                          f"ShipStation; no escalation needed"),
+                reason=(f"all {len(sos)} SOs shipped/closed; "
+                          f"no escalation needed"),
             )
             n_all_shipped += 1
             continue

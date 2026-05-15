@@ -188,16 +188,27 @@ def _is_thread_we_posted_in(channel_id: str,
                                 thread_ts: str) -> bool:
     """v2.67.109 — returns True if our bot has previously posted
     in this thread. Used so the bot continues a conversation
-    naturally without requiring a re-mention on each reply."""
+    naturally without requiring a re-mention on each reply.
+
+    v2.67.203 — also match the bot's STARTER message. When the
+    bot posts a new top-level message (e.g. the PO-dispatch
+    escalation, the back-in-stock arrival reminder), Slack sets
+    its thread_ts only AFTER the first reply lands. slack_sync's
+    initial poll captures the bot's row with thread_ts=NULL, so
+    the simple thread_ts=? join missed it. Now we ALSO match on
+    ts=thread_ts — that's the bot's own message ts when it
+    started the thread. Trevor's reply (thread_ts=parent_ts)
+    then matches the parent.ts of the bot's escalation."""
     if not channel_id or not thread_ts:
         return False
     try:
         with db.connect() as c:
             r = c.execute(
                 "SELECT 1 FROM slack_messages "
-                "WHERE channel_id = ? AND thread_ts = ? "
+                "WHERE channel_id = ? "
+                "  AND (thread_ts = ? OR ts = ?) "
                 "  AND is_our_bot = 1 LIMIT 1",
-                (channel_id, thread_ts)
+                (channel_id, thread_ts, thread_ts)
             ).fetchone()
         return r is not None
     except Exception:
