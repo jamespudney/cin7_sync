@@ -3974,7 +3974,13 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "comment": line.get("Comment") or "",
         })
 
-    # Header-level metadata.
+    # Header-level metadata. v2.67.197 — surface draft status
+    # explicitly so the AI can include a 📝 DRAFT badge in the
+    # reply (the commentary use case is largely about deciding
+    # whether to approve drafts, so this is the most important
+    # signal on the header).
+    status_raw = (purchase.get("Status") or "").upper()
+    is_draft = "DRAFT" in status_raw
     return {
         "matched": 1,
         "source": "cin7_live_api",
@@ -3983,6 +3989,7 @@ def get_purchase_live(engine_df: pd.DataFrame,
         "supplier": purchase.get("Supplier"),
         "supplier_id": purchase.get("SupplierID"),
         "status": purchase.get("Status"),
+        "is_draft": is_draft,
         "order_date": purchase.get("OrderDate"),
         "required_by": purchase.get("RequiredBy"),
         "comments": purchase.get("Comments"),
@@ -3999,7 +4006,11 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "12mo demand / dormancy, call get_sku_details or "
             "search_products_by_text with the SKU. Use the "
             "✅ / ⚠️ / 🪫 / 📦 / 💼 flags per the po_review "
-            "system prompt."),
+            "system prompt. If is_draft=True, lead with "
+            "'📝 *DRAFT* — pending approval. Commentary "
+            "follows so you can decide whether to approve.' "
+            "Draft commentary is the high-value path — "
+            "decisions get made off it."),
     }
 
 
