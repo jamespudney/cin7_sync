@@ -2789,22 +2789,41 @@ _PG_POST_CUTOVER_TABLES = [
 ]
 
 
+# v2.67.202 — once-per-process gate. Without this, the post-
+# cutover migrations re-run on EVERY connect — and once the
+# rename migrations have succeeded their first time, every
+# subsequent attempt fails with "column doesn't exist" because
+# the column was already renamed. That's expected idempotent
+# behaviour but it generated huge log spam (Cheran's morning
+# diagnostic was hundreds of duplicate warning lines).
+_pg_post_cutover_applied = False
+
+
 def _apply_pg_post_cutover(conn) -> None:
-    """Apply post-cutover schema migrations on Postgres. Called
-    once per `connect()` on the Postgres path. Each DDL uses
-    IF NOT EXISTS so re-runs are no-ops. Safe to extend the
-    _PG_POST_CUTOVER_TABLES list at any time."""
+    """Apply post-cutover schema migrations on Postgres. Runs
+    once per worker process (gated by _pg_post_cutover_applied).
+    Each DDL uses IF NOT EXISTS so re-runs would be no-ops, but
+    the one-per-process gate keeps the worker logs clean.
+
+    If a migration genuinely needs to re-run (e.g. you ship a
+    new entry to _PG_POST_CUTOVER_TABLES), restart the worker —
+    that resets the gate."""
+    global _pg_post_cutover_applied
+    if _pg_post_cutover_applied:
+        return
     for label, ddl in _PG_POST_CUTOVER_TABLES:
         try:
             conn.execute(ddl)
         except Exception as exc:
             # Don't fail the connection over a migration hiccup
-            # — log and let the caller see the missing-table
-            # error on the actual query. Helpful for debugging.
+            # — log at DEBUG (was WARNING — too noisy when the
+            # rename has already succeeded and the column the
+            # ALTER wants to rename no longer exists).
             import logging as _lg
-            _lg.getLogger("db").warning(
+            _lg.getLogger("db").debug(
                 "PG post-cutover migration %s failed: %s",
                 label, exc)
+    _pg_post_cutover_applied = True
 
 
 @contextmanager
