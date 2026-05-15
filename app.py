@@ -9439,9 +9439,19 @@ elif page == "Migrations":
     all_migs = [dict(r) for r in all_migs_rows]
     if not all_migs:
         st.info(
-            "No migrations recorded yet. Use the **+ Add migration** form "
-            "below or run `ip_import_migrations.py --apply` to import "
-            "from Inventory Planner.")
+            "No migrations recorded yet. Three ways to populate:\n"
+            "1. **CIN7-driven (recommended):** set each retiring "
+            "SKU's `AdditionalAttribute5` field to its successor "
+            "SKU in CIN7, then on the worker run "
+            "`python cin7_ingest_attributes.py --apply`. The "
+            "predecessor→successor mappings are derived from "
+            "CIN7 directly so they stay aligned with your "
+            "product master.\n"
+            "2. **Inventory Planner CSV:** drop an "
+            "ip_alternates CSV in /data/output/ and run "
+            "`python ip_import_migrations.py --apply`.\n"
+            "3. **Manual:** use the + Add migration form below "
+            "for one-off entries.")
     # ---- Summary stats -----------------------------------------------
     by_source: dict = {}
     for m in all_migs:
