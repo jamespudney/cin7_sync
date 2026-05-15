@@ -37,8 +37,13 @@ import pandas as pd
 
 import db
 
-
-OUTPUT_DIR = Path("output")
+# v2.67.201 — use the shared data_paths module so this finds
+# /data/output on Render. The hardcoded `Path("output")` only
+# worked when running from a specific local directory.
+try:
+    from data_paths import OUTPUT_DIR
+except ImportError:
+    OUTPUT_DIR = Path("output")
 
 
 def _latest(prefix: str) -> Path | None:
