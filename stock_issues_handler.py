@@ -225,76 +225,126 @@ _STOCK_BIN_LOOKUP_CACHE: Optional[dict] = None
 
 def _load_stock_bin_lookup() -> dict:
     """Return {sku_upper: {bin, on_hand, location, name}} from
-    the freshest stock_on_hand CSV. Built once per process,
-    cheap on lookup. Empty dict if no CSV is available."""
+    the freshest CSVs. v2.67.204 — reads TWO sources because
+    CIN7 splits the data:
+
+      products_*.csv         → StockLocator (the bin), Name
+                               (canonical source — the bin is a
+                               product-master attribute, not a
+                               stock-on-hand attribute)
+      stock_on_hand_*.csv    → OnHand, Location (warehouse)
+
+    Indexed by SKU. Per-process cache. Empty dict if no CSVs
+    available."""
     global _STOCK_BIN_LOOKUP_CACHE
     if _STOCK_BIN_LOOKUP_CACHE is not None:
         return _STOCK_BIN_LOOKUP_CACHE
     out: dict = {}
     try:
         import glob, os
-        candidates = sorted(
+
+        # ---- Source 1: products_*.csv — provides the BIN ----
+        # The Stock Locator field lives on the product master
+        # in CIN7 (one default bin per SKU). It does NOT come
+        # from productavailability / stock_on_hand. My v2.67.190
+        # missed this and only looked in stock_on_hand.
+        prod_cands = sorted(
+            glob.glob(str(OUTPUT_DIR / "products_*.csv")),
+            key=os.path.getmtime, reverse=True)
+        if prod_cands:
+            ppath = prod_cands[0]
+            pdf = pd.read_csv(ppath, low_memory=False)
+            psku_col = next(
+                (c for c in ("SKU", "Sku", "ProductCode")
+                  if c in pdf.columns), None)
+            # CIN7's API uses `StockLocator` (matching the UI
+            # label "Stock locator"). Older exports may use
+            # other variants — fall through.
+            pbin_col = next(
+                (c for c in ("StockLocator", "Stock Locator",
+                                "stock_locator", "Bin", "bin",
+                                "BinLocation")
+                  if c in pdf.columns), None)
+            pname_col = next(
+                (c for c in ("Name", "ProductName", "name")
+                  if c in pdf.columns), None)
+            log.info(
+                "stock_bin_lookup: products from %s — "
+                "sku=%s bin=%s name=%s",
+                ppath, psku_col, pbin_col, pname_col)
+            if psku_col:
+                for _, r in pdf.iterrows():
+                    sku_u = str(r.get(psku_col) or "").strip().upper()
+                    if not sku_u:
+                        continue
+                    entry = out.setdefault(sku_u, {
+                        "bin": None, "on_hand": None,
+                        "location": None, "name": None})
+                    if pbin_col:
+                        b = r.get(pbin_col)
+                        if pd.notna(b) and str(b).strip():
+                            entry["bin"] = str(b).strip()
+                    if pname_col and not entry["name"]:
+                        nm = r.get(pname_col)
+                        if pd.notna(nm) and str(nm).strip():
+                            entry["name"] = str(nm).strip()
+
+        # ---- Source 2: stock_on_hand_*.csv — OnHand + Location ----
+        soh_cands = sorted(
             glob.glob(str(OUTPUT_DIR / "stock_on_hand_*.csv")),
             key=os.path.getmtime, reverse=True)
-        if not candidates:
-            _STOCK_BIN_LOOKUP_CACHE = out
-            return out
-        path = candidates[0]
-        df = pd.read_csv(path, low_memory=False)
-        sku_col = next(
-            (c for c in ("SKU", "Sku", "ProductCode")
-              if c in df.columns), None)
-        if not sku_col:
-            _STOCK_BIN_LOOKUP_CACHE = out
-            return out
-        # Bin field — try every variant CIN7 has shipped under.
-        bin_col = next(
-            (c for c in ("Bin", "bin", "BinLocation",
-                            "StockLocator", "Stock Locator",
-                            "stock_locator")
-              if c in df.columns), None)
-        oh_col = next(
-            (c for c in ("OnHand", "on_hand", "Stock")
-              if c in df.columns), None)
-        loc_col = next(
-            (c for c in ("Location", "location",
-                            "WarehouseName", "Warehouse")
-              if c in df.columns), None)
-        name_col = next(
-            (c for c in ("Name", "name", "ProductName")
-              if c in df.columns), None)
-        log.info(
-            "stock_bin_lookup: loading %s — columns "
-            "sku=%s bin=%s onhand=%s loc=%s name=%s",
-            path, sku_col, bin_col, oh_col, loc_col, name_col)
-        for _, r in df.iterrows():
-            sku_u = str(r.get(sku_col) or "").strip().upper()
-            if not sku_u:
-                continue
-            entry = out.setdefault(sku_u, {
-                "bin": None, "on_hand": None,
-                "location": None, "name": None})
-            if bin_col:
-                b = r.get(bin_col)
-                if pd.notna(b) and str(b).strip():
-                    entry["bin"] = str(b).strip()
-            if oh_col:
-                try:
-                    v = float(r.get(oh_col) or 0)
-                    # Aggregate across locations if multiple rows.
-                    entry["on_hand"] = (
-                        (entry["on_hand"] or 0) + v)
-                except (TypeError, ValueError):
-                    pass
-            if loc_col and not entry["location"]:
-                ln = r.get(loc_col)
-                if pd.notna(ln) and str(ln).strip():
-                    entry["location"] = str(ln).strip()
-            if name_col and not entry["name"]:
-                nm = r.get(name_col)
-                if pd.notna(nm) and str(nm).strip():
-                    entry["name"] = str(nm).strip()
-        log.info("stock_bin_lookup: indexed %d SKUs", len(out))
+        if soh_cands:
+            spath = soh_cands[0]
+            sdf = pd.read_csv(spath, low_memory=False)
+            ssku_col = next(
+                (c for c in ("SKU", "Sku", "ProductCode")
+                  if c in sdf.columns), None)
+            # Even on stock_on_hand, attempt a bin lookup
+            # (some accounts include it here too) so the
+            # mechanism is belt-and-braces.
+            sbin_col = next(
+                (c for c in ("Bin", "bin", "BinLocation",
+                                "StockLocator", "Stock Locator")
+                  if c in sdf.columns), None)
+            soh_col = next(
+                (c for c in ("OnHand", "on_hand", "Stock")
+                  if c in sdf.columns), None)
+            loc_col = next(
+                (c for c in ("Location", "location",
+                                "WarehouseName", "Warehouse")
+                  if c in sdf.columns), None)
+            log.info(
+                "stock_bin_lookup: stock_on_hand from %s — "
+                "sku=%s bin=%s onhand=%s loc=%s",
+                spath, ssku_col, sbin_col, soh_col, loc_col)
+            if ssku_col:
+                for _, r in sdf.iterrows():
+                    sku_u = str(r.get(ssku_col) or "").strip().upper()
+                    if not sku_u:
+                        continue
+                    entry = out.setdefault(sku_u, {
+                        "bin": None, "on_hand": None,
+                        "location": None, "name": None})
+                    # Only fill bin from stock_on_hand if
+                    # products didn't already supply one.
+                    if sbin_col and not entry["bin"]:
+                        b = r.get(sbin_col)
+                        if pd.notna(b) and str(b).strip():
+                            entry["bin"] = str(b).strip()
+                    if soh_col:
+                        try:
+                            v = float(r.get(soh_col) or 0)
+                            entry["on_hand"] = (
+                                (entry["on_hand"] or 0) + v)
+                        except (TypeError, ValueError):
+                            pass
+                    if loc_col and not entry["location"]:
+                        ln = r.get(loc_col)
+                        if pd.notna(ln) and str(ln).strip():
+                            entry["location"] = str(ln).strip()
+
+        log.info("stock_bin_lookup: indexed %d SKUs total",
+                  len(out))
     except Exception as exc:
         log.warning(
             "stock_bin_lookup load failed: %s", exc)
