@@ -263,6 +263,64 @@ class Cin7Client:
                 "update_sale: sale_body must include 'ID'")
         return self.put("sale", sale_body)
 
+    def get_purchase(self, ref: str) -> Optional[Dict[str, Any]]:
+        """v2.67.196 — Fetch a full Purchase object live from
+        CIN7. Accepts either:
+          • a UUID (passed as ID parameter)
+          • a PO number like "PO-7160" or "7160" (passed as
+            OrderNumber parameter — CIN7 accepts both prefixed
+            and bare numeric forms)
+
+        Used by get_purchase_live AI tool when the local
+        purchase_lines CSV doesn't have a freshly-created PO
+        yet. Returns None on failure (logs the error so the
+        caller can surface a useful message)."""
+        if not ref:
+            return None
+        # UUIDs are 36 chars with hyphens; PO numbers are short
+        # or start with 'PO-'. Crude heuristic.
+        is_uuid = (len(ref) >= 32 and "-" in ref
+                      and not ref.upper().startswith("PO-"))
+        try:
+            if is_uuid:
+                return self.get("purchase", params={"ID": ref})
+            # Order-number lookup. CIN7 returns a list under
+            # /purchase when queried by OrderNumber.
+            ref_norm = ref.strip().upper().lstrip("PO-")
+            resp = self.get(
+                "purchase",
+                params={"OrderNumber": f"PO-{ref_norm}"})
+            # CIN7 may return:
+            #   - a dict with PurchaseOrderList containing matches
+            #   - a list directly
+            #   - a single dict (when ID is passed)
+            if isinstance(resp, dict):
+                items = (resp.get("PurchaseOrderList")
+                            or resp.get("Purchases")
+                            or [resp])
+            elif isinstance(resp, list):
+                items = resp
+            else:
+                items = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                ord_n = str(it.get("OrderNumber") or "").upper()
+                if ord_n.lstrip("PO-") == ref_norm:
+                    # If the search returned a thin header,
+                    # follow up with an ID lookup for full
+                    # detail.
+                    pid = it.get("ID")
+                    if pid and not it.get("Order"):
+                        return self.get("purchase",
+                                            params={"ID": pid})
+                    return it
+            return None
+        except Exception as exc:
+            log.error("CIN7 get_purchase(%s) failed: %s",
+                        ref, exc)
+            return None
+
 
     def paginate(
         self,

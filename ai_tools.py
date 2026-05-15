@@ -702,6 +702,42 @@ TOOL_SCHEMAS: list[dict] = [
         # v2.67.179 — Live CIN7 fallback when get_sale_order
         # misses. Fixes the SO-56331-style case where a sale was
         # just created but isn't in the 30-day cache yet.
+        # v2.67.196 — Live CIN7 fallback for fresh POs that
+        # haven't synced into the local purchase_lines CSV yet.
+        # Sister to get_sale_live. Fires when get_purchase_order
+        # returns matched=0 on a PO-NNNN reference.
+        "name": "get_purchase_live",
+        "description": (
+            "Fetch a purchase order's line items LIVE from CIN7 "
+            "via the API (bypasses the 30-day local sync "
+            "window). Use this when get_purchase_order returns "
+            "matched=0 for a recent PO — the PO was likely "
+            "created in the last few hours and hasn't synced "
+            "yet. Returns each line's SKU, name, qty, current "
+            "OnHand. Slower than get_purchase_order (one CIN7 "
+            "API call) so ONLY call this when the cached "
+            "lookup misses."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "po_number": {
+                    "type": "string",
+                    "description": (
+                        "Purchase order number (e.g. PO-7160 "
+                        "or 7160). Case-insensitive. Either "
+                        "this OR purchase_id is required."),
+                },
+                "purchase_id": {
+                    "type": "string",
+                    "description": (
+                        "CIN7 internal PurchaseID UUID. "
+                        "Skip the by-OrderNumber search step "
+                        "if you already have it. Optional."),
+                },
+            },
+        },
+    },
+    {
         "name": "get_sale_live",
         "description": (
             "Fetch a sale's line items LIVE from CIN7 via the "
@@ -3414,12 +3450,13 @@ def get_purchase_order(engine_df: pd.DataFrame,
             "date_from": date_from or None,
             "note": ("No purchase order matches the filter in the "
                      "local sync window. The line-detail sync covers "
-                     "the last ~30 days as of v2.67.51 (longer if a "
-                     "manual full-sync was run more recently). If "
-                     "the user mentioned an older PO, tell them the "
-                     "data isn't in this snapshot — they should look "
-                     "it up in CIN7 directly OR an admin can run a "
-                     "wider sync window."),
+                     "the last ~30 days. v2.67.196 — if a po_number "
+                     "was given and you suspect this is a freshly-"
+                     "created PO (created in the last few hours), "
+                     "call get_purchase_live with the same po_number "
+                     "to fetch the lines via CIN7's live API. Only "
+                     "fall back to 'check CIN7 directly' if "
+                     "get_purchase_live also returns matched=0."),
         }
 
     # Group by PO so each unique PO becomes one record with its
@@ -3852,6 +3889,117 @@ def get_sale_live(engine_df: pd.DataFrame,
             "`available` = yes/no based on current OnHand vs "
             "requested qty. Surface every line with availability "
             "status so the user gets a per-SKU answer."),
+    }
+
+
+def get_purchase_live(engine_df: pd.DataFrame,
+                        sale_lines_df: pd.DataFrame,
+                        args: dict) -> dict:
+    """v2.67.196 — Live CIN7 fallback when get_purchase_order
+    misses a freshly-created PO. Mirrors get_sale_live (v2.67.179).
+
+    Use case: PO commentary in #buyer-review fires off a brand-new
+    PO link (PO-7160 today). The PO was created in CIN7 minutes
+    before the buyer posted, so the local purchase_lines_*.csv
+    hasn't synced it yet. get_purchase_order returns matched=0.
+    This tool hits CIN7's GET /purchase endpoint directly to
+    fetch the lines.
+
+    Looks up by either PO number ("PO-7160" or "7160") or the
+    UUID if available. Returns each line's SKU/name/qty + current
+    engine OnHand so the AI can immediately compose per-SKU
+    commentary."""
+    po_ref = ((args.get("po_number") or "")
+                  or (args.get("purchase_id") or "")).strip()
+    if not po_ref:
+        return {"error": "po_number or purchase_id is required"}
+
+    import os
+    try:
+        from cin7_sync import Cin7Client
+    except Exception as exc:
+        return {"error": f"cin7_sync import failed: {exc}"}
+    account_id = os.environ.get("CIN7_ACCOUNT_ID", "").strip()
+    app_key = os.environ.get("CIN7_APPLICATION_KEY", "").strip()
+    if not (account_id and app_key):
+        return {
+            "error": ("CIN7 credentials not in env on this "
+                          "service — can't do a live fetch."),
+        }
+    try:
+        client = Cin7Client(account_id, app_key)
+        purchase = client.get_purchase(po_ref)
+    except Exception as exc:
+        return {"error": f"CIN7 GET /purchase failed: {exc}"}
+    if not isinstance(purchase, dict) or not purchase:
+        return {
+            "matched": 0,
+            "note": (f"CIN7 returned nothing for {po_ref}. "
+                      f"PO may not exist or was just created and "
+                      f"is still being processed."),
+        }
+
+    # Extract lines + enrich with current OnHand.
+    order_obj = purchase.get("Order") or {}
+    lines = order_obj.get("Lines") or purchase.get("Lines") or []
+    on_hand_map: dict = {}
+    if engine_df is not None and not engine_df.empty:
+        if ("SKU" in engine_df.columns
+                and "OnHand" in engine_df.columns):
+            on_hand_map = (
+                engine_df.set_index(
+                    engine_df["SKU"].astype(str).str.upper())[
+                    "OnHand"].apply(
+                    lambda v: float(v or 0)).to_dict())
+    line_rows = []
+    for line in lines:
+        sku = str(line.get("SKU") or "").strip()
+        qty = line.get("Quantity")
+        try:
+            qty_n = float(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty_n = None
+        oh = on_hand_map.get(sku.upper())
+        line_rows.append({
+            "sku": sku,
+            "name": line.get("Name") or "",
+            "quantity": qty_n,
+            "on_hand_now": oh,
+            "price": line.get("Price"),
+            "discount": line.get("Discount"),
+            "total": line.get("Total"),
+            "tax": line.get("Tax"),
+            "uom": line.get("UOM"),
+            "supplier_sku": line.get("SupplierSKU"),
+            "comment": line.get("Comment") or "",
+        })
+
+    # Header-level metadata.
+    return {
+        "matched": 1,
+        "source": "cin7_live_api",
+        "purchase_id": purchase.get("ID"),
+        "po_number": purchase.get("OrderNumber"),
+        "supplier": purchase.get("Supplier"),
+        "supplier_id": purchase.get("SupplierID"),
+        "status": purchase.get("Status"),
+        "order_date": purchase.get("OrderDate"),
+        "required_by": purchase.get("RequiredBy"),
+        "comments": purchase.get("Comments"),
+        "shipping_notes": purchase.get("ShippingNotes"),
+        "memo": purchase.get("Memo"),
+        "note": purchase.get("Note"),
+        "terms": purchase.get("Terms"),
+        "lines": line_rows,
+        "guidance": (
+            "Data fetched LIVE from CIN7 (bypasses the 30-day "
+            "local sync window). For each line, compose engine "
+            "commentary per the existing po_review prompt: "
+            "OnHand is in `on_hand_now`; for ABC / trend / "
+            "12mo demand / dormancy, call get_sku_details or "
+            "search_products_by_text with the SKU. Use the "
+            "✅ / ⚠️ / 🪫 / 📦 / 💼 flags per the po_review "
+            "system prompt."),
     }
 
 
@@ -5895,6 +6043,8 @@ TOOL_HANDLERS = {
     "get_sale_order": get_sale_order,
     # v2.67.179 — live CIN7 fallback for fresh orders.
     "get_sale_live": get_sale_live,
+    # v2.67.196 — live CIN7 fallback for fresh POs.
+    "get_purchase_live": get_purchase_live,
     "get_stock_adjustment": get_stock_adjustment,
     # v2.67.54 — ShipStation lookup.
     "get_shipping_details": get_shipping_details,
