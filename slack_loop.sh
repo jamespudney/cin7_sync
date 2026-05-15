@@ -186,6 +186,7 @@ last_si_escalate_epoch=0   # v2.67.144 stock-issue DM escalation
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
+last_bom_sync_epoch=0      # v2.67.195 BOM sync (weekly)
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -344,6 +345,22 @@ while true; do
         last_semrush_epoch=$(date -u +%s)
         _run_bg "semrush_sync" \
             "python semrush_sync.py weekly --limit 500"
+    fi
+
+    # v2.67.195 BOM sync — weekly. Powers the stock-locator
+    # audit + the runtime parent-SKU fallback in stock-issue
+    # replies. The BOM endpoint requires one CIN7 detail call
+    # per BOM-flagged product (~1k+ products), so at the 2.5s
+    # rate limit it takes ~1 hour. Backgrounded via _run_bg so
+    # the listener stays responsive throughout. Runs once every
+    # 7 days — BOMs change rarely.
+    seconds_since_bom=$(( now_epoch - last_bom_sync_epoch ))
+    if [ "$seconds_since_bom" -ge 604800 ] \
+            && [ -n "${CIN7_ACCOUNT_ID:-}" ] \
+            && [ -n "${CIN7_APPLICATION_KEY:-}" ]; then
+        last_bom_sync_epoch=$(date -u +%s)
+        _run_bg "cin7_boms" \
+            "python cin7_sync.py boms"
     fi
 
     seconds_since_googleads=$(( now_epoch - last_googleads_epoch ))
