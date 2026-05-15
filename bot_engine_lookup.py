@@ -199,7 +199,12 @@ def _row_to_signals(row: pd.Series) -> dict:
         "is_dormant": bool(_get("is_dormant", "IsDormant") or False),
         "excess_units": _get("excess_units", "ExcessUnits"),
         "stock": _get("OnHand", "on_hand", "Stock", "stock"),
-        "bin": _get("Bin", "bin", "BinLocation"),
+        # v2.67.190 — also try CIN7's newer "Stock Locator" label
+        # (the UI now shows this instead of "Bin"; some CSV
+        # exports preserve the spaced form verbatim).
+        "bin": _get("Bin", "bin", "BinLocation",
+                       "StockLocator", "Stock Locator",
+                       "stock_locator"),
         "family": _get("Family", "family"),
         "supplier": _get("Supplier", "supplier", "SupplierName"),
         "last_sold": _get("LastSold", "last_sold"),

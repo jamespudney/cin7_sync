@@ -208,6 +208,110 @@ def _is_dropship_sku(sku: str) -> bool:
     return sku.upper() in _load_dropship_sku_set()
 
 
+# v2.67.190 — Direct stock_on_hand_*.csv lookup. The primary
+# bin/OnHand source is the engine_df (via bot_engine_lookup),
+# but the engine output can lag if the engine hasn't recomputed
+# recently or if a SKU got added between recomputes. This module
+# provides a per-process cached direct read of the freshest
+# stock CSV — used as a SECOND-LINE fallback when engine_df
+# returns nothing.
+#
+# CIN7's UI calls the bin field "Stock Locator". The API returns
+# it under one of: Bin, BinLocation, StockLocator, Stock Locator
+# (the spaced form is from CSV exports that preserve the UI
+# header verbatim). We try every variant.
+_STOCK_BIN_LOOKUP_CACHE: Optional[dict] = None
+
+
+def _load_stock_bin_lookup() -> dict:
+    """Return {sku_upper: {bin, on_hand, location, name}} from
+    the freshest stock_on_hand CSV. Built once per process,
+    cheap on lookup. Empty dict if no CSV is available."""
+    global _STOCK_BIN_LOOKUP_CACHE
+    if _STOCK_BIN_LOOKUP_CACHE is not None:
+        return _STOCK_BIN_LOOKUP_CACHE
+    out: dict = {}
+    try:
+        import glob, os
+        candidates = sorted(
+            glob.glob(str(OUTPUT_DIR / "stock_on_hand_*.csv")),
+            key=os.path.getmtime, reverse=True)
+        if not candidates:
+            _STOCK_BIN_LOOKUP_CACHE = out
+            return out
+        path = candidates[0]
+        df = pd.read_csv(path, low_memory=False)
+        sku_col = next(
+            (c for c in ("SKU", "Sku", "ProductCode")
+              if c in df.columns), None)
+        if not sku_col:
+            _STOCK_BIN_LOOKUP_CACHE = out
+            return out
+        # Bin field — try every variant CIN7 has shipped under.
+        bin_col = next(
+            (c for c in ("Bin", "bin", "BinLocation",
+                            "StockLocator", "Stock Locator",
+                            "stock_locator")
+              if c in df.columns), None)
+        oh_col = next(
+            (c for c in ("OnHand", "on_hand", "Stock")
+              if c in df.columns), None)
+        loc_col = next(
+            (c for c in ("Location", "location",
+                            "WarehouseName", "Warehouse")
+              if c in df.columns), None)
+        name_col = next(
+            (c for c in ("Name", "name", "ProductName")
+              if c in df.columns), None)
+        log.info(
+            "stock_bin_lookup: loading %s — columns "
+            "sku=%s bin=%s onhand=%s loc=%s name=%s",
+            path, sku_col, bin_col, oh_col, loc_col, name_col)
+        for _, r in df.iterrows():
+            sku_u = str(r.get(sku_col) or "").strip().upper()
+            if not sku_u:
+                continue
+            entry = out.setdefault(sku_u, {
+                "bin": None, "on_hand": None,
+                "location": None, "name": None})
+            if bin_col:
+                b = r.get(bin_col)
+                if pd.notna(b) and str(b).strip():
+                    entry["bin"] = str(b).strip()
+            if oh_col:
+                try:
+                    v = float(r.get(oh_col) or 0)
+                    # Aggregate across locations if multiple rows.
+                    entry["on_hand"] = (
+                        (entry["on_hand"] or 0) + v)
+                except (TypeError, ValueError):
+                    pass
+            if loc_col and not entry["location"]:
+                ln = r.get(loc_col)
+                if pd.notna(ln) and str(ln).strip():
+                    entry["location"] = str(ln).strip()
+            if name_col and not entry["name"]:
+                nm = r.get(name_col)
+                if pd.notna(nm) and str(nm).strip():
+                    entry["name"] = str(nm).strip()
+        log.info("stock_bin_lookup: indexed %d SKUs", len(out))
+    except Exception as exc:
+        log.warning(
+            "stock_bin_lookup load failed: %s", exc)
+    _STOCK_BIN_LOOKUP_CACHE = out
+    return out
+
+
+def _direct_stock_lookup(sku: str) -> dict:
+    """Return {bin, on_hand, location, name} for a SKU from
+    stock_on_hand CSV directly. Skips the engine_df indirection.
+    Used as a fallback when bot_engine_lookup returns nothing."""
+    if not sku:
+        return {}
+    return _load_stock_bin_lookup().get(
+        sku.strip().upper(), {})
+
+
 # v2.67.173 — Stock-item SKU index. Per-process cache built lazily
 # from products_*.csv. CIN7 products have a Type column with
 # values 'Stock' or 'Service'. Non-stock items (services like
@@ -379,6 +483,40 @@ def _sku_intel(sku: str, sale_lines: pd.DataFrame) -> dict:
                         out["trend"] = sig_p.get("trend_flag")
         except Exception:
             pass
+
+    # v2.67.190 — Direct stock_on_hand CSV fallback when the
+    # engine_df pipeline returns nothing for bin/OnHand. This
+    # bypasses any engine-output staleness AND handles CSV
+    # exports that use the "Stock Locator" column name (CIN7's
+    # current UI label) instead of the legacy "Bin". Order of
+    # preference:
+    #   1. engine_df via bot_engine_lookup (above)
+    #   2. parent SKU's engine_df via BOM (above)
+    #   3. direct stock_on_hand CSV read for this SKU (here)
+    #   4. direct stock_on_hand CSV read for parent SKU (also
+    #      here, if step 1+2 gave us a parent)
+    # Each step fills in only fields still missing — no
+    # overwriting good data from earlier steps.
+    if (out.get("bin") in (None, "", "?")
+            or out.get("on_hand") is None):
+        direct = _direct_stock_lookup(sku)
+        if direct:
+            if out.get("on_hand") is None and direct.get("on_hand") is not None:
+                out["on_hand"] = direct["on_hand"]
+            if out.get("bin") in (None, "", "?") and direct.get("bin"):
+                out["bin"] = direct["bin"]
+            if not out.get("name") and direct.get("name"):
+                out["name"] = direct["name"]
+    # If still no bin and we have a parent, try the parent in the
+    # direct CSV too.
+    if (out.get("bin") in (None, "", "?")
+            and out.get("parent_sku")):
+        direct_p = _direct_stock_lookup(out["parent_sku"])
+        if direct_p:
+            if out.get("on_hand") is None and direct_p.get("on_hand") is not None:
+                out["on_hand"] = direct_p["on_hand"]
+            if out.get("bin") in (None, "", "?") and direct_p.get("bin"):
+                out["bin"] = direct_p["bin"]
     # Open SOs allocated against this SKU (count from sale_lines)
     if sale_lines is not None and not sale_lines.empty:
         sku_col = next(

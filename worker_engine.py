@@ -75,7 +75,11 @@ def compute_engine_signals(products: pd.DataFrame,
         stock_view = stock.copy()
         stock_view["SKU"] = stock_view["SKU"].astype(str)
         cols_to_pull = ["SKU"]
+        # v2.67.190 — include CIN7's newer "Stock Locator" /
+        # "StockLocator" column names too. Some CSV exports use
+        # the spaced UI label verbatim.
         for c in ("OnHand", "OnOrder", "Available", "Bin",
+                    "BinLocation", "StockLocator", "Stock Locator",
                     "Location", "StockOnHand"):
             if c in stock_view.columns:
                 cols_to_pull.append(c)
