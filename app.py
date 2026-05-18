@@ -21011,6 +21011,18 @@ elif page == "Cashflow":
         ("cellphones_internet", "Cellphones & internet"),
     ]
 
+    # v2.67.228 — cashflow week boundary. The team captures bank
+    # figures ~08:00 Monday; a payment scheduled Friday settles in
+    # the early hours of Monday — BEFORE that capture — so it
+    # counts in the week that just closed. A due date that lands
+    # on a Monday therefore buckets into the PREVIOUS week.
+    def _cf_week_monday(ts):
+        ts = pd.Timestamp(ts).normalize()
+        monday = ts - pd.Timedelta(days=ts.weekday())
+        if ts.weekday() == 0:  # Monday → previous cashflow week
+            monday = monday - pd.Timedelta(days=7)
+        return monday
+
     try:
         import qbo_oauth as _qbo_oauth
         import qbo_client as _qbo_client
@@ -21201,7 +21213,7 @@ elif page == "Cashflow":
             _ddt = pd.Timestamp(_d).normalize()
         except Exception:  # noqa: BLE001
             continue
-        _wk = _ddt - pd.Timedelta(days=_ddt.weekday())
+        _wk = _cf_week_monday(_ddt)
         if _wk.strftime("%Y-%m-%d") == _dash_mkey:
             _wk_sup += _dash_eff_amt(r)
     _wk_net = _wk_in - _wk_out - _wk_sup
@@ -21719,8 +21731,8 @@ elif page == "Cashflow":
             _due_ts = pd.Timestamp(_due).normalize()
         except Exception:  # noqa: BLE001
             continue
-        # Which week bucket? floor to the Monday.
-        _wk = _due_ts - pd.Timedelta(days=_due_ts.weekday())
+        # Which week bucket? Monday-08:00 boundary rule applies.
+        _wk = _cf_week_monday(_due_ts)
         _wk_key = _wk.strftime("%Y-%m-%d")
         if _wk_key in _cf_supplier_due:
             _amt = _p.get("amount_override")
