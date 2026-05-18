@@ -21545,14 +21545,30 @@ elif page == "Cashflow":
         "**Supplier payables** outflow row is filled automatically "
         "from the tracker above (bills bucketed by due date).")
 
-    _cf_horizon = st.selectbox(
-        "Forecast horizon", [13, 26, 53], index=1,
-        format_func=lambda n: f"{n} weeks",
-        key="_cf_horizon")
-
-    # Build the week anchors — Mondays from the current week.
+    # v2.67.225 — the grid can start ANY week, not just the
+    # current one, so past weeks can be reviewed and compared
+    # against the spreadsheet. Set the start back to see history.
     _cf_today = pd.Timestamp.today().normalize()
-    _cf_monday = _cf_today - pd.Timedelta(days=_cf_today.weekday())
+    _cf_this_monday = _cf_today - pd.Timedelta(
+        days=_cf_today.weekday())
+    _cf_fcols = st.columns([2, 2])
+    with _cf_fcols[0]:
+        _cf_start_in = st.date_input(
+            "Grid starts week of",
+            value=_cf_this_monday.date(),
+            key="_cf_start_week",
+            help="Set this back to review past weeks and "
+                 "compare them against the spreadsheet.")
+    with _cf_fcols[1]:
+        _cf_horizon = st.selectbox(
+            "Weeks shown", [13, 26, 53], index=1,
+            format_func=lambda n: f"{n} weeks",
+            key="_cf_horizon")
+
+    # Anchor the grid to the Monday of the chosen start week.
+    _cf_start_ts = pd.Timestamp(_cf_start_in)
+    _cf_monday = _cf_start_ts - pd.Timedelta(
+        days=_cf_start_ts.weekday())
     _cf_weeks = [_cf_monday + pd.Timedelta(weeks=i)
                  for i in range(int(_cf_horizon))]
     _cf_wkey = [w.strftime("%Y-%m-%d") for w in _cf_weeks]
