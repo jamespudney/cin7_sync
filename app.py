@@ -2386,6 +2386,47 @@ with st.sidebar:
                     pass
                 st.session_state.pop("_slack_oauth_state", None)
 
+    # ---- QuickBooks Online OAuth callback handler (v2.67.211) --------
+    # When a super-admin clicks "Connect QuickBooks Online", Intuit
+    # redirects back here with ?qbo_oauth=callback&code=...&state=...
+    # &realmId=... — realmId identifies which QBO company file was
+    # authorised. Process it before any page renders, then clean the
+    # URL so a refresh doesn't replay the (single-use) code.
+    if _qp.get("qbo_oauth") == "callback" and _qp.get("code"):
+        _expected_qbo_state = st.session_state.get(
+            "_qbo_oauth_state") or ""
+        _received_qbo_state = _qp.get("state") or ""
+        if (_expected_qbo_state
+                and _received_qbo_state != _expected_qbo_state):
+            st.error(":lock: QuickBooks OAuth state mismatch — "
+                       "possible CSRF. Try connecting again.")
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.session_state.pop("_qbo_oauth_state", None)
+        else:
+            try:
+                import qbo_oauth as _qbo_oauth
+                _realm = (_qp.get("realmId")
+                           or _qp.get("realmid") or "")
+                _qbo_oauth.exchange_code_for_token(
+                    code=_qp.get("code"),
+                    realm_id=_realm,
+                    connected_by=current_user or None)
+                st.success(
+                    ":white_check_mark: QuickBooks Online "
+                    "connected. The Cashflow Management page can "
+                    "now read your books.")
+            except Exception as _exc:  # noqa: BLE001
+                st.error(f":x: QuickBooks OAuth error: {_exc}")
+            finally:
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+                st.session_state.pop("_qbo_oauth_state", None)
+
     # ---- Quick-capture demand signal ----------------------------------
     # Available from every page so sales/buyers can log a customer
     # inquiry, quote request, lost sale, etc. in 15 seconds without
@@ -2774,6 +2815,7 @@ with st.sidebar:
             "Purchase Analysis",
             "Sales Recent",
             "Data Health",
+            "Cashflow",  # v2.67.211 — QBO-backed cash position
             "User Permissions",  # v2.67.185 — admin-only
     ]
     # v2.67.41 — one-line per-page descriptions, rendered as
@@ -2803,6 +2845,7 @@ with st.sidebar:
         "PO-side analytics: spend by supplier, lead-time variance.",
         "Recent sales feed + filters.",
         "Sync freshness, CSV row counts, data integrity flags.",
+        "Cash position + forecast, backed by QuickBooks Online.",
         "Admin: assign which pages each user can access.",
     ]
     # v2.67.185 — filter _page_options by per-user permissions.
@@ -20757,6 +20800,137 @@ elif page == "Data Health":
         "- **Team Actions** — flags, notes, approvals shared across users (SQLite).\n"
         "- **Auth + hosted URL** — public link with login for remote team members.\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# v2.67.211 — Cashflow Management (QuickBooks Online)
+# ---------------------------------------------------------------------------
+elif page == "Cashflow":
+    st.header(":moneybag: Cashflow Management")
+    st.caption(
+        "Cash position and forecast, backed by QuickBooks Online. "
+        "Connect QBO below; the full cashflow view is built once "
+        "the team's working spreadsheet has been shared.")
+
+    try:
+        import qbo_oauth as _qbo_oauth
+        import qbo_client as _qbo_client
+    except Exception as _exc:  # noqa: BLE001
+        _qbo_oauth = None
+        _qbo_client = None
+        st.error(f"QBO modules unavailable: {_exc}")
+
+    if _qbo_oauth is not None:
+        st.subheader(":satellite_antenna: QuickBooks Online connection")
+
+        _cf_role = (current_user_profile or {}).get("role") or "sales"
+        _cf_name = ((current_user_profile or {}).get("display_name")
+                       or st.session_state.get("current_user", ""))
+        _cf_is_super = db.is_super_admin(_cf_name, _cf_role)
+
+        try:
+            _qbo_info = _qbo_oauth.connection_info()
+        except Exception as _exc:  # noqa: BLE001
+            _qbo_info = None
+            st.warning(f"Could not read QBO connection state: {_exc}")
+
+        if _qbo_info:
+            _env = _qbo_info.get("environment") or "sandbox"
+            st.success(
+                f":white_check_mark: Connected to QuickBooks Online "
+                f"(**{_env}**) — company realm `"
+                f"{_qbo_info.get('realm_id')}`.")
+            _days_left = _qbo_info.get("refresh_days_left")
+            _meta_bits = []
+            if _qbo_info.get("connected_by"):
+                _meta_bits.append(
+                    f"connected by {_qbo_info['connected_by']}")
+            if _qbo_info.get("connected_at"):
+                _meta_bits.append(
+                    f"on {str(_qbo_info['connected_at'])[:16]}")
+            if _days_left is not None:
+                _meta_bits.append(
+                    f"re-auth needed in ~{_days_left} days")
+            if _meta_bits:
+                st.caption(" · ".join(_meta_bits))
+            if _days_left is not None and _days_left <= 14:
+                st.warning(
+                    ":warning: The QBO refresh token expires in "
+                    f"~{_days_left} days. Click Disconnect then "
+                    "reconnect before then to avoid an outage.")
+
+            # Live connection check — confirms the token actually
+            # works, not just that a row exists.
+            if st.button(":arrows_counterclockwise: Test connection",
+                          key="_qbo_test"):
+                try:
+                    _ci = _qbo_client.company_info()
+                    _cn = (_ci.get("CompanyName")
+                            or _ci.get("LegalName") or "(unknown)")
+                    st.success(
+                        f":white_check_mark: QBO API reachable — "
+                        f"company: **{_cn}**")
+                except Exception as _exc:  # noqa: BLE001
+                    st.error(f":x: QBO API call failed: {_exc}")
+
+            if _cf_is_super:
+                if st.button(":electric_plug: Disconnect QuickBooks",
+                              key="_qbo_disconnect",
+                              help="Revoke the stored tokens. The "
+                                    "Cashflow page goes dark until "
+                                    "reconnected."):
+                    try:
+                        _qbo_oauth.disconnect()
+                        st.success("QuickBooks Online disconnected.")
+                        st.rerun()
+                    except Exception as _exc:  # noqa: BLE001
+                        st.error(f"Disconnect failed: {_exc}")
+            else:
+                st.caption(
+                    "Only a super-admin can disconnect QuickBooks.")
+        else:
+            # Not connected — show the connect button (super-admin
+            # only; this is a company-wide financial connection).
+            if not _qbo_oauth.is_configured():
+                st.error(
+                    ":x: QuickBooks OAuth is not configured. An "
+                    "admin must set these env vars in the "
+                    "`cin7-shared` group: `QBO_CLIENT_ID`, "
+                    "`QBO_CLIENT_SECRET`, `QBO_REDIRECT_URI`, "
+                    "`QBO_ENVIRONMENT` (sandbox|production), and "
+                    "`QBO_TOKEN_ENCRYPTION_KEY` (or reuse "
+                    "`SLACK_USER_TOKEN_ENCRYPTION_KEY`).")
+            elif not _cf_is_super:
+                st.info(
+                    "QuickBooks Online is not connected yet. Ask a "
+                    "super-admin to connect it from this page.")
+            else:
+                try:
+                    import secrets as _secrets
+                    _qbo_state = _secrets.token_urlsafe(24)
+                    st.session_state["_qbo_oauth_state"] = _qbo_state
+                    _qbo_auth_url = _qbo_oauth.build_authorize_url(
+                        _qbo_state)
+                    st.markdown(
+                        f"[:link: **Connect QuickBooks Online** "
+                        f"(opens Intuit to authorise)]"
+                        f"({_qbo_auth_url})")
+                    st.caption(
+                        f"Environment: **{_qbo_oauth.environment()}**. "
+                        "The Intuit app's Redirect URI must match "
+                        "`QBO_REDIRECT_URI`. Tokens are encrypted "
+                        "at rest.")
+                except Exception as _exc:  # noqa: BLE001
+                    st.error(f"Connect button unavailable: {_exc}")
+
+    st.divider()
+    st.subheader(":construction: Cashflow view — coming next")
+    st.info(
+        "The cashflow dashboard (cash position, projected inflows/"
+        "outflows, runway) is built once James shares the team's "
+        "working Google Sheet so the layout mirrors what everyone "
+        "already uses. Connect QBO above in the meantime — the "
+        "data link will be ready the moment the page is built.")
 
 
 # ---------------------------------------------------------------------------
