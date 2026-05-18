@@ -21388,11 +21388,222 @@ elif page == "Cashflow":
                         st.error(f"Could not add invoice: {_exc}")
 
     st.divider()
-    st.subheader(":bar_chart: 53-week cashflow forecast")
+    st.subheader(":bar_chart: Weekly cashflow forecast")
     st.caption(
-        ":construction: The weekly forecast grid (bank balances, "
-        "inflows / outflows, projected closing balance) is the "
-        "next phase — building now.")
+        "Forward projection: opening cash, weekly inflows and "
+        "outflows, projected closing balance. Edit any cell; the "
+        "**Supplier payables** outflow row is filled automatically "
+        "from the tracker above (bills bucketed by due date).")
+
+    # Forecast line-item definitions (row_key, display label).
+    _CF_INFLOWS = [
+        ("forecast_sales", "Forecast sales"),
+        ("prolux", "Prolux"),
+        ("other_income_rent", "Other income / rent"),
+        ("wages_865", "865 wages"),
+    ]
+    _CF_OUTFLOWS = [
+        ("google_ads", "Google ads"),
+        ("advertising_bills", "Advertising bills"),
+        ("chase_credit_card", "Chase credit card"),
+        ("shopify_credit_card", "Shopify credit card"),
+        ("payroll_staff", "Payroll staff"),
+        ("non_payroll_staff", "Non-payroll staff"),
+        ("bi_weekly_staff", "Bi-weekly staff"),
+        ("amex_prime", "AMEX Prime"),
+        ("amex_gold", "AMEX Gold"),
+        ("rent", "Rent"),
+        ("bb_loan", "BB loan"),
+        ("ben_loan", "Ben loan"),
+        ("loan_repayments", "Loan repayments"),
+        ("ups_payments", "UPS / freight"),
+        ("sales_tax", "Sales tax"),
+        ("income_tax", "Income tax"),
+        ("tariffs", "Tariffs / duty"),
+        ("cwo_suppliers", "CWO suppliers"),
+        ("kub_utilities", "KUB / utilities"),
+        ("cellphones_internet", "Cellphones & internet"),
+    ]
+
+    _cf_horizon = st.selectbox(
+        "Forecast horizon", [13, 26, 53], index=1,
+        format_func=lambda n: f"{n} weeks",
+        key="_cf_horizon")
+
+    # Build the week anchors — Mondays from the current week.
+    _cf_today = pd.Timestamp.today().normalize()
+    _cf_monday = _cf_today - pd.Timedelta(days=_cf_today.weekday())
+    _cf_weeks = [_cf_monday + pd.Timedelta(weeks=i)
+                 for i in range(int(_cf_horizon))]
+    _cf_wkey = [w.strftime("%Y-%m-%d") for w in _cf_weeks]
+    _cf_wcol = [w.strftime("%m/%d") for w in _cf_weeks]
+    # Display label -> ISO week_start (columns can't collide
+    # within a 53-week window).
+    _cf_col2key = dict(zip(_cf_wcol, _cf_wkey))
+
+    try:
+        _cf_fc = db.get_forecast()
+    except Exception as _exc:  # noqa: BLE001
+        _cf_fc = {}
+        st.error(f"Could not load forecast: {_exc}")
+
+    # ---- Opening balance ----
+    _cf_open_key = (_cf_wkey[0], "opening_balance")
+    _cf_open_saved = _cf_fc.get(_cf_open_key)
+    _oc1, _oc2 = st.columns([2, 1])
+    with _oc1:
+        _cf_opening = st.number_input(
+            f"Opening cash balance — week of {_cf_wcol[0]}",
+            value=float(_cf_open_saved or 0.0), step=1000.0,
+            key="_cf_opening_input")
+    with _oc2:
+        if st.button(":bank: Pull from QuickBooks",
+                     key="_cf_pull_bank",
+                     help="Sum the current balances of your QBO "
+                          "Bank accounts."):
+            try:
+                _accts = _qbo_client.get_bank_accounts()
+                _bank_total = sum(
+                    float(a.get("CurrentBalance") or 0)
+                    for a in _accts)
+                db.set_forecast_cell(
+                    _cf_wkey[0], "opening_balance", _bank_total,
+                    updated_by=current_user)
+                st.success(
+                    f"Opening balance set to "
+                    f"{_fmt_money(_bank_total)} from "
+                    f"{len(_accts)} bank account(s).")
+                st.rerun()
+            except Exception as _exc:  # noqa: BLE001
+                st.error(f"Could not read QBO bank accounts: "
+                         f"{_exc}")
+
+    # ---- Supplier payables bucketed by due week (derived) ----
+    _cf_supplier_due = {k: 0.0 for k in _cf_wkey}
+    try:
+        _cf_pay_all = db.list_payables(
+            include_dismissed=False, include_paid=False)
+    except Exception:  # noqa: BLE001
+        _cf_pay_all = []
+    for _p in _cf_pay_all:
+        _due = (_p.get("due_date_override")
+                or _p.get("due_date") or "")
+        if not _due:
+            continue
+        try:
+            _due_ts = pd.Timestamp(_due).normalize()
+        except Exception:  # noqa: BLE001
+            continue
+        # Which week bucket? floor to the Monday.
+        _wk = _due_ts - pd.Timedelta(days=_due_ts.weekday())
+        _wk_key = _wk.strftime("%Y-%m-%d")
+        if _wk_key in _cf_supplier_due:
+            _amt = _p.get("amount_override")
+            if _amt is None:
+                _amt = _p.get("amount")
+            _cf_supplier_due[_wk_key] += float(_amt or 0)
+
+    # ---- Editable grid (line items) ----
+    _cf_rows = _CF_INFLOWS + _CF_OUTFLOWS
+    _cf_grid = {}
+    for _rk, _label in _cf_rows:
+        _cf_grid[_label] = [
+            float(_cf_fc.get((wk, _rk)) or 0.0) for wk in _cf_wkey]
+    _cf_grid_df = pd.DataFrame(_cf_grid, index=_cf_wcol).T
+    _cf_grid_df.index.name = "Line item"
+
+    _cf_edited_grid = st.data_editor(
+        _cf_grid_df,
+        use_container_width=True,
+        num_rows="fixed",
+        key="_cf_forecast_editor",
+        column_config={
+            c: st.column_config.NumberColumn(c, format="%.0f")
+            for c in _cf_wcol},
+    )
+
+    if st.button(":floppy_disk: Save forecast changes",
+                 key="_cf_save_forecast", type="primary"):
+        _label2key = {lbl: rk for rk, lbl in _cf_rows}
+        _n_cells = 0
+        _cells = []
+        for _label, _row in _cf_edited_grid.iterrows():
+            _rk = _label2key.get(_label)
+            if not _rk:
+                continue
+            for _wcol in _cf_wcol:
+                _wk = _cf_col2key[_wcol]
+                _new = _row.get(_wcol)
+                _new = (0.0 if pd.isna(_new) else float(_new))
+                _old = float(_cf_fc.get((_wk, _rk)) or 0.0)
+                if _new != _old:
+                    _cells.append((_wk, _rk, _new))
+                    _n_cells += 1
+        # Persist opening balance if changed.
+        if float(_cf_opening) != float(_cf_open_saved or 0.0):
+            _cells.append(
+                (_cf_wkey[0], "opening_balance",
+                 float(_cf_opening)))
+            _n_cells += 1
+        try:
+            db.bulk_set_forecast(_cells, updated_by=current_user)
+            st.success(f":white_check_mark: Saved {_n_cells} "
+                       f"forecast cell(s).")
+            st.rerun()
+        except Exception as _exc:  # noqa: BLE001
+            st.error(f"Could not save forecast: {_exc}")
+
+    # ---- Projection (read-only, derived) ----
+    _proj_rows = {
+        "Total inflows": [],
+        "Total outflows": [],
+        "  └ Supplier payables (tracker)": [],
+        "Net movement": [],
+        "Opening balance": [],
+        "Closing balance": [],
+    }
+    _running = float(_cf_opening)
+    for _i, _wk in enumerate(_cf_wkey):
+        _in = sum(float(_cf_fc.get((_wk, rk)) or 0.0)
+                  for rk, _ in _CF_INFLOWS)
+        _out_manual = sum(float(_cf_fc.get((_wk, rk)) or 0.0)
+                          for rk, _ in _CF_OUTFLOWS)
+        # Use edited grid values if the user has unsaved edits?
+        # Keep it simple: projection reflects SAVED data.
+        _sup = _cf_supplier_due.get(_wk, 0.0)
+        _out = _out_manual + _sup
+        _net = _in - _out
+        _proj_rows["Total inflows"].append(_in)
+        _proj_rows["Total outflows"].append(_out)
+        _proj_rows["  └ Supplier payables (tracker)"].append(_sup)
+        _proj_rows["Net movement"].append(_net)
+        _proj_rows["Opening balance"].append(_running)
+        _running += _net
+        _proj_rows["Closing balance"].append(_running)
+    _proj_df = pd.DataFrame(_proj_rows, index=_cf_wcol).T
+    _proj_df.index.name = "Projection"
+    st.markdown("**Projected cash position** "
+                "_(reflects saved data — Save above to refresh)_")
+    st.dataframe(
+        _proj_df.style.format("{:,.0f}"),
+        use_container_width=True)
+
+    _final_close = (_proj_rows["Closing balance"][-1]
+                    if _proj_rows["Closing balance"] else 0.0)
+    _min_close = (min(_proj_rows["Closing balance"])
+                  if _proj_rows["Closing balance"] else 0.0)
+    _pc1, _pc2 = st.columns(2)
+    _pc1.metric(f"Projected closing — week {_cf_wcol[-1]}",
+                _fmt_money(_final_close))
+    _pc2.metric("Lowest projected balance",
+                _fmt_money(_min_close),
+                help="The tightest week in the horizon — watch "
+                     "this for a cash squeeze.")
+    if _min_close < 0:
+        st.error(
+            ":rotating_light: Projection dips **below zero** — "
+            "the forecast shows a cash shortfall. Review the "
+            "weeks above.")
 
 
 # ---------------------------------------------------------------------------
