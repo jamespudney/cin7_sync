@@ -4844,8 +4844,38 @@ def lookup_aliases(phrase: str,
 # Per-user authentication is deliberately NOT in scope — see schema
 # comment on the users table.
 
-USER_ROLES = ("buyer", "sales", "admin", "viewer")
+# v2.67.207 — super_admin is the top tier. Only super_admins can
+# open the User Permissions page, change anyone's role, or
+# create/manage users. Regular 'admin' keeps full PAGE access
+# but cannot escalate privileges or manage other users.
+USER_ROLES = ("buyer", "sales", "admin", "super_admin", "viewer")
 DEFAULT_NEW_USER_ROLE = "sales"
+
+# Names listed in this env var are ALWAYS treated as super_admin,
+# regardless of their stored users.role. This solves the
+# bootstrap problem (you can't reach the super-admin-only User
+# Permissions page to make yourself super_admin if nobody is one
+# yet) and acts as a break-glass override that survives DB
+# resets. Comma-separated display names, case-insensitive.
+SUPER_ADMIN_ENV = "SUPER_ADMIN_NAMES"
+
+
+def is_super_admin(display_name: str = "", role: str = "") -> bool:
+    """v2.67.207 — True if the user is a super-admin via EITHER:
+      1. their users.role == 'super_admin', OR
+      2. their display_name appears in the SUPER_ADMIN_NAMES
+         env var (bootstrap / break-glass).
+    Case-insensitive on both."""
+    import os as _os
+    if (role or "").strip().lower() == "super_admin":
+        return True
+    name_lc = (display_name or "").strip().lower()
+    if not name_lc:
+        return False
+    env_raw = _os.environ.get(SUPER_ADMIN_ENV, "")
+    env_names = {n.strip().lower()
+                    for n in env_raw.split(",") if n.strip()}
+    return name_lc in env_names
 
 
 def get_user_by_name(display_name: str) -> Optional[sqlite3.Row]:

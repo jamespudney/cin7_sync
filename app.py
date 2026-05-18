@@ -2213,12 +2213,24 @@ with st.sidebar:
                 _new_name = st.text_input(
                     "Name", placeholder="e.g. James",
                     key="_signup_name")
+                # v2.67.207 — self-signup can ONLY pick a non-
+                # privileged role. admin / super_admin must be
+                # granted by a super-admin afterwards on the
+                # User Permissions page. Without this, anyone at
+                # the sign-in gate could create themselves a
+                # super_admin profile.
+                _self_signup_roles = [
+                    r for r in db.USER_ROLES
+                    if r not in ("admin", "super_admin")]
                 _new_role = st.selectbox(
-                    "Role", options=list(db.USER_ROLES),
-                    index=list(db.USER_ROLES).index("sales"),
+                    "Role", options=_self_signup_roles,
+                    index=(_self_signup_roles.index("sales")
+                              if "sales" in _self_signup_roles
+                              else 0),
                     key="_signup_role",
-                    help="buyer/sales/admin/viewer. You can change "
-                         "this later on the My Profile page.")
+                    help="buyer / sales / viewer. Admin access "
+                         "is granted separately by a super-admin "
+                         "— it can't be self-assigned.")
                 _signup_submit = st.form_submit_button(
                     ":sparkles: Create profile and sign in",
                     type="primary", width="stretch")
@@ -2754,12 +2766,23 @@ with st.sidebar:
     ]
     # v2.67.185 — filter _page_options by per-user permissions.
     # Unconfigured users (no rows in user_page_permissions) see
-    # everything (backwards compat). Admins always see everything.
-    # The "User Permissions" page itself is admin-only.
+    # everything (backwards compat).
+    # v2.67.207 — three-tier visibility:
+    #   super_admin → everything INCLUDING User Permissions
+    #   admin       → everything EXCEPT User Permissions
+    #   others      → per-page permission filter
     _user_role = (current_user_profile or {}).get("role") or "sales"
     _user_id = (current_user_profile or {}).get("user_id") or 0
-    if (_user_role or "").strip().lower() == "admin":
+    _user_name = ((current_user_profile or {}).get("display_name")
+                     or st.session_state.get("current_user", ""))
+    _is_super_admin = db.is_super_admin(_user_name, _user_role)
+    if _is_super_admin:
         _visible_pages = list(_page_options)
+    elif (_user_role or "").strip().lower() == "admin":
+        # Regular admin: full page access but NOT the
+        # super-admin-only User Permissions page.
+        _visible_pages = [p for p in _page_options
+                              if p != "User Permissions"]
     else:
         try:
             _visible_pages = [
@@ -19421,6 +19444,9 @@ elif page == "My Profile":
 
     _me = current_user_profile or {}
     _is_admin = (_me.get("role") == "admin")
+    # v2.67.207 — super-admin check for THIS user.
+    _me_is_super = db.is_super_admin(
+        _me.get("display_name") or "", _me.get("role") or "")
 
     if not _me:
         st.warning(
@@ -19432,14 +19458,22 @@ elif page == "My Profile":
                          f"(set at sign-in; cannot be edited here — "
                          f"sign out and back in with a different name "
                          f"to switch identity)")
-            _new_role = st.selectbox(
-                "Role",
-                options=list(db.USER_ROLES),
-                index=list(db.USER_ROLES).index(_me.get("role"))
-                       if _me.get("role") in db.USER_ROLES
-                       else list(db.USER_ROLES).index("sales"),
-                help="buyer/sales/admin/viewer. Currently advisory; "
-                     "permissions enforcement comes later.")
+            # v2.67.207 — role is NOT self-editable. Letting any
+            # user pick their own role from a dropdown (including
+            # super_admin) is a privilege-escalation hole. Only
+            # super-admins can change roles, and they do it on
+            # the User Permissions page. Here the role is shown
+            # read-only; _new_role passes the EXISTING role
+            # through unchanged on save.
+            _new_role = _me.get("role") or db.DEFAULT_NEW_USER_ROLE
+            st.markdown(
+                f"**Role:** `{_new_role}` "
+                + ("— you're a super-admin; change roles on the "
+                    "User Permissions page."
+                    if _me_is_super
+                    else "— role changes are made by a "
+                          "super-admin on the User Permissions "
+                          "page."))
             _new_email = st.text_input(
                 "Email (optional)",
                 value=_me.get("email") or "",
@@ -20650,16 +20684,32 @@ elif page == "User Permissions":
     st.caption(
         "Per-user page-access control. Tick the pages each user "
         "is allowed to see. Users with NO permissions configured "
-        "see everything (backwards-compat default). Admins always "
-        "see everything regardless of these settings.")
+        "see everything (backwards-compat default). Super-admins "
+        "and regular admins always see every page; this page "
+        "controls what everyone ELSE sees.")
 
-    _admin_role = (
-        (current_user_profile or {}).get("role") or "").strip().lower()
-    if _admin_role != "admin":
+    # v2.67.207 — super-admin gate. This page (and role
+    # management) is restricted to super-admins so a regular
+    # admin can't escalate their own or anyone else's
+    # privileges. Super-admin = users.role == 'super_admin' OR
+    # display_name in the SUPER_ADMIN_NAMES env var.
+    _cur_role = (
+        (current_user_profile or {}).get("role") or "").strip()
+    _cur_name = (
+        (current_user_profile or {}).get("display_name")
+        or st.session_state.get("current_user", ""))
+    if not db.is_super_admin(_cur_name, _cur_role):
         st.error(
-            "This page is admin-only. Ask an existing admin to "
-            "grant your profile the 'admin' role on the My Profile "
-            "page.")
+            "This page is **super-admin only**. Regular admins "
+            "have full page access but cannot manage users or "
+            "change roles.\n\n"
+            "To become a super-admin: an existing super-admin "
+            "sets your role to `super_admin` here, OR your "
+            "display name is added to the `SUPER_ADMIN_NAMES` "
+            "environment variable on the Render service "
+            "(comma-separated, used for the initial bootstrap "
+            "since the first super-admin can't be created from "
+            "inside the app).")
         st.stop()
 
     # ---- v2.67.189 — Add new user expander ---------------------
