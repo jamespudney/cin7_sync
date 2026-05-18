@@ -1136,6 +1136,56 @@ CREATE TABLE IF NOT EXISTS qbo_connection (
     updated_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v2.67.219 Cashflow Management — supplier-payables tracker.
+-- One row per supplier bill. QBO-sourced rows are kept in sync
+-- from QuickBooks Bills (qbo_bill_id set); manual rows (freight,
+-- duty, anything not yet billed in QBO) have source='manual'.
+-- James's overrides (amount_override, due_date_override) and the
+-- approval workflow fields are NEVER clobbered by the QBO sync —
+-- the sync only refreshes the qbo_* mirror columns.
+CREATE TABLE IF NOT EXISTS cashflow_payables (
+    payable_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    source            TEXT NOT NULL DEFAULT 'qbo',  -- qbo|manual
+    qbo_bill_id       TEXT,                         -- QBO Bill.Id
+    supplier          TEXT,
+    reference         TEXT,                         -- DocNumber / PO ref
+    description       TEXT,
+    amount            REAL,                         -- QBO TotalAmt mirror
+    currency          TEXT DEFAULT 'USD',
+    invoice_date      TEXT,                         -- YYYY-MM-DD
+    due_date          TEXT,                         -- YYYY-MM-DD
+    qbo_balance       REAL,                         -- outstanding per QBO
+    status            TEXT NOT NULL DEFAULT 'pending',
+    -- status: pending | approved | scheduled | paid
+    approved_by       TEXT,
+    approved_at       TIMESTAMP,
+    paid_date         TEXT,
+    paid_amount       REAL,
+    slack_ts          TEXT,                         -- approval post ts
+    notes             TEXT,
+    amount_override   REAL,                         -- James's override
+    due_date_override TEXT,
+    is_dismissed      INTEGER NOT NULL DEFAULT 0,
+    created_at        TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_at        TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_by        TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cashflow_payables_bill
+    ON cashflow_payables(qbo_bill_id);
+
+-- v2.67.219 Cashflow Management — 53-week forecast grid. A
+-- key-value cell store: one row per (week, line-item). row_key
+-- is an app-defined category ('forecast_sales', 'google_ads',
+-- 'rent', 'correction', ...). Editable in the dashboard.
+CREATE TABLE IF NOT EXISTS cashflow_forecast (
+    week_start  TEXT NOT NULL,    -- YYYY-MM-DD week anchor
+    row_key     TEXT NOT NULL,
+    amount      REAL,
+    updated_at  TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_by  TEXT,
+    PRIMARY KEY (week_start, row_key)
+);
+
 -- v2.67.126 Viktor bridge sessions. When the dashboard's AI
 -- Assistant posts to Slack on a user's behalf to forward a
 -- marketing question to Viktor, we record the post here so we
@@ -2632,6 +2682,187 @@ def clear_qbo_connection() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cashflow Management — supplier payables (v2.67.219)
+# ---------------------------------------------------------------------------
+# Columns a caller is allowed to update via update_payable(). The
+# QBO mirror columns are deliberately NOT in here — they are owned
+# by upsert_qbo_payable (the sync). amount_override/due_date_
+# override let James adjust a QBO bill without the sync undoing it.
+_PAYABLE_UPDATABLE = (
+    "supplier", "reference", "description", "amount", "currency",
+    "invoice_date", "due_date", "status", "paid_date",
+    "paid_amount", "slack_ts", "notes", "amount_override",
+    "due_date_override", "is_dismissed",
+)
+
+
+def upsert_qbo_payable(qbo_bill_id: str, supplier: Optional[str],
+                       reference: Optional[str],
+                       description: Optional[str],
+                       amount: Optional[float],
+                       currency: Optional[str],
+                       invoice_date: Optional[str],
+                       due_date: Optional[str],
+                       qbo_balance: Optional[float]) -> None:
+    """Insert or refresh a QBO-sourced payable. ON CONFLICT this
+    updates ONLY the QBO mirror columns — status, approval fields
+    and James's overrides are preserved so the sync never undoes
+    a human decision."""
+    sql = (
+        "INSERT INTO cashflow_payables "
+        "(source, qbo_bill_id, supplier, reference, description, "
+        " amount, currency, invoice_date, due_date, qbo_balance, "
+        " created_at, updated_at) "
+        "VALUES ('qbo', ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+        "        datetime('now'), datetime('now')) "
+        "ON CONFLICT(qbo_bill_id) DO UPDATE SET "
+        "  supplier = excluded.supplier, "
+        "  reference = excluded.reference, "
+        "  description = excluded.description, "
+        "  amount = excluded.amount, "
+        "  currency = excluded.currency, "
+        "  invoice_date = excluded.invoice_date, "
+        "  due_date = excluded.due_date, "
+        "  qbo_balance = excluded.qbo_balance, "
+        "  updated_at = datetime('now')")
+    with connect() as c:
+        c.execute(sql, (qbo_bill_id, supplier, reference,
+                          description, amount, currency,
+                          invoice_date, due_date, qbo_balance))
+
+
+def add_manual_payable(supplier: Optional[str],
+                       reference: Optional[str],
+                       description: Optional[str],
+                       amount: Optional[float],
+                       currency: str = "USD",
+                       invoice_date: Optional[str] = None,
+                       due_date: Optional[str] = None,
+                       updated_by: Optional[str] = None) -> int:
+    """Add a non-QBO payable (freight, duty, anything not yet
+    billed in QBO). Returns the new payable_id."""
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO cashflow_payables "
+            "(source, supplier, reference, description, amount, "
+            " currency, invoice_date, due_date, updated_by, "
+            " created_at, updated_at) "
+            "VALUES ('manual', ?, ?, ?, ?, ?, ?, ?, ?, "
+            "        datetime('now'), datetime('now'))",
+            (supplier, reference, description, amount, currency,
+              invoice_date, due_date, updated_by))
+        return int(cur.lastrowid)
+
+
+def list_payables(include_dismissed: bool = False,
+                  include_paid: bool = True) -> list:
+    """Return cashflow payables as a list of dicts, ordered by
+    due date (nulls last)."""
+    sql = "SELECT * FROM cashflow_payables WHERE 1=1"
+    if not include_dismissed:
+        sql += " AND is_dismissed = 0"
+    if not include_paid:
+        sql += " AND status != 'paid'"
+    sql += (" ORDER BY CASE WHEN due_date IS NULL OR due_date = '' "
+            "THEN 1 ELSE 0 END, due_date, payable_id")
+    with connect() as c:
+        rows = c.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_payable(payable_id: int) -> Optional[dict]:
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM cashflow_payables WHERE payable_id = ?",
+            (payable_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def update_payable(payable_id: int, fields: dict,
+                   updated_by: Optional[str] = None) -> None:
+    """Generic update — only whitelisted columns in
+    _PAYABLE_UPDATABLE are written. Always bumps updated_at."""
+    sets = []
+    vals: list = []
+    for col, val in (fields or {}).items():
+        if col in _PAYABLE_UPDATABLE:
+            sets.append(f"{col} = ?")
+            vals.append(val)
+    if not sets:
+        return
+    sets.append("updated_at = datetime('now')")
+    sets.append("updated_by = ?")
+    vals.append(updated_by)
+    vals.append(payable_id)
+    with connect() as c:
+        c.execute(
+            f"UPDATE cashflow_payables SET {', '.join(sets)} "
+            f"WHERE payable_id = ?", vals)
+
+
+def approve_payable(payable_id: int, approved_by: str,
+                   slack_ts: Optional[str] = None) -> None:
+    """Mark a payable approved for payment (James's go-ahead)."""
+    with connect() as c:
+        c.execute(
+            "UPDATE cashflow_payables SET status = 'approved', "
+            "approved_by = ?, approved_at = datetime('now'), "
+            "slack_ts = COALESCE(?, slack_ts), "
+            "updated_at = datetime('now'), updated_by = ? "
+            "WHERE payable_id = ?",
+            (approved_by, slack_ts, approved_by, payable_id))
+
+
+def delete_manual_payable(payable_id: int) -> None:
+    """Hard-delete a manual payable row. QBO-sourced rows should
+    be dismissed (is_dismissed) instead, or they'd reappear on
+    the next sync."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM cashflow_payables "
+            "WHERE payable_id = ? AND source = 'manual'",
+            (payable_id,))
+
+
+# ---------------------------------------------------------------------------
+# Cashflow Management — 53-week forecast grid (v2.67.219)
+# ---------------------------------------------------------------------------
+def set_forecast_cell(week_start: str, row_key: str,
+                     amount: Optional[float],
+                     updated_by: Optional[str] = None) -> None:
+    """Upsert one forecast cell (week × line-item)."""
+    with connect() as c:
+        c.execute(
+            "INSERT INTO cashflow_forecast "
+            "(week_start, row_key, amount, updated_at, updated_by) "
+            "VALUES (?, ?, ?, datetime('now'), ?) "
+            "ON CONFLICT(week_start, row_key) DO UPDATE SET "
+            "  amount = excluded.amount, "
+            "  updated_at = datetime('now'), "
+            "  updated_by = excluded.updated_by",
+            (week_start, row_key, amount, updated_by))
+
+
+def bulk_set_forecast(cells: list,
+                     updated_by: Optional[str] = None) -> None:
+    """Upsert many forecast cells at once. `cells` is a list of
+    (week_start, row_key, amount) tuples."""
+    for week_start, row_key, amount in cells:
+        set_forecast_cell(week_start, row_key, amount, updated_by)
+
+
+def get_forecast() -> dict:
+    """Return the whole forecast grid as a dict keyed by
+    (week_start, row_key) -> amount."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT week_start, row_key, amount "
+            "FROM cashflow_forecast").fetchall()
+    return {(r["week_start"], r["row_key"]): r["amount"]
+            for r in rows}
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge sessions (v2.67.126)
 # ---------------------------------------------------------------------------
 def create_viktor_bridge_session(session_id: str, user_id: int,
@@ -2877,6 +3108,51 @@ _PG_POST_CUTOVER_TABLES = [
           connected_by        TEXT,
           connected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    # v2.67.219 — Cashflow Management tables.
+    ("cashflow_payables",
+      """
+      CREATE TABLE IF NOT EXISTS cashflow_payables (
+          payable_id        SERIAL PRIMARY KEY,
+          source            TEXT NOT NULL DEFAULT 'qbo',
+          qbo_bill_id       TEXT,
+          supplier          TEXT,
+          reference         TEXT,
+          description       TEXT,
+          amount            DOUBLE PRECISION,
+          currency          TEXT DEFAULT 'USD',
+          invoice_date      TEXT,
+          due_date          TEXT,
+          qbo_balance       DOUBLE PRECISION,
+          status            TEXT NOT NULL DEFAULT 'pending',
+          approved_by       TEXT,
+          approved_at       TIMESTAMPTZ,
+          paid_date         TEXT,
+          paid_amount       DOUBLE PRECISION,
+          slack_ts          TEXT,
+          notes             TEXT,
+          amount_override   DOUBLE PRECISION,
+          due_date_override TEXT,
+          is_dismissed      INTEGER NOT NULL DEFAULT 0,
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_by        TEXT
+      );
+      """),
+    ("cashflow_payables_idx",
+      "CREATE UNIQUE INDEX IF NOT EXISTS "
+      "idx_cashflow_payables_bill "
+      "ON cashflow_payables(qbo_bill_id);"),
+    ("cashflow_forecast",
+      """
+      CREATE TABLE IF NOT EXISTS cashflow_forecast (
+          week_start  TEXT NOT NULL,
+          row_key     TEXT NOT NULL,
+          amount      DOUBLE PRECISION,
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_by  TEXT,
+          PRIMARY KEY (week_start, row_key)
       );
       """),
 ]

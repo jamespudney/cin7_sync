@@ -243,3 +243,74 @@ def profit_and_loss(start_date: str, end_date: str) -> dict:
         "start_date": start_date,
         "end_date": end_date,
     })
+
+
+# ---------------------------------------------------------------------------
+# Paginated query + Cashflow-page convenience wrappers (v2.67.219)
+# ---------------------------------------------------------------------------
+# QBO's query endpoint returns at most 1000 rows per call; large
+# result sets need STARTPOSITION paging. query() above is fine for
+# small/bounded queries; query_all() pages through everything.
+_QBO_PAGE_SIZE = 1000
+
+
+def query_all(select_from_where: str) -> list[dict]:
+    """Run a QBO query and page through ALL results.
+
+    Pass the query WITHOUT a STARTPOSITION/MAXRESULTS clause —
+    e.g. "SELECT * FROM Bill WHERE TxnDate >= '2026-01-01'".
+    query_all appends paging itself. Returns the combined list."""
+    out: list[dict] = []
+    start = 1  # QBO STARTPOSITION is 1-based.
+    while True:
+        page_sql = (f"{select_from_where} STARTPOSITION {start} "
+                    f"MAXRESULTS {_QBO_PAGE_SIZE}")
+        rows = query(page_sql)
+        out.extend(rows)
+        if len(rows) < _QBO_PAGE_SIZE:
+            break
+        start += _QBO_PAGE_SIZE
+        if start > 100_000:  # hard safety stop
+            log.warning("query_all hit the 100k safety cap.")
+            break
+    return out
+
+
+def _qbo_escape(value: str) -> str:
+    """Escape a string literal for embedding in a QBO query
+    (single quotes are doubled)."""
+    return str(value).replace("'", "''")
+
+
+def get_bills(since_date: Optional[str] = None,
+              only_unpaid: bool = False) -> list[dict]:
+    """Fetch supplier bills (accounts payable) from QBO.
+
+    - since_date: 'YYYY-MM-DD' lower bound on TxnDate. Defaults to
+      no bound (caller usually passes ~6 months back).
+    - only_unpaid: if True, only bills with an outstanding balance.
+
+    Each Bill dict includes Id, DocNumber, TxnDate, DueDate,
+    TotalAmt, Balance, VendorRef {value,name}, CurrencyRef. A
+    Balance of 0 means the bill is fully paid."""
+    clauses: list[str] = []
+    if only_unpaid:
+        clauses.append("Balance > '0'")
+    if since_date:
+        clauses.append(f"TxnDate >= '{_qbo_escape(since_date)}'")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return query_all(f"SELECT * FROM Bill{where} ORDERBY TxnDate")
+
+
+def get_bank_accounts() -> list[dict]:
+    """Fetch QBO Bank-type accounts with their current balances —
+    powers the bank-balance rows on the Cashflow page. Each dict
+    includes Id, Name, CurrentBalance, AccountSubType."""
+    return query_all(
+        "SELECT * FROM Account WHERE AccountType = 'Bank'")
+
+
+def get_vendors() -> list[dict]:
+    """Fetch QBO vendors (suppliers). Useful for mapping/display;
+    each dict includes Id, DisplayName, Active."""
+    return query_all("SELECT * FROM Vendor")
