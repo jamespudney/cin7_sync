@@ -500,6 +500,47 @@ def _to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def _safe_cache_clear() -> None:
+    """v2.67.210 — race-safe wrapper for Streamlit's cache_data
+    clear.
+
+    Streamlit's cache_data clear does a shutil.rmtree on the
+    on-disk cache directory (/opt/render/.streamlit/cache). The
+    background warm_engine.py process — kicked off by sync_loop
+    after every sync — writes @st.cache_data entries into that
+    SAME directory. If a clear and a warm-engine write
+    interleave, rmtree hits a freshly-created file mid-walk and
+    raises `OSError [Errno 39] Directory not empty`, which (un-
+    wrapped) crashes the whole Streamlit page.
+
+    The clear is best-effort: a missed clear just means the next
+    render recomputes a few cache entries. So we retry once
+    (the racing writer usually finishes within a few hundred ms)
+    then swallow the error. Never fatal.
+
+    Every callsite app-wide routes through this helper; the raw
+    Streamlit call is bound via getattr below so it appears
+    nowhere as a literal — that's deliberate, so the blanket
+    find/replace that introduced this helper couldn't recurse
+    into it."""
+    import time as _t
+    _clear = getattr(st.cache_data, "clear")
+    for _attempt in range(2):
+        try:
+            _clear()
+            return
+        except OSError:
+            if _attempt == 0:
+                _t.sleep(0.4)
+                continue
+            # Second failure — give up quietly. Stale cache is
+            # harmless; crashing the page is not.
+            return
+        except Exception:  # noqa: BLE001
+            # Any other cache-clear failure is also non-fatal.
+            return
+
+
 def _to_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True)
 
@@ -2849,7 +2890,8 @@ with st.sidebar:
                   help="Clear in-app caches and reload from the CSV files "
                        "on the server. CIN7 itself is auto-synced nightly "
                        "at 02:00 UTC — you don't normally need this."):
-        st.cache_data.clear()
+        # v2.67.210 — race-safe cache clear (see _safe_cache_clear).
+        _safe_cache_clear()
         # v2.67.45 — _get_engine_df is now @st.cache_resource. Clear
         # both cache stores so the next page render forces a fresh
         # _abc_engine call against the freshly-loaded data.
@@ -2879,7 +2921,7 @@ with st.sidebar:
                     timeout=300,
                 )
                 if result.returncode == 0:
-                    st.cache_data.clear()
+                    _safe_cache_clear()
                     st.success(":white_check_mark: Sync complete — data "
                                "refreshed. Rerunning page…")
                     # Show the last few log lines for confidence
@@ -4710,7 +4752,7 @@ def render_demand_breakdown(
                 try:
                     db.set_migration(sku, succ_pick, actor,
                                       share_pick, note_pick)
-                    st.cache_data.clear()
+                    _safe_cache_clear()
                     st.success(
                         f"Redirected: **{sku}** → **{succ_pick}** "
                         f"({share_pick:.0f}% of demand). "
@@ -4734,7 +4776,7 @@ def render_demand_breakdown(
                     try:
                         if hasattr(db, "clear_migration"):
                             db.clear_migration(sku, actor)
-                        st.cache_data.clear()
+                        _safe_cache_clear()
                         st.success(f"Cleared mapping for {sku}")
                         st.rerun()
                     except Exception as e:
@@ -7728,13 +7770,13 @@ elif page == "LED Tubes":
                              width="stretch"):
                     db.set_migration(retiring_pick, successor_pick,
                                       actor, share_pick, note_pick)
-                    st.cache_data.clear()
+                    _safe_cache_clear()
                     st.success(f"Saved: {retiring_pick} → {successor_pick}")
                     st.rerun()
                 if st.button("Clear", key="mig_clear_btn",
                              width="stretch"):
                     db.clear_migration(retiring_pick, actor)
-                    st.cache_data.clear()
+                    _safe_cache_clear()
                     st.success(f"Cleared mapping for {retiring_pick}")
                     st.rerun()
 
@@ -8165,7 +8207,7 @@ elif page == "LED Tubes":
                     if f4.button("Assign", key="fsa_save"):
                         db.set_family_supplier(fam_pick, sup_pick,
                                                 actor_s, fam_note)
-                        st.cache_data.clear()
+                        _safe_cache_clear()
                         st.success(f"{fam_pick} → {sup_pick}")
                         st.rerun()
 
@@ -8199,7 +8241,7 @@ elif page == "LED Tubes":
                     if o4.button("Assign", key="sso_save"):
                         db.set_sku_supplier(sku_over_pick, sku_sup_pick,
                                              actor_s, sku_note)
-                        st.cache_data.clear()
+                        _safe_cache_clear()
                         st.success(f"{sku_over_pick} → {sku_sup_pick}")
                         st.rerun()
                     if sku_overrides:
@@ -8283,7 +8325,7 @@ elif page == "LED Tubes":
                             currency=pr_currency,
                             actor=actor_s, note=pr_note,
                         )
-                        st.cache_data.clear()
+                        _safe_cache_clear()
                         st.success(
                             f"Saved pricing: {pr_supplier} → {pr_model}")
                         st.rerun()
@@ -9013,7 +9055,7 @@ elif page == "LED Tubes":
                     cc_fam, cc_comp, cc_actor,
                     role=cc_role, lead_time_days=int(cc_lead), note=cc_note,
                 )
-                st.cache_data.clear()
+                _safe_cache_clear()
                 st.success(f"Added critical component: {cc_fam} / {cc_comp}")
                 st.rerun()
 
@@ -9027,7 +9069,7 @@ elif page == "LED Tubes":
                                 key="cc_clear_pick")
             if st.button("Remove", key="cc_clear_btn"):
                 db.clear_critical_component(id_map[pick], cc_actor)
-                st.cache_data.clear()
+                _safe_cache_clear()
                 st.rerun()
 
     # --- Shared components (auto-discovered from BOM) ---------------------
@@ -11222,7 +11264,7 @@ elif page == "Ordering":
                     dropship_default=1 if ds_default else 0,
                     actor=actor_o,
                 )
-                st.cache_data.clear()
+                _safe_cache_clear()
                 st.success(f"Saved config for {cfg_supplier}")
                 st.rerun()
 
@@ -16915,7 +16957,7 @@ elif page == "Kits & Fixtures":
             if st.button(":pushpin: Flag", key="kf_qflag_btn",
                          width="stretch"):
                 db.set_flag(flag_sku, flag_type, actor, flag_note)
-                st.cache_data.clear()
+                _safe_cache_clear()
                 st.success(f"Flagged {flag_sku}: {flag_type}")
                 st.rerun()
 
@@ -16935,7 +16977,7 @@ elif page == "Kits & Fixtures":
                     )
                     if cc2.button("Clear", key=f"kf_clr_{f['id']}"):
                         db.clear_flag(f["id"], actor)
-                        st.cache_data.clear()
+                        _safe_cache_clear()
                         st.rerun()
 
     # --- Component view (needs BOM sync) ----------------------------------
@@ -20366,7 +20408,7 @@ elif page == "Demand Signals":
                         st.success(
                             f":white_check_mark: " + ", ".join(_msg_parts))
                         st.caption(_breakdown)
-                        st.cache_data.clear()
+                        _safe_cache_clear()
                         st.rerun()
                     else:
                         st.info(
@@ -20629,7 +20671,7 @@ elif page == "Demand Signals":
                         f":white_check_mark: Saved {_n_changed} "
                         "signal update(s). Audit log written. "
                         "Refreshing…")
-                    st.cache_data.clear()
+                    _safe_cache_clear()
                     st.rerun()
                 else:
                     info_col.info("No changes detected.")
