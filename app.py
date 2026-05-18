@@ -20977,9 +20977,39 @@ elif page == "Data Health":
 elif page == "Cashflow":
     st.header(":moneybag: Cashflow Management")
     st.caption(
-        "Cash position and forecast, backed by QuickBooks Online. "
-        "Connect QBO below; the full cashflow view is built once "
-        "the team's working spreadsheet has been shared.")
+        "Cash position, supplier payables and a weekly forward "
+        "forecast — backed by QuickBooks Online.")
+
+    # Forecast line-item definitions (row_key, display label) —
+    # shared by the dashboard summary and the forecast grid.
+    _CF_INFLOWS = [
+        ("forecast_sales", "Forecast sales"),
+        ("prolux", "Prolux"),
+        ("other_income_rent", "Other income / rent"),
+        ("wages_865", "865 wages"),
+    ]
+    _CF_OUTFLOWS = [
+        ("google_ads", "Google ads"),
+        ("advertising_bills", "Advertising bills"),
+        ("chase_credit_card", "Chase credit card"),
+        ("shopify_credit_card", "Shopify credit card"),
+        ("payroll_staff", "Payroll staff"),
+        ("non_payroll_staff", "Non-payroll staff"),
+        ("bi_weekly_staff", "Bi-weekly staff"),
+        ("amex_prime", "AMEX Prime"),
+        ("amex_gold", "AMEX Gold"),
+        ("rent", "Rent"),
+        ("bb_loan", "BB loan"),
+        ("ben_loan", "Ben loan"),
+        ("loan_repayments", "Loan repayments"),
+        ("ups_payments", "UPS / freight"),
+        ("sales_tax", "Sales tax"),
+        ("income_tax", "Income tax"),
+        ("tariffs", "Tariffs / duty"),
+        ("cwo_suppliers", "CWO suppliers"),
+        ("kub_utilities", "KUB / utilities"),
+        ("cellphones_internet", "Cellphones & internet"),
+    ]
 
     try:
         import qbo_oauth as _qbo_oauth
@@ -21091,6 +21121,126 @@ elif page == "Cashflow":
                         "at rest.")
                 except Exception as _exc:  # noqa: BLE001
                     st.error(f"Connect button unavailable: {_exc}")
+
+    st.divider()
+
+    # ---- Cashflow dashboard (v2.67.223) -----------------------------
+    st.subheader(":bar_chart: Cashflow dashboard")
+
+    _dash_today = pd.Timestamp.today().normalize()
+    _dash_monday = _dash_today - pd.Timedelta(
+        days=_dash_today.weekday())
+    _dash_mkey = _dash_monday.strftime("%Y-%m-%d")
+
+    try:
+        _dash_fc = db.get_forecast()
+    except Exception:  # noqa: BLE001
+        _dash_fc = {}
+    try:
+        _dash_pay = db.list_payables(
+            include_dismissed=False, include_paid=False)
+    except Exception:  # noqa: BLE001
+        _dash_pay = []
+
+    def _dash_eff_amt(r: dict) -> float:
+        _o = r.get("amount_override")
+        _v = _o if _o is not None else r.get("amount")
+        try:
+            return float(_v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _dash_eff_due(r: dict) -> str:
+        return (r.get("due_date_override")
+                or r.get("due_date") or "")
+
+    # Current cash — the opening-balance cell for this week.
+    _dash_cash = _dash_fc.get((_dash_mkey, "opening_balance"))
+
+    # Payables — totals + 7/30-day due windows.
+    _dash_out_total = sum(_dash_eff_amt(r) for r in _dash_pay)
+    _dash_appr = sum(_dash_eff_amt(r) for r in _dash_pay
+                     if r.get("status") == "approved")
+    _due7 = 0.0
+    _due30 = 0.0
+    _due30_rows = []
+    _cut7 = _dash_today + pd.Timedelta(days=7)
+    _cut30 = _dash_today + pd.Timedelta(days=30)
+    for r in _dash_pay:
+        _d = _dash_eff_due(r)
+        if not _d:
+            continue
+        try:
+            _ddt = pd.Timestamp(_d).normalize()
+        except Exception:  # noqa: BLE001
+            continue
+        _amt = _dash_eff_amt(r)
+        if _ddt <= _cut7:
+            _due7 += _amt
+        if _ddt <= _cut30:
+            _due30 += _amt
+            _due30_rows.append({
+                "Due": _d,
+                "Supplier": r.get("supplier") or "",
+                "Reference": r.get("reference") or "",
+                "Amount": _amt,
+                "Status": r.get("status") or "pending",
+            })
+
+    # This week's forecast net (incl. supplier bills due this wk).
+    _wk_in = sum(float(_dash_fc.get((_dash_mkey, rk)) or 0)
+                 for rk, _ in _CF_INFLOWS)
+    _wk_out = sum(float(_dash_fc.get((_dash_mkey, rk)) or 0)
+                  for rk, _ in _CF_OUTFLOWS)
+    _wk_sup = 0.0
+    for r in _dash_pay:
+        _d = _dash_eff_due(r)
+        if not _d:
+            continue
+        try:
+            _ddt = pd.Timestamp(_d).normalize()
+        except Exception:  # noqa: BLE001
+            continue
+        _wk = _ddt - pd.Timedelta(days=_ddt.weekday())
+        if _wk.strftime("%Y-%m-%d") == _dash_mkey:
+            _wk_sup += _dash_eff_amt(r)
+    _wk_net = _wk_in - _wk_out - _wk_sup
+
+    _d1, _d2, _d3 = st.columns(3)
+    _d1.metric(
+        "Current cash",
+        _fmt_money(_dash_cash) if _dash_cash is not None else "—",
+        help=("From the opening-balance cell for this week. Set "
+              "it via 'Pull from QuickBooks' in the forecast "
+              "below." if _dash_cash is None else None))
+    _d2.metric("Outstanding payables",
+               _fmt_money(_dash_out_total),
+               help="All un-paid supplier bills in the tracker.")
+    _d3.metric("Approved, awaiting payment",
+               _fmt_money(_dash_appr))
+
+    _d4, _d5, _d6 = st.columns(3)
+    _d4.metric("Due in next 7 days", _fmt_money(_due7))
+    _d5.metric("Due in next 30 days", _fmt_money(_due30))
+    _d6.metric(f"This week's net (wk {_dash_monday.strftime('%m/%d')})",
+               _fmt_money(_wk_net),
+               help="Forecast inflows minus outflows minus "
+                    "supplier bills due this week.")
+
+    if _due30_rows:
+        st.markdown("**Payments due in the next 30 days**")
+        _due_df = pd.DataFrame(
+            sorted(_due30_rows, key=lambda x: x["Due"]))
+        st.dataframe(
+            _due_df.style.format({"Amount": "{:,.2f}"}),
+            use_container_width=True, hide_index=True)
+    else:
+        st.caption("No supplier payments due in the next 30 days.")
+
+    st.caption(
+        ":information_source: Loan balances, credit-card balances "
+        "and Shopify Capital tiles will appear here once those "
+        "modules are built (next phases).")
 
     st.divider()
 
@@ -21394,36 +21544,6 @@ elif page == "Cashflow":
         "outflows, projected closing balance. Edit any cell; the "
         "**Supplier payables** outflow row is filled automatically "
         "from the tracker above (bills bucketed by due date).")
-
-    # Forecast line-item definitions (row_key, display label).
-    _CF_INFLOWS = [
-        ("forecast_sales", "Forecast sales"),
-        ("prolux", "Prolux"),
-        ("other_income_rent", "Other income / rent"),
-        ("wages_865", "865 wages"),
-    ]
-    _CF_OUTFLOWS = [
-        ("google_ads", "Google ads"),
-        ("advertising_bills", "Advertising bills"),
-        ("chase_credit_card", "Chase credit card"),
-        ("shopify_credit_card", "Shopify credit card"),
-        ("payroll_staff", "Payroll staff"),
-        ("non_payroll_staff", "Non-payroll staff"),
-        ("bi_weekly_staff", "Bi-weekly staff"),
-        ("amex_prime", "AMEX Prime"),
-        ("amex_gold", "AMEX Gold"),
-        ("rent", "Rent"),
-        ("bb_loan", "BB loan"),
-        ("ben_loan", "Ben loan"),
-        ("loan_repayments", "Loan repayments"),
-        ("ups_payments", "UPS / freight"),
-        ("sales_tax", "Sales tax"),
-        ("income_tax", "Income tax"),
-        ("tariffs", "Tariffs / duty"),
-        ("cwo_suppliers", "CWO suppliers"),
-        ("kub_utilities", "KUB / utilities"),
-        ("cellphones_internet", "Cellphones & internet"),
-    ]
 
     _cf_horizon = st.selectbox(
         "Forecast horizon", [13, 26, 53], index=1,
