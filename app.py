@@ -21093,13 +21093,306 @@ elif page == "Cashflow":
                     st.error(f"Connect button unavailable: {_exc}")
 
     st.divider()
-    st.subheader(":construction: Cashflow view — coming next")
-    st.info(
-        "The cashflow dashboard (cash position, projected inflows/"
-        "outflows, runway) is built once James shares the team's "
-        "working Google Sheet so the layout mirrors what everyone "
-        "already uses. Connect QBO above in the meantime — the "
-        "data link will be ready the moment the page is built.")
+
+    # ---- Supplier payables tracker (v2.67.220) ----------------------
+    st.subheader(":receipt: Supplier payables")
+    _cf_connected = (_qbo_oauth is not None and _qbo_info)
+    if not _cf_connected:
+        st.info(
+            "Connect QuickBooks Online above to load supplier "
+            "bills into the payables tracker.")
+    else:
+        import cashflow_sync as _cfsync
+
+        st.caption(
+            "Supplier bills pulled from QuickBooks. Edit amounts / "
+            "due dates / notes inline — your edits are kept even "
+            "when QuickBooks re-syncs. Set a row's status to "
+            "**approved** and Save to clear it for payment (posts "
+            "to the approvals Slack channel).")
+
+        _cf_btns = st.columns([2, 2, 3])
+        with _cf_btns[0]:
+            if st.button(
+                    ":arrows_counterclockwise: Sync from QuickBooks",
+                    key="_cf_sync_bills",
+                    help="Pull the last ~6 months of supplier "
+                         "bills from QuickBooks Online."):
+                try:
+                    _res = _cfsync.sync_bills_from_qbo()
+                    st.success(
+                        f":white_check_mark: Synced "
+                        f"{_res['upserted']} supplier bills from "
+                        f"QuickBooks (since {_res['since']}).")
+                except Exception as _exc:  # noqa: BLE001
+                    st.error(f":x: QBO bill sync failed: {_exc}")
+        with _cf_btns[1]:
+            _cf_show_paid = st.toggle(
+                "Show paid", value=False, key="_cf_show_paid",
+                help="Include bills already settled in QuickBooks.")
+
+        # Load payables.
+        try:
+            _payables_raw = db.list_payables(
+                include_dismissed=False,
+                include_paid=bool(_cf_show_paid))
+        except Exception as _exc:  # noqa: BLE001
+            _payables_raw = []
+            st.error(f"Could not load payables: {_exc}")
+
+        if not _payables_raw:
+            st.info(
+                "No supplier payables yet. Click **Sync from "
+                "QuickBooks** to pull bills, or add one manually "
+                "below.")
+        else:
+            _orig_by_id = {int(r["payable_id"]): r
+                           for r in _payables_raw}
+
+            def _eff_amount(r: dict):
+                _o = r.get("amount_override")
+                return _o if _o is not None else r.get("amount")
+
+            def _eff_due(r: dict):
+                return (r.get("due_date_override")
+                        or r.get("due_date") or "")
+
+            def _qbo_state(r: dict) -> str:
+                _bal = r.get("qbo_balance")
+                if (r.get("source") == "qbo" and _bal is not None
+                        and float(_bal) <= 0):
+                    return "Paid (QBO)"
+                if _bal is not None and float(_bal) > 0:
+                    return f"Open {_fmt_money(float(_bal))}"
+                return "—"
+
+            _rows = []
+            for r in _payables_raw:
+                _rows.append({
+                    "payable_id": int(r["payable_id"]),
+                    "Supplier": r.get("supplier") or "",
+                    "Reference": r.get("reference") or "",
+                    "Description": r.get("description") or "",
+                    "Amount": _eff_amount(r),
+                    "Cur": r.get("currency") or "USD",
+                    "Invoice": r.get("invoice_date") or "",
+                    "Due": _eff_due(r),
+                    "QBO": _qbo_state(r),
+                    "Status": r.get("status") or "pending",
+                    "Notes": r.get("notes") or "",
+                    "Dismiss": False,
+                    "Src": r.get("source") or "qbo",
+                })
+            _cf_df = pd.DataFrame(_rows).set_index("payable_id")
+
+            _cf_edited = st.data_editor(
+                _cf_df,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                key="_cf_payables_editor",
+                column_config={
+                    "Amount": st.column_config.NumberColumn(
+                        "Amount", format="%.2f"),
+                    "QBO": st.column_config.TextColumn(
+                        "QBO", disabled=True,
+                        help="Payment status in QuickBooks."),
+                    "Src": st.column_config.TextColumn(
+                        "Src", disabled=True),
+                    "Invoice": st.column_config.TextColumn(
+                        "Invoice", disabled=True),
+                    "Status": st.column_config.SelectboxColumn(
+                        "Status",
+                        options=["pending", "approved",
+                                 "scheduled", "paid"],
+                        required=True),
+                    "Dismiss": st.column_config.CheckboxColumn(
+                        "Dismiss",
+                        help="Tick + Save to hide this row."),
+                },
+            )
+
+            if st.button(":floppy_disk: Save payables changes",
+                         key="_cf_save_payables", type="primary"):
+                _n_updated = 0
+                _n_approved = 0
+                _n_slack_ok = 0
+                _slack_errs = []
+                for _pid, _erow in _cf_edited.iterrows():
+                    _pid = int(_pid)
+                    _orig = _orig_by_id.get(_pid)
+                    if not _orig:
+                        continue
+                    _src = _orig.get("source") or "qbo"
+                    _fields: dict = {}
+
+                    # Amount → override (qbo) or direct (manual).
+                    _new_amt = _erow.get("Amount")
+                    _new_amt = (None if pd.isna(_new_amt)
+                                else float(_new_amt))
+                    if _src == "qbo":
+                        _qbo_amt = _orig.get("amount")
+                        if _new_amt != _qbo_amt:
+                            _fields["amount_override"] = _new_amt
+                        elif _orig.get("amount_override") is not None:
+                            _fields["amount_override"] = None
+                    else:
+                        if _new_amt != _orig.get("amount"):
+                            _fields["amount"] = _new_amt
+
+                    # Due → override (qbo) or direct (manual).
+                    _new_due = (_erow.get("Due") or "").strip()
+                    if _src == "qbo":
+                        _qbo_due = _orig.get("due_date") or ""
+                        if _new_due != _qbo_due:
+                            _fields["due_date_override"] = (
+                                _new_due or None)
+                        elif _orig.get("due_date_override"):
+                            _fields["due_date_override"] = None
+                    else:
+                        if _new_due != (_orig.get("due_date") or ""):
+                            _fields["due_date"] = _new_due or None
+
+                    # Description always editable.
+                    _new_desc = (_erow.get("Description")
+                                 or "").strip()
+                    if _new_desc != (_orig.get("description")
+                                     or ""):
+                        _fields["description"] = _new_desc
+                    # Supplier/Reference editable for manual rows.
+                    if _src == "manual":
+                        _ns = (_erow.get("Supplier") or "").strip()
+                        if _ns != (_orig.get("supplier") or ""):
+                            _fields["supplier"] = _ns
+                        _nr = (_erow.get("Reference") or "").strip()
+                        if _nr != (_orig.get("reference") or ""):
+                            _fields["reference"] = _nr
+
+                    # Notes.
+                    _new_notes = (_erow.get("Notes") or "").strip()
+                    if _new_notes != (_orig.get("notes") or ""):
+                        _fields["notes"] = _new_notes
+
+                    # Dismiss.
+                    if bool(_erow.get("Dismiss")):
+                        _fields["is_dismissed"] = 1
+
+                    # Status — detect a transition INTO approved.
+                    _new_status = _erow.get("Status") or "pending"
+                    _old_status = _orig.get("status") or "pending"
+                    _newly_approved = (
+                        _new_status == "approved"
+                        and _old_status != "approved")
+
+                    if _newly_approved:
+                        # Approve + post to Slack.
+                        _eff = dict(_orig)
+                        _eff.update({
+                            k: v for k, v in _fields.items()})
+                        _ts, _serr = _cfsync.post_approval_to_slack(
+                            _eff, current_user or "a manager")
+                        try:
+                            db.approve_payable(
+                                _pid, current_user or "manager",
+                                slack_ts=_ts)
+                        except Exception as _exc:  # noqa: BLE001
+                            st.error(
+                                f"Approve failed for #{_pid}: "
+                                f"{_exc}")
+                        _n_approved += 1
+                        if _serr:
+                            _slack_errs.append(_serr)
+                        else:
+                            _n_slack_ok += 1
+                        # status already set by approve_payable;
+                        # drop it from the generic field write.
+                        _fields.pop("status", None)
+                    elif _new_status != _old_status:
+                        _fields["status"] = _new_status
+
+                    if _fields:
+                        try:
+                            db.update_payable(
+                                _pid, _fields,
+                                updated_by=current_user)
+                            _n_updated += 1
+                        except Exception as _exc:  # noqa: BLE001
+                            st.error(
+                                f"Update failed for #{_pid}: "
+                                f"{_exc}")
+
+                _msg = (f":white_check_mark: Saved — "
+                        f"{_n_updated} row(s) updated")
+                if _n_approved:
+                    _msg += (f", {_n_approved} approved "
+                             f"({_n_slack_ok} posted to Slack)")
+                st.success(_msg)
+                if _slack_errs:
+                    st.warning(
+                        "Slack post issue: "
+                        + "; ".join(dict.fromkeys(_slack_errs)))
+                _safe_cache_clear()
+                st.rerun()
+
+            # Totals.
+            _tot_open = sum(
+                (_eff_amount(r) or 0) for r in _payables_raw
+                if (r.get("status") != "paid"))
+            _tot_appr = sum(
+                (_eff_amount(r) or 0) for r in _payables_raw
+                if r.get("status") == "approved")
+            _m1, _m2 = st.columns(2)
+            _m1.metric("Outstanding (not paid)",
+                       _fmt_money(_tot_open))
+            _m2.metric("Approved & awaiting payment",
+                       _fmt_money(_tot_appr))
+
+        # ---- Add a manual payable ----
+        with st.expander(":heavy_plus_sign: Add a manual invoice "
+                         "(freight, duty, non-QBO)", expanded=False):
+            _mc1, _mc2, _mc3 = st.columns(3)
+            _m_supplier = _mc1.text_input(
+                "Supplier", key="_cf_m_supplier")
+            _m_reference = _mc2.text_input(
+                "Reference / PO", key="_cf_m_reference")
+            _m_currency = _mc3.selectbox(
+                "Currency", ["USD", "EUR", "GBP"],
+                key="_cf_m_currency")
+            _m_desc = st.text_input(
+                "Description", key="_cf_m_desc")
+            _mc4, _mc5, _mc6 = st.columns(3)
+            _m_amount = _mc4.number_input(
+                "Amount", min_value=0.0, step=100.0,
+                key="_cf_m_amount")
+            _m_invdate = _mc5.text_input(
+                "Invoice date (YYYY-MM-DD)", key="_cf_m_invdate")
+            _m_duedate = _mc6.text_input(
+                "Due date (YYYY-MM-DD)", key="_cf_m_duedate")
+            if st.button("Add invoice", key="_cf_m_add"):
+                if not _m_supplier or not _m_amount:
+                    st.warning("Supplier and Amount are required.")
+                else:
+                    try:
+                        db.add_manual_payable(
+                            supplier=_m_supplier,
+                            reference=_m_reference or None,
+                            description=_m_desc or None,
+                            amount=float(_m_amount),
+                            currency=_m_currency,
+                            invoice_date=_m_invdate or None,
+                            due_date=_m_duedate or None,
+                            updated_by=current_user)
+                        st.success("Manual invoice added.")
+                        st.rerun()
+                    except Exception as _exc:  # noqa: BLE001
+                        st.error(f"Could not add invoice: {_exc}")
+
+    st.divider()
+    st.subheader(":bar_chart: 53-week cashflow forecast")
+    st.caption(
+        ":construction: The weekly forecast grid (bank balances, "
+        "inflows / outflows, projected closing balance) is the "
+        "next phase — building now.")
 
 
 # ---------------------------------------------------------------------------
