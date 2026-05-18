@@ -21041,15 +21041,20 @@ elif page == "Cashflow":
                 return _cand
         return _cand
 
-    # v2.67.232 — credit-card payment schedule. (row_key, label,
-    # QBO chart-of-accounts number, payment day-of-month; 'last'
-    # = last day of the month). Wired4Signs settles the previous
-    # statement balance in full on each card's payment day.
+    # v2.67.233 — credit-card schedule. (row_key, label, QBO
+    # chart-of-accounts number, payment day-of-month, statement
+    # closing day-of-month). 'last' payment day = month-end;
+    # closing day None = unknown (falls back to current balance).
+    # Wired4Signs settles the previous statement balance in full
+    # on each card's payment day — the payment day is before the
+    # closing day, so each payment clears the statement that
+    # closed in the PREVIOUS month.
     _CF_CREDIT_CARDS = [
-        ("amex_gold", "AMEX Gold", "249", 10),
-        ("chase_credit_card", "Chase credit card", "250", 14),
-        ("shopify_credit_card", "Shopify Credit", "260", "last"),
-        ("amex_prime", "AMEX Prime", "248", 19),
+        ("amex_gold", "AMEX Gold", "249", 10, 15),
+        ("chase_credit_card", "Chase credit card", "250", 14, 20),
+        ("shopify_credit_card", "Shopify Credit", "260",
+         "last", None),
+        ("amex_prime", "AMEX Prime", "248", 19, 25),
     ]
 
     try:
@@ -21739,11 +21744,11 @@ elif page == "Cashflow":
                      "from QuickBooks", expanded=False):
         st.caption(
             "You settle the previous statement balance in full on "
-            "each card's payment day — AMEX Gold 10th · Chase "
-            "14th · Shopify Credit month-end · AMEX Prime 19th. "
-            "This places each card's current QuickBooks balance "
-            "onto its **next** payment date. Future months you "
-            "fill as each statement lands.")
+            "each card's payment day. This reads each card's "
+            "**statement-close balance** from QuickBooks (the "
+            "balance frozen on the statement closing date) and "
+            "places it on the **next** payment date. Future "
+            "months you fill as each statement lands.")
         if st.button("Pull credit-card payments",
                      key="_cf_cc_pull"):
             try:
@@ -21753,33 +21758,60 @@ elif page == "Cashflow":
                 st.error(f"Could not read QBO credit cards: "
                          f"{_exc}")
             if _ccs is not None:
-                _bal_by_acct = {}
+                _cc_by_acct = {}
                 for _a in _ccs:
                     _an = str(_a.get("AcctNum") or "").strip()
-                    if not _an:
-                        continue
-                    try:
-                        _bal_by_acct[_an] = abs(float(
-                            _a.get("CurrentBalance") or 0))
-                    except (TypeError, ValueError):
-                        pass
+                    if _an:
+                        _cc_by_acct[_an] = _a
                 _cc_done = []
                 _cc_miss = []
-                for _rk, _lbl, _acct, _day in _CF_CREDIT_CARDS:
-                    _bal = _bal_by_acct.get(_acct)
-                    if _bal is None:
+                for (_rk, _lbl, _acct, _pay_day,
+                     _close_day) in _CF_CREDIT_CARDS:
+                    _a = _cc_by_acct.get(_acct)
+                    if not _a:
                         _cc_miss.append(f"{_lbl} (acct {_acct})")
                         continue
-                    _pdate = _cf_next_payment_date(_day)
+                    _pdate = _cf_next_payment_date(_pay_day)
+                    _amt = None
+                    _src = ""
+                    if _close_day is not None:
+                        # Statement closed on close_day of the
+                        # month BEFORE the payment month.
+                        _close_mo = (_pdate.replace(day=1)
+                                     - pd.offsets.MonthBegin(1))
+                        _last = (_close_mo
+                                 + pd.offsets.MonthEnd(0)).day
+                        _sclose = _close_mo.replace(
+                            day=min(int(_close_day), _last))
+                        try:
+                            _amt = (
+                                _qbo_client.account_balance_as_of(
+                                    _sclose.strftime("%Y-%m-%d"),
+                                    account_id=_a.get("Id"),
+                                    account_name=_a.get("Name")))
+                        except Exception:  # noqa: BLE001
+                            _amt = None
+                        if _amt is not None:
+                            _amt = abs(float(_amt))
+                            _src = (f"stmt "
+                                    f"{_sclose.strftime('%m/%d')}")
+                    if _amt is None:
+                        try:
+                            _amt = abs(float(
+                                _a.get("CurrentBalance") or 0))
+                        except (TypeError, ValueError):
+                            _amt = 0.0
+                        _src = "current bal"
                     _wk = _cf_week_monday(_pdate)
                     db.set_forecast_cell(
-                        _wk.strftime("%Y-%m-%d"), _rk, _bal,
+                        _wk.strftime("%Y-%m-%d"), _rk, _amt,
                         updated_by="auto:cc")
                     _cc_done.append(
-                        f"{_lbl}: {_fmt_money(_bal)} "
-                        f"({_pdate.strftime('%m/%d')})")
+                        f"{_lbl}: {_fmt_money(_amt)} "
+                        f"({_pdate.strftime('%m/%d')} · {_src})")
                 if _cc_done:
-                    st.success("Placed — " + " · ".join(_cc_done))
+                    st.success("Placed — " + "  ·  ".join(
+                        _cc_done))
                 if _cc_miss:
                     st.warning(
                         "No QBO account matched: "

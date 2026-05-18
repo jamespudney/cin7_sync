@@ -325,3 +325,54 @@ def get_credit_card_accounts() -> list[dict]:
     return query_all(
         "SELECT * FROM Account "
         "WHERE AccountType = 'Credit Card'")
+
+
+def _walk_report_rows(node, out: list) -> None:
+    """Recursively collect (name, account_id, amount) tuples from
+    the nested Header/Rows structure of a QBO report."""
+    if isinstance(node, dict):
+        coldata = node.get("ColData")
+        if isinstance(coldata, list) and coldata:
+            name = (coldata[0] or {}).get("value") or ""
+            acct_id = (coldata[0] or {}).get("id") or ""
+            amount = None
+            # The balance is the last non-empty numeric cell.
+            for cell in reversed(coldata):
+                val = (cell or {}).get("value")
+                if val in (None, ""):
+                    continue
+                try:
+                    amount = float(str(val).replace(",", ""))
+                    break
+                except ValueError:
+                    continue
+            if name:
+                out.append((name, str(acct_id), amount))
+        for key in ("Rows", "Row"):
+            sub = node.get(key)
+            if isinstance(sub, (dict, list)):
+                _walk_report_rows(sub, out)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_report_rows(item, out)
+
+
+def account_balance_as_of(as_of_date: str,
+                          account_id: Optional[str] = None,
+                          account_name: Optional[str] = None
+                          ) -> Optional[float]:
+    """Return an account's balance as of `as_of_date`
+    ('YYYY-MM-DD') by reading the QBO Balance Sheet report. Match
+    by account_id (preferred) or account_name. Returns None if
+    the account is not found in the report."""
+    body = report("BalanceSheet", params={"end_date": as_of_date})
+    rows: list = []
+    _walk_report_rows(body.get("Rows") or {}, rows)
+    for name, aid, amount in rows:
+        if account_id and aid and aid == str(account_id):
+            return amount
+        if (account_name and name
+                and name.strip().lower()
+                == account_name.strip().lower()):
+            return amount
+    return None
