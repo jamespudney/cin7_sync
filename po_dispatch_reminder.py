@@ -142,14 +142,41 @@ def _load_open_so_set() -> set:
         log.warning("Sales CSV missing OrderNumber/SaleNumber — "
                       "filter disabled.")
         return set()
-    # Prefer combined status if present (header rolls up across
-    # lines); fall back to InvoiceStatus / Status.
-    status_col = next(
-        (c for c in ("CombinedInvoiceStatus",
-                        "Status",
-                        "InvoiceStatus",
-                        "SaleStatus")
+    # v2.67.213 — "does this SO still need shipping?" must be
+    # answered by the SHIPPING status, not the invoice status.
+    # CIN7's SaleList exposes:
+    #   CombinedShippingStatus — SHIPPED / SHIPPING / NOT SHIPPED
+    #                            / PARTIALLY SHIPPED / VOIDED /
+    #                            NOT AVAILABLE
+    #   FulFilmentStatus       — FULFILLED / PARTIALLY FULFILLED /
+    #                            NOT FULFILLED / VOIDED /
+    #                            NOT AVAILABLE
+    #
+    # The original code keyed off CombinedInvoiceStatus, whose
+    # values (PAID / AUTHORISED / DRAFT) never match a terminal
+    # keyword — so EVERY sale looked "open" and this stale-SO
+    # filter was effectively dead. Real symptom James hit:
+    # SO-54804 was fully shipped on 04/22 yet the bot escalated
+    # it as "STILL haven't shipped". Fixed by reading the
+    # shipping / fulfilment columns instead.
+    ship_col = ("CombinedShippingStatus"
+                if "CombinedShippingStatus" in df.columns else None)
+    fulfil_col = next(
+        (c for c in ("FulFilmentStatus", "FulfilmentStatus",
+                      "FulfillmentStatus")
           if c in df.columns), None)
+    # Legacy fallback — only consulted if neither shipping/
+    # fulfilment column exists (very old sync output).
+    legacy_status_col = None
+    if not ship_col and not fulfil_col:
+        legacy_status_col = next(
+            (c for c in ("Status", "InvoiceStatus", "SaleStatus")
+              if c in df.columns), None)
+
+    # A SO no longer needs shipping once it is shipped or voided.
+    _ship_done = ("SHIPPED", "VOIDED")
+    _fulfil_done = ("FULFILLED", "VOIDED")
+
     open_set: set = set()
     for _, row in df.iterrows():
         so_raw = str(row.get(so_col) or "").strip().upper()
@@ -161,17 +188,31 @@ def _load_open_so_set() -> set:
                 so_raw = f"SO-{so_raw}"
             else:
                 continue
-        if status_col:
+        done = False
+        if ship_col:
+            ship_u = str(row.get(ship_col) or "").upper().strip()
+            if ship_u in _ship_done:
+                done = True
+        if not done and fulfil_col:
+            fulfil_u = str(
+                row.get(fulfil_col) or "").upper().strip()
+            if fulfil_u in _fulfil_done:
+                done = True
+        if not done and legacy_status_col:
             status_u = str(
-                row.get(status_col) or "").upper().strip()
+                row.get(legacy_status_col) or "").upper().strip()
             # Terminal = closed. Anything else (AUTHORISED,
             # ORDERED, PARTIAL, IN_PROGRESS, etc.) counts as open.
             if any(t in status_u
                       for t in _TERMINAL_SALE_STATUSES):
-                continue
+                done = True
+        if done:
+            continue
         open_set.add(so_raw)
-    log.info("Loaded open-SO set: %d open SOs from %s",
-              len(open_set), sales_path.name)
+    log.info(
+        "Loaded open-SO set: %d SOs still needing shipping "
+        "(ship_col=%s fulfil_col=%s) from %s",
+        len(open_set), ship_col, fulfil_col, sales_path.name)
     return open_set
 
 
