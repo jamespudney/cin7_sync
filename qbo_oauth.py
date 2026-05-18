@@ -71,13 +71,33 @@ import db
 
 log = logging.getLogger("qbo_oauth")
 
-# Intuit OAuth2 endpoints (same host for sandbox + production —
-# only the API data host differs, see qbo_client.py).
-QBO_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
-QBO_TOKEN_URL = ("https://oauth.platform.intuit.com/oauth2/v1/"
-                 "tokens/bearer")
-QBO_REVOKE_URL = ("https://developer.api.intuit.com/v2/oauth2/"
-                  "tokens/revoke")
+# Intuit OAuth2 endpoints.
+#
+# v2.67.215 — rather than hardcode these, we read them at runtime
+# from Intuit's OpenID Connect *discovery document* (the
+# .well-known config), which is Intuit's recommended practice:
+# if Intuit ever moves an endpoint, the discovery doc updates and
+# we follow automatically. The constants below are kept ONLY as a
+# fallback for when the discovery fetch fails (offline, transient
+# network error) — they are the currently-published values.
+_DISCOVERY_URL = {
+    "production":
+        "https://developer.api.intuit.com/.well-known/"
+        "openid_configuration",
+    "sandbox":
+        "https://developer.api.intuit.com/.well-known/"
+        "openid_sandbox_configuration",
+}
+_FALLBACK_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
+_FALLBACK_TOKEN_URL = ("https://oauth.platform.intuit.com/oauth2/"
+                       "v1/tokens/bearer")
+_FALLBACK_REVOKE_URL = ("https://developer.api.intuit.com/v2/"
+                        "oauth2/tokens/revoke")
+
+# Module-level cache of the discovered endpoints, keyed by
+# environment. Populated lazily on first use; the discovery doc
+# is effectively static so a process-lifetime cache is fine.
+_discovery_cache: dict = {}
 
 # Accounting scope — read/write access to the books data the
 # Cashflow page needs (invoices, bills, P&L, cash-flow report).
@@ -178,6 +198,56 @@ def is_configured() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Endpoint discovery (OpenID Connect .well-known)
+# ---------------------------------------------------------------------------
+def _discover_endpoints() -> dict:
+    """Fetch + cache Intuit's OAuth2 endpoints from its OpenID
+    Connect discovery document (the .well-known config). This is
+    Intuit's recommended practice — if Intuit moves an endpoint,
+    the discovery doc updates and we follow automatically.
+
+    Returns a dict with keys 'authorize', 'token', 'revoke'.
+    Falls back to the published constants if the fetch fails, so
+    the OAuth flow keeps working through a transient network
+    error. Cached for the process lifetime (the doc is static)."""
+    env = environment()
+    cached = _discovery_cache.get(env)
+    if cached:
+        return cached
+    endpoints = {
+        "authorize": _FALLBACK_AUTH_URL,
+        "token": _FALLBACK_TOKEN_URL,
+        "revoke": _FALLBACK_REVOKE_URL,
+    }
+    url = _DISCOVERY_URL.get(env, _DISCOVERY_URL["sandbox"])
+    try:
+        r = requests.get(
+            url, headers={"Accept": "application/json"}, timeout=15)
+        if r.status_code == 200:
+            doc = r.json()
+            endpoints = {
+                "authorize": (doc.get("authorization_endpoint")
+                               or _FALLBACK_AUTH_URL),
+                "token": (doc.get("token_endpoint")
+                           or _FALLBACK_TOKEN_URL),
+                "revoke": (doc.get("revocation_endpoint")
+                            or _FALLBACK_REVOKE_URL),
+            }
+            log.info("QBO discovery doc loaded (%s): %s",
+                     env, endpoints)
+        else:
+            log.warning(
+                "QBO discovery doc HTTP %d — using fallback "
+                "endpoints.", r.status_code)
+    except (requests.RequestException, ValueError) as exc:
+        log.warning(
+            "QBO discovery doc fetch failed (%s) — using fallback "
+            "endpoints.", exc)
+    _discovery_cache[env] = endpoints
+    return endpoints
+
+
+# ---------------------------------------------------------------------------
 # Timestamp helpers
 # ---------------------------------------------------------------------------
 def _utcnow() -> _dt.datetime:
@@ -228,7 +298,8 @@ def build_authorize_url(state: str) -> str:
         "scope": " ".join(QBO_SCOPES),
         "state": state,
     }
-    return f"{QBO_AUTH_URL}?{urllib.parse.urlencode(params)}"
+    authorize_url = _discover_endpoints()["authorize"]
+    return f"{authorize_url}?{urllib.parse.urlencode(params)}"
 
 
 def _token_request(payload: dict) -> dict:
@@ -239,7 +310,7 @@ def _token_request(payload: dict) -> dict:
     cfg = _oauth_config()
     try:
         r = requests.post(
-            QBO_TOKEN_URL,
+            _discover_endpoints()["token"],
             data=payload,
             auth=(cfg["client_id"], cfg["client_secret"]),
             headers={"Accept": "application/json"},
@@ -413,7 +484,7 @@ def disconnect() -> None:
             cfg = _oauth_config()
             try:
                 requests.post(
-                    QBO_REVOKE_URL,
+                    _discover_endpoints()["revoke"],
                     json={"token": refresh_token},
                     auth=(cfg["client_id"], cfg["client_secret"]),
                     headers={"Accept": "application/json"},
