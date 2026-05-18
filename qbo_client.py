@@ -314,3 +314,14 @@ def get_vendors() -> list[dict]:
     """Fetch QBO vendors (suppliers). Useful for mapping/display;
     each dict includes Id, DisplayName, Active."""
     return query_all("SELECT * FROM Vendor")
+
+
+def get_credit_card_accounts() -> list[dict]:
+    """Fetch QBO Credit-Card-type accounts with their balances —
+    powers the credit-card payment rows on the Cashflow page.
+    Each dict includes Id, Name, AcctNum (the chart-of-accounts
+    number), CurrentBalance. For a credit card CurrentBalance is
+    the amount owed."""
+    return query_all(
+        "SELECT * FROM Account "
+        "WHERE AccountType = 'Credit Card'")

@@ -21023,6 +21023,35 @@ elif page == "Cashflow":
             monday = monday - pd.Timedelta(days=7)
         return monday
 
+    def _cf_next_payment_date(day):
+        """Next occurrence of a monthly payment day from today.
+        `day` is an int day-of-month or 'last' (last day of the
+        month). Clamps short months (e.g. 31 -> Feb 28)."""
+        _t = pd.Timestamp.today().normalize()
+        _cand = _t
+        for _mo in range(3):
+            _anchor = _t.replace(day=1)
+            if _mo:
+                _anchor = _anchor + pd.offsets.MonthBegin(_mo)
+            _last = (_anchor + pd.offsets.MonthEnd(0)).day
+            _d = (_last if day == "last"
+                  else min(int(day), _last))
+            _cand = _anchor.replace(day=_d)
+            if _cand >= _t:
+                return _cand
+        return _cand
+
+    # v2.67.232 — credit-card payment schedule. (row_key, label,
+    # QBO chart-of-accounts number, payment day-of-month; 'last'
+    # = last day of the month). Wired4Signs settles the previous
+    # statement balance in full on each card's payment day.
+    _CF_CREDIT_CARDS = [
+        ("amex_gold", "AMEX Gold", "249", 10),
+        ("chase_credit_card", "Chase credit card", "250", 14),
+        ("shopify_credit_card", "Shopify Credit", "260", "last"),
+        ("amex_prime", "AMEX Prime", "248", 19),
+    ]
+
     try:
         import qbo_oauth as _qbo_oauth
         import qbo_client as _qbo_client
@@ -21704,6 +21733,61 @@ elif page == "Cashflow":
                     f"{_ps_nodata} week(s) had no prior-year "
                     f"sales data.")
                 st.rerun()
+
+    # ---- Pull credit-card payments from QuickBooks (v2.67.232)
+    with st.expander(":credit_card: Pull credit-card payments "
+                     "from QuickBooks", expanded=False):
+        st.caption(
+            "You settle the previous statement balance in full on "
+            "each card's payment day — AMEX Gold 10th · Chase "
+            "14th · Shopify Credit month-end · AMEX Prime 19th. "
+            "This places each card's current QuickBooks balance "
+            "onto its **next** payment date. Future months you "
+            "fill as each statement lands.")
+        if st.button("Pull credit-card payments",
+                     key="_cf_cc_pull"):
+            try:
+                _ccs = _qbo_client.get_credit_card_accounts()
+            except Exception as _exc:  # noqa: BLE001
+                _ccs = None
+                st.error(f"Could not read QBO credit cards: "
+                         f"{_exc}")
+            if _ccs is not None:
+                _bal_by_acct = {}
+                for _a in _ccs:
+                    _an = str(_a.get("AcctNum") or "").strip()
+                    if not _an:
+                        continue
+                    try:
+                        _bal_by_acct[_an] = abs(float(
+                            _a.get("CurrentBalance") or 0))
+                    except (TypeError, ValueError):
+                        pass
+                _cc_done = []
+                _cc_miss = []
+                for _rk, _lbl, _acct, _day in _CF_CREDIT_CARDS:
+                    _bal = _bal_by_acct.get(_acct)
+                    if _bal is None:
+                        _cc_miss.append(f"{_lbl} (acct {_acct})")
+                        continue
+                    _pdate = _cf_next_payment_date(_day)
+                    _wk = _cf_week_monday(_pdate)
+                    db.set_forecast_cell(
+                        _wk.strftime("%Y-%m-%d"), _rk, _bal,
+                        updated_by="auto:cc")
+                    _cc_done.append(
+                        f"{_lbl}: {_fmt_money(_bal)} "
+                        f"({_pdate.strftime('%m/%d')})")
+                if _cc_done:
+                    st.success("Placed — " + " · ".join(_cc_done))
+                if _cc_miss:
+                    st.warning(
+                        "No QBO account matched: "
+                        + ", ".join(_cc_miss)
+                        + " — check the chart-of-accounts "
+                        "numbers.")
+                if _cc_done:
+                    st.rerun()
 
     # ---- Opening balance: actual, entered each Monday ----------
     # James's workflow: every Monday the ACTUAL bank opening
