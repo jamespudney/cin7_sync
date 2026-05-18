@@ -2862,6 +2862,20 @@ def get_forecast() -> dict:
             for r in rows}
 
 
+def get_forecast_owners() -> dict:
+    """Return {(week_start, row_key): updated_by} for the whole
+    forecast grid. Used by the sales-projection feature to tell a
+    human-edited cell (updated_by = a display name) apart from an
+    auto-projected one (updated_by = 'auto:sales') so a re-project
+    never silently overwrites a manual override."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT week_start, row_key, updated_by "
+            "FROM cashflow_forecast").fetchall()
+    return {(r["week_start"], r["row_key"]): r["updated_by"]
+            for r in rows}
+
+
 # ---------------------------------------------------------------------------
 # Viktor bridge sessions (v2.67.126)
 # ---------------------------------------------------------------------------

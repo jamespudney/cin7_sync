@@ -21567,6 +21567,90 @@ elif page == "Cashflow":
         _cf_fc = {}
         st.error(f"Could not load forecast: {_exc}")
 
+    # ---- Project forecast sales from prior-year actuals (v2.67.224)
+    with st.expander(":crystal_ball: Project the Forecast sales "
+                     "row (prior year + growth)", expanded=False):
+        st.caption(
+            "Fills the **Forecast sales** row: each week = the "
+            "same week one year ago (actual CIN7 sales) × "
+            "(1 + growth %). Weeks you have manually edited are "
+            "kept untouched — tick the override box to re-project "
+            "those too.")
+        _ps1, _ps2 = st.columns([1, 2])
+        _ps_growth = _ps1.number_input(
+            "Growth %", value=20.0, step=5.0, key="_cf_ps_growth")
+        _ps_force = _ps2.checkbox(
+            "Also overwrite weeks I manually edited",
+            value=False, key="_cf_ps_force")
+        if st.button("Project forecast sales", key="_cf_ps_run"):
+            # Weekly actual sales from the longest CIN7 sales
+            # history — group InvoiceAmount by the Monday of
+            # OrderDate.
+            _wk_actual = {}
+            try:
+                if (sales_full is not None
+                        and not sales_full.empty
+                        and "OrderDate" in sales_full.columns):
+                    _amt_col = next(
+                        (c for c in ("InvoiceAmount", "Total",
+                                      "InvoiceTotal")
+                          if c in sales_full.columns), None)
+                    if _amt_col:
+                        _sd = pd.to_datetime(
+                            sales_full["OrderDate"],
+                            errors="coerce")
+                        _sa = pd.to_numeric(
+                            sales_full[_amt_col],
+                            errors="coerce").fillna(0.0)
+                        _tmp = pd.DataFrame(
+                            {"d": _sd, "amt": _sa}).dropna(
+                            subset=["d"])
+                        _tmp["mon"] = (
+                            _tmp["d"]
+                            - pd.to_timedelta(
+                                _tmp["d"].dt.weekday, unit="D"))
+                        _wk_actual = (
+                            _tmp.groupby(
+                                _tmp["mon"].dt.strftime(
+                                    "%Y-%m-%d"))["amt"]
+                            .sum().to_dict())
+            except Exception as _exc:  # noqa: BLE001
+                st.error(f"Could not read sales history: {_exc}")
+            if not _wk_actual:
+                st.error(
+                    "No CIN7 sales history available to project "
+                    "from — the sales CSVs may not span back a "
+                    "full year yet.")
+            else:
+                _owners = db.get_forecast_owners()
+                _ps_set = _ps_kept = _ps_nodata = 0
+                for _wkey in _cf_wkey:
+                    _prior = (pd.Timestamp(_wkey)
+                              - pd.Timedelta(days=364))
+                    _base = _wk_actual.get(
+                        _prior.strftime("%Y-%m-%d"))
+                    if _base is None:
+                        _ps_nodata += 1
+                        continue
+                    _owner = _owners.get((_wkey, "forecast_sales"))
+                    _is_manual = (_owner is not None
+                                  and _owner != "auto:sales")
+                    if _is_manual and not _ps_force:
+                        _ps_kept += 1
+                        continue
+                    _proj = float(_base) * (
+                        1 + float(_ps_growth) / 100.0)
+                    db.set_forecast_cell(
+                        _wkey, "forecast_sales", _proj,
+                        updated_by="auto:sales")
+                    _ps_set += 1
+                st.success(
+                    f":white_check_mark: Projected {_ps_set} "
+                    f"week(s). Kept {_ps_kept} manual edit(s); "
+                    f"{_ps_nodata} week(s) had no prior-year "
+                    f"sales data.")
+                st.rerun()
+
     # ---- Opening balance ----
     _cf_open_key = (_cf_wkey[0], "opening_balance")
     _cf_open_saved = _cf_fc.get(_cf_open_key)
