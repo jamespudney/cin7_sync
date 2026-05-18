@@ -19,6 +19,50 @@ stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 echo "[$(stamp)] sync_loop starting; target hour UTC = $SYNC_HOUR_UTC" \
   | tee -a "$LOG"
 
+# v2.67.209 — catch-up-on-boot. sync_loop only runs daily_sync.sh
+# once a day at $SYNC_HOUR_UTC. But EVERY redeploy restarts this
+# loop and recomputes "next target" — so a stretch of frequent
+# deploys (e.g. the 20-commit weekend of the Postgres cutover)
+# can starve daily_sync entirely: each restart after the daily
+# hour pushes the run to "tomorrow", then the next deploy resets
+# it again. Symptom James hit: sales_last_30d_*.csv never
+# produced → Overview "Sales invoiced" tile stuck at $0.
+#
+# Fix: on startup, check whether the key daily-sync outputs are
+# missing or stale (> CATCHUP_STALE_HOURS old, default 20h). If
+# so, run daily_sync.sh ONCE immediately before entering the
+# sleep loop. Mirrors slack_loop.sh's first-boot bootstrap.
+CATCHUP_STALE_HOURS="${SYNC_CATCHUP_STALE_HOURS:-20}"
+_catchup_needed=0
+_freshest_sales=$(ls -t "${DATA_DIR}"/output/sales_last_30d_*.csv \
+    2>/dev/null | head -1)
+if [ -z "$_freshest_sales" ]; then
+    echo "[$(stamp)] catch-up: no sales_last_30d_*.csv found" \
+      | tee -a "$LOG"
+    _catchup_needed=1
+else
+    _age_s=$(( $(date -u +%s) \
+        - $(date -u -r "$_freshest_sales" +%s 2>/dev/null \
+            || echo 0) ))
+    _age_h=$(( _age_s / 3600 ))
+    if [ "$_age_h" -ge "$CATCHUP_STALE_HOURS" ]; then
+        echo "[$(stamp)] catch-up: sales CSV is ${_age_h}h old" \
+          | tee -a "$LOG"
+        _catchup_needed=1
+    fi
+fi
+if [ "$_catchup_needed" = "1" ]; then
+    echo "[$(stamp)] catch-up: running daily_sync.sh now" \
+      | tee -a "$LOG"
+    ./daily_sync.sh || \
+      echo "[$(stamp)] catch-up daily_sync.sh non-zero status" \
+        | tee -a "$LOG"
+    python warm_engine.py 2>&1 | tee -a "$LOG" || true
+else
+    echo "[$(stamp)] catch-up: data fresh, no immediate sync" \
+      | tee -a "$LOG"
+fi
+
 while true; do
     # Compute seconds until next $SYNC_HOUR_UTC:00:00.
     now_epoch=$(date -u +%s)
