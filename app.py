@@ -450,7 +450,7 @@ def _require_password() -> None:
 #   https://<app>/?legal=eula
 #   https://<app>/?legal=privacy
 _LEGAL_LAST_UPDATED = "18 May 2026"
-_LEGAL_CONTACT_EMAIL = "info@wired4signsusa.com"
+_LEGAL_CONTACT_EMAIL = "info@w4susa.com"
 
 _EULA_MARKDOWN = f"""
 # End-User License Agreement
