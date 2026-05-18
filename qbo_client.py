@@ -1,0 +1,229 @@
+"""qbo_client.py (v2.67.211)
+================================
+
+Thin API client for QuickBooks Online (QBO), sitting on top of the
+OAuth layer in qbo_oauth.py.
+
+Responsibilities
+----------------
+- Resolve the correct API host for the connected environment
+  (sandbox vs production).
+- Attach a valid bearer token to every request, transparently
+  refreshing it via qbo_oauth.get_valid_access_token().
+- On a 401 (token expired mid-flight despite the skew margin),
+  force ONE refresh + retry before giving up.
+- Expose the two QBO surfaces the Cashflow Management page needs:
+  the SQL-ish `query` endpoint and the `reports` endpoint.
+
+This module deliberately does NOT interpret the data — it returns
+raw QBO JSON. The Cashflow page (built once James shares the
+spreadsheet) will shape it.
+
+Public API
+----------
+- `is_ready()`                  — connected + token obtainable
+- `query(sql)`                  — run a QBO query, return entity rows
+- `report(name, params)`        — fetch a QBO report
+- `company_info()`              — CompanyInfo for the connected realm
+- `cashflow_report(start, end)` — convenience: CashFlow report
+- `profit_and_loss(start, end)` — convenience: ProfitAndLoss report
+
+All methods raise `QBOError` on failure.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Optional
+
+import requests
+
+import qbo_oauth
+import db
+
+log = logging.getLogger("qbo_client")
+
+# Data API hosts — distinct from the OAuth host in qbo_oauth.py.
+_API_HOST = {
+    "sandbox": "https://sandbox-quickbooks.api.intuit.com",
+    "production": "https://quickbooks.api.intuit.com",
+}
+
+# QBO API minor version — pin it so response shapes are stable.
+_MINOR_VERSION = "75"
+
+
+class QBOError(RuntimeError):
+    """Raised for any QBO API failure (not connected, HTTP error,
+    fault payload)."""
+
+
+# ---------------------------------------------------------------------------
+# Internal request plumbing
+# ---------------------------------------------------------------------------
+def _connection_or_raise() -> dict:
+    row = db.get_qbo_connection()
+    if not row:
+        raise QBOError(
+            "QuickBooks Online is not connected. Connect it from "
+            "the Cashflow Management page first.")
+    return row
+
+
+def _base_url(row: dict) -> str:
+    """Build the /v3/company/{realmId} base URL for the connected
+    realm + environment."""
+    realm_id = row.get("realm_id") or ""
+    if not realm_id:
+        raise QBOError("QBO connection row has no realm_id.")
+    env = (row.get("environment") or qbo_oauth.environment()).lower()
+    host = _API_HOST.get(env, _API_HOST["sandbox"])
+    return f"{host}/v3/company/{realm_id}"
+
+
+def _request(method: str, path: str,
+             params: Optional[dict] = None,
+             json_body: Optional[Any] = None,
+             data_body: Optional[str] = None,
+             content_type: str = "application/json") -> dict:
+    """Issue an authenticated request to the QBO API.
+
+    `path` is appended to the /v3/company/{realmId} base. Handles
+    one transparent token-refresh-and-retry on a 401. Returns the
+    parsed JSON body; raises QBOError on any failure."""
+    row = _connection_or_raise()
+    base = _base_url(row)
+    url = f"{base}{path}"
+
+    merged_params = dict(params or {})
+    merged_params.setdefault("minorversion", _MINOR_VERSION)
+
+    last_error = ""
+    for attempt in range(2):
+        token = qbo_oauth.get_valid_access_token()
+        if not token:
+            raise QBOError(
+                "Could not obtain a valid QBO access token "
+                "(connection may have been revoked — try "
+                "reconnecting).")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        if json_body is not None or data_body is not None:
+            headers["Content-Type"] = content_type
+        try:
+            r = requests.request(
+                method,
+                url,
+                params=merged_params,
+                json=json_body,
+                data=data_body,
+                headers=headers,
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise QBOError(
+                f"QBO API network error ({method} {path}): "
+                f"{exc}") from exc
+
+        if r.status_code == 401 and attempt == 0:
+            # Token was rejected — force a refresh on the next loop
+            # by clearing the cached access expiry implicitly: the
+            # next get_valid_access_token() sees a stale row only
+            # if expiry passed, so explicitly refresh here.
+            log.info("QBO API 401 — forcing token refresh + retry.")
+            refreshed = qbo_oauth._refresh_access_token(
+                db.get_qbo_connection() or {})
+            if not refreshed:
+                raise QBOError(
+                    "QBO API returned 401 and the token refresh "
+                    "failed — reconnect QuickBooks Online.")
+            continue
+
+        if r.status_code >= 400:
+            last_error = f"HTTP {r.status_code}: {r.text[:400]}"
+            raise QBOError(
+                f"QBO API error ({method} {path}): {last_error}")
+
+        try:
+            return r.json()
+        except ValueError as exc:
+            raise QBOError(
+                f"QBO API returned non-JSON ({method} {path}): "
+                f"{r.text[:300]}") from exc
+
+    raise QBOError(
+        f"QBO API call failed after retry ({method} {path}): "
+        f"{last_error}")
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def is_ready() -> bool:
+    """True if QBO is connected AND a valid access token can be
+    obtained right now. Safe to call from UI render paths — never
+    raises."""
+    try:
+        if not db.get_qbo_connection():
+            return False
+        return qbo_oauth.get_valid_access_token() is not None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("qbo_client.is_ready check failed: %s", exc)
+        return False
+
+
+def query(sql: str) -> list[dict]:
+    """Run a QBO query (the SQL-like language QBO exposes, e.g.
+    'SELECT * FROM Invoice WHERE TxnDate > '2026-01-01'') and
+    return the list of entity rows.
+
+    QBO wraps results as {'QueryResponse': {'<Entity>': [...]}}.
+    We unwrap to the inner list; an empty result yields []."""
+    body = _request("GET", "/query", params={"query": sql})
+    qr = body.get("QueryResponse") or {}
+    for key, value in qr.items():
+        # The entity list is the only list-valued key (others are
+        # startPosition / maxResults / totalCount ints).
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def report(name: str,
+           params: Optional[dict] = None) -> dict:
+    """Fetch a QBO report by name (e.g. 'CashFlow',
+    'ProfitAndLoss', 'BalanceSheet'). Returns the raw report JSON
+    — a nested Header/Columns/Rows structure."""
+    return _request("GET", f"/reports/{name}", params=params or {})
+
+
+def company_info() -> dict:
+    """Return the CompanyInfo entity for the connected realm —
+    useful to confirm the connection is live and show the company
+    name in the UI."""
+    row = _connection_or_raise()
+    realm_id = row.get("realm_id") or ""
+    body = _request("GET", f"/companyinfo/{realm_id}")
+    return (body.get("CompanyInfo")
+            or body.get("QueryResponse", {}).get("CompanyInfo")
+            or {})
+
+
+def cashflow_report(start_date: str, end_date: str) -> dict:
+    """Convenience wrapper: the QBO Statement of Cash Flows for a
+    date range. Dates are 'YYYY-MM-DD' strings."""
+    return report("CashFlow", params={
+        "start_date": start_date,
+        "end_date": end_date,
+    })
+
+
+def profit_and_loss(start_date: str, end_date: str) -> dict:
+    """Convenience wrapper: the QBO Profit & Loss report for a
+    date range. Dates are 'YYYY-MM-DD' strings."""
+    return report("ProfitAndLoss", params={
+        "start_date": start_date,
+        "end_date": end_date,
+    })

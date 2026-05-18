@@ -1119,6 +1119,23 @@ CREATE TABLE IF NOT EXISTS slack_user_tokens (
 CREATE INDEX IF NOT EXISTS idx_slack_user_tokens_slack_uid
     ON slack_user_tokens(slack_user_id);
 
+-- v2.67.211 QuickBooks Online connection. ONE row per connected
+-- QBO company (realm). Tokens encrypted with Fernet. The access
+-- token expires hourly; the refresh token lasts ~100 days and
+-- ROTATES on every refresh — both columns get rewritten each
+-- time qbo_oauth refreshes. Powers the Cashflow Management page.
+CREATE TABLE IF NOT EXISTS qbo_connection (
+    realm_id            TEXT PRIMARY KEY,     -- QBO company ID
+    access_token_enc    TEXT NOT NULL,        -- Fernet-encrypted
+    refresh_token_enc   TEXT NOT NULL,        -- Fernet-encrypted
+    access_expires_at   TIMESTAMP,            -- ~1h out
+    refresh_expires_at  TIMESTAMP,            -- ~100d out
+    environment         TEXT DEFAULT 'sandbox',  -- sandbox|production
+    connected_by        TEXT,
+    connected_at        TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.67.126 Viktor bridge sessions. When the dashboard's AI
 -- Assistant posts to Slack on a user's behalf to forward a
 -- marketing question to Viktor, we record the post here so we
@@ -2554,6 +2571,67 @@ def delete_slack_user_token(user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# QuickBooks Online connection (v2.67.211)
+# ---------------------------------------------------------------------------
+# ONE QBO company at a time — Wired4Signs has a single books file.
+# We model that with a fixed primary key so an UPSERT always
+# targets the same row; a reconnect to a different realm simply
+# overwrites it. Callers (qbo_oauth.py) decrypt the token columns.
+def save_qbo_connection(realm_id: str,
+                          access_token_enc: str,
+                          refresh_token_enc: str,
+                          access_expires_at: Optional[str],
+                          refresh_expires_at: Optional[str],
+                          environment: str = "sandbox",
+                          connected_by: Optional[str] = None) -> None:
+    """Insert or update the single QBO connection row. Token
+    columns must already be Fernet-encrypted by the caller.
+    Both tokens are rewritten on every refresh (QBO rotates the
+    refresh token), so this doubles as the refresh-persist path."""
+    sql = (
+        "INSERT INTO qbo_connection "
+        "(realm_id, access_token_enc, refresh_token_enc, "
+        " access_expires_at, refresh_expires_at, environment, "
+        " connected_by, connected_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now')) "
+        "ON CONFLICT(realm_id) DO UPDATE SET "
+        "  access_token_enc = excluded.access_token_enc, "
+        "  refresh_token_enc = excluded.refresh_token_enc, "
+        "  access_expires_at = excluded.access_expires_at, "
+        "  refresh_expires_at = excluded.refresh_expires_at, "
+        "  environment = excluded.environment, "
+        "  connected_by = excluded.connected_by, "
+        "  updated_at = datetime('now')")
+    with connect() as c:
+        c.execute(sql, (realm_id, access_token_enc, refresh_token_enc,
+                          access_expires_at, refresh_expires_at,
+                          environment, connected_by))
+
+
+def get_qbo_connection() -> Optional[dict]:
+    """Return the current QBO connection row (or None if not yet
+    connected). Caller decrypts access/refresh tokens via
+    qbo_oauth.decrypt_token. Only one realm is ever stored, so we
+    return the most-recently-updated row defensively."""
+    with connect() as c:
+        r = c.execute(
+            "SELECT realm_id, access_token_enc, refresh_token_enc, "
+            "       access_expires_at, refresh_expires_at, "
+            "       environment, connected_by, connected_at, "
+            "       updated_at "
+            "FROM qbo_connection "
+            "ORDER BY updated_at DESC LIMIT 1").fetchone()
+    return dict(r) if r else None
+
+
+def clear_qbo_connection() -> None:
+    """Disconnect QBO — drop all stored tokens (user clicked
+    'Disconnect' or revoked access from the Intuit side)."""
+    with connect() as c:
+        c.execute("DELETE FROM qbo_connection")
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge sessions (v2.67.126)
 # ---------------------------------------------------------------------------
 def create_viktor_bridge_session(session_id: str, user_id: int,
@@ -2786,6 +2864,21 @@ _PG_POST_CUTOVER_TABLES = [
     ("supplier_config_rename_review_days_C",
       'ALTER TABLE supplier_config RENAME COLUMN '
       '"review_days_C" TO review_days_c;'),
+    # v2.67.211 — QuickBooks Online connection table.
+    ("qbo_connection",
+      """
+      CREATE TABLE IF NOT EXISTS qbo_connection (
+          realm_id            TEXT PRIMARY KEY,
+          access_token_enc    TEXT NOT NULL,
+          refresh_token_enc   TEXT NOT NULL,
+          access_expires_at   TIMESTAMPTZ,
+          refresh_expires_at  TIMESTAMPTZ,
+          environment         TEXT DEFAULT 'sandbox',
+          connected_by        TEXT,
+          connected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
 ]
 
 
