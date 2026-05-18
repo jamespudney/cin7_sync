@@ -21667,36 +21667,41 @@ elif page == "Cashflow":
                     f"sales data.")
                 st.rerun()
 
-    # ---- Opening balance ----
-    _cf_open_key = (_cf_wkey[0], "opening_balance")
-    _cf_open_saved = _cf_fc.get(_cf_open_key)
-    _oc1, _oc2 = st.columns([2, 1])
-    with _oc1:
-        _cf_opening = st.number_input(
-            f"Opening cash balance — week of {_cf_wcol[0]}",
-            value=float(_cf_open_saved or 0.0), step=1000.0,
-            key="_cf_opening_input")
-    with _oc2:
-        if st.button(":bank: Pull from QuickBooks",
-                     key="_cf_pull_bank",
-                     help="Sum the current balances of your QBO "
-                          "Bank accounts."):
-            try:
-                _accts = _qbo_client.get_bank_accounts()
-                _bank_total = sum(
-                    float(a.get("CurrentBalance") or 0)
-                    for a in _accts)
-                db.set_forecast_cell(
-                    _cf_wkey[0], "opening_balance", _bank_total,
-                    updated_by=current_user)
-                st.success(
-                    f"Opening balance set to "
-                    f"{_fmt_money(_bank_total)} from "
-                    f"{len(_accts)} bank account(s).")
-                st.rerun()
-            except Exception as _exc:  # noqa: BLE001
-                st.error(f"Could not read QBO bank accounts: "
-                         f"{_exc}")
+    # ---- Opening balance: actual, entered each Monday ----------
+    # James's workflow: every Monday the ACTUAL bank opening
+    # balance for the new week is entered, so each week starts
+    # from reality. The gap from the prior week's forecast
+    # closing is the variance worth watching. Opening balance is
+    # the first editable row of the grid below; this button just
+    # drops the live QBO bank total into THIS week's cell.
+    _cf_tw_key = _cf_this_monday.strftime("%Y-%m-%d")
+    st.caption(
+        ":information_source: Enter each week's **actual** bank "
+        "opening balance in the *Opening balance (actual)* row of "
+        "the grid. Weeks without one roll the forecast forward. "
+        "The projection's **Variance** row shows actual vs "
+        "forecast.")
+    if st.button(":bank: Pull this week's opening balance from "
+                 "QuickBooks", key="_cf_pull_bank",
+                 help="Sum the current QBO Bank account balances "
+                      "into the opening-balance cell for the "
+                      "current week."):
+        try:
+            _accts = _qbo_client.get_bank_accounts()
+            _bank_total = sum(
+                float(a.get("CurrentBalance") or 0)
+                for a in _accts)
+            db.set_forecast_cell(
+                _cf_tw_key, "opening_balance", _bank_total,
+                updated_by=current_user)
+            st.success(
+                f"Opening balance for week "
+                f"{_cf_this_monday.strftime('%m/%d')} set to "
+                f"{_fmt_money(_bank_total)} from {len(_accts)} "
+                f"bank account(s).")
+            st.rerun()
+        except Exception as _exc:  # noqa: BLE001
+            st.error(f"Could not read QBO bank accounts: {_exc}")
 
     # ---- Supplier payables bucketed by due week (derived) ----
     _cf_supplier_due = {k: 0.0 for k in _cf_wkey}
@@ -21724,7 +21729,11 @@ elif page == "Cashflow":
             _cf_supplier_due[_wk_key] += float(_amt or 0)
 
     # ---- Editable grid (line items) ----
-    _cf_rows = _CF_INFLOWS + _CF_OUTFLOWS
+    # Opening balance is the first row — James edits each week's
+    # actual here. It is NOT summed into inflows/outflows; the
+    # projection reads it separately.
+    _cf_rows = ([("opening_balance", "Opening balance (actual)")]
+                + _CF_INFLOWS + _CF_OUTFLOWS)
     _cf_grid = {}
     for _rk, _label in _cf_rows:
         _cf_grid[_label] = [
@@ -21759,12 +21768,6 @@ elif page == "Cashflow":
                 if _new != _old:
                     _cells.append((_wk, _rk, _new))
                     _n_cells += 1
-        # Persist opening balance if changed.
-        if float(_cf_opening) != float(_cf_open_saved or 0.0):
-            _cells.append(
-                (_cf_wkey[0], "opening_balance",
-                 float(_cf_opening)))
-            _n_cells += 1
         try:
             db.bulk_set_forecast(_cells, updated_by=current_user)
             st.success(f":white_check_mark: Saved {_n_cells} "
@@ -21774,51 +21777,93 @@ elif page == "Cashflow":
             st.error(f"Could not save forecast: {_exc}")
 
     # ---- Projection (read-only, derived) ----
+    # A week's opening balance is the ACTUAL entered for that week
+    # if present, otherwise the prior week's forecast closing
+    # rolled forward. Variance = actual opening − the forecast we
+    # had rolled to — the figure James monitors each Monday.
     _proj_rows = {
+        "Opening balance": [],
         "Total inflows": [],
         "Total outflows": [],
         "  └ Supplier payables (tracker)": [],
         "Net movement": [],
-        "Opening balance": [],
         "Closing balance": [],
+        "Variance (actual vs forecast)": [],
     }
-    _running = float(_cf_opening)
-    for _i, _wk in enumerate(_cf_wkey):
+    _running = None  # prior week's forecast closing
+    _closings = []
+    for _wk in _cf_wkey:
+        _actual_open = _cf_fc.get((_wk, "opening_balance"))
+        if _actual_open is not None:
+            _opening = float(_actual_open)
+        elif _running is not None:
+            _opening = _running
+        else:
+            _opening = 0.0
+        if _actual_open is not None and _running is not None:
+            _variance = _opening - _running
+        else:
+            _variance = None
         _in = sum(float(_cf_fc.get((_wk, rk)) or 0.0)
                   for rk, _ in _CF_INFLOWS)
         _out_manual = sum(float(_cf_fc.get((_wk, rk)) or 0.0)
                           for rk, _ in _CF_OUTFLOWS)
-        # Use edited grid values if the user has unsaved edits?
-        # Keep it simple: projection reflects SAVED data.
         _sup = _cf_supplier_due.get(_wk, 0.0)
         _out = _out_manual + _sup
         _net = _in - _out
+        _closing = _opening + _net
+        _proj_rows["Opening balance"].append(_opening)
         _proj_rows["Total inflows"].append(_in)
         _proj_rows["Total outflows"].append(_out)
-        _proj_rows["  └ Supplier payables (tracker)"].append(_sup)
+        _proj_rows["  └ Supplier payables (tracker)"].append(
+            _sup)
         _proj_rows["Net movement"].append(_net)
-        _proj_rows["Opening balance"].append(_running)
-        _running += _net
-        _proj_rows["Closing balance"].append(_running)
+        _proj_rows["Closing balance"].append(_closing)
+        _proj_rows["Variance (actual vs forecast)"].append(
+            _variance)
+        _closings.append(_closing)
+        _running = _closing
+
+    def _cf_cell_fmt(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        try:
+            return f"{float(v):,.0f}"
+        except (TypeError, ValueError):
+            return "—"
+
     _proj_df = pd.DataFrame(_proj_rows, index=_cf_wcol).T
     _proj_df.index.name = "Projection"
-    st.markdown("**Projected cash position** "
-                "_(reflects saved data — Save above to refresh)_")
+    st.markdown(
+        "**Projected cash position** — opening balance uses the "
+        "**actual** figure where you've entered one, otherwise "
+        "rolls the forecast forward. _Reflects saved data._")
     st.dataframe(
-        _proj_df.style.format("{:,.0f}"),
+        _proj_df.style.format(_cf_cell_fmt),
         use_container_width=True)
 
-    _final_close = (_proj_rows["Closing balance"][-1]
-                    if _proj_rows["Closing balance"] else 0.0)
-    _min_close = (min(_proj_rows["Closing balance"])
-                  if _proj_rows["Closing balance"] else 0.0)
-    _pc1, _pc2 = st.columns(2)
+    _final_close = _closings[-1] if _closings else 0.0
+    _min_close = min(_closings) if _closings else 0.0
+    _vars = [v for v in _proj_rows["Variance (actual vs forecast)"]
+             if v is not None]
+    _pc1, _pc2, _pc3 = st.columns(3)
     _pc1.metric(f"Projected closing — week {_cf_wcol[-1]}",
                 _fmt_money(_final_close))
     _pc2.metric("Lowest projected balance",
                 _fmt_money(_min_close),
                 help="The tightest week in the horizon — watch "
                      "this for a cash squeeze.")
+    if _vars:
+        _pc3.metric(
+            "Avg actual-vs-forecast variance",
+            _fmt_money(sum(_vars) / len(_vars)),
+            help=f"Across {len(_vars)} week(s) where an actual "
+                 f"opening balance was entered. Positive = "
+                 f"actuals ran ahead of forecast.")
+    else:
+        _pc3.metric("Avg actual-vs-forecast variance", "—",
+                    help="No actual opening balances entered in "
+                         "this range yet.")
     if _min_close < 0:
         st.error(
             ":rotating_light: Projection dips **below zero** — "

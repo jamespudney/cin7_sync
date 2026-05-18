@@ -52,6 +52,9 @@ SHEET_CSV_URL = (
 
 # Spreadsheet row label (lower-cased, stripped) -> app row_key.
 ROW_MAP = {
+    # The actual bank opening balance entered each Monday — this
+    # is what anchors each week to reality (see app projection).
+    "actual opening balance": "opening_balance",
     "forecast sales": "forecast_sales",
     "prolux": "prolux",
     "other income incl rent": "other_income_rent",
@@ -172,12 +175,20 @@ def main() -> int:
             val = _num(row[col])
             if val is None:
                 continue
+            # An opening-balance of 0 in the sheet means "no
+            # actual entered for this week" — skip it so the app
+            # rolls the forecast forward instead.
+            if row_key == "opening_balance" and val == 0:
+                continue
             key = (wk, row_key)
             cells[key] = cells.get(key, 0.0) + val
 
-    if opening_balance is not None:
-        cells[(week_keys[first_col], "opening_balance")] = \
-            opening_balance
+    # Week-1 fallback: if the 'Actual opening balance' row had no
+    # value for the first week, seed it from 'Forcast Cash
+    # Balance' (Chase + Pinnacle on day one).
+    _first_key = (week_keys[first_col], "opening_balance")
+    if opening_balance is not None and _first_key not in cells:
+        cells[_first_key] = opening_balance
 
     print(f"  mapped {len(matched_rows)} line-item rows -> "
           f"{len(cells)} cells")
