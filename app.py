@@ -6792,15 +6792,21 @@ if page == "Overview":
                 _gap_value = 0.0
             _delta = _fallback_total - stock_value
             if _delta > 100:  # only show when material
-                st.caption(
+                # v2.67.208 — escape `$` so Streamlit doesn't
+                # interpret the text between dollar signs as
+                # LaTeX math. _fmt_money returns "$670,976";
+                # two of those in one markdown string triggered
+                # equation rendering. \$ renders a literal $.
+                _diag = (
                     f":mag: *Diagnostic:* CIN7 FIFO above = "
                     f"**{_fmt_money(stock_value)}**. The "
-                    f"`OnHand × AverageCost` fallback for SKUs "
+                    f"OnHand × AverageCost fallback for SKUs "
                     f"missing FIFO basis would add "
                     f"**{_fmt_money(_delta)}** "
                     f"({_gap_skus:,} SKUs · estimated value "
                     f"{_fmt_money(_gap_value)}). Headline stays "
                     f"FIFO-only for commissions consistency.")
+                st.caption(_diag.replace("$", "\\$"))
     except Exception:
         # Diagnostic must never break the tile.
         pass
@@ -6823,8 +6829,26 @@ if page == "Overview":
     #      as "Revenue". Subtracts tax so the numbers match.
     sales_total = 0.0
     revenue_pretax = 0.0
-    if not sales_headers.empty and "InvoiceAmount" in sales_headers.columns:
+    # v2.67.208 — track WHY the figure is what it is so a $0 tile
+    # explains itself instead of silently misleading. James saw
+    # "$0" with no context — could be empty CSV, missing column,
+    # or a genuine zero. The diagnostic caption below makes the
+    # cause visible.
+    _sales_diag = ""
+    _n_rows_in_window = 0
+    if sales_headers.empty:
+        _sales_diag = (
+            "no sales-headers data loaded — the "
+            "sales_last_30d_*.csv file is missing on this "
+            "service. Run `python cin7_sync.py sales --days 30`.")
+    elif "InvoiceAmount" not in sales_headers.columns:
+        _sales_diag = (
+            "sales-headers CSV has no InvoiceAmount column "
+            f"(columns: {list(sales_headers.columns)[:8]}). "
+            "The sync may have written an unexpected shape.")
+    else:
         sh = sales_headers.copy()
+        _n_total = len(sh)
         if "InvoiceDate" in sh.columns:
             sh["InvoiceDate"] = pd.to_datetime(
                 sh["InvoiceDate"], errors="coerce", utc=True
@@ -6835,7 +6859,18 @@ if page == "Overview":
         if "Status" in sh.columns:
             _bad = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
             sh = sh[~sh["Status"].astype(str).str.upper().isin(_bad)]
+        _n_rows_in_window = len(sh)
         sales_total = float(_to_num(sh["InvoiceAmount"]).fillna(0).sum())
+        if _n_rows_in_window == 0 and _n_total > 0:
+            _sales_diag = (
+                f"the CSV has {_n_total:,} sales rows but NONE "
+                "fall in the last 30 days (by InvoiceDate) — "
+                "the sales_last_30d_*.csv is stale. Run "
+                "`python cin7_sync.py sales --days 30`.")
+        elif _n_rows_in_window == 0:
+            _sales_diag = (
+                "the sales CSV is present but empty after "
+                "filtering. Re-run the sales sync.")
 
         # For pre-tax (CIN7 Revenue match), subtract tax summed from
         # sale_lines for the same SaleIDs.
@@ -6858,6 +6893,12 @@ if page == "Overview":
              "'pre-tax ≈' line under it is the closest match to CIN7's "
              "Overview dashboard 'Revenue' metric (pre-tax).",
     )
+    # v2.67.208 — surface WHY when the tile is $0.
+    if sales_total == 0 and _sales_diag:
+        c2.markdown(
+            f"<small style='color:#dc2626;'>⚠ {_sales_diag}"
+            "</small>",
+            unsafe_allow_html=True)
     # v2.67.43 — freshness indicator. If the underlying
     # sales_last_30d_*.csv is more than ~36h old, the tile is
     # undercounting and the user should know. Without this hint,
