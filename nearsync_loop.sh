@@ -36,5 +36,27 @@ while true; do
         ./nearsync.sh || \
           echo "[$(stamp)] nearsync.sh exited non-zero" >> "$LOG"
     fi
+
+    # v2.67.230 — Monday bank-balance capture. Once per Monday at
+    # ~13:00 UTC (08:00 EST / 09:00 EDT) sum the QBO bank-account
+    # balances into the cashflow week's opening_balance cell —
+    # automating the manual Monday-morning capture. A dated
+    # sentinel file on the persistent disk gates it to ONE run
+    # per Monday; >=13 means a redeploy that misses 13:00 still
+    # catches up later that Monday.
+    DOW=$(date -u +%u)   # 1 = Monday
+    CAP_SENTINEL="${DATA_DIR}/output/.bank_capture_$(date -u +%Y-%m-%d)"
+    if [ "$DOW" = "1" ] && [ "$HOUR_NUM" -ge 13 ] \
+            && [ ! -f "$CAP_SENTINEL" ]; then
+        echo "[$(stamp)] Monday — capturing QBO bank opening balance" \
+          | tee -a "$LOG"
+        if python capture_bank_balance.py 2>&1 | tee -a "$LOG"; then
+            touch "$CAP_SENTINEL"
+        else
+            echo "[$(stamp)] capture_bank_balance.py non-zero — " \
+                 "will retry next tick" >> "$LOG"
+        fi
+    fi
+
     sleep $((INTERVAL_MIN * 60))
 done
