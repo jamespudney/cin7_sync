@@ -3148,6 +3148,14 @@ with st.sidebar:
         "The button triggers a manual pull on demand."
     )
 
+    # v2.67.217 — in-app support contact. Required by Intuit's
+    # QuickBooks Online app review ("a way for users to contact
+    # you for support from within your app") and useful anyway.
+    st.divider()
+    st.caption(
+        f":email: **Need help?** Contact support: "
+        f"{_LEGAL_CONTACT_EMAIL}")
+
 
 # ---------------------------------------------------------------------------
 # Shared data loads

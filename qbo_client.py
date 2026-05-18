@@ -127,31 +127,47 @@ def _request(method: str, path: str,
                 f"QBO API network error ({method} {path}): "
                 f"{exc}") from exc
 
+        # v2.67.217 — capture Intuit's transaction id from the
+        # response headers. Intuit support uses intuit_tid to
+        # trace a specific API call; surfacing it in every error
+        # and log line makes troubleshooting far faster.
+        intuit_tid = (r.headers.get("intuit_tid")
+                      or r.headers.get("Intuit-Tid") or "")
+
         if r.status_code == 401 and attempt == 0:
             # Token was rejected — force a refresh on the next loop
             # by clearing the cached access expiry implicitly: the
             # next get_valid_access_token() sees a stale row only
             # if expiry passed, so explicitly refresh here.
-            log.info("QBO API 401 — forcing token refresh + retry.")
+            log.info("QBO API 401 (intuit_tid=%s) — forcing token "
+                     "refresh + retry.", intuit_tid)
             refreshed = qbo_oauth._refresh_access_token(
                 db.get_qbo_connection() or {})
             if not refreshed:
                 raise QBOError(
                     "QBO API returned 401 and the token refresh "
-                    "failed — reconnect QuickBooks Online.")
+                    "failed — reconnect QuickBooks Online. "
+                    f"(intuit_tid={intuit_tid})")
             continue
 
         if r.status_code >= 400:
-            last_error = f"HTTP {r.status_code}: {r.text[:400]}"
+            last_error = (f"HTTP {r.status_code} "
+                          f"(intuit_tid={intuit_tid}): "
+                          f"{r.text[:400]}")
+            log.error("QBO API error %s %s — %s",
+                      method, path, last_error)
             raise QBOError(
                 f"QBO API error ({method} {path}): {last_error}")
 
+        if intuit_tid:
+            log.debug("QBO API ok %s %s (intuit_tid=%s)",
+                      method, path, intuit_tid)
         try:
             return r.json()
         except ValueError as exc:
             raise QBOError(
-                f"QBO API returned non-JSON ({method} {path}): "
-                f"{r.text[:300]}") from exc
+                f"QBO API returned non-JSON ({method} {path}, "
+                f"intuit_tid={intuit_tid}): {r.text[:300]}") from exc
 
     raise QBOError(
         f"QBO API call failed after retry ({method} {path}): "

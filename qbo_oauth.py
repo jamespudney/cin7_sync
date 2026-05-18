@@ -344,9 +344,15 @@ def _token_request(payload: dict) -> dict:
             last_error = f"HTTP {r.status_code}"
             _time.sleep(1.5)
             continue
+        # v2.67.217 — include Intuit's transaction id so support
+        # can trace a failed token call.
+        _tid = (r.headers.get("intuit_tid")
+                or r.headers.get("Intuit-Tid") or "")
+        log.error("QBO token endpoint HTTP %d (intuit_tid=%s): %s",
+                  r.status_code, _tid, r.text[:300])
         raise RuntimeError(
-            f"QBO token endpoint HTTP {r.status_code}: "
-            f"{r.text[:300]}")
+            f"QBO token endpoint HTTP {r.status_code} "
+            f"(intuit_tid={_tid}): {r.text[:300]}")
     raise RuntimeError(
         f"QBO token endpoint failed after retry: {last_error}")
 
