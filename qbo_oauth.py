@@ -56,6 +56,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import os
+import time as _time
 import urllib.parse
 from typing import Optional
 
@@ -308,27 +309,46 @@ def _token_request(payload: dict) -> dict:
     exchange and refreshes. Returns the parsed JSON body, or raises
     RuntimeError with a readable message."""
     cfg = _oauth_config()
-    try:
-        r = requests.post(
-            _discover_endpoints()["token"],
-            data=payload,
-            auth=(cfg["client_id"], cfg["client_secret"]),
-            headers={"Accept": "application/json"},
-            timeout=20,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"QBO token endpoint network error: {exc}") from exc
-    if r.status_code != 200:
+    url = _discover_endpoints()["token"]
+    # v2.67.216 — retry ONCE on a transient failure (network
+    # error, HTTP 429, or 5xx). Deterministic 4xx failures
+    # (invalid_grant, invalid_client, etc.) are NOT retried —
+    # retrying them is pointless and can trip rate limits.
+    last_error = ""
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                url,
+                data=payload,
+                auth=(cfg["client_id"], cfg["client_secret"]),
+                headers={"Accept": "application/json"},
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            last_error = f"network error: {exc}"
+            if attempt == 0:
+                _time.sleep(1.5)
+                continue
+            raise RuntimeError(
+                f"QBO token endpoint {last_error}") from exc
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"QBO token endpoint returned non-JSON: "
+                    f"{r.text[:300]}") from exc
+        # Non-200 — retry only transient server-side statuses.
+        if (r.status_code in (429, 500, 502, 503, 504)
+                and attempt == 0):
+            last_error = f"HTTP {r.status_code}"
+            _time.sleep(1.5)
+            continue
         raise RuntimeError(
             f"QBO token endpoint HTTP {r.status_code}: "
             f"{r.text[:300]}")
-    try:
-        return r.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"QBO token endpoint returned non-JSON: "
-            f"{r.text[:300]}") from exc
+    raise RuntimeError(
+        f"QBO token endpoint failed after retry: {last_error}")
 
 
 def _persist_tokens(realm_id: str, body: dict,
