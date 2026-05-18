@@ -439,6 +439,167 @@ def _require_password() -> None:
     st.stop()
 
 
+# ---------------------------------------------------------------------------
+# Public legal pages (v2.67.214)
+# ---------------------------------------------------------------------------
+# Intuit's QuickBooks Online production onboarding requires PUBLIC
+# URLs for an end-user license agreement and a privacy policy.
+# The rest of this app is behind the team-password gate, so we
+# serve these two pages BEFORE _require_password() runs, keyed off
+# a ?legal= query param. Stable URLs:
+#   https://<app>/?legal=eula
+#   https://<app>/?legal=privacy
+_LEGAL_LAST_UPDATED = "18 May 2026"
+_LEGAL_CONTACT_EMAIL = "info@wired4signsusa.com"
+
+_EULA_MARKDOWN = f"""
+# End-User License Agreement
+
+**{COMPANY_NAME} Analytics**
+_Last updated: {_LEGAL_LAST_UPDATED}_
+
+This End-User License Agreement ("Agreement") governs your use of
+the {COMPANY_NAME} Analytics application ("the Application"), an
+internal operations and analytics tool operated by
+{COMPANY_NAME}.
+
+### 1. Licence
+The Application is provided solely for authorised staff and
+representatives of {COMPANY_NAME} for internal business purposes.
+{COMPANY_NAME} grants you a limited, non-exclusive,
+non-transferable, revocable licence to access and use the
+Application in the course of your work.
+
+### 2. Permitted use
+You may use the Application only to view, analyse and act on
+{COMPANY_NAME}'s own business data — inventory, sales, purchasing,
+marketing and accounting information. You must not use the
+Application for any unlawful purpose or in any way that could
+damage, disable or impair it.
+
+### 3. Accounts and access
+Access requires credentials issued by {COMPANY_NAME}. You are
+responsible for keeping your credentials confidential and for all
+activity under your account. Access may be revoked at any time.
+
+### 4. Third-party services
+The Application connects to third-party services including
+Cin7 Core, Shopify, QuickBooks Online and Google services. Your
+use of data from those services is also subject to their
+respective terms. The Application is not endorsed by or
+affiliated with Intuit Inc.
+
+### 5. Intellectual property
+The Application and all associated software and content are owned
+by {COMPANY_NAME}. No ownership rights are transferred to you.
+
+### 6. Disclaimer and liability
+The Application is provided "as is" without warranties of any
+kind. {COMPANY_NAME} is not liable for any indirect or
+consequential loss arising from its use. Business decisions made
+using the Application remain the responsibility of the user.
+
+### 7. Termination
+This licence terminates automatically if you breach this
+Agreement or when your authorisation to use the Application ends.
+
+### 8. Contact
+Questions about this Agreement: {_LEGAL_CONTACT_EMAIL}
+"""
+
+_PRIVACY_MARKDOWN = f"""
+# Privacy Policy
+
+**{COMPANY_NAME} Analytics**
+_Last updated: {_LEGAL_LAST_UPDATED}_
+
+This Privacy Policy explains how {COMPANY_NAME} ("we", "us")
+collects, uses and protects information in connection with the
+{COMPANY_NAME} Analytics application ("the Application"). The
+Application is an internal business tool used only by authorised
+{COMPANY_NAME} staff.
+
+### 1. Information we process
+The Application connects to business systems operated by or on
+behalf of {COMPANY_NAME}, including:
+
+- **Cin7 Core** — inventory, product, sales and purchasing data.
+- **Shopify** — store, order and customer data.
+- **QuickBooks Online (Intuit)** — accounting data such as
+  invoices, bills, payments and financial reports, used to
+  display cash-flow and financial summaries.
+- **Google Ads / Google Analytics** — advertising performance
+  data.
+
+We also process limited staff account information (name, role,
+sign-in activity) for access control.
+
+### 2. How we use information
+Information is used solely for {COMPANY_NAME}'s internal
+operations — analysing inventory, sales, purchasing, marketing
+performance and cash flow, and supporting day-to-day business
+decisions. We do **not** sell, rent or trade any information, and
+we do **not** use QuickBooks/Intuit data for advertising.
+
+### 3. QuickBooks Online data
+Data retrieved from QuickBooks Online is used only to present
+financial and cash-flow information to authorised
+{COMPANY_NAME} staff within the Application. Intuit OAuth access
+and refresh tokens are encrypted at rest. We access only the
+accounting scope necessary for these features and retain
+QuickBooks data only as long as needed for the features
+described. You may disconnect QuickBooks Online at any time from
+within the Application, which deletes the stored connection
+tokens.
+
+### 4. Storage and security
+Application data is stored in a private database hosted on Render
+in the United States. Access requires authentication.
+Credentials and third-party access tokens are encrypted at rest.
+Access is limited to authorised {COMPANY_NAME} personnel.
+
+### 5. Data sharing
+We do not share information with third parties except the service
+providers that host the Application or that the Application
+integrates with, and only as needed to operate it, or where
+required by law.
+
+### 6. Data retention and deletion
+We retain information only as long as needed for the purposes
+described or as required by law. To request deletion of data, or
+to disconnect a third-party integration, contact us using the
+details below.
+
+### 7. Changes
+We may update this Policy from time to time. The "last updated"
+date above reflects the current version.
+
+### 8. Contact
+Questions or requests regarding this Privacy Policy:
+{_LEGAL_CONTACT_EMAIL}
+"""
+
+
+def _serve_legal_pages() -> None:
+    """Render a public EULA / privacy-policy page when ?legal= is
+    in the URL, then stop — so these pages are reachable WITHOUT
+    the team password (required by Intuit's QBO onboarding)."""
+    try:
+        _legal = (st.query_params.get("legal") or "").strip().lower()
+    except Exception:
+        _legal = ""
+    if _legal not in ("eula", "privacy"):
+        return
+    st.markdown(
+        "<div style='max-width:780px;margin:0 auto;'>",
+        unsafe_allow_html=True)
+    st.markdown(
+        _EULA_MARKDOWN if _legal == "eula" else _PRIVACY_MARKDOWN)
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+
+
+_serve_legal_pages()
 _require_password()
 
 
