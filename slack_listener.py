@@ -100,6 +100,23 @@ QUESTION_WORDS = {
 SKU_RE = re.compile(r"\b(LED(?:KIT)?-[A-Z0-9-]+)\b", re.IGNORECASE)
 SO_RE = re.compile(r"\bSO-\d+\b", re.IGNORECASE)
 PO_RE = re.compile(r"\bPO-\d+\b", re.IGNORECASE)
+# v2.67.222 — UUID embedded in a CIN7 PurchaseAdvanced URL, e.g.
+# .../PurchaseAdvanced#15153eff-6c4a-412a-a74f-4a54d31830d4 (the
+# fragment may carry extra ~uuid~tab parts; we want the first).
+_PO_UUID_RE = re.compile(
+    r"PurchaseAdvanced#([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
+
+
+def _extract_po_uuid(text: str):
+    """Return the CIN7 PO UUID from a PurchaseAdvanced URL in
+    `text`, or None. Used to make draft-PO commentary deterministic
+    — the UUID lookup retrieves DRAFT purchase orders that an
+    OrderNumber search filters out."""
+    if not text:
+        return None
+    m = _PO_UUID_RE.search(text)
+    return m.group(1) if m else None
 INV_RE = re.compile(r"\bINV-\d+\b", re.IGNORECASE)
 TRACKING_RE = re.compile(r"\b1Z[A-Z0-9]{16}\b")  # UPS tracking format
 
@@ -1827,9 +1844,30 @@ def process_once(max_messages: int = 25) -> int:
                 "Composing po_commentary_crosspost for %s/%s "
                 "→ posting to %s",
                 ch_name, msg["ts"], tgt_channel)
+            # v2.67.222 — draft-PO commentary must be deterministic.
+            # If the source message carries a CIN7 PurchaseAdvanced
+            # URL, extract the UUID in CODE and hand it to the AI as
+            # an explicit directive. Relying on the model to parse
+            # the URL fragment itself was unreliable — PO-7164 (a
+            # DRAFT) was reported "not found" because the AI fell
+            # back to an OrderNumber search, which filters drafts.
+            _msg_for_compose = msg
+            _po_uuid = _extract_po_uuid(msg.get("text") or "")
+            if _po_uuid:
+                _msg_for_compose = dict(msg)
+                _msg_for_compose["text"] = (
+                    (msg.get("text") or "")
+                    + f"\n\n[system note: this purchase order's "
+                    f"CIN7 UUID is {_po_uuid}. You MUST call "
+                    f"get_purchase_live with "
+                    f"purchase_id=\"{_po_uuid}\" — the UUID lookup "
+                    f"retrieves DRAFT purchase orders that an "
+                    f"OrderNumber search misses. Do NOT report the "
+                    f"PO as 'not found' until this UUID lookup has "
+                    f"been tried.]")
             try:
                 text, tools = _compose_response(
-                    msg, "po_review", "po_review")
+                    _msg_for_compose, "po_review", "po_review")
             except Exception as exc:
                 log.error("po_commentary compose failed: %s", exc)
                 continue
