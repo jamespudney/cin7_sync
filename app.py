@@ -21339,6 +21339,7 @@ elif page == "Cashflow":
                     "Cur": r.get("currency") or "USD",
                     "Invoice": r.get("invoice_date") or "",
                     "Due": _eff_due(r),
+                    "Shift wks": 0,
                     "QBO": _qbo_state(r),
                     "Status": r.get("status") or "pending",
                     "Notes": r.get("notes") or "",
@@ -21363,6 +21364,13 @@ elif page == "Cashflow":
                         "Src", disabled=True),
                     "Invoice": st.column_config.TextColumn(
                         "Invoice", disabled=True),
+                    "Shift wks": st.column_config.NumberColumn(
+                        "Shift wks", step=1, format="%d",
+                        help="Defer or pull a payment when cash "
+                             "is tight: +1 = push the due date a "
+                             "week later, -1 = a week earlier. "
+                             "Set it, Save, and the payment "
+                             "re-buckets into that week."),
                     "Status": st.column_config.SelectboxColumn(
                         "Status",
                         options=["pending", "approved",
@@ -21404,6 +21412,24 @@ elif page == "Cashflow":
 
                     # Due → override (qbo) or direct (manual).
                     _new_due = (_erow.get("Due") or "").strip()
+                    # Week-shift: +N / -N weeks, applied on top of
+                    # whatever the Due cell holds. Lets James defer
+                    # a supplier payment when cash is tight.
+                    _shift = _erow.get("Shift wks")
+                    try:
+                        _shift = (0 if _shift is None
+                                  or pd.isna(_shift)
+                                  else int(_shift))
+                    except (TypeError, ValueError):
+                        _shift = 0
+                    if _shift and _new_due:
+                        try:
+                            _new_due = (
+                                pd.Timestamp(_new_due)
+                                + pd.Timedelta(weeks=_shift)
+                            ).strftime("%Y-%m-%d")
+                        except Exception:  # noqa: BLE001
+                            pass
                     if _src == "qbo":
                         _qbo_due = _orig.get("due_date") or ""
                         if _new_due != _qbo_due:
