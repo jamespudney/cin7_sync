@@ -7090,18 +7090,29 @@ if page == "Overview":
     # cause visible.
     _sales_diag = ""
     _n_rows_in_window = 0
-    if sales_headers.empty:
+    # v2.67.236 — fall back to the merged longest-window sales
+    # data when the 30-day file specifically is missing, so the
+    # tile survives a missing sales_last_30d_*.csv instead of
+    # showing a misleading $0. The 30-day InvoiceDate filter
+    # below still yields the correct last-30-days figure.
+    _sh_src = sales_headers
+    _sh_fallback = False
+    if (_sh_src.empty and sales_full is not None
+            and not sales_full.empty):
+        _sh_src = sales_full
+        _sh_fallback = True
+    if _sh_src.empty:
         _sales_diag = (
             "no sales-headers data loaded — the "
             "sales_last_30d_*.csv file is missing on this "
             "service. Run `python cin7_sync.py sales --days 30`.")
-    elif "InvoiceAmount" not in sales_headers.columns:
+    elif "InvoiceAmount" not in _sh_src.columns:
         _sales_diag = (
             "sales-headers CSV has no InvoiceAmount column "
-            f"(columns: {list(sales_headers.columns)[:8]}). "
+            f"(columns: {list(_sh_src.columns)[:8]}). "
             "The sync may have written an unexpected shape.")
     else:
-        sh = sales_headers.copy()
+        sh = _sh_src.copy()
         _n_total = len(sh)
         if "InvoiceDate" in sh.columns:
             sh["InvoiceDate"] = pd.to_datetime(
@@ -7152,6 +7163,16 @@ if page == "Overview":
         c2.markdown(
             f"<small style='color:#dc2626;'>⚠ {_sales_diag}"
             "</small>",
+            unsafe_allow_html=True)
+    # v2.67.236 — note when the figure came from the fallback
+    # (the 30-day file was missing but the merged sales history
+    # covered it).
+    elif _sh_fallback and _n_rows_in_window > 0:
+        c2.markdown(
+            "<small style='color:#6b7280;'>ℹ from merged sales "
+            "history — sales_last_30d file is missing, run "
+            "<code>python cin7_sync.py sales --days 30</code> to "
+            "restore the dedicated feed.</small>",
             unsafe_allow_html=True)
     # v2.67.43 — freshness indicator. If the underlying
     # sales_last_30d_*.csv is more than ~36h old, the tile is
