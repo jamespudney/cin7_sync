@@ -15710,7 +15710,7 @@ elif page == "Monthly Metrics":
 
         llm_markdown = "\n".join(llm_md_lines)
         e2.download_button(
-            ":robot_face: LLM-ready markdown",
+            "🤖 LLM-ready markdown",
             data=llm_markdown,
             file_name=f"monthly_metrics_for_chatgpt_{current_month}.md",
             mime="text/markdown",
