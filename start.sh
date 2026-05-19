@@ -20,11 +20,29 @@ set -euo pipefail
 mkdir -p "${DATA_DIR:-/data}/output"
 mkdir -p "${DATA_DIR:-/data}/.streamlit"
 
-# Start both sync loops in the background. Trap SIGTERM so a clean
-# Render restart kills all processes together.
-./nearsync_loop.sh &
+# v2.67.237 — supervise the sync loops. They are infinite while-
+# loops and should never exit on their own, but if one ever does
+# (crash, wedge cleared, OOM kill) it would otherwise stay dead
+# until the next redeploy — which is exactly how nearsync
+# silently stalled for ~24h. The supervisor restarts a loop 30s
+# after any exit so the syncs are self-healing.
+_supervise() {
+    local name="$1"
+    local script="$2"
+    local log="${DATA_DIR:-/data}/output/${name}_loop.log"
+    while true; do
+        "$script" || true
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [supervise] ${name}" \
+             "loop exited — restarting in 30s" >> "$log"
+        sleep 30
+    done
+}
+
+# Start both sync loops under supervision, in the background.
+# Trap SIGTERM so a clean Render restart kills all processes.
+_supervise nearsync ./nearsync_loop.sh &
 NEARSYNC_PID=$!
-./sync_loop.sh &
+_supervise sync ./sync_loop.sh &
 SYNC_PID=$!
 trap "kill $NEARSYNC_PID $SYNC_PID 2>/dev/null || true" EXIT
 
