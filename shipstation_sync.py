@@ -602,6 +602,27 @@ def _flatten_shipment(s: Dict[str, Any]) -> Dict[str, Any]:
 # CSV writer
 # ---------------------------------------------------------------------------
 
+# v2.67.238 — prune old timestamped snapshots / backups so the
+# recent-sync (runs every ~15 min via nearsync) can't fill the
+# /data disk. Keeps the newest OUTPUT_SNAPSHOTS_KEEP per pattern.
+_OUTPUT_KEEP = int(os.environ.get("OUTPUT_SNAPSHOTS_KEEP", "6") or 6)
+
+
+def _prune_snapshots(pattern: str, keep: int = _OUTPUT_KEEP) -> None:
+    """Keep only the newest `keep` files matching the glob
+    pattern in OUTPUT_DIR; delete the rest. Never raises."""
+    try:
+        files = sorted(
+            OUTPUT_DIR.glob(pattern),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
 
 def _write_csv(name: str, rows: List[Dict[str, Any]]) -> Path:
     """Write rows out as a timestamped CSV in OUTPUT_DIR. Same
@@ -634,6 +655,7 @@ def _write_csv(name: str, rows: List[Dict[str, Any]]) -> Path:
         for r in rows:
             writer.writerow(r)
     log.info("Wrote %s (%d shipments)", out_path.name, len(rows))
+    _prune_snapshots(f"{name}_*.csv")
     return out_path
 
 
@@ -717,6 +739,8 @@ def sync_full(session: requests.Session, days: int = 1825,
         out_path.rename(backup)
         log.info("Backed up previous shipments_full.csv to %s",
                    backup.name)
+        # v2.67.238 — keep only a few rolling backups.
+        _prune_snapshots("shipments_full.bak.*.csv")
     if not rows:
         with out_path.open("w", encoding="utf-8", newline="") as f:
             f.write("ShipmentID,OrderNumber,ShipDate,ShipmentCost\n")

@@ -559,6 +559,28 @@ def _flatten_shopify_order(o: dict) -> dict:
     }
 
 
+# v2.67.238 — prune old timestamped snapshots / backups so the
+# orders sync (runs every ~15 min via nearsync) can't fill the
+# /data disk. Keeps the newest OUTPUT_SNAPSHOTS_KEEP per pattern.
+_OUTPUT_KEEP = int(os.environ.get("OUTPUT_SNAPSHOTS_KEEP", "6") or 6)
+
+
+def _prune_snapshots(pattern: str, keep: int = _OUTPUT_KEEP) -> None:
+    """Keep only the newest `keep` files matching the glob
+    pattern in _CIN7_OUTPUT_DIR; delete the rest. Never raises."""
+    try:
+        files = sorted(
+            _CIN7_OUTPUT_DIR.glob(pattern),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in files[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def _write_orders_csv(name: str, rows: list) -> Path:
     """Same CSV-writer pattern shipstation_sync uses. Drops a
     timestamped file in cin7_sync's OUTPUT_DIR so the merge loader
@@ -571,6 +593,7 @@ def _write_orders_csv(name: str, rows: list) -> Path:
             f.write("ShopifyOrderID,Name,OrderNumber,CreatedAt,"
                      "TotalPrice\n")
         log.info("Wrote empty %s (0 orders)", out_path.name)
+        _prune_snapshots(f"{name}_*.csv")
         return out_path
     fieldnames = list(rows[0].keys())
     seen = set(fieldnames)
@@ -586,6 +609,7 @@ def _write_orders_csv(name: str, rows: list) -> Path:
         for r in rows:
             writer.writerow(r)
     log.info("Wrote %s (%d orders)", out_path.name, len(rows))
+    _prune_snapshots(f"{name}_*.csv")
     return out_path
 
 
@@ -625,6 +649,8 @@ def sync_orders_full(client: ShopifyClient, days: int = 1825) -> Path:
         out_path.rename(backup)
         log.info("Backed up previous shopify_orders_full.csv to %s",
                    backup.name)
+        # v2.67.238 — keep only a few rolling backups.
+        _prune_snapshots("shopify_orders_full.bak.*.csv")
     if not rows:
         with out_path.open("w", encoding="utf-8", newline="") as f:
             f.write("ShopifyOrderID,Name,OrderNumber,CreatedAt\n")
