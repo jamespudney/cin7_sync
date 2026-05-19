@@ -216,6 +216,108 @@ def _load_open_so_set() -> set:
     return open_set
 
 
+# ---------------------------------------------------------------------------
+# v2.67.240 — SO -> SKU map. Brandon flagged (PO-7130) that the
+# reminder cross-tagged every SO against every PO line: the buyer
+# wrote both SO numbers on all 5 lines, so SO-56098 (which needs
+# only ONE of the SKUs) was listed against all five. The fix is
+# to look up each SO's ACTUAL line items and show only the SKUs
+# it genuinely needs from this PO.
+# ---------------------------------------------------------------------------
+def _find_widest_sale_lines() -> Optional[Path]:
+    """Pick the sale_lines CSV covering the widest day-window, so
+    backorder SOs are as likely as possible to be present."""
+    best = None
+    best_days = -1
+    best_mtime = -1.0
+    for p in glob.glob(str(OUTPUT_DIR / "sale_lines_last_*d_*.csv")):
+        m = re.search(r"sale_lines_last_(\d+)d_",
+                       os.path.basename(p))
+        if not m:
+            continue
+        days = int(m.group(1))
+        mtime = os.path.getmtime(p)
+        if days > best_days or (days == best_days
+                                  and mtime > best_mtime):
+            best, best_days, best_mtime = p, days, mtime
+    return Path(best) if best else None
+
+
+def _load_so_line_skus() -> Dict[str, set]:
+    """Return {SO-number: set of SKUs on that sale order}, from
+    the widest sale_lines CSV. Empty dict if no data — callers
+    then fall back to listing SOs without a per-SO SKU breakdown."""
+    path = _find_widest_sale_lines()
+    if not path:
+        log.warning("No sale_lines CSV — per-SO SKU breakdown "
+                      "disabled this run.")
+        return {}
+    try:
+        df = pd.read_csv(path, low_memory=False)
+    except Exception as exc:
+        log.warning("Failed to read %s: %s", path, exc)
+        return {}
+    if "OrderNumber" not in df.columns or "SKU" not in df.columns:
+        return {}
+    out: Dict[str, set] = {}
+    for _, row in df.iterrows():
+        so = str(row.get("OrderNumber") or "").strip().upper()
+        sku = str(row.get("SKU") or "").strip()
+        if not so or not sku:
+            continue
+        if not so.startswith("SO-"):
+            if so.isdigit():
+                so = f"SO-{so}"
+            else:
+                continue
+        out.setdefault(so, set()).add(sku.upper())
+    log.info("Loaded SO->SKU map: %d sale orders from %s",
+              len(out), path.name)
+    return out
+
+
+def _po_sku_qty(po_lines: pd.DataFrame) -> List[Tuple[str, object]]:
+    """Distinct (SKU, quantity) pairs for a PO, in line order."""
+    out: List[Tuple[str, object]] = []
+    seen: Set[str] = set()
+    if "SKU" not in po_lines.columns:
+        return out
+    for _, row in po_lines.iterrows():
+        sku = str(row.get("SKU") or "").strip()
+        if not sku or sku.upper() in seen:
+            continue
+        seen.add(sku.upper())
+        out.append((sku, row.get("Quantity")))
+    return out
+
+
+def _build_so_needs(all_sos: List[str], po_sku_set: Set[str],
+                      so_line_skus: Dict[str, set]
+                      ) -> List[Tuple[str, Optional[List[str]]]]:
+    """For each backorder SO, work out which of the PO's SKUs it
+    ACTUALLY needs (intersection of the SO's line items with the
+    PO's SKUs). Returns (so, [skus]) — or (so, None) when the
+    SO's lines can't be looked up.
+
+    SOs proven to need NONE of the PO's SKUs are dropped (those
+    are the cross-tag false positives). If that would drop every
+    SO, all are kept as 'unconfirmed' rather than posting an
+    empty reminder."""
+    needs: List[Tuple[str, Optional[List[str]]]] = []
+    for so in all_sos:
+        so_skus = so_line_skus.get(so)
+        if so_skus is None:
+            needs.append((so, None))      # couldn't look it up
+        else:
+            need = sorted(so_skus & po_sku_set)
+            if need:
+                needs.append((so, need))
+            # else: SO needs nothing from this PO — drop it.
+    if not needs and all_sos:
+        needs = [(so, None) for so in all_sos]
+    return needs
+
+
 def _load_purchases_and_lines() -> Tuple[Optional[pd.DataFrame],
                                                 Optional[pd.DataFrame]]:
     """Load the latest purchases + purchase_lines CSVs into
@@ -332,10 +434,16 @@ def _compose_reminder(po_number: str,
                           supplier: Optional[str],
                           received_status: str,
                           received_date: Optional[str],
-                          all_sos: List[str],
-                          line_ctx: List[dict]) -> str:
-    """Build the Slack message body. Mrkdwn formatting — bold for
-    the PO number, bullets for each backorder line."""
+                          po_sku_qty: List[Tuple[str, object]],
+                          so_needs: List[Tuple[str,
+                                               Optional[List[str]]]]
+                          ) -> str:
+    """v2.67.240 — two-part Slack message (Brandon's request):
+    1. the SKUs on this PO, and
+    2. the sales orders waiting on one or more of those SKUs,
+       each with the SPECIFIC SKUs it needs.
+    Replaces the old per-line layout that cross-tagged every SO
+    against every SKU."""
     header_bits = [f"📦 *{po_number} received*"]
     if supplier:
         header_bits.append(f"({supplier}")
@@ -349,14 +457,26 @@ def _compose_reminder(po_number: str,
     if "PARTIAL" in (received_status or "").upper():
         header += "  _(partial delivery)_"
 
-    lines: List[str] = [header, "", "*Backorders to dispatch:*"]
-    for ctx in line_ctx:
-        sku = ctx.get("sku") or "?"
-        qty = ctx.get("quantity")
-        sos_str = " · ".join(ctx["sos"])
+    lines: List[str] = [header, "", "*SKUs on this PO:*"]
+    for sku, qty in po_sku_qty:
         qty_str = (f" × {int(qty)}" if qty is not None
                      and not pd.isna(qty) else "")
-        lines.append(f"• {sos_str} — `{sku}`{qty_str}")
+        lines.append(f"• `{sku}`{qty_str}")
+
+    lines.append("")
+    lines.append("*Sales orders waiting on one or more of these "
+                  "SKUs:*")
+    if so_needs:
+        for so, skus in so_needs:
+            if skus:
+                _s = " · ".join(f"`{s}`" for s in skus)
+                lines.append(f"• {so} — needs {_s}")
+            else:
+                lines.append(
+                    f"• {so} — _which SKUs unconfirmed; check "
+                    f"the SO_")
+    else:
+        lines.append("• _(none identified)_")
     lines.append("")
     lines.append("_Please pick these orders first when this PO "
                   "arrives in the warehouse._")
@@ -468,6 +588,8 @@ def scan_and_notify(dryrun: bool = False,
     # typed into PO comments months ago that have since been
     # shipped from other stock).
     open_so_set = _load_open_so_set()
+    # v2.67.240 — SO->SKU map for the per-SO SKU breakdown.
+    so_line_skus = _load_so_line_skus()
 
     for _, po in eligible.iterrows():
         po_number = str(po.get("OrderNumber") or "").strip()
@@ -600,8 +722,15 @@ def scan_and_notify(dryrun: bool = False,
                 received_date = str(po.get(cand))[:10]
                 break
 
+        # v2.67.240 — list the PO's SKUs, then map each backorder
+        # SO to the SKUs it ACTUALLY needs (not every line).
+        po_sku_qty = _po_sku_qty(po_lines)
+        po_sku_set = {s.upper() for s, _ in po_sku_qty}
+        so_needs = _build_so_needs(all_sos, po_sku_set,
+                                     so_line_skus)
         msg = _compose_reminder(po_number, supplier, status,
-                                    received_date, all_sos, line_ctx)
+                                    received_date, po_sku_qty,
+                                    so_needs)
         log.info("PO %s: %d SOs (%s) %s",
                   po_number, len(all_sos),
                   ", ".join(all_sos[:5])
@@ -1010,19 +1139,19 @@ def cmd_one(args: argparse.Namespace) -> int:
                   "Line fields scanned: %s",
                   _HEADER_COMMENT_FIELDS, _COMMENT_FIELDS)
         return 0
-    if header_sos and not line_ctx:
-        line_ctx = [{
-            "sku": "(see PO)",
-            "quantity": None,
-            "sos": header_sos,
-        }]
+    # v2.67.240 — same two-part composition as the production
+    # flow: PO SKUs + per-SO needed-SKU breakdown.
+    po_sku_qty = _po_sku_qty(lines_for)
+    po_sku_set = {s.upper() for s, _ in po_sku_qty}
+    so_needs = _build_so_needs(
+        all_sos, po_sku_set, _load_so_line_skus())
     msg = _compose_reminder(
         args.po,
         po.get("Supplier"),
         po.get("CombinedReceivingStatus") or "",
         None,
-        all_sos,
-        line_ctx,
+        po_sku_qty,
+        so_needs,
     )
     print(msg)
     return 0
