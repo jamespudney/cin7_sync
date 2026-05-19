@@ -1186,6 +1186,37 @@ CREATE TABLE IF NOT EXISTS cashflow_forecast (
     PRIMARY KEY (week_start, row_key)
 );
 
+-- v2.67.234 Cashflow scenarios — named what-if copies of the
+-- forecast. The 'base' forecast lives in cashflow_forecast above;
+-- each named scenario gets its own cell set here (cloned from
+-- base on creation, then edited freely without touching base).
+CREATE TABLE IF NOT EXISTS cashflow_scenarios (
+    name        TEXT PRIMARY KEY,
+    created_by  TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS cashflow_scenario_forecast (
+    scenario    TEXT NOT NULL,
+    week_start  TEXT NOT NULL,
+    row_key     TEXT NOT NULL,
+    amount      REAL,
+    updated_at  TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_by  TEXT,
+    PRIMARY KEY (scenario, week_start, row_key)
+);
+-- Custom (user-added) forecast line items. scenario='base' for
+-- rows added to the live forecast; a scenario name for rows that
+-- exist only in that what-if.
+CREATE TABLE IF NOT EXISTS cashflow_custom_rows (
+    scenario    TEXT NOT NULL DEFAULT 'base',
+    row_key     TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'outflow',  -- inflow|outflow
+    sort_order  INTEGER NOT NULL DEFAULT 100,
+    created_at  TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (scenario, row_key)
+);
+
 -- v2.67.126 Viktor bridge sessions. When the dashboard's AI
 -- Assistant posts to Slack on a user's behalf to forward a
 -- marketing question to Viktor, we record the post here so we
@@ -2829,51 +2860,187 @@ def delete_manual_payable(payable_id: int) -> None:
 # ---------------------------------------------------------------------------
 def set_forecast_cell(week_start: str, row_key: str,
                      amount: Optional[float],
-                     updated_by: Optional[str] = None) -> None:
-    """Upsert one forecast cell (week × line-item)."""
+                     updated_by: Optional[str] = None,
+                     scenario: str = "base") -> None:
+    """Upsert one forecast cell. scenario='base' writes the live
+    forecast; any other name writes that what-if scenario."""
     with connect() as c:
-        c.execute(
-            "INSERT INTO cashflow_forecast "
-            "(week_start, row_key, amount, updated_at, updated_by) "
-            "VALUES (?, ?, ?, datetime('now'), ?) "
-            "ON CONFLICT(week_start, row_key) DO UPDATE SET "
-            "  amount = excluded.amount, "
-            "  updated_at = datetime('now'), "
-            "  updated_by = excluded.updated_by",
-            (week_start, row_key, amount, updated_by))
+        if scenario == "base":
+            c.execute(
+                "INSERT INTO cashflow_forecast "
+                "(week_start, row_key, amount, updated_at, "
+                " updated_by) "
+                "VALUES (?, ?, ?, datetime('now'), ?) "
+                "ON CONFLICT(week_start, row_key) DO UPDATE SET "
+                "  amount = excluded.amount, "
+                "  updated_at = datetime('now'), "
+                "  updated_by = excluded.updated_by",
+                (week_start, row_key, amount, updated_by))
+        else:
+            c.execute(
+                "INSERT INTO cashflow_scenario_forecast "
+                "(scenario, week_start, row_key, amount, "
+                " updated_at, updated_by) "
+                "VALUES (?, ?, ?, ?, datetime('now'), ?) "
+                "ON CONFLICT(scenario, week_start, row_key) "
+                "DO UPDATE SET "
+                "  amount = excluded.amount, "
+                "  updated_at = datetime('now'), "
+                "  updated_by = excluded.updated_by",
+                (scenario, week_start, row_key, amount,
+                  updated_by))
 
 
 def bulk_set_forecast(cells: list,
-                     updated_by: Optional[str] = None) -> None:
+                     updated_by: Optional[str] = None,
+                     scenario: str = "base") -> None:
     """Upsert many forecast cells at once. `cells` is a list of
     (week_start, row_key, amount) tuples."""
     for week_start, row_key, amount in cells:
-        set_forecast_cell(week_start, row_key, amount, updated_by)
+        set_forecast_cell(week_start, row_key, amount,
+                          updated_by, scenario)
 
 
-def get_forecast() -> dict:
-    """Return the whole forecast grid as a dict keyed by
-    (week_start, row_key) -> amount."""
+def get_forecast(scenario: str = "base") -> dict:
+    """Return a forecast grid as a dict keyed by
+    (week_start, row_key) -> amount. scenario='base' = the live
+    forecast; any other name = that what-if scenario."""
     with connect() as c:
-        rows = c.execute(
-            "SELECT week_start, row_key, amount "
-            "FROM cashflow_forecast").fetchall()
+        if scenario == "base":
+            rows = c.execute(
+                "SELECT week_start, row_key, amount "
+                "FROM cashflow_forecast").fetchall()
+        else:
+            rows = c.execute(
+                "SELECT week_start, row_key, amount "
+                "FROM cashflow_scenario_forecast "
+                "WHERE scenario = ?", (scenario,)).fetchall()
     return {(r["week_start"], r["row_key"]): r["amount"]
             for r in rows}
 
 
-def get_forecast_owners() -> dict:
-    """Return {(week_start, row_key): updated_by} for the whole
-    forecast grid. Used by the sales-projection feature to tell a
-    human-edited cell (updated_by = a display name) apart from an
-    auto-projected one (updated_by = 'auto:sales') so a re-project
-    never silently overwrites a manual override."""
+def get_forecast_owners(scenario: str = "base") -> dict:
+    """Return {(week_start, row_key): updated_by} for a forecast
+    grid. Used by the sales-projection feature to tell a human-
+    edited cell apart from an auto-projected one."""
     with connect() as c:
-        rows = c.execute(
-            "SELECT week_start, row_key, updated_by "
-            "FROM cashflow_forecast").fetchall()
+        if scenario == "base":
+            rows = c.execute(
+                "SELECT week_start, row_key, updated_by "
+                "FROM cashflow_forecast").fetchall()
+        else:
+            rows = c.execute(
+                "SELECT week_start, row_key, updated_by "
+                "FROM cashflow_scenario_forecast "
+                "WHERE scenario = ?", (scenario,)).fetchall()
     return {(r["week_start"], r["row_key"]): r["updated_by"]
             for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Cashflow scenarios — named what-if copies (v2.67.234)
+# ---------------------------------------------------------------------------
+def list_scenarios() -> list:
+    """Return all named what-if scenarios (not 'base')."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT name, created_by, created_at "
+            "FROM cashflow_scenarios "
+            "ORDER BY created_at").fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_scenario(name: str,
+                    created_by: Optional[str] = None) -> None:
+    """Create a what-if scenario as a CLONE of the base forecast
+    — copies every base cell and base custom row into the new
+    scenario so the user starts from the live position."""
+    with connect() as c:
+        c.execute(
+            "INSERT INTO cashflow_scenarios (name, created_by) "
+            "VALUES (?, ?)", (name, created_by))
+        base_cells = c.execute(
+            "SELECT week_start, row_key, amount "
+            "FROM cashflow_forecast").fetchall()
+        for r in base_cells:
+            c.execute(
+                "INSERT INTO cashflow_scenario_forecast "
+                "(scenario, week_start, row_key, amount, "
+                " updated_by) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scenario, week_start, row_key) "
+                "DO NOTHING",
+                (name, r["week_start"], r["row_key"],
+                  r["amount"], created_by))
+        base_rows = c.execute(
+            "SELECT row_key, label, kind, sort_order "
+            "FROM cashflow_custom_rows "
+            "WHERE scenario = 'base'").fetchall()
+        for r in base_rows:
+            c.execute(
+                "INSERT INTO cashflow_custom_rows "
+                "(scenario, row_key, label, kind, sort_order) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scenario, row_key) DO NOTHING",
+                (name, r["row_key"], r["label"], r["kind"],
+                  r["sort_order"]))
+
+
+def delete_scenario(name: str) -> None:
+    """Delete a what-if scenario and all its cells/custom rows.
+    Refuses to touch 'base'."""
+    if name == "base":
+        return
+    with connect() as c:
+        c.execute("DELETE FROM cashflow_scenario_forecast "
+                    "WHERE scenario = ?", (name,))
+        c.execute("DELETE FROM cashflow_custom_rows "
+                    "WHERE scenario = ?", (name,))
+        c.execute("DELETE FROM cashflow_scenarios "
+                    "WHERE name = ?", (name,))
+
+
+# ---------------------------------------------------------------------------
+# Cashflow custom rows — user-added forecast line items (v2.67.234)
+# ---------------------------------------------------------------------------
+def get_custom_rows(scenario: str = "base") -> list:
+    """Return custom (user-added) forecast rows for a scenario,
+    each a dict with row_key/label/kind/sort_order."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT row_key, label, kind, sort_order "
+            "FROM cashflow_custom_rows WHERE scenario = ? "
+            "ORDER BY sort_order, row_key", (scenario,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_custom_row(scenario: str, row_key: str, label: str,
+                  kind: str = "outflow") -> None:
+    """Add (or relabel) a custom forecast line item."""
+    with connect() as c:
+        c.execute(
+            "INSERT INTO cashflow_custom_rows "
+            "(scenario, row_key, label, kind) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(scenario, row_key) DO UPDATE SET "
+            "  label = excluded.label, kind = excluded.kind",
+            (scenario, row_key, label, kind))
+
+
+def delete_custom_row(scenario: str, row_key: str) -> None:
+    """Remove a custom row and its cells from a scenario."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM cashflow_custom_rows "
+            "WHERE scenario = ? AND row_key = ?",
+            (scenario, row_key))
+        if scenario == "base":
+            c.execute("DELETE FROM cashflow_forecast "
+                        "WHERE row_key = ?", (row_key,))
+        else:
+            c.execute(
+                "DELETE FROM cashflow_scenario_forecast "
+                "WHERE scenario = ? AND row_key = ?",
+                (scenario, row_key))
 
 
 # ---------------------------------------------------------------------------
@@ -3167,6 +3334,39 @@ _PG_POST_CUTOVER_TABLES = [
           updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_by  TEXT,
           PRIMARY KEY (week_start, row_key)
+      );
+      """),
+    # v2.67.234 — Cashflow scenario planning tables.
+    ("cashflow_scenarios",
+      """
+      CREATE TABLE IF NOT EXISTS cashflow_scenarios (
+          name        TEXT PRIMARY KEY,
+          created_by  TEXT,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("cashflow_scenario_forecast",
+      """
+      CREATE TABLE IF NOT EXISTS cashflow_scenario_forecast (
+          scenario    TEXT NOT NULL,
+          week_start  TEXT NOT NULL,
+          row_key     TEXT NOT NULL,
+          amount      DOUBLE PRECISION,
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_by  TEXT,
+          PRIMARY KEY (scenario, week_start, row_key)
+      );
+      """),
+    ("cashflow_custom_rows",
+      """
+      CREATE TABLE IF NOT EXISTS cashflow_custom_rows (
+          scenario    TEXT NOT NULL DEFAULT 'base',
+          row_key     TEXT NOT NULL,
+          label       TEXT NOT NULL,
+          kind        TEXT NOT NULL DEFAULT 'outflow',
+          sort_order  INTEGER NOT NULL DEFAULT 100,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (scenario, row_key)
       );
       """),
 ]
