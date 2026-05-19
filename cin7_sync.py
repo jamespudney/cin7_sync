@@ -364,13 +364,42 @@ def _flatten(row: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str,
     return out
 
 
+# v2.67.238 — how many timestamped snapshots to KEEP per output
+# name (per extension). Older ones are pruned after every write.
+# Without this the /data disk fills: nearsync runs every 15 min
+# and write_outputs left every snapshot behind forever — the disk
+# filled and ALL syncs started failing with ENOSPC.
+_OUTPUT_KEEP = int(os.environ.get("OUTPUT_SNAPSHOTS_KEEP", "6") or 6)
+
+
+def _prune_old_outputs(name: str, keep: int = _OUTPUT_KEEP) -> None:
+    """Keep only the newest `keep` timestamped files for this
+    output name (each extension separately); delete the rest.
+    Best-effort — never raises."""
+    for ext in ("csv", "json"):
+        try:
+            files = sorted(
+                OUTPUT_DIR.glob(f"{name}_*.{ext}"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True)
+        except OSError:
+            continue
+        for old in files[keep:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
 def write_outputs(name: str, rows: List[Dict[str, Any]]) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     json_path = OUTPUT_DIR / f"{name}_{stamp}.json"
     csv_path = OUTPUT_DIR / f"{name}_{stamp}.csv"
 
+    # v2.67.238 — compact JSON (no indent) to roughly halve the
+    # raw-dump size; the CSV is the file the app actually reads.
     json_path.write_text(
-        json.dumps(rows, indent=2, ensure_ascii=False, default=str),
+        json.dumps(rows, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
 
@@ -393,6 +422,8 @@ def write_outputs(name: str, rows: List[Dict[str, Any]]) -> Path:
 
     log.info("Wrote %d rows -> %s", len(rows), csv_path.name)
     log.info("          and -> %s", json_path.name)
+    # v2.67.238 — prune old snapshots so /data can't fill up.
+    _prune_old_outputs(name)
     return csv_path
 
 
