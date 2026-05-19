@@ -1217,6 +1217,24 @@ CREATE TABLE IF NOT EXISTS cashflow_custom_rows (
     PRIMARY KEY (scenario, row_key)
 );
 
+-- v2.67.235 Cashflow loans — private / term loan register. The
+-- amortization schedule is computed deterministically from these
+-- params by loan_amortization.py (Actual/365 simple interest).
+CREATE TABLE IF NOT EXISTS cashflow_loans (
+    loan_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    lender             TEXT NOT NULL,
+    principal          REAL NOT NULL,
+    apr                REAL NOT NULL,        -- annual %, e.g. 6.5
+    start_date         TEXT NOT NULL,        -- YYYY-MM-DD
+    first_payment_date TEXT NOT NULL,
+    monthly_payment    REAL NOT NULL,
+    forecast_row_key   TEXT,                 -- forecast row to feed
+    notes              TEXT,
+    active             INTEGER NOT NULL DEFAULT 1,
+    created_at         TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    updated_at         TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.67.126 Viktor bridge sessions. When the dashboard's AI
 -- Assistant posts to Slack on a user's behalf to forward a
 -- marketing question to Viktor, we record the post here so we
@@ -3044,6 +3062,80 @@ def delete_custom_row(scenario: str, row_key: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cashflow loans (v2.67.235)
+# ---------------------------------------------------------------------------
+_LOAN_UPDATABLE = (
+    "lender", "principal", "apr", "start_date",
+    "first_payment_date", "monthly_payment", "forecast_row_key",
+    "notes", "active",
+)
+
+
+def add_loan(lender: str, principal: float, apr: float,
+            start_date: str, first_payment_date: str,
+            monthly_payment: float,
+            forecast_row_key: Optional[str] = None,
+            notes: Optional[str] = None) -> int:
+    """Register a loan. The amortization schedule is computed on
+    demand by loan_amortization.py — only the params are stored."""
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO cashflow_loans "
+            "(lender, principal, apr, start_date, "
+            " first_payment_date, monthly_payment, "
+            " forecast_row_key, notes, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+            "        datetime('now'), datetime('now'))",
+            (lender, principal, apr, start_date,
+              first_payment_date, monthly_payment,
+              forecast_row_key, notes))
+        return int(cur.lastrowid)
+
+
+def list_loans(active_only: bool = True) -> list:
+    """Return registered loans."""
+    sql = "SELECT * FROM cashflow_loans"
+    if active_only:
+        sql += " WHERE active = 1"
+    sql += " ORDER BY loan_id"
+    with connect() as c:
+        rows = c.execute(sql).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_loan(loan_id: int) -> Optional[dict]:
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM cashflow_loans WHERE loan_id = ?",
+            (loan_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def update_loan(loan_id: int, fields: dict) -> None:
+    """Update whitelisted loan columns."""
+    sets = []
+    vals: list = []
+    for col, val in (fields or {}).items():
+        if col in _LOAN_UPDATABLE:
+            sets.append(f"{col} = ?")
+            vals.append(val)
+    if not sets:
+        return
+    sets.append("updated_at = datetime('now')")
+    vals.append(loan_id)
+    with connect() as c:
+        c.execute(
+            f"UPDATE cashflow_loans SET {', '.join(sets)} "
+            f"WHERE loan_id = ?", vals)
+
+
+def delete_loan(loan_id: int) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM cashflow_loans WHERE loan_id = ?",
+                    (loan_id,))
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge sessions (v2.67.126)
 # ---------------------------------------------------------------------------
 def create_viktor_bridge_session(session_id: str, user_id: int,
@@ -3367,6 +3459,23 @@ _PG_POST_CUTOVER_TABLES = [
           sort_order  INTEGER NOT NULL DEFAULT 100,
           created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY (scenario, row_key)
+      );
+      """),
+    ("cashflow_loans",
+      """
+      CREATE TABLE IF NOT EXISTS cashflow_loans (
+          loan_id            SERIAL PRIMARY KEY,
+          lender             TEXT NOT NULL,
+          principal          DOUBLE PRECISION NOT NULL,
+          apr                DOUBLE PRECISION NOT NULL,
+          start_date         TEXT NOT NULL,
+          first_payment_date TEXT NOT NULL,
+          monthly_payment    DOUBLE PRECISION NOT NULL,
+          forecast_row_key   TEXT,
+          notes              TEXT,
+          active             INTEGER NOT NULL DEFAULT 1,
+          created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       """),
 ]

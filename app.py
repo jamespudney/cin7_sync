@@ -22212,6 +22212,130 @@ elif page == "Cashflow":
             "colour is inverted — a lower outflow is the good "
             "direction.")
 
+    # ---- Loans & debt (v2.67.235) ----------------------------------
+    st.divider()
+    st.subheader(":bank: Loans & debt")
+    st.caption(
+        "Term / private loans with a deterministic Actual/365 "
+        "amortization schedule — the app computes every payment, "
+        "the interest / principal split and the payoff date. "
+        "Push the schedule into the forecast to see the loan in "
+        "your cash projection.")
+    import loan_amortization as _loan_amort
+
+    try:
+        _cf_loans = db.list_loans(active_only=True)
+    except Exception as _exc:  # noqa: BLE001
+        _cf_loans = []
+        st.error(f"Could not load loans: {_exc}")
+
+    _cf_out_keys = [rk for rk, _ in _CF_OUTFLOWS]
+    for _ln in _cf_loans:
+        with st.expander(
+                f"{_ln['lender']} — "
+                f"{_fmt_money(_ln['principal'])} @ "
+                f"{_ln['apr']}%", expanded=False):
+            _sched = _loan_amort.compute_schedule(
+                _ln["principal"], _ln["apr"], _ln["start_date"],
+                _ln["first_payment_date"],
+                _ln["monthly_payment"])
+            _summ = _loan_amort.schedule_summary(_sched)
+            _lm = st.columns(4)
+            _lm[0].metric("Payoff date",
+                          _summ["payoff_date"] or "—")
+            _lm[1].metric("Total payments", _summ["periods"])
+            _lm[2].metric("Total interest",
+                          _fmt_money(_summ["total_interest"]))
+            _lm[3].metric("Total to repay",
+                          _fmt_money(_summ["total_paid"]))
+            if _sched:
+                _sdf = pd.DataFrame(_sched)
+                _sdf.columns = ["Date", "Opening", "Interest",
+                                "Principal", "Payment", "Closing"]
+                st.dataframe(
+                    _sdf.style.format({
+                        _c: "{:,.2f}" for _c in
+                        ("Opening", "Interest", "Principal",
+                         "Payment", "Closing")}),
+                    use_container_width=True, hide_index=True)
+            _push_cols = st.columns([2, 1, 1])
+            _default_row = (_ln.get("forecast_row_key")
+                            or "ben_loan")
+            with _push_cols[0]:
+                _push_row = st.selectbox(
+                    "Forecast outflow row", _cf_out_keys,
+                    index=(_cf_out_keys.index(_default_row)
+                           if _default_row in _cf_out_keys
+                           else 0),
+                    key=f"_cf_loan_row_{_ln['loan_id']}")
+            with _push_cols[1]:
+                st.write("")
+                st.write("")
+                if st.button("Push to forecast",
+                             key=f"_cf_loan_push_"
+                                 f"{_ln['loan_id']}"):
+                    _n = 0
+                    for _r in _sched:
+                        _wk = _cf_week_monday(
+                            pd.Timestamp(_r["date"]))
+                        db.set_forecast_cell(
+                            _wk.strftime("%Y-%m-%d"), _push_row,
+                            _r["payment"], updated_by="auto:loan",
+                            scenario=_cf_scenario)
+                        _n += 1
+                    db.update_loan(
+                        _ln["loan_id"],
+                        {"forecast_row_key": _push_row})
+                    st.success(
+                        f"Pushed {_n} payment(s) into the "
+                        f"'{_push_row}' row.")
+                    st.rerun()
+            with _push_cols[2]:
+                st.write("")
+                st.write("")
+                if st.button("Remove loan",
+                             key=f"_cf_loan_del_"
+                                 f"{_ln['loan_id']}"):
+                    db.delete_loan(_ln["loan_id"])
+                    st.success("Loan removed.")
+                    st.rerun()
+
+    with st.expander(":heavy_plus_sign: Add a loan",
+                     expanded=(not _cf_loans)):
+        st.caption("Pre-filled with the Ben Jurgens loan — "
+                   "adjust as needed.")
+        _la1, _la2, _la3 = st.columns(3)
+        _l_lender = _la1.text_input(
+            "Lender", value="Ben Jurgens", key="_cf_l_lender")
+        _l_principal = _la2.number_input(
+            "Principal", value=160000.0, step=1000.0,
+            key="_cf_l_principal")
+        _l_apr = _la3.number_input(
+            "APR %", value=6.5, step=0.25, key="_cf_l_apr")
+        _la4, _la5, _la6 = st.columns(3)
+        _l_start = _la4.text_input(
+            "Start date (YYYY-MM-DD)", value="2025-11-26",
+            key="_cf_l_start")
+        _l_first = _la5.text_input(
+            "First payment (YYYY-MM-DD)", value="2026-01-01",
+            key="_cf_l_first")
+        _l_monthly = _la6.number_input(
+            "Monthly payment", value=12500.0, step=500.0,
+            key="_cf_l_monthly")
+        if st.button("Add loan", key="_cf_l_add"):
+            if not (_l_lender or "").strip():
+                st.warning("Enter a lender name.")
+            else:
+                try:
+                    db.add_loan(
+                        _l_lender.strip(), float(_l_principal),
+                        float(_l_apr), _l_start.strip(),
+                        _l_first.strip(), float(_l_monthly))
+                    st.success(f"Loan '{_l_lender}' added.")
+                    st.rerun()
+                except Exception as _exc:  # noqa: BLE001
+                    st.error(f"Could not add loan: {_exc}")
+
 
 # ---------------------------------------------------------------------------
 # v2.67.185 — User Permissions admin page
