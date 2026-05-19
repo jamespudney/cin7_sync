@@ -21617,6 +21617,60 @@ elif page == "Cashflow":
         "**Supplier payables** outflow row is filled automatically "
         "from the tracker above (bills bucketed by due date).")
 
+    # ---- Scenario selector (v2.67.234) -------------------------
+    try:
+        _cf_scen_list = db.list_scenarios()
+    except Exception:  # noqa: BLE001
+        _cf_scen_list = []
+    _cf_scen_names = ["base"] + [s["name"] for s in _cf_scen_list]
+    _scsel, _scnew = st.columns([2, 3])
+    with _scsel:
+        _cf_scenario = st.selectbox(
+            "Scenario",
+            _cf_scen_names,
+            format_func=lambda n: ("Base forecast (live)"
+                                   if n == "base" else n),
+            key="_cf_scenario_sel",
+            help="'Base forecast' is your live forecast. Create "
+                 "a named what-if scenario to model changes "
+                 "without touching it.")
+    with _scnew:
+        _cf_new_scen = st.text_input(
+            "New what-if scenario", key="_cf_new_scen",
+            placeholder="e.g. Refinance, Lower sales — then Create")
+        _nc1, _nc2 = st.columns(2)
+        with _nc1:
+            if st.button("Create scenario", key="_cf_create_scen"):
+                _nm = (_cf_new_scen or "").strip()
+                if not _nm or _nm.lower() == "base":
+                    st.warning("Enter a scenario name.")
+                elif _nm in _cf_scen_names:
+                    st.warning("That scenario already exists.")
+                else:
+                    try:
+                        db.create_scenario(_nm, current_user)
+                        st.success(
+                            f"Scenario '{_nm}' created — a clone "
+                            f"of the base forecast.")
+                        st.rerun()
+                    except Exception as _exc:  # noqa: BLE001
+                        st.error(f"Could not create: {_exc}")
+        with _nc2:
+            if (_cf_scenario != "base" and st.button(
+                    "Delete this scenario", key="_cf_del_scen")):
+                try:
+                    db.delete_scenario(_cf_scenario)
+                    st.success(
+                        f"Scenario '{_cf_scenario}' deleted.")
+                    st.rerun()
+                except Exception as _exc:  # noqa: BLE001
+                    st.error(f"Could not delete: {_exc}")
+    if _cf_scenario != "base":
+        st.info(
+            f":test_tube: Editing scenario **{_cf_scenario}** — "
+            f"changes here do NOT affect your live (base) "
+            f"forecast.")
+
     # v2.67.225 — the grid can start ANY week, not just the
     # current one, so past weeks can be reviewed and compared
     # against the spreadsheet. Set the start back to see history.
@@ -21650,7 +21704,7 @@ elif page == "Cashflow":
     _cf_col2key = dict(zip(_cf_wcol, _cf_wkey))
 
     try:
-        _cf_fc = db.get_forecast()
+        _cf_fc = db.get_forecast(_cf_scenario)
     except Exception as _exc:  # noqa: BLE001
         _cf_fc = {}
         st.error(f"Could not load forecast: {_exc}")
@@ -21710,7 +21764,7 @@ elif page == "Cashflow":
                     "from — the sales CSVs may not span back a "
                     "full year yet.")
             else:
-                _owners = db.get_forecast_owners()
+                _owners = db.get_forecast_owners(_cf_scenario)
                 _ps_set = _ps_kept = _ps_nodata = 0
                 for _wkey in _cf_wkey:
                     _prior = (pd.Timestamp(_wkey)
@@ -21730,7 +21784,8 @@ elif page == "Cashflow":
                         1 + float(_ps_growth) / 100.0)
                     db.set_forecast_cell(
                         _wkey, "forecast_sales", _proj,
-                        updated_by="auto:sales")
+                        updated_by="auto:sales",
+                        scenario=_cf_scenario)
                     _ps_set += 1
                 st.success(
                     f":white_check_mark: Projected {_ps_set} "
@@ -21805,7 +21860,8 @@ elif page == "Cashflow":
                     _wk = _cf_week_monday(_pdate)
                     db.set_forecast_cell(
                         _wk.strftime("%Y-%m-%d"), _rk, _amt,
-                        updated_by="auto:cc")
+                        updated_by="auto:cc",
+                        scenario=_cf_scenario)
                     _cc_done.append(
                         f"{_lbl}: {_fmt_money(_amt)} "
                         f"({_pdate.strftime('%m/%d')} · {_src})")
@@ -21847,7 +21903,7 @@ elif page == "Cashflow":
                 for a in _accts)
             db.set_forecast_cell(
                 _cf_tw_key, "opening_balance", _bank_total,
-                updated_by=current_user)
+                updated_by=current_user, scenario=_cf_scenario)
             st.success(
                 f"Opening balance for week "
                 f"{_cf_this_monday.strftime('%m/%d')} set to "
@@ -21885,9 +21941,20 @@ elif page == "Cashflow":
     # ---- Editable grid (line items) ----
     # Opening balance is the first row — James edits each week's
     # actual here. It is NOT summed into inflows/outflows; the
-    # projection reads it separately.
+    # projection reads it separately. Custom (user-added) rows for
+    # this scenario slot in after the built-in inflow/outflow sets.
+    try:
+        _cf_custom = db.get_custom_rows(_cf_scenario)
+    except Exception:  # noqa: BLE001
+        _cf_custom = []
+    _cf_inflow_rows = list(_CF_INFLOWS) + [
+        (r["row_key"], r["label"]) for r in _cf_custom
+        if r.get("kind") == "inflow"]
+    _cf_outflow_rows = list(_CF_OUTFLOWS) + [
+        (r["row_key"], r["label"]) for r in _cf_custom
+        if r.get("kind") != "inflow"]
     _cf_rows = ([("opening_balance", "Opening balance (actual)")]
-                + _CF_INFLOWS + _CF_OUTFLOWS)
+                + _cf_inflow_rows + _cf_outflow_rows)
     _cf_grid = {}
     for _rk, _label in _cf_rows:
         _cf_grid[_label] = [
@@ -21923,12 +21990,65 @@ elif page == "Cashflow":
                     _cells.append((_wk, _rk, _new))
                     _n_cells += 1
         try:
-            db.bulk_set_forecast(_cells, updated_by=current_user)
+            db.bulk_set_forecast(_cells, updated_by=current_user,
+                                 scenario=_cf_scenario)
             st.success(f":white_check_mark: Saved {_n_cells} "
                        f"forecast cell(s).")
             st.rerun()
         except Exception as _exc:  # noqa: BLE001
             st.error(f"Could not save forecast: {_exc}")
+
+    # ---- Add / remove custom rows (v2.67.234) ----
+    with st.expander(":heavy_plus_sign: Add or remove a custom "
+                     "forecast row", expanded=False):
+        st.caption(
+            "Custom rows apply to "
+            + ("the base forecast"
+               if _cf_scenario == "base"
+               else f"scenario '{_cf_scenario}'")
+            + ". Use them for one-off items, new costs or extra "
+            "income not covered by the standard rows.")
+        _arc1, _arc2, _arc3 = st.columns([3, 1, 1])
+        _ar_label = _arc1.text_input(
+            "New row label", key="_cf_ar_label")
+        _ar_kind = _arc2.selectbox(
+            "Type", ["outflow", "inflow"], key="_cf_ar_kind")
+        with _arc3:
+            st.write("")
+            st.write("")
+            if st.button("Add", key="_cf_ar_add"):
+                _lbl = (_ar_label or "").strip()
+                if not _lbl:
+                    st.warning("Enter a row label.")
+                else:
+                    _rk = "custom_" + "".join(
+                        _c if _c.isalnum() else "_"
+                        for _c in _lbl.lower())[:40].strip("_")
+                    try:
+                        db.add_custom_row(_cf_scenario, _rk,
+                                          _lbl, _ar_kind)
+                        st.success(f"Row '{_lbl}' added.")
+                        st.rerun()
+                    except Exception as _exc:  # noqa: BLE001
+                        st.error(f"Could not add row: {_exc}")
+        if _cf_custom:
+            _ar_del = st.selectbox(
+                "Remove a custom row",
+                ["—"] + [r["label"] for r in _cf_custom],
+                key="_cf_ar_del")
+            if _ar_del != "—" and st.button(
+                    "Remove row", key="_cf_ar_delbtn"):
+                _rk_del = next(
+                    (r["row_key"] for r in _cf_custom
+                     if r["label"] == _ar_del), None)
+                if _rk_del:
+                    try:
+                        db.delete_custom_row(_cf_scenario,
+                                             _rk_del)
+                        st.success(f"Row '{_ar_del}' removed.")
+                        st.rerun()
+                    except Exception as _exc:  # noqa: BLE001
+                        st.error(f"Could not remove: {_exc}")
 
     # ---- Projection (read-only, derived) ----
     # A week's opening balance is the ACTUAL entered for that week
@@ -21959,9 +22079,9 @@ elif page == "Cashflow":
         else:
             _variance = None
         _in = sum(float(_cf_fc.get((_wk, rk)) or 0.0)
-                  for rk, _ in _CF_INFLOWS)
+                  for rk, _ in _cf_inflow_rows)
         _out_manual = sum(float(_cf_fc.get((_wk, rk)) or 0.0)
-                          for rk, _ in _CF_OUTFLOWS)
+                          for rk, _ in _cf_outflow_rows)
         _sup = _cf_supplier_due.get(_wk, 0.0)
         _out = _out_manual + _sup
         _net = _in - _out
@@ -22023,6 +22143,74 @@ elif page == "Cashflow":
             ":rotating_light: Projection dips **below zero** — "
             "the forecast shows a cash shortfall. Review the "
             "weeks above.")
+
+    # ---- Scenario vs base comparison (v2.67.234) ----
+    if _cf_scenario != "base":
+        def _cf_run_projection(_fc, _in_rows, _out_rows):
+            _r = None
+            _cl = []
+            _ti = _to = 0.0
+            for _w in _cf_wkey:
+                _ao = _fc.get((_w, "opening_balance"))
+                if _ao is not None:
+                    _op = float(_ao)
+                elif _r is not None:
+                    _op = _r
+                else:
+                    _op = 0.0
+                _i = sum(float(_fc.get((_w, rk)) or 0.0)
+                         for rk, _ in _in_rows)
+                _om = sum(float(_fc.get((_w, rk)) or 0.0)
+                          for rk, _ in _out_rows)
+                _o = _om + _cf_supplier_due.get(_w, 0.0)
+                _c = _op + _i - _o
+                _cl.append(_c)
+                _ti += _i
+                _to += _o
+                _r = _c
+            return _cl, _ti, _to
+
+        def _cf_delta(v):
+            _s = _fmt_money(abs(v))
+            return ("+" + _s) if v >= 0 else ("-" + _s)
+
+        try:
+            _base_fc = db.get_forecast("base")
+            _base_custom = db.get_custom_rows("base")
+        except Exception:  # noqa: BLE001
+            _base_fc, _base_custom = {}, []
+        _base_in = list(_CF_INFLOWS) + [
+            (r["row_key"], r["label"]) for r in _base_custom
+            if r.get("kind") == "inflow"]
+        _base_out = list(_CF_OUTFLOWS) + [
+            (r["row_key"], r["label"]) for r in _base_custom
+            if r.get("kind") != "inflow"]
+        _b_cl, _b_ti, _b_to = _cf_run_projection(
+            _base_fc, _base_in, _base_out)
+        _s_cl, _s_ti, _s_to = _cf_run_projection(
+            _cf_fc, _cf_inflow_rows, _cf_outflow_rows)
+        _s_end = _s_cl[-1] if _s_cl else 0.0
+        _b_end = _b_cl[-1] if _b_cl else 0.0
+        _s_low = min(_s_cl) if _s_cl else 0.0
+        _b_low = min(_b_cl) if _b_cl else 0.0
+        st.divider()
+        st.markdown(
+            f"**Scenario `{_cf_scenario}` vs base forecast** — "
+            f"summary over {_cf_horizon} weeks")
+        _sc = st.columns(4)
+        _sc[0].metric("Closing balance", _fmt_money(_s_end),
+                      delta=_cf_delta(_s_end - _b_end))
+        _sc[1].metric("Lowest week", _fmt_money(_s_low),
+                      delta=_cf_delta(_s_low - _b_low))
+        _sc[2].metric("Total inflows", _fmt_money(_s_ti),
+                      delta=_cf_delta(_s_ti - _b_ti))
+        _sc[3].metric("Total outflows", _fmt_money(_s_to),
+                      delta=_cf_delta(_s_to - _b_to),
+                      delta_color="inverse")
+        st.caption(
+            "Delta is scenario minus base. On outflows the "
+            "colour is inverted — a lower outflow is the good "
+            "direction.")
 
 
 # ---------------------------------------------------------------------------
