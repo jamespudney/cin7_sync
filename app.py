@@ -22357,6 +22357,102 @@ elif page == "Cashflow":
                 except Exception as _exc:  # noqa: BLE001
                     st.error(f"Could not add loan: {_exc}")
 
+    # ---- Daily cashflow calendar (v2.67.241) -----------------------
+    st.divider()
+    st.subheader(":calendar: Daily cashflow — which days are tight")
+    st.caption(
+        "Day-by-day view of money coming off for a chosen week — "
+        "supplier bills, credit-card payments and loan payments "
+        "by their actual date. Spot the tight days at a glance.")
+    import loan_amortization as _dc_loan
+
+    _dc_in = st.date_input(
+        "Week of", value=_cf_this_monday.date(), key="_dc_week")
+    _dc_ts = pd.Timestamp(_dc_in)
+    _dc_mon = _dc_ts - pd.Timedelta(days=_dc_ts.weekday())
+    _dc_days = [_dc_mon + pd.Timedelta(days=i) for i in range(7)]
+    _dc_events = {d.strftime("%Y-%m-%d"): [] for d in _dc_days}
+
+    # Supplier bills — by effective due date.
+    try:
+        for _p in db.list_payables(include_dismissed=False,
+                                   include_paid=False):
+            _d = (_p.get("due_date_override")
+                  or _p.get("due_date") or "")
+            if _d in _dc_events:
+                _a = _p.get("amount_override")
+                if _a is None:
+                    _a = _p.get("amount")
+                _dc_events[_d].append(
+                    (f"Supplier — {_p.get('supplier') or '?'}",
+                     float(_a or 0)))
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Credit-card payments — by payment day-of-month; amount from
+    # the base forecast cell for that card's row in the week.
+    try:
+        _dc_base_fc = db.get_forecast("base")
+    except Exception:  # noqa: BLE001
+        _dc_base_fc = {}
+    for _rk, _lbl, _acct, _payday, _close in _CF_CREDIT_CARDS:
+        for _d in _dc_days:
+            if _payday == "last":
+                _is_pay = ((_d + pd.Timedelta(days=1)).month
+                           != _d.month)
+            else:
+                _is_pay = (_d.day == int(_payday))
+            if not _is_pay:
+                continue
+            _wk = _cf_week_monday(_d).strftime("%Y-%m-%d")
+            _amt = float(_dc_base_fc.get((_wk, _rk)) or 0.0)
+            if _amt:
+                _dc_events[_d.strftime("%Y-%m-%d")].append(
+                    (f"Card — {_lbl}", _amt))
+
+    # Loan payments — by amortization-schedule date.
+    try:
+        for _ln in db.list_loans(active_only=True):
+            for _r in _dc_loan.compute_schedule(
+                    _ln["principal"], _ln["apr"],
+                    _ln["start_date"], _ln["first_payment_date"],
+                    _ln["monthly_payment"]):
+                if _r["date"] in _dc_events:
+                    _dc_events[_r["date"]].append(
+                        (f"Loan — {_ln['lender']}",
+                         float(_r["payment"])))
+    except Exception:  # noqa: BLE001
+        pass
+
+    _dc_rows = []
+    for _d in _dc_days:
+        _evs = _dc_events[_d.strftime("%Y-%m-%d")]
+        _tot = sum(_a for _, _a in _evs)
+        _dc_rows.append({
+            "Day": _d.strftime("%a %d %b"),
+            "Money out": " · ".join(
+                f"{_n} {_fmt_money(_a)}" for _n, _a in _evs)
+            or "—",
+            "Day total": _tot,
+        })
+    st.dataframe(
+        pd.DataFrame(_dc_rows).style.format(
+            {"Day total": "{:,.0f}"}),
+        use_container_width=True, hide_index=True)
+    _dc_wktot = sum(r["Day total"] for r in _dc_rows)
+    _dc_peak = max((r["Day total"] for r in _dc_rows),
+                   default=0.0)
+    _dcm1, _dcm2 = st.columns(2)
+    _dcm1.metric("Week's dated outflows", _fmt_money(_dc_wktot))
+    _dcm2.metric("Heaviest single day", _fmt_money(_dc_peak),
+                 help="The tightest day this week — line up cash "
+                      "or shift a payment before it.")
+    st.caption(
+        "Covers dated items only — supplier bills, credit cards "
+        "and loans. Weekly items (payroll, rent) live in the "
+        "forecast grid above. Use the payables 'Shift wks' "
+        "control to move a bill off a heavy day.")
+
 
 # ---------------------------------------------------------------------------
 # v2.67.185 — User Permissions admin page
