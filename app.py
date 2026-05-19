@@ -21304,10 +21304,123 @@ elif page == "Cashflow":
     else:
         st.caption("No supplier payments due in the next 30 days.")
 
-    st.caption(
-        ":information_source: Loan balances, credit-card balances "
-        "and Shopify Capital tiles will appear here once those "
-        "modules are built (next phases).")
+    # ---- Cashflow alerts (v2.67.242) ----
+    _alerts = []  # list of (severity, message); severity error|warn
+    _al_today = pd.Timestamp.today().normalize()
+    _al_cut7 = _al_today + pd.Timedelta(days=7)
+
+    # 1. Projected cash shortfall — 13-week base projection.
+    try:
+        _al_run = None
+        for _i in range(13):
+            _w = _dash_monday + pd.Timedelta(weeks=_i)
+            _wk = _w.strftime("%Y-%m-%d")
+            _ao = _dash_fc.get((_wk, "opening_balance"))
+            _op = (float(_ao) if _ao is not None
+                   else (_al_run if _al_run is not None else 0.0))
+            _ain = sum(float(_dash_fc.get((_wk, rk)) or 0.0)
+                       for rk, _ in _CF_INFLOWS)
+            _aout = sum(float(_dash_fc.get((_wk, rk)) or 0.0)
+                        for rk, _ in _CF_OUTFLOWS)
+            _asup = 0.0
+            for _p in _dash_pay:
+                _d = (_p.get("due_date_override")
+                      or _p.get("due_date") or "")
+                if not _d:
+                    continue
+                try:
+                    _pdt = pd.Timestamp(_d).normalize()
+                except Exception:  # noqa: BLE001
+                    continue
+                if (_cf_week_monday(_pdt).strftime("%Y-%m-%d")
+                        == _wk):
+                    _av = _p.get("amount_override")
+                    _asup += float(
+                        (_av if _av is not None
+                         else _p.get("amount")) or 0)
+            _acl = _op + _ain - _aout - _asup
+            if _acl < 0:
+                _alerts.append((
+                    "error",
+                    f":rotating_light: Projected cash shortfall "
+                    f"— week of {_w.strftime('%d %b')} closes at "
+                    f"{_fmt_money(_acl)}."))
+                break
+            _al_run = _acl
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2. Loan payments due within 7 days.
+    try:
+        import loan_amortization as _al_loan
+        for _ln in db.list_loans(active_only=True):
+            for _r in _al_loan.compute_schedule(
+                    _ln["principal"], _ln["apr"],
+                    _ln["start_date"], _ln["first_payment_date"],
+                    _ln["monthly_payment"]):
+                _rd = pd.Timestamp(_r["date"]).normalize()
+                if _al_today <= _rd <= _al_cut7:
+                    _alerts.append((
+                        "warn",
+                        f":bank: Loan payment due "
+                        f"{_rd.strftime('%d %b')} — "
+                        f"{_ln['lender']} "
+                        f"{_fmt_money(_r['payment'])}."))
+                    break
+                if _rd > _al_cut7:
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. Credit-card payments due within 7 days.
+    for _rk, _lbl, _acct, _payday, _close in _CF_CREDIT_CARDS:
+        try:
+            _cpd = _cf_next_payment_date(_payday)
+            if _al_today <= _cpd <= _al_cut7:
+                _alerts.append((
+                    "warn",
+                    f":credit_card: {_lbl} payment due "
+                    f"{_cpd.strftime('%d %b')}."))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 4. Supplier bills due within 7 days, not yet approved.
+    _al_due_soon = []
+    for _p in _dash_pay:
+        if (_p.get("status") or "pending") in (
+                "approved", "scheduled", "paid"):
+            continue
+        _d = (_p.get("due_date_override")
+              or _p.get("due_date") or "")
+        if not _d:
+            continue
+        try:
+            _pdt = pd.Timestamp(_d).normalize()
+        except Exception:  # noqa: BLE001
+            continue
+        if _al_today <= _pdt <= _al_cut7:
+            _al_due_soon.append(_p)
+    if _al_due_soon:
+        _ds_tot = sum(
+            float((_p.get("amount_override")
+                   if _p.get("amount_override") is not None
+                   else _p.get("amount")) or 0)
+            for _p in _al_due_soon)
+        _alerts.append((
+            "warn",
+            f":receipt: {len(_al_due_soon)} supplier bill(s) "
+            f"({_fmt_money(_ds_tot)}) due within 7 days and not "
+            f"yet approved."))
+
+    st.markdown("**:warning: Cashflow alerts**")
+    if _alerts:
+        for _sev, _msg in _alerts:
+            (st.error if _sev == "error" else st.warning)(_msg)
+    else:
+        st.success(
+            ":white_check_mark: No cashflow alerts — nothing "
+            "pressing in the next 7 days, projection stays "
+            "positive.")
 
     st.divider()
 
