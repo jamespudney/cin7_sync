@@ -2806,12 +2806,18 @@ def add_manual_payable(supplier: Optional[str],
 def list_payables(include_dismissed: bool = False,
                   include_paid: bool = True) -> list:
     """Return cashflow payables as a list of dicts, ordered by
-    due date (nulls last)."""
+    due date (nulls last). 'include_paid=False' excludes BOTH
+    rows whose local workflow status is 'paid' AND rows where
+    QBO reports zero outstanding balance — without that second
+    filter, paid QBO bills (status still 'pending' locally)
+    would inflate the dashboard's outstanding-payables total."""
     sql = "SELECT * FROM cashflow_payables WHERE 1=1"
     if not include_dismissed:
         sql += " AND is_dismissed = 0"
     if not include_paid:
-        sql += " AND status != 'paid'"
+        sql += (" AND status != 'paid' "
+                " AND NOT (qbo_balance IS NOT NULL "
+                "          AND qbo_balance <= 0)")
     sql += (" ORDER BY CASE WHEN due_date IS NULL OR due_date = '' "
             "THEN 1 ELSE 0 END, due_date, payable_id")
     with connect() as c:

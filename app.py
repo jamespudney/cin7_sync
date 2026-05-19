@@ -21228,6 +21228,11 @@ elif page == "Cashflow":
     _dash_out_total = sum(_dash_eff_amt(r) for r in _dash_pay)
     _dash_appr = sum(_dash_eff_amt(r) for r in _dash_pay
                      if r.get("status") == "approved")
+    # v2.67.244 — separate OVERDUE from "Due in next N days".
+    # The earlier filter was unbounded on the past, so a bill
+    # due 6 months ago was counted as "due in next 7 days",
+    # inflating the urgency to 90%+ of all outstanding.
+    _overdue_total = 0.0
     _due7 = 0.0
     _due30 = 0.0
     _due30_rows = []
@@ -21242,6 +21247,18 @@ elif page == "Cashflow":
         except Exception:  # noqa: BLE001
             continue
         _amt = _dash_eff_amt(r)
+        if _ddt < _dash_today:
+            _overdue_total += _amt
+            # Surface overdue bills in the 30-day table too so
+            # they don't disappear — flagged via Status.
+            _due30_rows.append({
+                "Due": _d,
+                "Supplier": r.get("supplier") or "",
+                "Reference": r.get("reference") or "",
+                "Amount": _amt,
+                "Status": "OVERDUE",
+            })
+            continue
         if _ddt <= _cut7:
             _due7 += _amt
         if _ddt <= _cut30:
@@ -21286,10 +21303,16 @@ elif page == "Cashflow":
     _d3.metric("Approved, awaiting payment",
                _fmt_money(_dash_appr))
 
-    _d4, _d5, _d6 = st.columns(3)
-    _d4.metric("Due in next 7 days", _fmt_money(_due7))
-    _d5.metric("Due in next 30 days", _fmt_money(_due30))
-    _d6.metric(f"This week's net (wk {_dash_monday.strftime('%m/%d')})",
+    _d4, _d5, _d6, _d7 = st.columns(4)
+    _d4.metric("Overdue", _fmt_money(_overdue_total),
+               help="Bills whose due date has already passed — "
+                    "settle, dispute, or shift the date.")
+    _d5.metric("Due in next 7 days", _fmt_money(_due7),
+               help="Effective due date between today and 7 "
+                    "days out — overdue bills are counted "
+                    "separately.")
+    _d6.metric("Due in next 30 days", _fmt_money(_due30))
+    _d7.metric(f"This week's net (wk {_dash_monday.strftime('%m/%d')})",
                _fmt_money(_wk_net),
                help="Forecast inflows minus outflows minus "
                     "supplier bills due this week.")
