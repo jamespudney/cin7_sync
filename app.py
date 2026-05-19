@@ -17508,7 +17508,7 @@ elif page == "Kits & Fixtures":
 #     answer; DB records prompt + tool calls + answer + feedback.
 #   - APP_PASSWORD-gated already — no extra auth needed.
 elif page == "AI Assistant":
-    st.header(":robot_face: AI Assistant")
+    st.header("🤖 AI Assistant")
     st.caption(
         "Ask natural-language questions about inventory, sales, "
         "dead stock, migrations, or velocity. The AI looks at live "
@@ -17945,7 +17945,7 @@ elif page == "AI Assistant":
                         with st.chat_message("assistant"):
                             _vb_placeholder = st.empty()
                             _vb_placeholder.markdown(
-                                ":satellite_antenna: _Marketing "
+                                "📡 _Marketing "
                                 "question — asking Viktor on your "
                                 "behalf in Slack…_")
                             try:
@@ -17978,7 +17978,7 @@ elif page == "AI Assistant":
                                 if _reply:
                                     _viktor_handled = True
                                     _combined = (
-                                        ":satellite_antenna: "
+                                        "📡 "
                                         "**Viktor:**\n\n"
                                         + (_reply["reply_text"] or "")
                                     )
@@ -19846,7 +19846,7 @@ elif page == "My Profile":
     # the dashboard with our engine-signal overlay.
     if _me.get("user_id"):
         st.divider()
-        st.subheader(":satellite_antenna: Connect Slack (for Viktor)")
+        st.subheader("📡 Connect Slack (for Viktor)")
         st.caption(
             "Authorise the dashboard to ask Viktor on your behalf "
             "when you ask marketing questions here. One-time "
@@ -21087,7 +21087,7 @@ elif page == "Cashflow":
         st.error(f"QBO modules unavailable: {_exc}")
 
     if _qbo_oauth is not None:
-        st.subheader(":satellite_antenna: QuickBooks Online connection")
+        st.subheader("📡 QuickBooks Online connection")
 
         _cf_role = (current_user_profile or {}).get("role") or "sales"
         _cf_name = ((current_user_profile or {}).get("display_name")
