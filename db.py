@@ -2296,6 +2296,28 @@ def resolve_stock_issue(issue_id: int, resolved_by: str,
             (resolved_by, (resolution_text or "")[:500], issue_id))
 
 
+def acknowledge_stock_issue(issue_id: int, ack_by: str,
+                                  ack_text: str) -> bool:
+    """v2.67.247 — mark a stock issue ACKNOWLEDGED by a human
+    reply that wasn't a strict resolution keyword. The morning
+    summary excludes acknowledged items (the team is on it) but
+    keeps them eligible for later 'fixed' / 'adjusted' style
+    resolution. Only transitions from open / awaiting_response /
+    escalated — won't overwrite a resolved row. Returns True if
+    a row was actually updated."""
+    with connect() as c:
+        cur = c.execute(
+            "UPDATE stock_issues SET "
+            "  status = 'acknowledged', "
+            "  resolved_at = datetime('now'), "
+            "  resolved_by = ?, resolution_text = ? "
+            "WHERE id = ? AND status IN "
+            "  ('open', 'awaiting_response', 'escalated')",
+            (ack_by, (ack_text or "")[:500], issue_id))
+    return (cur.rowcount or 0) > 0 if hasattr(cur, "rowcount") \
+        else True
+
+
 def list_open_stock_issues(limit: int = 100,
                                 max_age_days: int = 30) -> list:
     """Open + escalated, ordered oldest first."""
@@ -2319,7 +2341,9 @@ def list_open_stock_issues(limit: int = 100,
 def find_stock_issue_by_thread(raise_channel: str,
                                        thread_ts: str) -> Optional[dict]:
     """Used when a reply lands in a thread — find the parent issue
-    so we can pick up the staff's confirmation/resolution text."""
+    so we can pick up the staff's confirmation/resolution text.
+    Includes 'acknowledged' so a later 'fixed' reply can promote
+    an already-acknowledged issue to fully resolved."""
     if not raise_channel or not thread_ts:
         return None
     with connect() as c:
@@ -2330,7 +2354,7 @@ def find_stock_issue_by_thread(raise_channel: str,
             "WHERE raise_channel = ? "
             "  AND raise_thread_ts = ? "
             "  AND status IN ('open', 'awaiting_response', "
-            "                  'escalated') "
+            "                  'escalated', 'acknowledged') "
             "LIMIT 1",
             (raise_channel, thread_ts)).fetchone()
     return dict(r) if r else None

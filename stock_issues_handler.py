@@ -1589,6 +1589,7 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
     session = slack_sync._build_session(token)
     n_checked = 0
     n_resolved = 0
+    n_acknowledged = 0
     for issue in issues:
         ch = issue.get("raise_channel")
         ts = (issue.get("raise_thread_ts")
@@ -1610,7 +1611,16 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
             issue["id"], ch, ts, max(0, len(msgs) - 1))
         if len(msgs) < 2:
             continue  # parent only — no replies
-        # Skip the parent (msgs[0]) and scan thread replies.
+        # v2.67.247 — two-tier resolution:
+        #   keyword match -> mark RESOLVED (high confidence done)
+        #   any other substantive human reply -> mark ACKNOWLEDGED
+        #     (team is on it; drops from morning summary)
+        # Both pass; resolved is stronger. Acknowledged is set on
+        # the FIRST human reply; resolved overrides if a later
+        # reply contains a keyword.
+        already_acked = (
+            (issue.get("status") or "") == "acknowledged")
+        resolved_for_issue = False
         for m in msgs[1:]:
             user_id = m.get("user") or m.get("bot_id") or ""
             is_bot = bool(m.get("bot_id")
@@ -1623,7 +1633,7 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
                 user_id or "?", is_bot, _kw_hit, text[:120])
             if is_bot:
                 continue
-            if not _kw_hit:
+            if not text.strip():
                 continue
             user_name = ""
             if user_id:
@@ -1642,15 +1652,43 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
                 "is_our_bot": False,
                 "ts": m.get("ts"),
             }
+            if _kw_hit:
+                if dryrun:
+                    log.info(
+                        "[DRY] would resolve issue %s from %s: "
+                        "%r", issue["id"], user_name, text[:80])
+                    resolved_for_issue = True
+                    break
+                if maybe_resolve_from_thread_reply(reply_msg):
+                    n_resolved += 1
+                    resolved_for_issue = True
+                    break
+                continue
+            # No keyword — acknowledge once per issue.
+            if already_acked or resolved_for_issue:
+                continue
             if dryrun:
                 log.info(
-                    "[DRY] would resolve issue %s from %s: %r",
-                    issue["id"], user_name, text[:80])
-                break
-            if maybe_resolve_from_thread_reply(reply_msg):
-                n_resolved += 1
-                break  # first matching reply resolves the issue
-    return {"checked": n_checked, "resolved": n_resolved}
+                    "[DRY] would acknowledge issue %s from %s: "
+                    "%r", issue["id"], user_name, text[:80])
+                already_acked = True
+                continue
+            try:
+                if db.acknowledge_stock_issue(
+                        int(issue["id"]),
+                        user_name or "unknown",
+                        text):
+                    log.info(
+                        "Acknowledged stock_issue %s via reply "
+                        "from %s", issue["id"], user_name)
+                    n_acknowledged += 1
+                    already_acked = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("acknowledge failed for %s: %s",
+                              issue["id"], exc)
+    return {"checked": n_checked,
+            "resolved": n_resolved,
+            "acknowledged": n_acknowledged}
 
 
 def cmd_check_replies(args: argparse.Namespace) -> int:
