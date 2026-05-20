@@ -346,6 +346,88 @@ def _row_title(properties: Dict) -> str:
     return "(untitled)"
 
 
+def _format_property_value(prop_val: Dict) -> str:
+    """Render a single Notion property value to a plain string.
+    Handles the common property types used in playbook databases."""
+    if not isinstance(prop_val, dict):
+        return ""
+    t = prop_val.get("type")
+    if t == "rich_text":
+        return _rich_text_to_plain(prop_val.get("rich_text"))
+    if t == "title":
+        return _rich_text_to_plain(prop_val.get("title"))
+    if t == "number":
+        n = prop_val.get("number")
+        return "" if n is None else str(n)
+    if t == "select":
+        return ((prop_val.get("select") or {})
+                .get("name") or "")
+    if t == "status":
+        return ((prop_val.get("status") or {})
+                .get("name") or "")
+    if t == "multi_select":
+        return ", ".join(
+            (o or {}).get("name") or ""
+            for o in (prop_val.get("multi_select") or []))
+    if t == "date":
+        d = prop_val.get("date") or {}
+        start = d.get("start") or ""
+        end = d.get("end")
+        return f"{start} → {end}" if end else start
+    if t == "checkbox":
+        return "✓" if prop_val.get("checkbox") else "✗"
+    if t == "url":
+        return prop_val.get("url") or ""
+    if t == "email":
+        return prop_val.get("email") or ""
+    if t == "phone_number":
+        return prop_val.get("phone_number") or ""
+    if t == "people":
+        names = []
+        for p in (prop_val.get("people") or []):
+            names.append(p.get("name") or p.get("id") or "")
+        return ", ".join(n for n in names if n)
+    if t == "files":
+        return ", ".join(
+            (f or {}).get("name") or ""
+            for f in (prop_val.get("files") or []))
+    if t == "formula":
+        f = prop_val.get("formula") or {}
+        ft = f.get("type")
+        if ft == "string":
+            return f.get("string") or ""
+        if ft == "number":
+            n = f.get("number")
+            return "" if n is None else str(n)
+        if ft == "boolean":
+            return "✓" if f.get("boolean") else "✗"
+        if ft == "date":
+            d = f.get("date") or {}
+            return d.get("start") or ""
+    if t in ("created_time", "last_edited_time"):
+        return prop_val.get(t) or ""
+    if t == "created_by":
+        return (prop_val.get("created_by") or {}).get("name") or ""
+    if t == "last_edited_by":
+        return ((prop_val.get("last_edited_by") or {})
+                .get("name") or "")
+    return ""
+
+
+def _format_row_properties(properties: Dict) -> str:
+    """Render every non-title Notion DB property as a markdown
+    bullet ('**Column name:** value'). Empty values skipped."""
+    lines: List[str] = []
+    for name, val in (properties or {}).items():
+        if (val or {}).get("type") == "title":
+            continue
+        rendered = _format_property_value(val)
+        if not rendered:
+            continue
+        lines.append(f"- **{name}:** {rendered}")
+    return "\n".join(lines)
+
+
 def pull_playbooks(dry_run: bool = False) -> Dict:
     """Walk the children of NOTION_PLAYBOOKS_PARENT_ID (falls
     back to NOTION_TEAM_PARENT_PAGE_ID). For each child_page,
@@ -407,6 +489,12 @@ def pull_playbooks(dry_run: bool = False) -> Dict:
                             "last_edited_time": row.get(
                                 "last_edited_time"),
                             "source": "database_row",
+                            # v2.67.256 — keep the row's
+                            # properties so the mirrored
+                            # content includes column values,
+                            # not just the page body.
+                            "properties": row.get(
+                                "properties") or {},
                         })
                         n_db_rows += 1
                     if not qres.get("has_more"):
@@ -424,12 +512,23 @@ def pull_playbooks(dry_run: bool = False) -> Dict:
     for p in pages:
         try:
             blocks = _fetch_block_children(p["id"], cfg)
-            md = _render_blocks_md(blocks, cfg).strip()
+            body_md = _render_blocks_md(blocks, cfg).strip()
         except Exception as exc:  # noqa: BLE001
             log.warning("Block fetch failed for %s (%s): %s",
                           p["title"], p["id"], exc)
             n_err += 1
             continue
+        # v2.67.256 — for database rows, include the row's
+        # properties (column values) above the body so the AI
+        # sees the structured data even when the body is empty.
+        props_md = _format_row_properties(
+            p.get("properties") or {})
+        if props_md and body_md:
+            md = props_md + "\n\n---\n\n" + body_md
+        elif props_md:
+            md = props_md
+        else:
+            md = body_md
         url = f"https://www.notion.so/{p['id']}"
         if dry_run:
             log.info("[dry-run] %s — %d chars",
