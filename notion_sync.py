@@ -491,7 +491,13 @@ def _build_slow_mover_rows() -> List[Dict]:
             on_hand * cost_each
             if (on_hand is not None and cost_each is not None)
             else None)
-        first_dormant = (w.get("first_seen_dormant_at") or "")[:10]
+        # v2.67.251 — Postgres returns these as datetime objects,
+        # SQLite as ISO strings. Coerce defensively so the [:10]
+        # slice and date parsing work either way.
+        _fd_raw = w.get("first_seen_dormant_at")
+        first_dormant = str(_fd_raw)[:10] if _fd_raw else ""
+        _le_raw = w.get("last_engine_run_at")
+        last_engine_run = str(_le_raw)[:10] if _le_raw else ""
         days_dormant = None
         if first_dormant:
             try:
@@ -505,8 +511,7 @@ def _build_slow_mover_rows() -> List[Dict]:
             "on_hand": on_hand,
             "days_dormant": days_dormant,
             "first_dormant": first_dormant,
-            "last_engine_run": (
-                (w.get("last_engine_run_at") or "")[:10]),
+            "last_engine_run": last_engine_run,
             "status": "Active",
             "cost_tied_up": cost_tied,
         })
