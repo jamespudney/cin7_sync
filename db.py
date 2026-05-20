@@ -2297,16 +2297,15 @@ def resolve_stock_issue(issue_id: int, resolved_by: str,
 
 
 def acknowledge_stock_issue(issue_id: int, ack_by: str,
-                                  ack_text: str) -> bool:
+                                  ack_text: str) -> None:
     """v2.67.247 — mark a stock issue ACKNOWLEDGED by a human
     reply that wasn't a strict resolution keyword. The morning
     summary excludes acknowledged items (the team is on it) but
     keeps them eligible for later 'fixed' / 'adjusted' style
     resolution. Only transitions from open / awaiting_response /
-    escalated — won't overwrite a resolved row. Returns True if
-    a row was actually updated."""
+    escalated — won't overwrite a resolved row."""
     with connect() as c:
-        cur = c.execute(
+        c.execute(
             "UPDATE stock_issues SET "
             "  status = 'acknowledged', "
             "  resolved_at = datetime('now'), "
@@ -2314,8 +2313,6 @@ def acknowledge_stock_issue(issue_id: int, ack_by: str,
             "WHERE id = ? AND status IN "
             "  ('open', 'awaiting_response', 'escalated')",
             (ack_by, (ack_text or "")[:500], issue_id))
-    return (cur.rowcount or 0) > 0 if hasattr(cur, "rowcount") \
-        else True
 
 
 def list_open_stock_issues(limit: int = 100,

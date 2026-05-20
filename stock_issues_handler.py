@@ -1674,15 +1674,15 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
                 already_acked = True
                 continue
             try:
-                if db.acknowledge_stock_issue(
-                        int(issue["id"]),
-                        user_name or "unknown",
-                        text):
-                    log.info(
-                        "Acknowledged stock_issue %s via reply "
-                        "from %s", issue["id"], user_name)
-                    n_acknowledged += 1
-                    already_acked = True
+                db.acknowledge_stock_issue(
+                    int(issue["id"]),
+                    user_name or "unknown",
+                    text)
+                log.info(
+                    "Acknowledged stock_issue %s via reply "
+                    "from %s", issue["id"], user_name)
+                n_acknowledged += 1
+                already_acked = True
             except Exception as exc:  # noqa: BLE001
                 log.warning("acknowledge failed for %s: %s",
                               issue["id"], exc)
