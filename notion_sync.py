@@ -336,38 +336,89 @@ def _render_blocks_md(blocks: List[Dict],
 # ---------------------------------------------------------------------------
 # Playbook pull — operational knowledge -> local mirror
 # ---------------------------------------------------------------------------
+def _row_title(properties: Dict) -> str:
+    """Extract the title property value from a Notion database
+    row (each DB has exactly one title-typed property)."""
+    for _name, val in (properties or {}).items():
+        if (val or {}).get("type") == "title":
+            return _rich_text_to_plain(val.get("title")) \
+                or "(untitled)"
+    return "(untitled)"
+
+
 def pull_playbooks(dry_run: bool = False) -> Dict:
-    """List every child_page under NOTION_PLAYBOOKS_PARENT_ID
-    (falls back to NOTION_TEAM_PARENT_PAGE_ID), fetch each page's
-    content, render to markdown, and upsert into the local
-    notion_kb_articles mirror. The AI Assistant then searches
+    """Walk the children of NOTION_PLAYBOOKS_PARENT_ID (falls
+    back to NOTION_TEAM_PARENT_PAGE_ID). For each child_page,
+    mirror it. For each child_database, query the database and
+    mirror every row (each row is itself a page in Notion).
+    Renders block content to markdown and upserts to the
+    notion_kb_articles local mirror — the AI Assistant searches
     against the mirror via the search_knowledge_base tool."""
     cfg = _config()
     parent = (os.environ.get(
         "NOTION_PLAYBOOKS_PARENT_ID", "").strip().replace("-", "")
               or cfg["parent"])
-    log.info("Pulling playbook child-pages under parent %s ...",
+    log.info("Pulling playbook content under parent %s ...",
              parent)
-    # List child_page blocks under the parent.
     cursor = None
     pages: List[Dict] = []
+    n_child_pages = 0
+    n_databases = 0
+    n_db_rows = 0
     while True:
         path = (f"/blocks/{parent}/children?page_size=100"
                 + (f"&start_cursor={cursor}" if cursor else ""))
         body = _request("GET", path, cfg=cfg)
         for b in body.get("results") or []:
-            if b.get("type") != "child_page":
-                continue
-            pages.append({
-                "id": (b.get("id") or "").replace("-", ""),
-                "title": ((b.get("child_page") or {})
-                          .get("title") or "(untitled)"),
-                "last_edited_time": b.get("last_edited_time"),
-            })
+            btype = b.get("type")
+            if btype == "child_page":
+                n_child_pages += 1
+                pages.append({
+                    "id": (b.get("id") or "").replace("-", ""),
+                    "title": ((b.get("child_page") or {})
+                              .get("title") or "(untitled)"),
+                    "last_edited_time": b.get("last_edited_time"),
+                    "source": "child_page",
+                })
+            elif btype == "child_database":
+                n_databases += 1
+                db_id = b.get("id")
+                db_title = ((b.get("child_database") or {})
+                            .get("title") or "(database)")
+                log.info("  Walking database %r (%s) ...",
+                          db_title, db_id)
+                # Query the database for ALL rows; each is a page.
+                db_cursor = None
+                while True:
+                    qbody = {"page_size": 100}
+                    if db_cursor:
+                        qbody["start_cursor"] = db_cursor
+                    qres = _request(
+                        "POST", f"/databases/{db_id}/query",
+                        json_body=qbody, cfg=cfg)
+                    for row in qres.get("results") or []:
+                        row_id = (row.get("id")
+                                  or "").replace("-", "")
+                        title = _row_title(
+                            row.get("properties") or {})
+                        pages.append({
+                            "id": row_id,
+                            "title": f"{db_title} — {title}",
+                            "last_edited_time": row.get(
+                                "last_edited_time"),
+                            "source": "database_row",
+                        })
+                        n_db_rows += 1
+                    if not qres.get("has_more"):
+                        break
+                    db_cursor = qres.get("next_cursor")
         if not body.get("has_more"):
             break
         cursor = body.get("next_cursor")
-    log.info("Found %d child page(s) under parent", len(pages))
+    log.info(
+        "Found %d page(s) to mirror: %d direct child pages + "
+        "%d row(s) across %d database(s)",
+        len(pages), n_child_pages, n_db_rows, n_databases)
     n_ok = 0
     n_err = 0
     for p in pages:

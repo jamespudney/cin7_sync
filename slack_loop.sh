@@ -184,6 +184,8 @@ last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
 last_si_escalate_epoch=0   # v2.67.144 stock-issue DM escalation
 last_si_replies_epoch=0    # v2.67.245 stock-issue thread-reply poll
+last_notion_pull_epoch=0   # v2.67.254 Notion playbook pull
+last_notion_push_epoch=0   # v2.67.254 Notion slow-movers push
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
@@ -451,6 +453,32 @@ while true; do
         last_si_escalate_epoch=$(date -u +%s)
         _run_bg "stock_issues_escalate" \
             "python stock_issues_handler.py escalate"
+    fi
+
+    # v2.67.254 Notion playbook pull. Every 30 min, mirror the
+    # team's Notion playbook pages (direct child pages + rows of
+    # any database under the playbooks parent) into the local
+    # notion_kb_articles table so the AI's search_knowledge_base
+    # tool sees the freshest content. Idempotent — silent skip
+    # if NOTION_INTEGRATION_SECRET isn't set.
+    seconds_since_notion_pull=$(( now_epoch - last_notion_pull_epoch ))
+    if [ "$seconds_since_notion_pull" -ge 1800 ] \
+            && [ -n "${NOTION_INTEGRATION_SECRET:-}" ]; then
+        last_notion_pull_epoch=$(date -u +%s)
+        _run_bg "notion_pull" \
+            "python notion_sync.py pull-playbooks"
+    fi
+
+    # v2.67.254 Notion slow-movers push. Once a day (86400s), push
+    # the top-N dormant SKUs into the Slow Movers database under
+    # the team parent. Cheaper than every-30-min and the data
+    # itself only changes when the engine runs.
+    seconds_since_notion_push=$(( now_epoch - last_notion_push_epoch ))
+    if [ "$seconds_since_notion_push" -ge 86400 ] \
+            && [ -n "${NOTION_INTEGRATION_SECRET:-}" ]; then
+        last_notion_push_epoch=$(date -u +%s)
+        _run_bg "notion_push_slow_movers" \
+            "python notion_sync.py slow-movers"
     fi
 
     # v2.67.245 Stock-issue thread-reply poll. Slack's
