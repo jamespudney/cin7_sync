@@ -1136,6 +1136,21 @@ CREATE TABLE IF NOT EXISTS qbo_connection (
     updated_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v2.67.250 Notion knowledge-base mirror. Operational playbooks
+-- (and later: product FAQs, troubleshooting) live in Notion as
+-- the team's editable source of truth; we mirror their contents
+-- here so the AI Assistant can ground answers in them without
+-- a slow round-trip to the Notion API on every question.
+CREATE TABLE IF NOT EXISTS notion_kb_articles (
+    page_id          TEXT PRIMARY KEY,   -- Notion page ID, no hyphens
+    title            TEXT NOT NULL,
+    content_md       TEXT,               -- rendered markdown body
+    url              TEXT,
+    category         TEXT,               -- e.g. 'playbook', 'product-faq'
+    notion_edited_at TIMESTAMP,
+    synced_at        TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.67.219 Cashflow Management — supplier-payables tracker.
 -- One row per supplier bill. QBO-sourced rows are kept in sync
 -- from QuickBooks Bills (qbo_bill_id set); manual rows (freight,
@@ -3163,6 +3178,81 @@ def delete_loan(loan_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Notion knowledge-base mirror (v2.67.250)
+# ---------------------------------------------------------------------------
+def upsert_kb_article(page_id: str, title: str,
+                          content_md: Optional[str],
+                          url: Optional[str],
+                          notion_edited_at: Optional[str] = None,
+                          category: Optional[str] = None
+                          ) -> None:
+    """Upsert one Notion KB article (page) by page_id."""
+    sql = (
+        "INSERT INTO notion_kb_articles "
+        "(page_id, title, content_md, url, category, "
+        " notion_edited_at, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(page_id) DO UPDATE SET "
+        "  title = excluded.title, "
+        "  content_md = excluded.content_md, "
+        "  url = excluded.url, "
+        "  category = excluded.category, "
+        "  notion_edited_at = excluded.notion_edited_at, "
+        "  synced_at = datetime('now')")
+    with connect() as c:
+        c.execute(sql, (page_id, title, content_md, url, category,
+                          notion_edited_at))
+
+
+def list_kb_articles(limit: int = 500) -> list:
+    """Return all mirrored KB articles, newest sync first."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT page_id, title, content_md, url, category, "
+            "       notion_edited_at, synced_at "
+            "FROM notion_kb_articles "
+            "ORDER BY synced_at DESC LIMIT ?",
+            (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_kb_article(page_id: str) -> Optional[dict]:
+    with connect() as c:
+        r = c.execute(
+            "SELECT * FROM notion_kb_articles WHERE page_id = ?",
+            (page_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def search_kb_articles(query: str, limit: int = 5) -> list:
+    """Case-insensitive substring search across title + content.
+    Returns up to `limit` rows. Title matches are ranked above
+    body matches via a CASE expression."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    like = f"%{q}%"
+    with connect() as c:
+        rows = c.execute(
+            "SELECT page_id, title, content_md, url, category, "
+            "       notion_edited_at "
+            "FROM notion_kb_articles "
+            "WHERE LOWER(title) LIKE ? "
+            "   OR LOWER(content_md) LIKE ? "
+            "ORDER BY CASE WHEN LOWER(title) LIKE ? "
+            "              THEN 0 ELSE 1 END, title "
+            "LIMIT ?",
+            (like, like, like, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_kb_article(page_id: str) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM notion_kb_articles "
+                    "WHERE page_id = ?", (page_id,))
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge sessions (v2.67.126)
 # ---------------------------------------------------------------------------
 def create_viktor_bridge_session(session_id: str, user_id: int,
@@ -3486,6 +3576,19 @@ _PG_POST_CUTOVER_TABLES = [
           sort_order  INTEGER NOT NULL DEFAULT 100,
           created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY (scenario, row_key)
+      );
+      """),
+    # v2.67.250 Notion KB mirror.
+    ("notion_kb_articles",
+      """
+      CREATE TABLE IF NOT EXISTS notion_kb_articles (
+          page_id          TEXT PRIMARY KEY,
+          title            TEXT NOT NULL,
+          content_md       TEXT,
+          url              TEXT,
+          category         TEXT,
+          notion_edited_at TIMESTAMPTZ,
+          synced_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       """),
     ("cashflow_loans",

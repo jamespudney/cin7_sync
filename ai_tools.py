@@ -1675,6 +1675,39 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    # v2.67.250 — Notion-backed knowledge-base search.
+    {
+        "name": "search_knowledge_base",
+        "description": (
+            "Search the team's internal knowledge base "
+            "(operational playbooks, processes, escalation "
+            "rules, FAQs) mirrored from Notion. Use this for "
+            "'how do we…' / 'what's our process for…' style "
+            "questions — e.g. 'how do we handle drop-ship "
+            "backorders?', 'what's our PO approval process?', "
+            "'rules for stock-issue escalation', 'supplier "
+            "payment terms'. Returns matching articles with "
+            "title, content excerpt and the Notion URL — "
+            "ALWAYS cite the URL when you ground an answer in "
+            "an article. Returns empty when nothing matches; "
+            "fall back to your normal reasoning if so."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Free-text search across article titles "
+                        "and bodies. Keep it short — 2-6 "
+                        "keywords work best. Examples: "
+                        "'drop-ship backorder', 'PO approval', "
+                        "'stock issue escalation'."),
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -6043,6 +6076,52 @@ def compare_ad_periods(engine_df: pd.DataFrame,
     }
 
 
+def search_knowledge_base(engine_df: pd.DataFrame,
+                            sale_lines_df: pd.DataFrame,
+                            args: dict) -> dict:
+    """v2.67.250 — search the local mirror of Notion playbooks +
+    FAQs. Returns up to 5 matching articles with content excerpts
+    + the Notion URL so the AI can cite source."""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"matched": 0,
+                "note": "Provide a 'query' string."}
+    try:
+        articles = db.search_kb_articles(query, limit=5)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"KB search failed: {exc}"}
+    if not articles:
+        return {
+            "matched": 0,
+            "query": query,
+            "note": ("No knowledge-base article matched. "
+                     "Fall back to your normal reasoning, or "
+                     "ask the user to add a Notion page for "
+                     "this topic."),
+        }
+    out = []
+    for a in articles:
+        content = (a.get("content_md") or "")[:2000]
+        out.append({
+            "title": a.get("title"),
+            "url": a.get("url"),
+            "category": a.get("category"),
+            "content": content,
+            "notion_edited_at": a.get("notion_edited_at"),
+            "truncated": (
+                bool((a.get("content_md") or "")[2000:])),
+        })
+    return {
+        "matched": len(out),
+        "query": query,
+        "results": out,
+        "note": ("ALWAYS cite the article URL when you ground an "
+                 "answer in one of these results. Content is "
+                 "truncated to 2000 chars per result — the URL "
+                 "is the full source."),
+    }
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
@@ -6093,6 +6172,8 @@ TOOL_HANDLERS = {
     "attribution_sanity_check": attribution_sanity_check,
     "compare_ad_periods": compare_ad_periods,
     "get_sku_ad_spend": get_sku_ad_spend,  # v2.67.105
+    # v2.67.250 — Notion-backed playbook / FAQ search.
+    "search_knowledge_base": search_knowledge_base,
 }
 
 

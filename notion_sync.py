@@ -239,6 +239,172 @@ def _p_select(value: Optional[str]) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# Notion page reading (Phase 2 — playbook pull)
+# ---------------------------------------------------------------------------
+def _rich_text_to_plain(rich: Optional[List[Dict]]) -> str:
+    return "".join((rt.get("plain_text") or "")
+                    for rt in (rich or []))
+
+
+def _block_to_md(block: Dict, indent: str = "") -> str:
+    """Render a single Notion block to markdown. Best-effort — a
+    block whose type we don't recognise still surfaces its plain
+    text so nothing is silently dropped from the AI's view."""
+    t = block.get("type") or ""
+    data = block.get(t) or {}
+    rt = _rich_text_to_plain(data.get("rich_text"))
+    if t == "paragraph":
+        return indent + rt
+    if t == "heading_1":
+        return f"# {rt}"
+    if t == "heading_2":
+        return f"## {rt}"
+    if t == "heading_3":
+        return f"### {rt}"
+    if t == "bulleted_list_item":
+        return f"{indent}- {rt}"
+    if t == "numbered_list_item":
+        return f"{indent}1. {rt}"
+    if t == "to_do":
+        return (f"{indent}- "
+                f"{'[x]' if data.get('checked') else '[ ]'} "
+                f"{rt}")
+    if t == "toggle":
+        return f"{indent}▸ {rt}"
+    if t == "quote":
+        return f"{indent}> {rt}"
+    if t == "code":
+        lang = data.get("language") or ""
+        return f"```{lang}\n{rt}\n```"
+    if t == "callout":
+        emoji = (data.get("icon") or {}).get("emoji") or "💡"
+        return f"{emoji} {rt}"
+    if t == "divider":
+        return "---"
+    if t == "child_page":
+        return f"(sub-page: {data.get('title') or ''})"
+    if t == "table_row":
+        cells = [
+            _rich_text_to_plain(c) for c in
+            (data.get("cells") or [])]
+        return "| " + " | ".join(cells) + " |"
+    # Fallback — emit text if present.
+    return indent + rt if rt else ""
+
+
+def _fetch_block_children(page_id: str,
+                          cfg: Dict[str, str]) -> List[Dict]:
+    """Page through /blocks/{id}/children — Notion paginates at 100."""
+    blocks: List[Dict] = []
+    cursor = None
+    while True:
+        path = (f"/blocks/{page_id}/children?page_size=100"
+                + (f"&start_cursor={cursor}" if cursor else ""))
+        body = _request("GET", path, cfg=cfg)
+        blocks.extend(body.get("results") or [])
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+    return blocks
+
+
+def _render_blocks_md(blocks: List[Dict],
+                      cfg: Dict[str, str],
+                      indent: str = "",
+                      depth: int = 0) -> str:
+    if depth > 6:
+        return ""  # depth guard
+    parts: List[str] = []
+    for b in blocks:
+        rendered = _block_to_md(b, indent)
+        if rendered:
+            parts.append(rendered)
+        if b.get("has_children") and b.get("id"):
+            try:
+                children = _fetch_block_children(b["id"], cfg)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not fetch sub-blocks of %s: %s",
+                              b.get("id"), exc)
+                children = []
+            sub = _render_blocks_md(
+                children, cfg, indent + "    ", depth + 1)
+            if sub:
+                parts.append(sub)
+    return "\n".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Playbook pull — operational knowledge -> local mirror
+# ---------------------------------------------------------------------------
+def pull_playbooks(dry_run: bool = False) -> Dict:
+    """List every child_page under NOTION_PLAYBOOKS_PARENT_ID
+    (falls back to NOTION_TEAM_PARENT_PAGE_ID), fetch each page's
+    content, render to markdown, and upsert into the local
+    notion_kb_articles mirror. The AI Assistant then searches
+    against the mirror via the search_knowledge_base tool."""
+    cfg = _config()
+    parent = (os.environ.get(
+        "NOTION_PLAYBOOKS_PARENT_ID", "").strip().replace("-", "")
+              or cfg["parent"])
+    log.info("Pulling playbook child-pages under parent %s ...",
+             parent)
+    # List child_page blocks under the parent.
+    cursor = None
+    pages: List[Dict] = []
+    while True:
+        path = (f"/blocks/{parent}/children?page_size=100"
+                + (f"&start_cursor={cursor}" if cursor else ""))
+        body = _request("GET", path, cfg=cfg)
+        for b in body.get("results") or []:
+            if b.get("type") != "child_page":
+                continue
+            pages.append({
+                "id": (b.get("id") or "").replace("-", ""),
+                "title": ((b.get("child_page") or {})
+                          .get("title") or "(untitled)"),
+                "last_edited_time": b.get("last_edited_time"),
+            })
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+    log.info("Found %d child page(s) under parent", len(pages))
+    n_ok = 0
+    n_err = 0
+    for p in pages:
+        try:
+            blocks = _fetch_block_children(p["id"], cfg)
+            md = _render_blocks_md(blocks, cfg).strip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Block fetch failed for %s (%s): %s",
+                          p["title"], p["id"], exc)
+            n_err += 1
+            continue
+        url = f"https://www.notion.so/{p['id']}"
+        if dry_run:
+            log.info("[dry-run] %s — %d chars",
+                      p["title"], len(md))
+            continue
+        try:
+            db.upsert_kb_article(
+                page_id=p["id"],
+                title=p["title"],
+                content_md=md,
+                url=url,
+                notion_edited_at=p.get("last_edited_time"),
+                category="playbook",
+            )
+            n_ok += 1
+            log.info("Mirrored %r (%d chars)",
+                      p["title"], len(md))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("DB upsert failed for %s: %s",
+                          p["title"], exc)
+            n_err += 1
+    return {"found": len(pages), "synced": n_ok,
+            "errors": n_err, "dry_run": dry_run}
+
+
+# ---------------------------------------------------------------------------
 # Slow Movers — Phase 1 sync
 # ---------------------------------------------------------------------------
 SLOW_MOVERS_TITLE = "Slow Movers"
@@ -406,6 +572,13 @@ def cmd_slow_movers(args) -> int:
     return 0
 
 
+def cmd_pull_playbooks(args) -> int:
+    _setup_log(args.verbose)
+    result = pull_playbooks(dry_run=bool(args.dry_run))
+    log.info("DONE: %s", result)
+    return 0
+
+
 def cmd_check(args) -> int:
     """Smoke-test the Notion auth + parent-page access."""
     _setup_log(args.verbose)
@@ -435,6 +608,13 @@ def main() -> int:
     p_sm.add_argument("--dry-run", action="store_true")
     p_sm.add_argument("--verbose", action="store_true")
     p_sm.set_defaults(func=cmd_slow_movers)
+    p_pb = sub.add_parser(
+        "pull-playbooks",
+        help="Mirror playbook child-pages from Notion into "
+              "notion_kb_articles for the AI to search.")
+    p_pb.add_argument("--dry-run", action="store_true")
+    p_pb.add_argument("--verbose", action="store_true")
+    p_pb.set_defaults(func=cmd_pull_playbooks)
     p_ck = sub.add_parser(
         "check", help="Verify auth and parent-page access.")
     p_ck.add_argument("--verbose", action="store_true")
