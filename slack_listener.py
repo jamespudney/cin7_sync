@@ -437,6 +437,17 @@ def _classify(msg: Dict[str, Any], bot_self_id: str,
         if SKU_RE.search(text) or SO_RE.search(text) or INV_RE.search(text):
             return "returns_warning"
 
+    # v2.67.255 — Shipping channel: any SO/INV reference is a
+    # request to investigate that shipment's margin. Brandon
+    # flagged the bot was silent on "SO-56629 client paid $43,
+    # we paid $151" — the channel was treated as generic chat.
+    # Now it auto-fires like orders/returns: SO or INV mention
+    # -> classify as shipping_review, prompt the AI to pull the
+    # sale + ShipStation cost + compute the gap.
+    if channel_intent == "shipping":
+        if SO_RE.search(text) or INV_RE.search(text):
+            return "shipping_review"
+
     # v2.67.62 — Orders channel: any SO/INV/customer reference is
     # actionable, especially mentions of cancellations. Like
     # #returns, staff don't ask questions here — they discuss
@@ -1158,9 +1169,30 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
             "SHIPPING / FULFILMENT MODE: when invoice numbers "
             "(INV-XXXXX) or tracking numbers are mentioned, call "
             "get_shipping_details and surface ship date, carrier, "
-            "tracking, address. If a shipping-cost question, "
-            "compute margin = customer_charge - actual_cost from "
-            "the data."
+            "tracking, address.\n\n"
+            "**Margin investigation (v2.67.255):** when a SO or "
+            "INV is referenced — especially with phrases like "
+            "'client paid X', 'we paid Y', or any cost / charge "
+            "numbers — do a full investigation. Steps in order:\n"
+            "1. `get_sale_order` for the SO/INV — pull the "
+            "customer name and find the shipping charge "
+            "(AdditionalCharge line whose Description starts "
+            "with 'Shipping ').\n"
+            "2. `get_shipping_details` for the same order — pull "
+            "carrier, service, ShipDate, tracking, and the actual "
+            "shipmentCost ShipStation recorded.\n"
+            "3. `get_shipping_margin` for the same order — uses "
+            "both feeds and returns the customer_charge, "
+            "actual_cost, and net margin pre-computed.\n"
+            "4. Compose a reply with: customer · SO/INV · carrier · "
+            "service · charge · cost · *margin (or loss)*. Flag "
+            "explicitly if the loss exceeds $20 ('🔴 *${X} loss*') "
+            "or the margin is over 50% ('💸 fat margin'). State "
+            "concrete possible causes (under-quoted on dims/weight, "
+            "expedited upgrade, dim-weight surcharge, residential "
+            "fee, freight class, declared value).\n"
+            "Do NOT answer with vague guesses — the data is "
+            "available; investigate before replying."
         )
     elif channel_intent == "sales":
         base += (
