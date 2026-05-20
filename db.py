@@ -1136,6 +1136,17 @@ CREATE TABLE IF NOT EXISTS qbo_connection (
     updated_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v2.67.257 Notion database IDs by logical name. find_or_create
+-- used to look up databases by title only, which created
+-- duplicates when the title search missed (rename, move, API
+-- quirk). Storing the canonical ID here means we always reuse
+-- the same DB once created.
+CREATE TABLE IF NOT EXISTS notion_db_ids (
+    name   TEXT PRIMARY KEY,    -- logical name e.g. 'slow_movers'
+    db_id  TEXT NOT NULL,       -- Notion database ID
+    set_at TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.67.250 Notion knowledge-base mirror. Operational playbooks
 -- (and later: product FAQs, troubleshooting) live in Notion as
 -- the team's editable source of truth; we mirror their contents
@@ -3253,6 +3264,38 @@ def delete_kb_article(page_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Notion database ID registry (v2.67.257)
+# ---------------------------------------------------------------------------
+def get_notion_db_id(name: str) -> Optional[str]:
+    """Return the stored Notion database id for `name`, or None."""
+    with connect() as c:
+        r = c.execute(
+            "SELECT db_id FROM notion_db_ids WHERE name = ?",
+            (name,)).fetchone()
+    return r["db_id"] if r else None
+
+
+def set_notion_db_id(name: str, db_id: str) -> None:
+    """Upsert the canonical database id for a logical name."""
+    with connect() as c:
+        c.execute(
+            "INSERT INTO notion_db_ids (name, db_id, set_at) "
+            "VALUES (?, ?, datetime('now')) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "  db_id = excluded.db_id, "
+            "  set_at = datetime('now')",
+            (name, db_id))
+
+
+def clear_notion_db_id(name: str) -> None:
+    """Forget the stored id (forces the next sync to look up or
+    create the database fresh)."""
+    with connect() as c:
+        c.execute("DELETE FROM notion_db_ids WHERE name = ?",
+                    (name,))
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge sessions (v2.67.126)
 # ---------------------------------------------------------------------------
 def create_viktor_bridge_session(session_id: str, user_id: int,
@@ -3576,6 +3619,15 @@ _PG_POST_CUTOVER_TABLES = [
           sort_order  INTEGER NOT NULL DEFAULT 100,
           created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY (scenario, row_key)
+      );
+      """),
+    # v2.67.257 Notion database ID registry.
+    ("notion_db_ids",
+      """
+      CREATE TABLE IF NOT EXISTS notion_db_ids (
+          name   TEXT PRIMARY KEY,
+          db_id  TEXT NOT NULL,
+          set_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       """),
     # v2.67.250 Notion KB mirror.

@@ -156,15 +156,54 @@ def _create_database(parent_page_id: str, title: str,
 
 
 def find_or_create_database(title: str, schema: Dict[str, Dict],
-                             cfg: Optional[Dict[str, str]] = None
+                             cfg: Optional[Dict[str, str]] = None,
+                             registry_name: Optional[str] = None
                              ) -> str:
+    """v2.67.257 — canonical-ID lookup first, then title fallback.
+
+    Resolution order:
+      1. Stored ID in notion_db_ids (registry_name; defaults to
+         title.lower()). Verify it still exists via GET; if so,
+         reuse — even if the DB was moved or renamed in Notion.
+      2. Title search under the configured parent (legacy).
+      3. Create a new database.
+    Whichever path wins, store the resulting ID so subsequent
+    runs hit step 1 — no more duplicate databases."""
     cfg = cfg or _config()
-    existing = _find_database_by_title(
-        cfg["parent"], title, cfg)
+    key = (registry_name or title).strip().lower()
+    # 1. Stored ID.
+    try:
+        stored = db.get_notion_db_id(key)
+    except Exception:  # noqa: BLE001
+        stored = None
+    if stored:
+        try:
+            _request("GET", f"/databases/{stored}", cfg=cfg)
+            return stored
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Stored Notion DB id %s for %r no longer "
+                "resolves (%s) — falling back.", stored, key, exc)
+            try:
+                db.clear_notion_db_id(key)
+            except Exception:  # noqa: BLE001
+                pass
+    # 2. Title search (handles a DB created before this fix).
+    existing = _find_database_by_title(cfg["parent"], title, cfg)
     if existing:
+        try:
+            db.set_notion_db_id(key, existing)
+        except Exception:  # noqa: BLE001
+            pass
         return existing
+    # 3. Create.
     log.info("Creating Notion database %r ...", title)
-    return _create_database(cfg["parent"], title, schema, cfg)
+    new_id = _create_database(cfg["parent"], title, schema, cfg)
+    try:
+        db.set_notion_db_id(key, new_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return new_id
 
 
 def query_database_by_title(database_id: str, title_prop: str,
@@ -558,6 +597,7 @@ def pull_playbooks(dry_run: bool = False) -> Dict:
 # Slow Movers — Phase 1 sync
 # ---------------------------------------------------------------------------
 SLOW_MOVERS_TITLE = "Slow Movers"
+SLOW_MOVERS_DB_KEY = "slow_movers"  # registry key for db ID
 SLOW_MOVERS_SCHEMA = {
     # Title property — Notion requires exactly one of these.
     "SKU": {"title": {}},
@@ -701,7 +741,8 @@ def sync_slow_movers(dry_run: bool = False,
         return {"pushed": 0, "rows": len(rows), "dry_run": True}
     cfg = _config()
     db_id = find_or_create_database(
-        SLOW_MOVERS_TITLE, SLOW_MOVERS_SCHEMA, cfg)
+        SLOW_MOVERS_TITLE, SLOW_MOVERS_SCHEMA, cfg,
+        registry_name=SLOW_MOVERS_DB_KEY)
     n_ok = 0
     n_err = 0
     for r in rows:
@@ -780,6 +821,35 @@ def cmd_dump_glossary(args) -> int:
     return 0
 
 
+def cmd_set_db_id(args) -> int:
+    """v2.67.257 — manually register a Notion database ID under
+    a logical name. Use after cleaning up duplicate databases:
+    delete the dud in Notion, then bind the sync to the kept
+    one so subsequent runs upsert into it."""
+    _setup_log(args.verbose)
+    name = (args.name or "").strip().lower()
+    db_id = (args.db_id or "").strip().replace("-", "")
+    if not name or not db_id:
+        log.error("--name and --db-id are required")
+        return 1
+    db.set_notion_db_id(name, db_id)
+    log.info("Set notion_db_ids[%s] = %s", name, db_id)
+    return 0
+
+
+def cmd_clear_db_id(args) -> int:
+    """Forget a stored Notion database id — the next sync run
+    will look it up by title or create a fresh one."""
+    _setup_log(args.verbose)
+    name = (args.name or "").strip().lower()
+    if not name:
+        log.error("--name is required")
+        return 1
+    db.clear_notion_db_id(name)
+    log.info("Cleared notion_db_ids[%s]", name)
+    return 0
+
+
 def cmd_check(args) -> int:
     """Smoke-test the Notion auth + parent-page access."""
     _setup_log(args.verbose)
@@ -828,6 +898,23 @@ def main() -> int:
                              "app_glossary.md).")
     p_dg.add_argument("--verbose", action="store_true")
     p_dg.set_defaults(func=cmd_dump_glossary)
+    p_sd = sub.add_parser(
+        "set-db-id",
+        help="Bind a logical sync name to an existing Notion "
+              "database ID (e.g. after cleaning up duplicates).")
+    p_sd.add_argument("--name", required=True,
+                        help="Logical name, e.g. 'slow_movers'.")
+    p_sd.add_argument("--db-id", required=True,
+                        help="The Notion database ID (32-char "
+                              "hex, hyphens optional).")
+    p_sd.add_argument("--verbose", action="store_true")
+    p_sd.set_defaults(func=cmd_set_db_id)
+    p_cd = sub.add_parser(
+        "clear-db-id",
+        help="Forget a stored database id — next sync re-resolves.")
+    p_cd.add_argument("--name", required=True)
+    p_cd.add_argument("--verbose", action="store_true")
+    p_cd.set_defaults(func=cmd_clear_db_id)
     p_ck = sub.add_parser(
         "check", help="Verify auth and parent-page access.")
     p_ck.add_argument("--verbose", action="store_true")
