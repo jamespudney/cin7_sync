@@ -519,12 +519,28 @@ def _build_slow_mover_rows() -> List[Dict]:
     return rows
 
 
-def sync_slow_movers(dry_run: bool = False) -> Dict:
-    """Push the current slow-movers register to Notion."""
+def sync_slow_movers(dry_run: bool = False,
+                       limit: Optional[int] = None) -> Dict:
+    """Push the current slow-movers register to Notion. `limit`
+    caps the rows pushed (highest cost-tied-up first) — defaults
+    to NOTION_SLOW_MOVERS_LIMIT env var or 200; Notion's 3-req/s
+    rate limit makes full pushes of large registers slow."""
     rows = _build_slow_mover_rows()
     if not rows:
         log.info("No slow movers to push.")
         return {"pushed": 0, "rows": 0}
+    if limit is None:
+        try:
+            limit = int(os.environ.get(
+                "NOTION_SLOW_MOVERS_LIMIT", "") or "200")
+        except ValueError:
+            limit = 200
+    if limit and len(rows) > limit:
+        log.info("Capping push to top %d of %d slow movers "
+                  "(highest cost-tied-up first). Raise/clear via "
+                  "--limit or NOTION_SLOW_MOVERS_LIMIT.",
+                  limit, len(rows))
+        rows = rows[:limit]
     log.info("Built %d slow-mover row(s) "
              "(top cost-tied-up: %s · $%s)",
              len(rows), rows[0]["sku"],
@@ -572,7 +588,10 @@ def _setup_log(verbose: bool) -> None:
 
 def cmd_slow_movers(args) -> int:
     _setup_log(args.verbose)
-    result = sync_slow_movers(dry_run=bool(args.dry_run))
+    limit = getattr(args, "limit", None)
+    result = sync_slow_movers(
+        dry_run=bool(args.dry_run),
+        limit=(int(limit) if limit else None))
     log.info("DONE: %s", result)
     return 0
 
@@ -612,6 +631,9 @@ def main() -> int:
         help="Push the current slow-movers register.")
     p_sm.add_argument("--dry-run", action="store_true")
     p_sm.add_argument("--verbose", action="store_true")
+    p_sm.add_argument("--limit", type=int, default=None,
+                        help="Cap pushed rows (default 200; set "
+                              "to 0 for unlimited).")
     p_sm.set_defaults(func=cmd_slow_movers)
     p_pb = sub.add_parser(
         "pull-playbooks",
