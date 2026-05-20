@@ -1561,6 +1561,99 @@ def _setup_log(verbose: bool = False) -> None:
         format=LOG_FORMAT, stream=sys.stdout, force=True)
 
 
+# ---------------------------------------------------------------------------
+# Thread-reply poller (v2.67.245)
+# ---------------------------------------------------------------------------
+# Slack's conversations.history (the channel-level poll) returns
+# top-level messages + broadcast replies, but NOT regular in-
+# thread replies. So when Jamie replied 'fixed' in a stock-issue
+# thread WITHOUT ticking "Also send to channel", the bot never saw
+# the reply and the issue stayed awaiting_response — SO-56536 is
+# the example Brandon flagged. Fix: for every open stock_issue,
+# poll conversations.replies directly and run the same resolution-
+# keyword detection on each in-thread reply.
+def check_open_issues_for_replies(dryrun: bool = False) -> dict:
+    """Poll conversations.replies for every open stock_issue and
+    apply maybe_resolve_from_thread_reply to each human reply."""
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        return {"checked": 0, "skipped_no_token": True}
+    issues = db.list_open_stock_issues(
+        limit=200, max_age_days=14)
+    if not issues:
+        return {"checked": 0, "resolved": 0}
+    try:
+        import slack_sync
+    except ImportError as exc:
+        return {"error": f"slack_sync import: {exc}"}
+    session = slack_sync._build_session(token)
+    n_checked = 0
+    n_resolved = 0
+    for issue in issues:
+        ch = issue.get("raise_channel")
+        ts = (issue.get("raise_thread_ts")
+              or issue.get("raise_ts"))
+        if not ch or not ts:
+            continue
+        n_checked += 1
+        try:
+            body = slack_sync._slack_get(
+                session, "conversations.replies",
+                {"channel": ch, "ts": ts, "limit": 50})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("conversations.replies %s/%s failed: %s",
+                          ch, ts, exc)
+            continue
+        msgs = body.get("messages") or []
+        if len(msgs) < 2:
+            continue  # parent only — no replies
+        # Skip the parent (msgs[0]) and scan thread replies.
+        for m in msgs[1:]:
+            user_id = m.get("user") or m.get("bot_id") or ""
+            is_bot = bool(m.get("bot_id")
+                          or m.get("subtype") == "bot_message")
+            if is_bot:
+                continue
+            text = m.get("text") or ""
+            if not any(k in text.lower()
+                       for k in _RESOLUTION_KEYWORDS):
+                continue
+            user_name = ""
+            if user_id:
+                try:
+                    user_name = slack_sync._resolve_user(
+                        session, user_id)
+                except Exception:  # noqa: BLE001
+                    user_name = user_id
+            reply_msg = {
+                "text": text,
+                "channel_id": ch,
+                "thread_ts": ts,
+                "user_id": user_id,
+                "user_name": user_name,
+                "is_bot": False,
+                "is_our_bot": False,
+                "ts": m.get("ts"),
+            }
+            if dryrun:
+                log.info(
+                    "[DRY] would resolve issue %s from %s: %r",
+                    issue["id"], user_name, text[:80])
+                break
+            if maybe_resolve_from_thread_reply(reply_msg):
+                n_resolved += 1
+                break  # first matching reply resolves the issue
+    return {"checked": n_checked, "resolved": n_resolved}
+
+
+def cmd_check_replies(args: argparse.Namespace) -> int:
+    _setup_log(args.verbose)
+    result = check_open_issues_for_replies(
+        dryrun=bool(args.dryrun))
+    log.info("DONE: %s", result)
+    return 0
+
+
 def cmd_escalate(args: argparse.Namespace) -> int:
     _setup_log(args.verbose)
     hours = int(os.environ.get(
@@ -1624,6 +1717,16 @@ def main() -> int:
     p_i.add_argument("--issue-id", type=int, required=True)
     p_i.add_argument("--verbose", action="store_true")
     p_i.set_defaults(func=cmd_inspect)
+
+    p_cr = sub.add_parser("check-replies",
+        help="Poll conversations.replies for each open issue and "
+              "close any whose threads contain a 'fixed' / "
+              "'adjusted' / 'no change' style reply that the "
+              "channel-level history poll missed.")
+    p_cr.add_argument("--dryrun", action="store_true")
+    p_cr.add_argument("--verbose", action="store_true")
+    p_cr.set_defaults(func=cmd_check_replies)
+
     args = parser.parse_args()
     return args.func(args)
 

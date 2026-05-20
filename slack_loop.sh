@@ -183,6 +183,7 @@ last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
 last_si_escalate_epoch=0   # v2.67.144 stock-issue DM escalation
+last_si_replies_epoch=0    # v2.67.245 stock-issue thread-reply poll
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
@@ -450,6 +451,19 @@ while true; do
         last_si_escalate_epoch=$(date -u +%s)
         _run_bg "stock_issues_escalate" \
             "python stock_issues_handler.py escalate"
+    fi
+
+    # v2.67.245 Stock-issue thread-reply poll. Slack's
+    # conversations.history doesn't return regular (non-broadcast)
+    # in-thread replies, so a Jamie 'fixed' reply was being missed
+    # and the issue stayed awaiting_response (Brandon flagged
+    # SO-56536). Every 5 min, poll conversations.replies for each
+    # open issue and apply the resolution-keyword check directly.
+    seconds_since_si_replies=$(( now_epoch - last_si_replies_epoch ))
+    if [ "$seconds_since_si_replies" -ge 300 ]; then
+        last_si_replies_epoch=$(date -u +%s)
+        _run_bg "stock_issues_check_replies" \
+            "python stock_issues_handler.py check-replies"
     fi
 
     # v2.67.144 Stock-issue morning summary. Fires once per day
