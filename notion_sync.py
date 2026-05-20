@@ -603,6 +603,33 @@ def cmd_pull_playbooks(args) -> int:
     return 0
 
 
+def cmd_dump_glossary(args) -> int:
+    """Write the current engine glossary to a markdown file —
+    drop the file into Notion via Import -> Markdown for a clean
+    page. Re-run after the engine evolves to refresh."""
+    _setup_log(args.verbose)
+    try:
+        from intelligence_glossary import GLOSSARY_MARKDOWN
+    except ImportError as exc:
+        log.error("intelligence_glossary import failed: %s", exc)
+        return 1
+    output = args.output or "/tmp/app_glossary.md"
+    header = (
+        "# Wired4Signs App Glossary\n\n"
+        "_Single source of truth for the ABC engine's "
+        "intelligence rules and the signals the app surfaces. "
+        "Generated from `intelligence_glossary.py`. To refresh: "
+        "`python notion_sync.py dump-glossary`._\n\n---\n"
+    )
+    with open(output, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write(GLOSSARY_MARKDOWN.lstrip("\n"))
+    log.info("Wrote %d chars -> %s",
+             len(GLOSSARY_MARKDOWN), output)
+    print(f"OK: {output}")
+    return 0
+
+
 def cmd_check(args) -> int:
     """Smoke-test the Notion auth + parent-page access."""
     _setup_log(args.verbose)
@@ -642,6 +669,15 @@ def main() -> int:
     p_pb.add_argument("--dry-run", action="store_true")
     p_pb.add_argument("--verbose", action="store_true")
     p_pb.set_defaults(func=cmd_pull_playbooks)
+    p_dg = sub.add_parser(
+        "dump-glossary",
+        help="Write the engine glossary to a markdown file you "
+              "can import into Notion.")
+    p_dg.add_argument("--output", default=None,
+                       help="Output path (default /tmp/"
+                             "app_glossary.md).")
+    p_dg.add_argument("--verbose", action="store_true")
+    p_dg.set_defaults(func=cmd_dump_glossary)
     p_ck = sub.add_parser(
         "check", help="Verify auth and parent-page access.")
     p_ck.add_argument("--verbose", action="store_true")
