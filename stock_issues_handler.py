@@ -1605,6 +1605,9 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
                           ch, ts, exc)
             continue
         msgs = body.get("messages") or []
+        log.info(
+            "issue %s · thread %s/%s · %d reply(ies) returned",
+            issue["id"], ch, ts, max(0, len(msgs) - 1))
         if len(msgs) < 2:
             continue  # parent only — no replies
         # Skip the parent (msgs[0]) and scan thread replies.
@@ -1612,11 +1615,15 @@ def check_open_issues_for_replies(dryrun: bool = False) -> dict:
             user_id = m.get("user") or m.get("bot_id") or ""
             is_bot = bool(m.get("bot_id")
                           or m.get("subtype") == "bot_message")
+            text = m.get("text") or ""
+            _kw_hit = any(k in text.lower()
+                          for k in _RESOLUTION_KEYWORDS)
+            log.info(
+                "  reply: user=%s is_bot=%s kw_match=%s text=%r",
+                user_id or "?", is_bot, _kw_hit, text[:120])
             if is_bot:
                 continue
-            text = m.get("text") or ""
-            if not any(k in text.lower()
-                       for k in _RESOLUTION_KEYWORDS):
+            if not _kw_hit:
                 continue
             user_name = ""
             if user_id:
