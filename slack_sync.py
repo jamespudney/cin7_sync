@@ -273,6 +273,21 @@ def _configured_channels() -> List[str]:
             c = c.strip()
             if c and c not in out:
                 out.append(c)
+    # v2.67.259 — auto-include the dedicated single-purpose
+    # channels. Each has its own env var AND the bot processes
+    # INCOMING messages there (UPS emails, stock issues, PO
+    # commentary, shipping reviews). Previously the operator had
+    # to ALSO remember to add each one to SLACK_AI_CHANNELS — a
+    # silent gap that left #dropship-tracking completely
+    # un-polled, so UPS emails never reached the handler.
+    for var in ("SLACK_DROPSHIP_TRACKING_CHANNEL_ID",
+                 "SLACK_STOCK_ISSUES_CHANNEL_ID",
+                 "SLACK_PURCHASE_BACKORDER_CHANNEL_ID",
+                 "SLACK_PO_COMMENTARY_SOURCE_CHANNEL_ID",
+                 "SLACK_SHIPPING_ISSUES_CHANNEL_ID"):
+        c = os.environ.get(var, "").strip()
+        if c and c not in out:
+            out.append(c)
     return out
 
 
