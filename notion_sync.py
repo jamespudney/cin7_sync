@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -96,23 +97,34 @@ def _request(method: str, path: str,
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-    try:
-        r = requests.request(method, url, headers=headers,
-                              json=json_body, timeout=30)
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Notion API network error ({method} {path}): "
-            f"{exc}") from exc
-    if r.status_code >= 400:
-        raise RuntimeError(
-            f"Notion API error ({method} {path}): "
-            f"HTTP {r.status_code} — {r.text[:400]}")
-    try:
-        return r.json()
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Notion API returned non-JSON ({method} {path}): "
-            f"{r.text[:300]}") from exc
+    for attempt in range(6):
+        try:
+            r = requests.request(method, url, headers=headers,
+                                  json=json_body, timeout=30)
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Notion API network error ({method} {path}): "
+                f"{exc}") from exc
+        # Notion limits to ~3 req/s — honour Retry-After on 429.
+        if r.status_code == 429 and attempt < 5:
+            try:
+                wait = float(r.headers.get("Retry-After", "1"))
+            except (TypeError, ValueError):
+                wait = 1.0
+            time.sleep(min(wait, 10.0) + 0.25)
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Notion API error ({method} {path}): "
+                f"HTTP {r.status_code} — {r.text[:400]}")
+        try:
+            return r.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Notion API returned non-JSON ({method} {path}): "
+                f"{r.text[:300]}") from exc
+    raise RuntimeError(
+        f"Notion API rate-limited ({method} {path}) after retries")
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +626,15 @@ SLOW_MOVERS_SCHEMA = {
     "Cost tied up ($)": {"number": {"format": "dollar"}},
 }
 
+# Customer-facing register — a single page in the Product Info
+# database, refreshed alongside the slow-movers push. SKU / name /
+# stock only: never costs or dormancy, because Product Info is read
+# by the customer-facing AI.
+PRODUCT_INFO_DB_ID = os.environ.get(
+    "NOTION_PRODUCT_INFO_DB_ID",
+    "3661616a25fa80889a38c29abc4688e2").strip().replace("-", "")
+CUSTOMER_STOCK_PAGE_TITLE = "Priority Stock for Recommendations"
+
 
 def _latest_csv(pattern: str) -> Optional[Path]:
     files = glob.glob(str(OUTPUT_DIR / pattern))
@@ -709,16 +730,123 @@ def _build_slow_mover_rows() -> List[Dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Customer-facing stock page — Product Info mirror
+# ---------------------------------------------------------------------------
+def _rt(text: str) -> List[Dict]:
+    """Notion rich-text array for a plain string in a block."""
+    return [{"type": "text",
+             "text": {"content": (text or "")[:1900]}}]
+
+
+def _block(btype: str, payload: Dict) -> Dict:
+    return {"object": "block", "type": btype, btype: payload}
+
+
+def _replace_page_body(page_id: str, children: List[Dict],
+                       cfg: Dict[str, str]) -> None:
+    """Delete every existing child block of `page_id`, then append
+    `children` fresh. Notion appends max 100 blocks per request."""
+    existing: List[str] = []
+    cursor = None
+    while True:
+        path = (f"/blocks/{page_id}/children?page_size=100"
+                + (f"&start_cursor={cursor}" if cursor else ""))
+        body = _request("GET", path, cfg=cfg)
+        for b in body.get("results", []) or []:
+            if b.get("id"):
+                existing.append(b["id"])
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+    for block_id in existing:
+        try:
+            _request("DELETE", f"/blocks/{block_id}", cfg=cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not delete stale block %s: %s",
+                        block_id, exc)
+    for i in range(0, len(children), 100):
+        _request("PATCH", f"/blocks/{page_id}/children",
+                 json_body={"children": children[i:i + 100]},
+                 cfg=cfg)
+
+
+def _build_customer_stock_blocks(rows: List[Dict]) -> List[Dict]:
+    """Customer-safe body for the Priority Stock page: an intro
+    callout plus one bullet per in-stock slow mover. SKU / name /
+    stock only — costs and dormancy are deliberately omitted."""
+    today = datetime.date.today().isoformat()
+    blocks = [
+        _block("callout", {
+            "rich_text": _rt(
+                "Well-stocked lines to recommend first. When one of "
+                "these genuinely meets the customer's need and there "
+                "is stock to fulfil the order, suggest it ahead of "
+                "alternatives."),
+            "icon": {"type": "emoji", "emoji": "\U0001F4E6"}}),
+        _block("paragraph", {"rich_text": _rt(
+            f"Auto-maintained from the slow-movers register. "
+            f"Last updated {today}.")}),
+        _block("divider", {}),
+    ]
+    for r in rows:
+        on_hand = r.get("on_hand")
+        if on_hand is None or on_hand <= 0:
+            continue  # can't recommend what we can't fulfil
+        name = r.get("name") or ""
+        label = (f"{r['sku']}"
+                 + (f" — {name}" if name else "")
+                 + f" — {int(on_hand)} in stock")
+        blocks.append(_block("bulleted_list_item",
+                             {"rich_text": _rt(label)}))
+    return blocks
+
+
+def sync_customer_stock_page(rows: List[Dict],
+                             cfg: Optional[Dict[str, str]] = None
+                             ) -> Dict:
+    """Refresh the customer-facing 'Priority Stock for
+    Recommendations' page in the Product Info database from the
+    current slow-mover rows. Costs and dormancy are excluded —
+    Product Info is read by the customer-facing AI."""
+    cfg = cfg or _config()
+    blocks = _build_customer_stock_blocks(rows)
+    n_listed = sum(1 for b in blocks
+                   if b["type"] == "bulleted_list_item")
+    page_id = query_database_by_title(
+        PRODUCT_INFO_DB_ID, "Name", CUSTOMER_STOCK_PAGE_TITLE, cfg)
+    if page_id:
+        _replace_page_body(page_id, blocks, cfg)
+        log.info("Refreshed customer stock page (%d product(s)).",
+                 n_listed)
+    else:
+        res = _request("POST", "/pages", json_body={
+            "parent": {"database_id": PRODUCT_INFO_DB_ID},
+            "properties": {"Name": {"title": _rt(
+                CUSTOMER_STOCK_PAGE_TITLE)}},
+            "children": blocks[:100],
+        }, cfg=cfg)
+        page_id = res["id"]
+        for i in range(100, len(blocks), 100):
+            _request("PATCH", f"/blocks/{page_id}/children",
+                     json_body={"children": blocks[i:i + 100]},
+                     cfg=cfg)
+        log.info("Created customer stock page (%d product(s)).",
+                 n_listed)
+    return {"page_id": page_id, "products": n_listed}
+
+
 def sync_slow_movers(dry_run: bool = False,
                        limit: Optional[int] = None) -> Dict:
     """Push the current slow-movers register to Notion. `limit`
     caps the rows pushed (highest cost-tied-up first) — defaults
     to NOTION_SLOW_MOVERS_LIMIT env var or 200; Notion's 3-req/s
     rate limit makes full pushes of large registers slow."""
-    rows = _build_slow_mover_rows()
-    if not rows:
+    all_rows = _build_slow_mover_rows()
+    if not all_rows:
         log.info("No slow movers to push.")
         return {"pushed": 0, "rows": 0}
+    rows = all_rows
     if limit is None:
         try:
             limit = int(os.environ.get(
@@ -736,8 +864,12 @@ def sync_slow_movers(dry_run: bool = False,
              len(rows), rows[0]["sku"],
              f"{rows[0].get('cost_tied_up') or 0:,.0f}")
     if dry_run:
+        n_cust = sum(1 for r in all_rows
+                     if (r.get("on_hand") or 0) > 0)
         log.info("[dry-run] sample row:\n%s",
                  json.dumps(rows[0], indent=2, default=str))
+        log.info("[dry-run] customer stock page would list %d "
+                 "in-stock product(s).", n_cust)
         return {"pushed": 0, "rows": len(rows), "dry_run": True}
     cfg = _config()
     db_id = find_or_create_database(
@@ -764,7 +896,13 @@ def sync_slow_movers(dry_run: bool = False,
                           r["sku"], exc)
             n_err += 1
     log.info("Notion sync done: %d ok, %d errors", n_ok, n_err)
-    return {"pushed": n_ok, "errors": n_err, "rows": len(rows)}
+    try:
+        cust = sync_customer_stock_page(all_rows, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Customer stock page refresh failed: %s", exc)
+        cust = {"products": 0}
+    return {"pushed": n_ok, "errors": n_err, "rows": len(rows),
+            "customer_products": cust.get("products", 0)}
 
 
 # ---------------------------------------------------------------------------
