@@ -301,6 +301,61 @@ def _ingest_only_channels() -> set:
     return {c.strip() for c in raw.split(",") if c.strip()}
 
 
+def _discover_dm_channels(session: requests.Session) -> List[str]:
+    """v2.67.260 — discover the bot's open DM (IM) conversations so
+    staff can chat with the assistant 1:1 in Slack.
+
+    DM channel IDs start with 'D'. They can't be put in
+    SLACK_AI_CHANNELS ahead of time — Slack mints one the first
+    time each user DMs the bot, so the operator never knows the
+    IDs. We list them here via users.conversations and poll each
+    one exactly like a normal channel. slack_listener.py already
+    treats any D-prefix channel as a mention ('DMs always get
+    answered'), so once the message is ingested the bot replies.
+
+    Requires the bot scopes `im:history` + `im:read`. Without them
+    Slack returns `missing_scope`; we log once and return [] so the
+    rest of the poll still runs. Set SLACK_DM_CHAT_ENABLED=0 to
+    disable DM polling entirely."""
+    if os.environ.get(
+            "SLACK_DM_CHAT_ENABLED", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return []
+    out: List[str] = []
+    cursor = None
+    try:
+        while True:
+            params: Dict[str, Any] = {
+                "types": "im",
+                "limit": 200,
+                "exclude_archived": "true",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            body = _slack_get(session, "users.conversations", params)
+            for ch in body.get("channels") or []:
+                cid = ch.get("id") or ""
+                # Skip DMs with deactivated users and the bot's
+                # self-DM (is_user_deleted / the Slackbot DM).
+                if cid and not ch.get("is_user_deleted"):
+                    out.append(cid)
+            cursor = ((body.get("response_metadata") or {})
+                      .get("next_cursor") or "")
+            if not cursor:
+                break
+    except RuntimeError as exc:
+        if "missing_scope" in str(exc):
+            log.warning(
+                "DM chat: bot is missing the im:history/im:read "
+                "scope — skipping DM polling. Add the scopes and "
+                "reinstall the Slack app to enable 1:1 chat. (%s)",
+                exc)
+        else:
+            log.error("DM channel discovery failed: %s", exc)
+        return []
+    return out
+
+
 # ---------------------------------------------------------------------------
 # v2.67.66 — Feedback ingest helpers
 # ---------------------------------------------------------------------------
@@ -658,6 +713,17 @@ def poll_once(lookback_hours: Optional[int] = None) -> Dict[str, int]:
         return {}
     session = _build_session(token)
     bot_self = get_bot_self_id(session)
+    # v2.67.260 — append the bot's DM conversations so staff can
+    # chat with the assistant 1:1. Discovered dynamically every
+    # poll: a new DM channel appears the moment a user first
+    # messages the bot.
+    dm_channels = _discover_dm_channels(session)
+    for d in dm_channels:
+        if d not in channels:
+            channels.append(d)
+    if dm_channels:
+        log.info("Polling %d DM conversation(s) for 1:1 chat.",
+                  len(dm_channels))
     out = {}
     for ch in channels:
         try:
