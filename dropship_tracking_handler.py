@@ -157,16 +157,27 @@ def _strip_markdown_bold(text: str) -> str:
     return re.sub(r"\*([^*\n]+?)\*", r"\1", text)
 
 
-def parse_ups_email(text: str) -> dict:
+def parse_ups_email(text: str, subject: str = "") -> dict:
     """Extract structured fields from a UPS shipment-notification
     email body. Returns dict with whichever fields parsed; missing
-    fields are None / empty."""
+    fields are None / empty. v2.67.258 — `subject` is searched as
+    a fallback for the tracking number: UPS subjects reliably
+    read 'UPS Ship Notification, Tracking Number 1Z...' even when
+    the HTML body's plain-text conversion is mangled."""
     out: dict = {}
-    if not text:
+    if not text and not subject:
         return out
-    text = _strip_markdown_bold(text)
+    text = _strip_markdown_bold(text or "")
 
     m = _TRACKING_RE.search(text)
+    if not m and subject:
+        m = _TRACKING_RE.search(_strip_markdown_bold(subject))
+    if not m and subject:
+        # Subject sometimes has the bare code with no label.
+        m2 = re.search(r"\b(1Z[A-Z0-9]{10,18})\b",
+                        subject, re.IGNORECASE)
+        if m2:
+            out["tracking_number"] = m2.group(1).strip()
     if m:
         out["tracking_number"] = m.group(1).strip()
 
@@ -745,13 +756,34 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
     f = _email_payload(msg)
     if not f:
         return "", []
-    body = f.get("plain_text") or ""
-    parsed = parse_ups_email(body)
+    # v2.67.258 — Slack's Email app sometimes leaves plain_text
+    # thin/empty for HTML-only emails; fall back to preview, then
+    # to the message text itself.
+    body = (f.get("plain_text") or f.get("preview")
+            or msg.get("text") or "")
+    subject = f.get("subject") or ""
+    parsed = parse_ups_email(body, subject=subject)
     tools_used: List[str] = ["parse_ups_email"]
 
     if not parsed.get("tracking_number"):
-        log.warning("UPS email had no parseable tracking")
-        return "", tools_used
+        # v2.67.258 — was a silent return, which left Cheran
+        # unsure if the bot even saw the email. Post a diagnostic
+        # showing the raw text so (a) staff know it was seen and
+        # (b) we can see exactly what to fix in the parser.
+        log.warning("UPS email had no parseable tracking — "
+                     "subject=%r body[:200]=%r",
+                     subject, body[:200])
+        snippet = (body or "(plain-text body was empty)")[:900]
+        return (
+            "📦 *UPS email received — couldn't parse it "
+            "automatically*\n\n"
+            f"Subject: `{subject or '(none)'}`\n\n"
+            "I detected a UPS shipment email but couldn't pull a "
+            "tracking number out of it. Raw text I received:\n"
+            f"```\n{snippet}\n```\n"
+            "_Cheran: add the tracking to CIN7 manually for now. "
+            "This text lets us fix the auto-parser._"
+        ), tools_used
 
     sale_match = _find_matching_sale(parsed)
     if not sale_match:
