@@ -32,6 +32,16 @@ echo "[$(stamp)] cin7_sync quick --days 3" >> "$LOG"
 python cin7_sync.py quick --days 3 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync quick FAILED (continuing)" >> "$LOG"
 
+# v2.67.264 — BOM / parent-child structure. Previously refreshed
+# only by the weekend deep sync, leaving the engine's bulk-to-cut
+# rollup on week-stale (or absent) BOM data. boms is a per-product
+# detail loop; placed after `quick` so it reuses the fresh
+# products_*.json, and it has its own checkpoint so an interrupted
+# run resumes on the next day's pass.
+echo "[$(stamp)] cin7_sync boms" >> "$LOG"
+python cin7_sync.py boms >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync boms FAILED (continuing)" >> "$LOG"
+
 # v2.67.43 — refresh the 30-day sale-header window daily. The
 # Overview tile "Sales invoiced (last 30d)" reads sales_last_30d_*
 # directly. Without this refresh the file goes stale (we observed
