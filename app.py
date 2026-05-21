@@ -6092,6 +6092,17 @@ def _abc_engine(products: pd.DataFrame,
         sku_s = str(p.get("SKU"))
         if not _is_strip_sku(sku_s, p.get("Name", "")):
             continue
+        # v2.67.265 — the strip parser is a naming-based FALLBACK for
+        # SKUs CIN7 has no BOM for. When a SKU does have a real BOM,
+        # the BOM path is authoritative — skip it here so the naming
+        # heuristic can't override it. Without this, BOM-managed
+        # channel families whose name contains "Strip" (e.g.
+        # LED-BROADWAY-B) were mis-handled: the real -3050-BULK master
+        # SKU doesn't parse as a length, so it dropped out of the
+        # family and the largest cut (LED-BROADWAY-B-3) got crowned as
+        # the bulk master and given a spurious reorder recommendation.
+        if sku_s in bom_components_by_asm:
+            continue
         parse = _parse_strip_base(sku_s)
         if not parse:
             continue
