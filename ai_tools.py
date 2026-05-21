@@ -1676,8 +1676,13 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     # v2.67.250 — Notion-backed knowledge-base search.
+    # v2.67.261 — renamed from search_knowledge_base to
+    # search_team_playbooks: it collided with the on-disk
+    # ai_kb docs tool of the same name, and the Claude API
+    # rejects a tool list with duplicate names ("Tool names
+    # must be unique") — which silently broke EVERY AI call.
     {
-        "name": "search_knowledge_base",
+        "name": "search_team_playbooks",
         "description": (
             "Search the team's internal knowledge base "
             "(operational playbooks, processes, escalation "
@@ -6076,12 +6081,15 @@ def compare_ad_periods(engine_df: pd.DataFrame,
     }
 
 
-def search_knowledge_base(engine_df: pd.DataFrame,
+def search_team_playbooks(engine_df: pd.DataFrame,
                             sale_lines_df: pd.DataFrame,
                             args: dict) -> dict:
     """v2.67.250 — search the local mirror of Notion playbooks +
     FAQs. Returns up to 5 matching articles with content excerpts
-    + the Notion URL so the AI can cite source."""
+    + the Notion URL so the AI can cite source.
+
+    v2.67.261 — renamed from search_knowledge_base (collided with
+    the on-disk ai_kb tool; duplicate tool names break the API)."""
     query = (args.get("query") or "").strip()
     if not query:
         return {"matched": 0,
@@ -6173,7 +6181,8 @@ TOOL_HANDLERS = {
     "compare_ad_periods": compare_ad_periods,
     "get_sku_ad_spend": get_sku_ad_spend,  # v2.67.105
     # v2.67.250 — Notion-backed playbook / FAQ search.
-    "search_knowledge_base": search_knowledge_base,
+    # v2.67.261 — renamed from search_knowledge_base (name clash).
+    "search_team_playbooks": search_team_playbooks,
 }
 
 
