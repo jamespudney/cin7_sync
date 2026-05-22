@@ -1,4 +1,4 @@
-"""dropship_tracking_handler.py (v2.67.271)
+"""dropship_tracking_handler.py (v2.67.272)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
@@ -861,18 +861,45 @@ def write_tracking_to_sale(sale_id: str,
             "detail": ("Sale has no Fulfilments — can't add "
                           "tracking. Investigate the sale state."),
         }
-    # Append to the first fulfilment's Ship.Lines
+    # 3b. Update or append the ship line.
+    # CIN7 auto-creates a ship record (with carrier pre-set but no
+    # tracking) when a dropship sale syncs from Shopify. We should
+    # UPDATE that existing line rather than append a duplicate.
+    # Only fall back to appending if no such line exists.
     first = fulfilments[0]
     ship = first.setdefault("Ship", {})
     lines = ship.setdefault("Lines", [])
-    lines.append(new_line)
-    # Force Ship.Status to AUTHORISED so CIN7 processes the new
-    # line. setdefault() would silently leave DRAFT unchanged,
-    # so assign directly.
+
+    # Find the first line that has no tracking number yet — that's
+    # the CIN7-auto-created placeholder we want to fill in.
+    existing = next(
+        (l for l in lines
+         if not (l.get("TrackingNumber") or "").strip()),
+        None)
+
+    if existing:
+        # Update the placeholder line in-place, preserving its ID
+        # so CIN7 treats it as an update not a new row.
+        existing["TrackingNumber"] = tracking_number
+        existing["TrackingURL"] = tracking_url or ""
+        existing["IsShipped"] = True
+        if carrier:
+            existing["Carrier"] = carrier
+        if boxes:
+            existing["Boxes"] = str(int(boxes))
+        if shipment_date:
+            existing["ShipmentDate"] = shipment_date
+        log.info("Updating existing ship line %s with tracking",
+                 existing.get("ID"))
+    else:
+        # No placeholder line — add a fresh one.
+        lines.append(new_line)
+        log.info("Appending new ship line with tracking")
+
+    # Force Ship.Status to AUTHORISED so CIN7 processes the line.
     ship["Status"] = "AUTHORISED"
-    # AddTrackingNumbers=true tells CIN7 to accept new tracking
-    # lines even when the existing ship record is already
-    # AUTHORISED (without it, CIN7 silently ignores the update).
+    # AddTrackingNumbers=true tells CIN7 to accept tracking updates
+    # on an already-AUTHORISED ship record without rejecting the PUT.
     ship["AddTrackingNumbers"] = True
 
     # 4. PUT the modified sale back
