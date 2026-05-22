@@ -134,6 +134,9 @@ CREATE TABLE IF NOT EXISTS supplier_config (
     review_days_A       INTEGER DEFAULT 14,
     review_days_B       INTEGER DEFAULT 30,
     review_days_C       INTEGER DEFAULT 45,
+    order_cadence_days  INTEGER,            -- v2.67.283 — real reorder
+                                            -- interval (e.g. 7 = weekly);
+                                            -- overrides ABC review_days
     set_by              TEXT    NOT NULL,
     set_at              TIMESTAMP NOT NULL DEFAULT (datetime('now')),
     note                TEXT
@@ -1348,6 +1351,24 @@ def _migrate_supplier_stockout_recovery(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE supplier_config ADD COLUMN "
                 "stockout_min_cover_days INTEGER DEFAULT 60")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_supplier_cadence(conn: sqlite3.Connection) -> None:
+    """v2.67.283 — add order_cadence_days to supplier_config. The
+    real interval between reorders for this supplier (e.g. 7 when
+    ordered weekly). When set, it overrides the ABC-class
+    review_days in the reorder engine — each order then only needs
+    to bridge to the NEXT order, not a generic 30-45 days, which is
+    the single biggest lever for freeing cash tied up in stock."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('supplier_config')").fetchall()}
+        if "order_cadence_days" not in cols:
+            conn.execute(
+                "ALTER TABLE supplier_config ADD COLUMN "
+                "order_cadence_days INTEGER")
     except sqlite3.Error:
         pass
 
@@ -3545,6 +3566,12 @@ _PG_POST_CUTOVER_TABLES = [
     ("supplier_config_rename_review_days_C",
       'ALTER TABLE supplier_config RENAME COLUMN '
       '"review_days_C" TO review_days_c;'),
+    # v2.67.283 — per-supplier reorder cadence (overrides the
+    # ABC-class review days when set). IF NOT EXISTS keeps it
+    # idempotent across re-runs.
+    ("supplier_config_add_order_cadence_days",
+      "ALTER TABLE supplier_config "
+      "ADD COLUMN IF NOT EXISTS order_cadence_days INTEGER;"),
     # v2.67.211 — QuickBooks Online connection table.
     ("qbo_connection",
       """
@@ -3769,6 +3796,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_ui_prefs_widths(conn)
         _migrate_supplier_dropship(conn)
         _migrate_supplier_stockout_recovery(conn)
+        _migrate_supplier_cadence(conn)
         _migrate_demand_signal_match_columns(conn)
         _migrate_product_aliases_multi_target(conn)
         _migrate_ad_campaign_skus_spend(conn)  # v2.67.105
@@ -4099,6 +4127,7 @@ def set_supplier_config(
     review_days_A: int = 14,
     review_days_B: int = 30,
     review_days_C: int = 45,
+    order_cadence_days: Optional[int] = None,
     dropship_default: int = 0,
     stockout_min_cover_days: int = 60,
     actor: str,
@@ -4114,9 +4143,10 @@ def set_supplier_config(
                  preferred_freight,
                  safety_pct_A, safety_pct_B, safety_pct_C,
                  review_days_A, review_days_B, review_days_C,
+                 order_cadence_days,
                  dropship_default, stockout_min_cover_days,
                  set_by, note)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(supplier_name) DO UPDATE SET
                 lead_time_sea_days = excluded.lead_time_sea_days,
                 lead_time_air_days = excluded.lead_time_air_days,
@@ -4132,6 +4162,7 @@ def set_supplier_config(
                 review_days_A = excluded.review_days_A,
                 review_days_B = excluded.review_days_B,
                 review_days_C = excluded.review_days_C,
+                order_cadence_days = excluded.order_cadence_days,
                 dropship_default = excluded.dropship_default,
                 stockout_min_cover_days = excluded.stockout_min_cover_days,
                 set_by = excluded.set_by,
@@ -4143,6 +4174,8 @@ def set_supplier_config(
              moq_units, mov_amount, mov_currency, preferred_freight,
              safety_pct_A, safety_pct_B, safety_pct_C,
              review_days_A, review_days_B, review_days_C,
+             (int(order_cadence_days)
+              if order_cadence_days else None),
              int(bool(dropship_default)),
              int(stockout_min_cover_days),
              actor, note),

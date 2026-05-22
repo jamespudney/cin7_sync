@@ -10743,11 +10743,28 @@ elif page == "Ordering":
             "B": cfg.get("safety_pct_B") or 20.0,
             "C": cfg.get("safety_pct_C") or 15.0,
         }.get(abc, 20.0)
-        review_days = {
+        # v2.67.283 — review period = the supplier's ACTUAL reorder
+        # cadence when configured (e.g. 7 for a weekly supplier).
+        # The ABC-class review_days are only the fallback. Carrying
+        # a generic 30-45d of next-cycle stock when you actually
+        # reorder weekly is the single biggest cash drag.
+        abc_review_days = {
             "A": cfg.get("review_days_A") or 14,
             "B": cfg.get("review_days_B") or 30,
             "C": cfg.get("review_days_C") or 45,
         }.get(abc, 30)
+        _cadence = cfg.get("order_cadence_days")
+        if _cadence and int(_cadence) > 0:
+            review_days = int(_cadence)
+            review_basis = (
+                f"you reorder {supplier or 'this supplier'} every "
+                f"{review_days}d, so each order only bridges to the "
+                f"next one")
+        else:
+            review_days = abc_review_days
+            review_basis = (
+                f"class-{abc} default — set this supplier's order "
+                f"cadence in Supplier settings to tighten it")
 
         avg_daily = row["avg_daily"]
         lt_demand = avg_daily * lead_time_days
@@ -10990,8 +11007,8 @@ elif page == "Ordering":
                if (air_eligible_default and air_max_len
                    and length_mm is not None and length_mm > air_max_len)
                else "\n\n")
-            + f"**ABC class**: {abc} → safety {safety_pct:.0f}%, "
-            f"review {review_days}d\n\n"
+            + f"**ABC class**: {abc} → safety {safety_pct:.0f}%\n\n"
+            f"**Review period**: {review_days}d — {review_basis}\n\n"
             f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "
             f"= {lt_demand:.1f} units\n\n"
             f"**Safety stock**: {lt_demand:.1f} × {safety_pct/100:.2f} "
@@ -11533,6 +11550,33 @@ elif page == "Ordering":
                                             value=int(existing.get("review_days_C") or 45),
                                             key="sc_rvC")
 
+            # v2.67.283 — order cadence. The real interval between
+            # reorders with this supplier. Drives the reorder
+            # engine's review period — the leanest, highest-impact
+            # cashflow lever (carry stock only until the NEXT order,
+            # not a generic 30-45 days).
+            st.markdown("**Order cadence** — how often you actually "
+                         "place orders with this supplier")
+            oc_cols = st.columns([2, 4])
+            order_cadence = oc_cols[0].number_input(
+                "Order cadence (days)",
+                min_value=0, max_value=180,
+                value=int(existing.get("order_cadence_days") or 0),
+                key="sc_cadence",
+                help="The real gap between reorders — e.g. 7 if you "
+                     "order this supplier weekly. The engine then "
+                     "stocks only enough to bridge to the next "
+                     "order, not a generic 30-45 days. 0 = not set "
+                     "(falls back to the ABC-class review days).",
+            )
+            oc_cols[1].caption(
+                ":information_source: Set this for your regular "
+                "suppliers — Neonica, Topmet, Luz Negra, LEDsOn are "
+                "ordered weekly, so set them to **7**. This is the "
+                "biggest single lever for freeing cash tied up in "
+                "stock; the per-SKU reorder explanation shows the "
+                "effect.")
+
             # 100%-dropship supplier toggle — covers Gyford-type suppliers
             # where every SKU is order-on-demand (we never stock any of it).
             # When on, EVERY product whose primary supplier is this supplier
@@ -11575,6 +11619,9 @@ elif page == "Ordering":
                     review_days_A=int(rv_A),
                     review_days_B=int(rv_B),
                     review_days_C=int(rv_C),
+                    order_cadence_days=(int(order_cadence)
+                                         if order_cadence > 0
+                                         else None),
                     dropship_default=1 if ds_default else 0,
                     actor=actor_o,
                 )
@@ -11594,6 +11641,9 @@ elif page == "Ordering":
                         "Air elig.": "Yes" if c.get("air_eligible_default") else "No",
                         "Air max len": (str(c.get("air_max_length_mm"))
                                          if c.get("air_max_length_mm") else "—"),
+                        "Cadence": (f"{c.get('order_cadence_days')}d"
+                                     if c.get("order_cadence_days")
+                                     else "—"),
                         "MOQ": (str(c.get("moq_units"))
                                  if c.get("moq_units") else "—"),
                         "MOV": (f"{c.get('mov_currency') or ''}"
