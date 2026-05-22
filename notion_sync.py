@@ -812,19 +812,25 @@ def sync_slow_movers(dry_run: bool = False,
 
 
 # ---------------------------------------------------------------------------
-# Product Dimensions — push the vision-extracted spec table to Notion
+# Product dimensions -> the Product Info database
 # ---------------------------------------------------------------------------
 # v2.67.276 — extract_dimensions.py crawled every Shopify product
 # image with Claude vision and cached the cross-section specs in the
 # product_dimensions table (one row per Shopify product/handle).
-# This pushes that table into a Notion database so the team — and
-# future customer-facing agents — share a single, browsable source.
-PRODUCT_DIMS_TITLE = "Product Dimensions"
-PRODUCT_DIMS_DB_KEY = "product_dimensions"  # registry key for db ID
-PRODUCT_DIMS_SCHEMA = {
-    # Title property — the human-readable product name.
-    "Product": {"title": {}},
-    # Shopify handle: the natural key we upsert on.
+# v2.67.278 — per James: Notion's "Product Info" database is the
+# single source of truth for everything product-related. So the
+# dimension data is written INTO that existing database as page
+# rows — NOT a separate database. We add the dimension columns to
+# Product Info on first run, then upsert each product as a row
+# keyed on the database's "Name" (title) column.
+PRODUCT_INFO_TITLE = "Product Info"
+PRODUCT_INFO_DB_KEY = "product_info"     # registry key for db ID
+PRODUCT_INFO_TITLE_PROP = "Name"         # the DB's title column
+
+# The dimension columns we add to the Product Info database. The
+# title column ("Name") already exists and is NOT in here — a
+# database has exactly one title property.
+PRODUCT_DIM_COLUMNS = {
     "Handle": {"rich_text": {}},
     "Family": {"rich_text": {}},
     "Outer width (mm)": {"number": {"format": "number"}},
@@ -863,6 +869,11 @@ PRODUCT_DIMS_SCHEMA = {
     "Extracted": {"date": {}},
 }
 
+# Used only if the Product Info database can't be found and has to
+# be created from scratch (normally it already exists).
+PRODUCT_INFO_CREATE_SCHEMA = dict(
+    {PRODUCT_INFO_TITLE_PROP: {"title": {}}}, **PRODUCT_DIM_COLUMNS)
+
 # Columns that count as 'real' dimensional data — a row is worth
 # pushing if it has a diagram or at least one of these populated.
 _PRODUCT_DIM_VALUE_COLS = (
@@ -877,14 +888,55 @@ def _dim_row_has_data(r: Dict) -> bool:
                for c in _PRODUCT_DIM_VALUE_COLS)
 
 
+def _ensure_database_properties(db_id: str,
+                                 props: Dict[str, Dict],
+                                 cfg: Dict[str, str]) -> List[str]:
+    """Add any properties in `props` that don't already exist on
+    the database. Notion's PATCH /databases merges properties —
+    existing columns, their data, and rows are untouched. Returns
+    the list of column names that were added."""
+    meta = _request("GET", f"/databases/{db_id}", cfg=cfg)
+    existing = set((meta.get("properties") or {}).keys())
+    missing = {k: v for k, v in props.items() if k not in existing}
+    if not missing:
+        return []
+    _request("PATCH", f"/databases/{db_id}",
+              json_body={"properties": missing}, cfg=cfg)
+    added = sorted(missing)
+    log.info("Added %d new column(s) to %r: %s",
+              len(added), PRODUCT_INFO_TITLE, ", ".join(added))
+    return added
+
+
+def _sample_row_titles(db_id: str, title_prop: str,
+                        cfg: Dict[str, str],
+                        n: int = 12) -> List[str]:
+    """Return up to `n` existing row titles from a database — used
+    in dry-run to confirm name-matching before any write."""
+    try:
+        res = _request("POST", f"/databases/{db_id}/query",
+                         json_body={"page_size": n}, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001
+        return [f"<query failed: {exc}>"]
+    out: List[str] = []
+    for row in res.get("results") or []:
+        tp = (row.get("properties") or {}).get(title_prop) or {}
+        out.append(_rich_text_to_plain(tp.get("title"))
+                   or "(untitled)")
+    return out
+
+
 def sync_product_dimensions(dry_run: bool = False,
                              include_empty: bool = False,
                              limit: Optional[int] = None) -> Dict:
-    """Push the product_dimensions table (vision-extracted Shopify
-    product specs) to a Notion database. Upserts each row keyed on
-    the Shopify handle, so re-runs update in place rather than
-    duplicating. By default rows with no diagram and no dimensions
-    are skipped — pass include_empty=True to push everything."""
+    """Write the product_dimensions table (vision-extracted Shopify
+    product specs) into the Notion "Product Info" database. Adds
+    the dimension columns to that database on first run, then
+    upserts each product as a row keyed on the "Name" column — so
+    re-runs update in place rather than duplicating.
+
+    Rows with no diagram and no dimensions are skipped unless
+    include_empty=True."""
     try:
         rows = db.all_product_dimensions()
     except Exception as exc:  # noqa: BLE001
@@ -915,22 +967,43 @@ def sync_product_dimensions(dry_run: bool = False,
         log.info("Capping push to first %d of %d rows.",
                   limit, len(rows))
         rows = rows[:limit]
-    if dry_run:
-        log.info("[dry-run] would push %d row(s). Sample:\n%s",
-                  len(rows),
-                  json.dumps(rows[0], indent=2, default=str))
-        return {"pushed": 0, "rows": len(rows), "dry_run": True}
     cfg = _config()
+    # Resolve the Product Info database (title search finds it
+    # under the parent page; ID is then cached in the registry).
     db_id = find_or_create_database(
-        PRODUCT_DIMS_TITLE, PRODUCT_DIMS_SCHEMA, cfg,
-        registry_name=PRODUCT_DIMS_DB_KEY)
+        PRODUCT_INFO_TITLE, PRODUCT_INFO_CREATE_SCHEMA, cfg,
+        registry_name=PRODUCT_INFO_DB_KEY)
+    log.info("Target: %r database (%s), upsert keyed on %r.",
+              PRODUCT_INFO_TITLE, db_id, PRODUCT_INFO_TITLE_PROP)
+
+    if dry_run:
+        existing_names = _sample_row_titles(
+            db_id, PRODUCT_INFO_TITLE_PROP, cfg, n=12)
+        log.info("Would add columns: %s",
+                  ", ".join(sorted(PRODUCT_DIM_COLUMNS)))
+        log.info("--- Sample EXISTING %r rows in the database: ---",
+                  PRODUCT_INFO_TITLE_PROP)
+        for nm in existing_names:
+            log.info("   • %s", nm)
+        log.info("--- Sample dimension titles to match/insert: ---")
+        for r in rows[:12]:
+            log.info("   • %s", r.get("title") or "(no title)")
+        log.info("[dry-run] would upsert %d row(s) keyed on %r. "
+                  "If the two lists above use the SAME naming, "
+                  "rows match in place; if not, new rows are "
+                  "added.", len(rows), PRODUCT_INFO_TITLE_PROP)
+        return {"pushed": 0, "rows": len(rows), "dry_run": True}
+
+    # Ensure the dimension columns exist before writing to them.
+    _ensure_database_properties(db_id, PRODUCT_DIM_COLUMNS, cfg)
+
     n_ok = 0
     n_err = 0
     for r in rows:
         handle = (r.get("shopify_handle") or "").strip()
-        if not handle:
+        name = (r.get("title") or handle or "").strip()
+        if not name:
             continue
-        product = (r.get("title") or handle)[:1900]
         props = {
             "Handle": _p_text(handle),
             "Family": _p_text(r.get("family")),
@@ -953,24 +1026,14 @@ def sync_product_dimensions(dry_run: bool = False,
             "Source image": _p_url(r.get("source_image_url")),
             "Extracted": _p_date(
                 str(r.get("extracted_at") or "")[:10]),
-            "Product": {"title": [
-                {"type": "text",
-                 "text": {"content": product}}]},
         }
         try:
-            existing = query_database_by_rich_text(
-                db_id, "Handle", handle, cfg)
-            if existing:
-                _request("PATCH", f"/pages/{existing}",
-                          json_body={"properties": props}, cfg=cfg)
-            else:
-                _request("POST", "/pages", json_body={
-                    "parent": {"database_id": db_id},
-                    "properties": props}, cfg=cfg)
+            upsert_row(db_id, PRODUCT_INFO_TITLE_PROP, name,
+                       props, cfg=cfg)
             n_ok += 1
         except Exception as exc:  # noqa: BLE001
             log.warning("Notion upsert failed for %s: %s",
-                          handle, exc)
+                          name, exc)
             n_err += 1
     log.info("Product-dimensions sync done: %d ok, %d errors",
               n_ok, n_err)
