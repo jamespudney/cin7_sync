@@ -1,4 +1,4 @@
-"""dropship_tracking_handler.py (v2.67.270)
+"""dropship_tracking_handler.py (v2.67.271)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
@@ -559,70 +559,101 @@ def _cin7_sale_url(sale_id: str) -> str:
 
 def _compose_confirmation(parsed: dict, sale_match: dict,
                                 weight_alert: Optional[str],
-                                write_result: Optional[dict] = None
+                                write_result: Optional[dict] = None,
+                                weight_checked: bool = False,
+                                weight_supplier_lbs: Optional[float] = None,
+                                weight_quoted_lbs: Optional[float] = None,
                                 ) -> str:
-    """Build the Slack confirmation reply. Always shows the
-    parsed tracking + matched SO + click-through. Adds the
-    weight-mismatch warning when applicable. Reflects the auto-
-    write outcome at the bottom so staff can tell at a glance
-    whether they need to do anything."""
+    """Build the Slack confirmation reply.
+
+    Structure:
+      Header — tracking number + matched SO link
+      Details — customer, service, packages, supplier weight
+      Check results — CIN7 write outcome + weight audit
+      Summary — ✅ All good / ⚠️ action needed
+    """
     sale_no = sale_match.get("sale_number") or "?"
     sale_id = sale_match.get("sale_id") or ""
     cust = sale_match.get("customer") or ""
     cust_ref = sale_match.get("customer_reference") or ""
     cin7_url = _cin7_sale_url(sale_id)
-
     sale_link = (f"<{cin7_url}|*{sale_no}*>" if cin7_url
                   else f"*{sale_no}*")
+    tracking = parsed.get("tracking_number") or "?"
 
+    # ── Header ──────────────────────────────────────────────────
     lines: List[str] = [
-        f"📦 *UPS tracking received — match to {sale_link}*",
+        f"📦 *Dropship shipment received — {sale_link} · {cust}*",
         "",
-        f"• Customer: {cust}"
-        + (f" · Shopify Order: {cust_ref}" if cust_ref else ""),
-        f"• Tracking: `{parsed.get('tracking_number') or '?'}`",
     ]
+
+    # ── Shipment details ────────────────────────────────────────
+    lines.append(f"• Tracking: `{tracking}`")
     svc = parsed.get("ups_service")
     if svc:
         lines.append(f"• Service: {svc}")
-    if parsed.get("weight_value") is not None:
-        unit = parsed.get("weight_unit") or "LBS"
-        lines.append(
-            f"• Supplier weight: "
-            f"{parsed['weight_value']} {unit}")
     pkgs = parsed.get("package_count")
     if pkgs:
         lines.append(f"• Packages: {pkgs}")
+    if parsed.get("weight_value") is not None:
+        unit = parsed.get("weight_unit") or "LBS"
+        lines.append(f"• Supplier weight: {parsed['weight_value']} {unit}")
+    if cust_ref:
+        lines.append(f"• Shopify order: {cust_ref}")
+    from_party = parsed.get("from_party")
+    if from_party:
+        lines.append(f"• Shipped from: {from_party}")
 
-    if weight_alert:
-        lines.append("")
-        lines.append(weight_alert)
-
-    # Auto-write outcome footer (v2.67.159)
+    # ── Check results ───────────────────────────────────────────
     lines.append("")
+    lines.append("*Checks*")
+
+    # CIN7 write
+    cin7_ok = False
     if write_result:
         status = write_result.get("status")
         if status == "written":
-            lines.append(
-                "✅ *Tracking auto-written to CIN7* — fulfillment "
-                "will push to Shopify automatically. No manual "
-                "step needed.")
+            cin7_ok = True
+            lines.append(f"✅ CIN7 tracking written — Shopify fulfillment will auto-update")
         elif status == "already_present":
-            lines.append(
-                "ℹ️ Tracking was already on this sale — no change "
-                "made.")
+            cin7_ok = True
+            lines.append("ℹ️ CIN7 — tracking already on this sale, no change needed")
         else:
-            detail = (write_result.get("detail")
-                        or "unknown failure")
+            detail = write_result.get("detail") or "unknown error"
             lines.append(
-                f"❌ *Auto-write failed* — {detail}. Cheran: open "
-                f"the sale and paste the tracking manually in "
-                f"CIN7's Ship tab.")
+                f"❌ CIN7 write failed — {detail}\n"
+                f"   _Cheran: paste `{tracking}` into the Ship tab manually_")
     else:
         lines.append(
-            "_Auto-write skipped (no sale_id). Cheran: open the "
-            "sale and paste the tracking manually in CIN7's Ship "
-            "tab._")
+            f"⚠️ CIN7 write skipped — couldn't identify sale\n"
+            f"   _Cheran: paste `{tracking}` into {sale_link} Ship tab_")
+
+    # Weight audit
+    weight_ok = False
+    if weight_alert:
+        lines.append(weight_alert)
+    elif weight_checked and weight_supplier_lbs and weight_quoted_lbs:
+        weight_ok = True
+        lines.append(
+            f"✅ Weight OK — supplier {weight_supplier_lbs:.1f} lbs "
+            f"vs quoted {weight_quoted_lbs:.1f} lbs (within tolerance)")
+    else:
+        # No Shopify weight to compare against — not a failure, just skipped
+        lines.append("➖ Weight check skipped — no Shopify order weight on file")
+
+    # ── Summary ─────────────────────────────────────────────────
+    lines.append("")
+    all_good = cin7_ok and (weight_ok or not weight_checked)
+    has_weight_issue = bool(weight_alert)
+    if all_good and not has_weight_issue:
+        lines.append("*✅ All good — nothing to action.*")
+    elif cin7_ok and has_weight_issue:
+        lines.append(
+            "*⚠️ Tracking written but weight mismatch needs review.*")
+    elif not cin7_ok:
+        lines.append(
+            "*❌ Action needed — see CIN7 write failure above.*")
+
     return "\n".join(lines)
 
 
@@ -949,6 +980,9 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
 
     # Weight check
     weight_alert = None
+    weight_checked = False   # True = comparison ran (result may be OK or flagged)
+    weight_supplier_lbs: Optional[float] = None
+    weight_quoted_lbs: Optional[float] = None
     try:
         cust_ref = sale_match.get("customer_reference") or ""
         if (cust_ref
@@ -960,6 +994,9 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
             if quoted and supplier_lbs is not None:
                 quoted_lbs = _to_pounds(quoted[0], quoted[1])
                 if quoted_lbs:
+                    weight_checked = True
+                    weight_supplier_lbs = supplier_lbs
+                    weight_quoted_lbs = quoted_lbs
                     weight_alert = _weight_mismatch_text(
                         supplier_lbs, quoted_lbs)
                     tools_used.append("weight_compared")
@@ -968,7 +1005,10 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
 
     reply = _compose_confirmation(parsed, sale_match,
                                           weight_alert,
-                                          write_result)
+                                          write_result,
+                                          weight_checked=weight_checked,
+                                          weight_supplier_lbs=weight_supplier_lbs,
+                                          weight_quoted_lbs=weight_quoted_lbs)
     return reply, tools_used
 
 
