@@ -237,6 +237,25 @@ def query_database_by_title(database_id: str, title_prop: str,
     return rows[0]["id"] if rows else None
 
 
+def query_database_by_rich_text(database_id: str, prop: str,
+                                 value: str,
+                                 cfg: Optional[Dict[str, str]] = None
+                                 ) -> Optional[str]:
+    """Return the page id of the row whose rich_text property `prop`
+    equals `value`, or None. Used to upsert keyed on a non-title
+    natural key (e.g. a Shopify handle)."""
+    cfg = cfg or _config()
+    body = {
+        "filter": {"property": prop,
+                   "rich_text": {"equals": value}},
+        "page_size": 1,
+    }
+    res = _request("POST", f"/databases/{database_id}/query",
+                    json_body=body, cfg=cfg)
+    rows = res.get("results") or []
+    return rows[0]["id"] if rows else None
+
+
 def upsert_row(database_id: str, title_prop: str,
                title_value: str, properties: Dict,
                cfg: Optional[Dict[str, str]] = None) -> str:
@@ -286,7 +305,20 @@ def _p_date(value: Optional[str]) -> Dict:
 
 
 def _p_select(value: Optional[str]) -> Dict:
-    return {"select": ({"name": value} if value else None)}
+    s = (str(value).strip() if value not in (None, "") else "")
+    # Notion select option names can't contain commas; cap at 100.
+    s = s.replace(",", " ")[:100]
+    return {"select": ({"name": s} if s else None)}
+
+
+def _p_checkbox(value) -> Dict:
+    """0/1/'1'/True/None → Notion checkbox bool."""
+    return {"checkbox": bool(value) and str(value) not in ("0", "")}
+
+
+def _p_url(value: Optional[str]) -> Dict:
+    s = (value or "").strip()
+    return {"url": s or None}
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +812,172 @@ def sync_slow_movers(dry_run: bool = False,
 
 
 # ---------------------------------------------------------------------------
+# Product Dimensions — push the vision-extracted spec table to Notion
+# ---------------------------------------------------------------------------
+# v2.67.276 — extract_dimensions.py crawled every Shopify product
+# image with Claude vision and cached the cross-section specs in the
+# product_dimensions table (one row per Shopify product/handle).
+# This pushes that table into a Notion database so the team — and
+# future customer-facing agents — share a single, browsable source.
+PRODUCT_DIMS_TITLE = "Product Dimensions"
+PRODUCT_DIMS_DB_KEY = "product_dimensions"  # registry key for db ID
+PRODUCT_DIMS_SCHEMA = {
+    # Title property — the human-readable product name.
+    "Product": {"title": {}},
+    # Shopify handle: the natural key we upsert on.
+    "Handle": {"rich_text": {}},
+    "Family": {"rich_text": {}},
+    "Outer width (mm)": {"number": {"format": "number"}},
+    "Outer height (mm)": {"number": {"format": "number"}},
+    "Channel width (mm)": {"number": {"format": "number"}},
+    "Channel depth (mm)": {"number": {"format": "number"}},
+    "Max strip width (mm)": {"number": {"format": "number"}},
+    "Wing width (mm)": {"number": {"format": "number"}},
+    "Wing count": {"number": {"format": "number"}},
+    "Mounting type": {"select": {"options": [
+        {"name": "surface", "color": "blue"},
+        {"name": "recessed", "color": "purple"},
+        {"name": "mud-in", "color": "orange"},
+        {"name": "corner", "color": "green"},
+        {"name": "pendant", "color": "pink"},
+        {"name": "unknown", "color": "gray"},
+    ]}},
+    "Profile shape": {"select": {"options": [
+        {"name": "U", "color": "blue"},
+        {"name": "square", "color": "green"},
+        {"name": "angled", "color": "orange"},
+        {"name": "round", "color": "purple"},
+        {"name": "oval", "color": "pink"},
+        {"name": "wing", "color": "yellow"},
+        {"name": "unknown", "color": "gray"},
+    ]}},
+    "Clip lips": {"checkbox": {}},
+    "Confidence": {"select": {"options": [
+        {"name": "high", "color": "green"},
+        {"name": "medium", "color": "yellow"},
+        {"name": "low", "color": "red"},
+    ]}},
+    "Has diagram": {"checkbox": {}},
+    "Notes": {"rich_text": {}},
+    "Source image": {"url": {}},
+    "Extracted": {"date": {}},
+}
+
+# Columns that count as 'real' dimensional data — a row is worth
+# pushing if it has a diagram or at least one of these populated.
+_PRODUCT_DIM_VALUE_COLS = (
+    "outer_width_mm", "outer_height_mm", "channel_width_mm",
+    "channel_depth_mm", "max_strip_width_mm", "wing_width_mm")
+
+
+def _dim_row_has_data(r: Dict) -> bool:
+    if r.get("has_diagram"):
+        return True
+    return any(r.get(c) not in (None, "")
+               for c in _PRODUCT_DIM_VALUE_COLS)
+
+
+def sync_product_dimensions(dry_run: bool = False,
+                             include_empty: bool = False,
+                             limit: Optional[int] = None) -> Dict:
+    """Push the product_dimensions table (vision-extracted Shopify
+    product specs) to a Notion database. Upserts each row keyed on
+    the Shopify handle, so re-runs update in place rather than
+    duplicating. By default rows with no diagram and no dimensions
+    are skipped — pass include_empty=True to push everything."""
+    try:
+        rows = db.all_product_dimensions()
+    except Exception as exc:  # noqa: BLE001
+        log.error("Could not load product_dimensions: %s", exc)
+        return {"pushed": 0, "rows": 0, "error": str(exc)}
+    if not rows:
+        log.info("product_dimensions table is EMPTY — nothing to "
+                  "push. Run extract_dimensions.py first.")
+        return {"pushed": 0, "rows": 0}
+    total = len(rows)
+    rows = [dict(r) for r in rows]
+    if not include_empty:
+        rows = [r for r in rows if _dim_row_has_data(r)]
+    log.info("product_dimensions: %d row(s) in table, %d with "
+              "dimensional data%s",
+              total, len(rows),
+              "" if include_empty
+              else " (empty rows skipped — --include-empty to "
+                    "push all)")
+    if not rows:
+        log.info("No rows with dimensional data to push.")
+        return {"pushed": 0, "rows": 0}
+    # Most-complete rows first so a --limit'd test run is useful.
+    rows.sort(key=lambda r: -sum(
+        1 for c in _PRODUCT_DIM_VALUE_COLS
+        if r.get(c) not in (None, "")))
+    if limit and len(rows) > limit:
+        log.info("Capping push to first %d of %d rows.",
+                  limit, len(rows))
+        rows = rows[:limit]
+    if dry_run:
+        log.info("[dry-run] would push %d row(s). Sample:\n%s",
+                  len(rows),
+                  json.dumps(rows[0], indent=2, default=str))
+        return {"pushed": 0, "rows": len(rows), "dry_run": True}
+    cfg = _config()
+    db_id = find_or_create_database(
+        PRODUCT_DIMS_TITLE, PRODUCT_DIMS_SCHEMA, cfg,
+        registry_name=PRODUCT_DIMS_DB_KEY)
+    n_ok = 0
+    n_err = 0
+    for r in rows:
+        handle = (r.get("shopify_handle") or "").strip()
+        if not handle:
+            continue
+        product = (r.get("title") or handle)[:1900]
+        props = {
+            "Handle": _p_text(handle),
+            "Family": _p_text(r.get("family")),
+            "Outer width (mm)": _p_num(r.get("outer_width_mm")),
+            "Outer height (mm)": _p_num(r.get("outer_height_mm")),
+            "Channel width (mm)": _p_num(
+                r.get("channel_width_mm")),
+            "Channel depth (mm)": _p_num(
+                r.get("channel_depth_mm")),
+            "Max strip width (mm)": _p_num(
+                r.get("max_strip_width_mm")),
+            "Wing width (mm)": _p_num(r.get("wing_width_mm")),
+            "Wing count": _p_num(r.get("wing_count")),
+            "Mounting type": _p_select(r.get("mounting_type")),
+            "Profile shape": _p_select(r.get("profile_shape")),
+            "Clip lips": _p_checkbox(r.get("has_clip_lips")),
+            "Confidence": _p_select(r.get("confidence")),
+            "Has diagram": _p_checkbox(r.get("has_diagram")),
+            "Notes": _p_text(r.get("extra_notes")),
+            "Source image": _p_url(r.get("source_image_url")),
+            "Extracted": _p_date(
+                str(r.get("extracted_at") or "")[:10]),
+            "Product": {"title": [
+                {"type": "text",
+                 "text": {"content": product}}]},
+        }
+        try:
+            existing = query_database_by_rich_text(
+                db_id, "Handle", handle, cfg)
+            if existing:
+                _request("PATCH", f"/pages/{existing}",
+                          json_body={"properties": props}, cfg=cfg)
+            else:
+                _request("POST", "/pages", json_body={
+                    "parent": {"database_id": db_id},
+                    "properties": props}, cfg=cfg)
+            n_ok += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Notion upsert failed for %s: %s",
+                          handle, exc)
+            n_err += 1
+    log.info("Product-dimensions sync done: %d ok, %d errors",
+              n_ok, n_err)
+    return {"pushed": n_ok, "errors": n_err, "rows": len(rows)}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _setup_log(verbose: bool) -> None:
@@ -794,6 +992,17 @@ def cmd_slow_movers(args) -> int:
     limit = getattr(args, "limit", None)
     result = sync_slow_movers(
         dry_run=bool(args.dry_run),
+        limit=(int(limit) if limit else None))
+    log.info("DONE: %s", result)
+    return 0
+
+
+def cmd_product_dimensions(args) -> int:
+    _setup_log(args.verbose)
+    limit = getattr(args, "limit", None)
+    result = sync_product_dimensions(
+        dry_run=bool(args.dry_run),
+        include_empty=bool(args.include_empty),
         limit=(int(limit) if limit else None))
     log.info("DONE: %s", result)
     return 0
@@ -1035,6 +1244,18 @@ def main() -> int:
                         help="Cap pushed rows (default 200; set "
                               "to 0 for unlimited).")
     p_sm.set_defaults(func=cmd_slow_movers)
+    p_pd = sub.add_parser(
+        "product-dimensions",
+        help="Push the vision-extracted product_dimensions table "
+              "(Shopify product specs) to a Notion database.")
+    p_pd.add_argument("--dry-run", action="store_true")
+    p_pd.add_argument("--verbose", action="store_true")
+    p_pd.add_argument(
+        "--include-empty", action="store_true",
+        help="Also push rows with no diagram and no dimensions.")
+    p_pd.add_argument("--limit", type=int, default=None,
+                        help="Cap pushed rows (most-complete first).")
+    p_pd.set_defaults(func=cmd_product_dimensions)
     p_pb = sub.add_parser(
         "pull-playbooks",
         help="Mirror playbook child-pages from Notion into "
