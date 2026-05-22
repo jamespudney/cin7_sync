@@ -1,4 +1,4 @@
-"""dropship_tracking_handler.py (v2.67.269)
+"""dropship_tracking_handler.py (v2.67.270)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
@@ -839,6 +839,10 @@ def write_tracking_to_sale(sale_id: str,
     # line. setdefault() would silently leave DRAFT unchanged,
     # so assign directly.
     ship["Status"] = "AUTHORISED"
+    # AddTrackingNumbers=true tells CIN7 to accept new tracking
+    # lines even when the existing ship record is already
+    # AUTHORISED (without it, CIN7 silently ignores the update).
+    ship["AddTrackingNumbers"] = True
 
     # 4. PUT the modified sale back
     try:
