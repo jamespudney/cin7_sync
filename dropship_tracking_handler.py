@@ -1,4 +1,4 @@
-"""dropship_tracking_handler.py (v2.67.160)
+"""dropship_tracking_handler.py (v2.67.269)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
@@ -42,17 +42,21 @@ Public API:
 
 from __future__ import annotations
 
+import email as _email_lib
 import glob
+import html
 import json
 import logging
 import os
 import re
 import sys
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -64,6 +68,121 @@ except ImportError:
     OUTPUT_DIR = SCRIPT_DIR / "output"
 
 log = logging.getLogger("dropship_tracking_handler")
+
+
+# ---------------------------------------------------------------------------
+# HTML → plain-text helper (stdlib only, no BeautifulSoup needed)
+# ---------------------------------------------------------------------------
+class _HTMLTextExtractor(HTMLParser):
+    """Minimal HTML → text extractor. Strips tags, decodes entities,
+    skips <style> and <script> content entirely."""
+    def __init__(self):
+        super().__init__()
+        self._parts: List[str] = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("style", "script"):
+            self._skip = True
+        elif tag in ("br", "p", "div", "tr", "li"):
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("style", "script"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._parts.append(data)
+
+    def handle_entityref(self, name):
+        self._parts.append(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        self._parts.append(html.unescape(f"&#{name};"))
+
+    def get_text(self) -> str:
+        return re.sub(r"\n{3,}", "\n\n",
+                      "".join(self._parts)).strip()
+
+
+def _html_to_text(html_src: str) -> str:
+    p = _HTMLTextExtractor()
+    try:
+        p.feed(html_src)
+        return p.get_text()
+    except Exception:
+        # If the HTML is truly broken, fall back to stripping all tags
+        return re.sub(r"<[^>]+>", " ", html_src)
+
+
+def _fetch_email_body(f: dict) -> str:
+    """v2.67.269 — Download the raw email from Slack's private URL
+    when plain_text is empty (HTML-only emails like UPS notifications).
+
+    Slack Email app stores the raw MIME email at url_private_download.
+    We fetch it with the bot token, parse the MIME structure, and
+    extract the best available plain text:
+      1. text/plain part (preferred — directly parseable)
+      2. text/html part → strip tags (UPS emails are HTML-only)
+
+    Returns empty string on any failure so the caller degrades
+    gracefully to the diagnostic path."""
+    url = f.get("url_private_download") or f.get("url_private") or ""
+    if not url:
+        return ""
+    token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    if not token:
+        return ""
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            log.warning("_fetch_email_body: HTTP %s for %s",
+                        resp.status_code, url)
+            return ""
+        raw_bytes = resp.content
+    except Exception as exc:
+        log.warning("_fetch_email_body: download failed: %s", exc)
+        return ""
+
+    # Try to parse as MIME email first (most common for Slack Email app)
+    try:
+        msg = _email_lib.message_from_bytes(raw_bytes)
+        plain_parts: List[str] = []
+        html_parts: List[str] = []
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/plain":
+                charset = part.get_content_charset() or "utf-8"
+                decoded = part.get_payload(decode=True)
+                if decoded:
+                    plain_parts.append(
+                        decoded.decode(charset, errors="replace"))
+            elif ct == "text/html":
+                charset = part.get_content_charset() or "utf-8"
+                decoded = part.get_payload(decode=True)
+                if decoded:
+                    html_parts.append(
+                        decoded.decode(charset, errors="replace"))
+        if plain_parts:
+            return "\n".join(plain_parts)
+        if html_parts:
+            return _html_to_text("\n".join(html_parts))
+    except Exception as exc:
+        log.warning("_fetch_email_body: MIME parse failed: %s", exc)
+
+    # Fallback: treat raw bytes as HTML or plain text
+    try:
+        text = raw_bytes.decode("utf-8", errors="replace")
+        if "<html" in text.lower() or "<body" in text.lower():
+            return _html_to_text(text)
+        return text
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -757,12 +876,20 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
     f = _email_payload(msg)
     if not f:
         return "", []
-    # v2.67.258 — Slack's Email app sometimes leaves plain_text
-    # thin/empty for HTML-only emails; fall back to preview, then
-    # to the message text itself.
-    body = (f.get("plain_text") or f.get("preview")
-            or msg.get("text") or "")
+    # v2.67.269 — UPS emails are HTML-only; Slack Email app leaves
+    # plain_text empty. Fallback chain:
+    #   1. plain_text  (populated for text/plain emails)
+    #   2. preview     (short Slack-generated snippet, rarely enough)
+    #   3. Download full email from url_private_download + parse MIME
+    #   4. msg.text    (message-level text, usually empty for email posts)
     subject = f.get("subject") or ""
+    body = f.get("plain_text") or ""
+    if not body or len(body) < 50:
+        body = f.get("preview") or ""
+    if not body or len(body) < 50:
+        body = _fetch_email_body(f)
+    if not body:
+        body = msg.get("text") or ""
     parsed = parse_ups_email(body, subject=subject)
     tools_used: List[str] = ["parse_ups_email"]
 
