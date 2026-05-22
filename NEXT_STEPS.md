@@ -8,227 +8,248 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-04-30
+Last updated: 2026-05-22 (v2.67.267)
 
 ---
 
 ## How to use this file
 
-1. **At the start of any session**, ask Claude to read `NEXT_STEPS.md`
-   — it'll pick up the latest priorities without you re-explaining.
-2. **As work happens**, the task tool tracks in-flight items. At the
-   end of a session, I'll move completed ones into "Shipped" here.
-3. **Long-form context** (architecture decisions, why we did things
-   a certain way) lives in `docs/` — that's also indexed by the AI.
+1. **At the start of any session**, read this file + `git log -10 --oneline`
+   — picks up the latest priorities without re-explaining.
+2. **As work happens**, use TaskCreate/TaskUpdate for in-flight items.
+3. **At the end of each session**, move completed items into "Shipped".
+4. Long-form architecture decisions live in `docs/`.
+
+---
+
+## Strategic north star (2026-05-18)
+
+**Viktor (3rd-party Slack AI) wins on Q&A.** Our system owns:
+1. The ABC / reorder / dormancy **engine** — Wired4Signs' actual buying policy
+2. **Automations that ACT** — write-backs to CIN7, scheduled jobs, reminders
+3. **The dashboard** — Ordering page, Slow Movers, Cashflow, Monthly Metrics
+4. **CIN7 write-backs** — closing loops, not just reporting
+
+Stop polishing the bot as a generalist answerer. Spend the build
+budget on **action, not answers**.
+
+The core business goal hasn't changed: **shrink stock holding**.
 
 ---
 
 ## Active backlog (priority order)
 
-### Strategic principle (ADDED 2026-04-30 EOD)
+### Immediate — verify & stabilise (this session)
 
-The AI Assistant is REACTIVE intelligence today (Q&A over data + KB).
-The bigger goal is PROACTIVE intelligence — automatic detection of
-patterns, signals, and warnings the buyer can act on.
+1. **Verify dropship UPS tracking end-to-end** — just fixed today
+   (v2.67.266: `ship["Status"] = "AUTHORISED"` bug + channel ID wired).
+   A live UPS email landed — check Render logs for
+   `"Posted dropship-UPS confirmation"` or check the Slack thread for
+   a bot reply. If it worked, this is done. If not, debug.
 
-**The correct build order is:**
+2. **BOM engine parent-child fix** — PAUSED pending Nicolas Noakes'
+   deep dive (started 2026-05-21). Multi-level BOMs (6" Sample ←
+   609mm ← 2m ← bulk roll) currently strand demand at intermediate
+   levels; the bulk roll is under-credited. Fix: resolve every BOM
+   chain to root, roll all-level demand onto root, don't credit
+   intermediate on-hand stock as coverage. DO NOT patch until
+   Nicolas's model is confirmed — risk of over-correcting.
 
-```
-AI foundation ✅ DONE
-→ Demand signals (NEXT — Tier 1A)
-→ Buyer warnings (Tier 1B)
-→ Slack / Gorgias / SEO / Shopify advanced (Tier 3+)
-```
+### Tier 1 — Automations that ACT (priority per Viktor strategy)
 
-DO NOT start Slack/Gorgias/SEO ingestion until demand_signals +
-reorder warnings are working. Slack messages without a signal
-storage system = noise. Slack WITH the signal system = intelligence.
+3. **Non-UPS carrier dropship tracking** — handler currently only
+   parses UPS forwarded emails. If suppliers use FedEx, USPS, or DHL,
+   those emails are ignored. Add carrier detection + separate parsers
+   (or a generic tracking-number extractor). Medium effort ~1 day.
 
-The AI must become a DECISION SYSTEM for the buyer, not a fancy
-search bar.
+4. **Dropship: manual tracking fallback** — if email parse fails,
+   today the bot posts a diagnostic. Add a Slack button or slash
+   command so staff can trigger a manual write to CIN7 without opening
+   the sale. Saves Cheran copy-paste. ~3 hours.
 
-### Tier 1A — Demand Signal Foundation (NEXT SESSION)
+5. **Cashflow: QBO sync reliability** — QBO token refresh + bill
+   sync are running but may have edge cases. Monitor for 401/expired-
+   token errors in logs. If recurring, add an auto-reconnect flow.
+   Ongoing.
 
-1. **Build `demand_signals` table + manual entry UI** — schema:
-   source / sku / product_family / signal_type / quantity / customer
-   / salesperson / confidence / note / created_at. Add a "Capture
-   demand signal" form so anyone can log in 30 seconds. Manual
-   first; ingestion later. ~2 hours.
-2. **Feed signals into AI tools** — new tools `get_recent_signals`,
-   `get_rising_demand`, `get_signals_for_sku`,
-   `get_top_inquired_products`. AI can now answer "what's getting
-   attention?", "what's rising?", "any inquiries about X lately?".
-   ~2 hours.
+6. **Stock locator audit** — scheduled daily (v2.67.194). Verify it's
+   posting to Slack each morning and the output is useful. Tune if
+   noisy. Low effort.
 
-### Tier 1B — Buyer Warning Column (HIGH ROI)
+7. **Weekly slow-movers email** — `weekly_slow_movers_email.py`
+   exists. Verify it's scheduled and Cheran/buyer is receiving it.
+   Check output quality. Low effort.
 
-3. **Reorder warning column on Ordering page** — pure rule-based,
-   no LLM call per row. Rules: previously dead/slow now showing
-   demand → caution; long dormancy → caution; recent spike from one
-   customer/salesperson → caution; cancellation in last N days →
-   caution; signal logged but no sale conversion → watch. Each row
-   gets level (none/low/medium/high) + short text + click-through
-   to evidence. ~3 hours.
-4. **Document demand scoring formula** — not building yet, but
-   designing. Inputs: signal count + recency + sources + conversion
-   + concentration + classification history + promotion/return/
-   cancellation flags. Output: 0-100 score + confidence + "why"
-   explanation. Lives in `docs/demand-scoring.md` so future Slack/
-   Gorgias signals plug in without re-architecting. ~2 hours.
+### Tier 2 — Dashboard & quality
 
-### Tier 1C — Carry-overs from earlier (lower urgency now)
+8. **Overview page KPI refresh** — replace current overview with
+   CIN7-style KPI cards (Revenue, Net, Pending, Inflow, Outflow) +
+   area chart + period selector. James flagged this look. ~3 hours.
 
-5. **Auto-finalize submitted POs (Phase 3)** — when CIN7 sync
-   detects a submitted PO has flipped to `ORDERED`, auto-transition
-   `po_drafts.status` from `submitted` → `finalized`. ~30 min.
-6. **Master-1-per-draft session safeguard** — belt-and-braces in
-   `cin7_post_po.py` against the orphan-PO scenario. ~30 min.
-7. **Feedback review page + auto-alias learning** — turn AI thumbs-
-   down feedback into product_aliases mappings. ~3 hours.
-8. **Inline charts in AI answers** — sales-history line charts in
-   AI responses. ~30 min.
+9. **ModifiedSince for master data syncs** — products / customers /
+   suppliers / stock are full pulls every night (~10 min). CIN7's
+   `ModifiedSince` param would cut to ~2 min. ~2 hours.
 
-### Tier 2 — quality & performance
+10. **Adaptive CIN7 rate limiting** — replace fixed 2.5s with
+    adaptive: speed up to 1.5s after clean stretch, back off on 429.
+    ~2 hours.
 
-5. **Refresh Overview to CIN7-style KPI dashboard** — KPI cards
-   across the top (Revenue, Net, Pending, Inflow, Outflow), area
-   chart below, period selector. User flagged this as the look they
-   like in CIN7. ~3 hours.
-6. **Use ModifiedSince for master data syncs** — products /
-   customers / suppliers / stock are full pulls every night
-   (~10 min). CIN7's `ModifiedSince` parameter would cut that to
-   ~2 min by only fetching changed rows. ~2 hours.
-7. **Adaptive CIN7 rate limiting** — replace fixed 2.5s rate with
-   adaptive: speed up to 1.5s after several minutes without a 429,
-   back off on first 429. Optimally uses whatever bandwidth is
-   available regardless of what other integrations are doing.
-   ~2 hours.
-8. **Preemptive empty-data guards** — proactively scan the major
-   pages (Overview, Monthly Metrics, FixedCost Audit, Ordering, LED
-   Tubes) for `df["X"]` patterns where X might not exist on a fresh
-   deploy. Replace with safe `.get()` patterns. ~2 hours.
+11. **SQLite backup to cloud** — `team_actions.db` is source of truth
+    for migrations / drafts / pricing. Rsync nightly to Backblaze B2
+    (~$1/mo). ~2 hours + B2 account setup.
 
-### Tier 3 — bigger features
-
-9. **Shopify integration via Dev Dashboard OAuth (Phase 1)** —
-   refactor `shopify_sync.py` to use modern Dev Dashboard flow:
-   `SHOPIFY_CLIENT_ID` + `SHOPIFY_CLIENT_SECRET`, request access
-   tokens programmatically, cache + refresh, prefer GraphQL Admin
-   API over REST. Don't depend on the legacy `shpat_` token
-   long-term (currently borrowed from Darryl's app). ~1 day.
-10. **CIN7 PO push: pre-submit validation enrichment** — verify
-    Location exists in CIN7; compute CIN7's expected line Total in
-    dry-run BEFORE master POST so mismatches are caught early; warn
-    if a SKU has no per-supplier `Cost` (would fall back to
-    `AverageCost`). ~3 hours.
-11. **Nightly SQLite backup to cloud storage** — `team_actions.db`
-    is the source of truth for migrations / drafts / pricing. We
-    should rsync it to Backblaze B2 (~$1/mo) every night. ~2 hours
-    + B2 account setup.
 12. **Custom domain** — `analytics.w4susa.com` instead of
-    `wired4signs-app.onrender.com`. ~30 min, requires DNS access.
+    `wired4signs-app.onrender.com`. ~30 min, needs DNS access.
 
-### Tier 4 — Commercial Intelligence System (the big vision)
+13. **Shopify Dev Dashboard OAuth** — currently using borrowed
+    `shpat_` token from Darryl's app. Proper `SHOPIFY_CLIENT_ID` +
+    `SHOPIFY_CLIENT_SECRET` flow so we own the token. ~1 day.
 
-This is the multi-month roadmap. Each is its own project, queued in
-priority order. **CRITICAL:** demand_signals + reorder warnings
-(Tier 1A/1B) must ship first — Slack messages without a signal
-system to land in are just noise.
+### Tier 3 — Commercial Intelligence
 
-13. **Slack demand-signal capture** — bot with /stock, /askstock,
-    /slowstock, /deadstock, /cancel, /return commands; LLM
-    extraction of demand signals from Slack messages; AI
-    clarification loop in threads. Records flow into the
-    demand_signals table built in Tier 1A. ~2 weeks.
-14. **Cancellation + return intelligence** — extract from Slack/
-    Gorgias mentions; reduce demand-signal weight for cancelled
-    orders; warn buyer before reordering returned products.
-    ~1 week.
-15. **Gorgias integration** — pull customer support conversations;
+14. **Gorgias integration** — pull customer support conversations;
     extract demand signals + product complaints + return requests.
-    ~1 week.
-16. **SEO intelligence layer** — monitor a dedicated Slack channel
-    for SEO updates; map ranking changes to Shopify collections;
-    classify demand as early/emerging/confirmed. ~1 week.
-17. **Weekly buyer summary email** — top demand signals, rising
-    families, repeated out-of-stock inquiries, dead stock with new
-    demand, return-affected reorders. ~3 days.
-18. **Multimodal Slack attachment analysis** — vision API on photos
-    of damaged products, screenshots of CIN7 issues, customer
-    install pics. ~1 week.
-19. **Inventory Planner decommission** — IP is the legacy system
-    we want to drop. Audit what IP still does that we don't, build
-    replacements, set sunset date. ~2 weeks.
+    Foundation for seeing what customers are asking for that we don't
+    stock. ~1 week.
 
-### Tier 5 — SaaS readiness (only if/when we go multi-tenant)
+15. **Cancellation + return intelligence** — extract from Slack /
+    Gorgias; reduce demand-signal weight for cancelled orders; warn
+    buyer before reordering returned products. ~1 week.
 
-See `SAAS_NOTES.md` for the full list. Headline items:
+16. **SEO intelligence layer** — monitor Slack channel for SEO
+    updates; map ranking changes to Shopify collections; classify
+    demand as early/emerging/confirmed. ~1 week.
 
-- Postgres migration (replace SQLite for multi-tenant queries)
-- Per-tenant authentication + isolation
-- Pull "Wired4Signs USA" hardcoded business logic out of core code
-- Per-customer billing / Stripe integration
+17. **Inventory Planner decommission** — IP is the legacy system we
+    want to drop. Audit what IP still does that we don't cover, build
+    replacements, set sunset date. Our engine now does ABC / reorder /
+    dormancy; the gap is probably just the UI for buyers who use IP
+    directly. ~2 weeks.
 
-Don't do these until we have at least 1-2 paying customers asking
-for it. Wasted effort otherwise.
+18. **Multimodal Slack analysis** — vision API on photos of damaged
+    products, install pics, CIN7 screenshots. ~1 week.
 
----
+### Tier 4 — Customer-facing AI (medium-term)
 
-## Shipped recently
+Not building yet — staff version must be solid first. Key constraint:
+**never expose Classification, costs, dormancy dates, or supplier
+names to the customer-facing surface**. Enforce at the data-access
+layer (don't just instruct the AI to hide it).
 
-### 2026-04-30 (today)
+19. **Customer-facing product assistant** — embedded on
+    wired4signs.com. Subset of current tools, tighter system prompt,
+    slow-mover preference (to shift stock) without exposing WHY it's
+    preferred. Design the staff version with this future split in mind.
 
-- **AI Assistant Phase 0** — natural-language Q&A page, 6 live tools
-  (search_products, get_sku_details, get_velocity, get_dead_stock,
-  get_migration_chain, get_sales_totals, search_knowledge_base),
-  multi-turn conversation memory, audit log, thumbs up/down feedback.
-- **Knowledge base layer** — `ai_kb.py` indexes `docs/` (8 starter
-  docs: inventory-rules, reorder-engine, sync-cadences, migrations,
-  po-workflow, glossary, data-sources, README) plus root-level
-  RULES.md / DEPLOY.md / SAAS_NOTES.md.
-- **Render deploy live** — single web service, persistent disk,
-  password gate, 15-minute nearsync + nightly daily-sync, both
-  inside the same container.
-- **Today/MTD revenue fix** — switched to order-level
-  `InvoiceAmount` so revenue matches CIN7's dashboard (includes
-  shipping + tax).
-- **Sidebar declutter** — consolidated 4 refresh-related buttons
-  into 1.
-- **Shopify content sync** — `shopify_sync.py` pulls products /
-  collections / pages / blog articles via Admin API; AI knowledge
-  base auto-indexes them. Uses borrowed token from Darryl's app
-  for now (proper OAuth in Tier 3).
-- **Source-of-truth rules** — docs/data-sources.md baked into
-  system prompt: CIN7 for numbers, Shopify for words.
-- **Path refactor for portability** — `data_paths.py` centralises
-  `DATA_DIR` so the same code runs locally and on Render.
-- **CIN7 PO POST integration** — multi-step flow with auto-rollback,
-  strict supplier matching, per-supplier-Cost lookup, retry-lines
-  recovery for partially-failed pushes.
-- **`sync_supplier_names.py`** — drift detector + renamer across
-  9 supplier-referencing tables; CIN7 is source of truth.
+### Tier 5 — SaaS (only if/when multi-tenant)
 
-### Earlier (April 28-29)
-
-- v2.22 — migration-aware demand rollup in engine
-- v2.31-v2.33 — 45d/90d/365d customer rollups
-- v2.34-v2.40 — CIN7 PO POST iteration cycle
-- Multi-draft PO system with pessimistic locking
-- IP merged[] migration import
-
-See `git log` for the full history.
+See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
+- Postgres migration
+- Per-tenant auth + isolation
+- Strip Wired4Signs-specific hardcoding from core
+- Stripe billing
 
 ---
 
-## Conventions for future Claude sessions
+## Shipped (since 2026-04-30)
 
-When starting a new session, please:
+### 2026-05-22 (today)
 
-1. Read this file first.
-2. Read `RULES.md` (business rules) and `docs/data-sources.md`
-   (where to trust which data).
-3. Check `git log -10 --oneline` to see what's changed recently.
-4. Use TaskCreate/TaskUpdate liberally — even small tasks are worth
-   tracking so they don't slip.
-5. **At the end of each session**, update this file's "Shipped"
-   section so the next session has accurate context.
+- **v2.67.267** — Fix `get_slack_messages` correlated subquery alias
+  (`slack_messages.channel_id` → `m.channel_id`; was breaking all
+  channel-filtered Slack queries from the AI assistant)
+- **v2.67.266** — Dropship tracking bug fixes: `ship["Status"] =
+  "AUTHORISED"` (setdefault left DRAFT sales unprocessed by CIN7);
+  `SLACK_DROPSHIP_TRACKING_CHANNEL_ID=C0B3KD6GBM3` wired into
+  render.yaml so the listener gates on the right channel
+- **Port from Max plan session** — merged sad-volhard branch (v2.67.20
+  → v2.67.265) into main on the company plan, bringing ~245 commits
+  across
+
+### 2026-05-18 to 2026-05-21 (Max plan session, now merged)
+
+- **Viktor strategy pivot** — decided 2026-05-18: stop competing on
+  Q&A, specialise on engine/automations/write-backs/dashboard. Viktor
+  bridge (v2.67.124-126) routes Q&A to Viktor, bot overlays engine
+  signals Viktor can't compute.
+- **v2.67.265** — ABC engine: strip parser defers to BOM data (fixes
+  BROADWAY family mis-classification)
+- **v2.67.264** — Daily BOM sync so BOM data isn't week-stale
+- **v2.67.263-262** — Notion sync: customer-safe Priority Stock page;
+  stop creating duplicate pages
+- **v2.67.261** — Fix duplicate tool name breaking every AI call
+- **v2.67.260** — Slack: poll bot DM conversations for 1:1 chat
+- **v2.67.259** — Slack: auto-poll dedicated single-purpose channels
+- **v2.67.258** — Dropship tracking: subject fallback + diagnostic
+  reply when parse fails
+- **v2.67.257** — Notion sync: store DB IDs locally; stop duplicates
+- **v2.67.256** — Notion pull: include DB row properties
+- **v2.67.255** — Shipping channel: auto-investigate margin on
+  SO/INV mention
+- **v2.67.254** — Notion pull walks databases + auto-schedule on worker
+- **v2.67.253** — dump-glossary command + app_glossary.md snapshot
+- **v2.67.252-249** — Notion sync phases 1-2: slow-movers register
+  + playbook pull + AI search tool (`search_knowledge_base`)
+- **v2.67.248-245** — Stock-issues tracker hardening: reply polling,
+  acknowledgement, escalation
+- **v2.67.244-241** — Cashflow: overdue separation, daily calendar,
+  alert system
+- **v2.67.240** — PO-dispatch reminder: accurate per-SO SKU breakdown
+- **v2.67.237** — Fix nearsync loop wedge + supervise sync loops
+- **v2.67.236** — Overview: sales tile survives missing 30-day file
+- **v2.67.235** — Cashflow: loan & debt tracker (amortization engine)
+- **v2.67.234** — Cashflow: scenario planning + custom rows
+- **v2.67.233-219** — Cashflow dashboard built end-to-end: QBO
+  OAuth + bills + payables + weekly forecast grid + projections +
+  actual opening balances + credit-card payments + week-shift control
+  + scenario planning + loan tracker + alert system
+- **v2.67.213-207** — QBO/app hardening: fix PO-dispatch false
+  positives, EULA + privacy pages, QBO token retry, super_admin tier
+- **v2.67.206-204** — Stock/purchase analysis fixes; Recent Sales
+  window filter
+- **v2.67.203** — PO escalation: check CIN7 live status too; bot
+  replies in own threads
+- **v2.67.202** — PG post-cutover migrations: once-per-process gate
+- **v2.67.199** — Fix Postgres case-sensitivity on supplier_config
+- **v2.67.198** — Slow Movers: coerce datetime to str before slice
+- **v2.67.197** — PO commentary: handle draft POs via UUID-from-URL
+- **v2.67.196** — `get_purchase_live` tool: live CIN7 fallback for
+  fresh POs not yet in the sync CSV
+- **v2.67.195-194** — Schedule BOM sync weekly; schedule stock
+  locator audit as daily morning Slack post
+- **v2.67.193** — PO commentary: trigger on bare PO refs + CIN7 URLs
+- **v2.67.192-189** — User Permissions: form-reset fix, Slack DM
+  invites, resend button, 'Add new user' expander
+- **v2.67.188** — PO commentary crosspost: read POs from one channel,
+  post analysis to another
+- **v2.67.185** — User Permissions portal
+- **v2.67.160-153** — Dropship UPS tracking: full handler built —
+  parse UPS forwarded email, match CIN7 sale by customer name, write
+  `TrackingNumber` to `Fulfilments[0].Ship.Lines`, weight-mismatch
+  check vs Shopify order, threaded Slack reply
+- **v2.67.145-144** — Stock-issues tracker with context-provider
+  design; tighten buyer-ping rule
+- **v2.67.141-136** — Back-in-stock handler: walk Slack share-message
+  attachment blocks; arrival matching; subscription handler
+- **v2.67.130-124** — Viktor bridge: forwarding + overlay flow;
+  channel-gated forwarding; overlay engine signals on Viktor replies
+- **v2.67.111-57** — Slack listener + sync full build: channel
+  polling, classification, autonomous response, audit DB, returns
+  channel, orders channel, PO-review channel
+
+### 2026-04-30 (from old NEXT_STEPS.md)
+
+- AI Assistant Phase 0 (6 tools, multi-turn, audit log, feedback)
+- Knowledge base layer (ai_kb.py + docs/)
+- Render deploy live (single service, persistent disk, password gate)
+- Shopify content sync (shopify_sync.py)
+- CIN7 PO POST integration (multi-step, auto-rollback)
+- Demand signals table + manual entry UI (v2.58-v2.61)
+- Demand Signals review/edit page + auto-reconcile to CIN7 sales
+- Buyer warning column on Ordering page
+- Demand scoring doc (docs/demand-scoring.md)
+- Auto-finalize submitted POs
+- Master-1-per-draft safeguard
+- Feedback review page + auto-alias learning
+- Inline charts in AI answers
+- Weekly slow-movers email (weekly_slow_movers_email.py)
