@@ -812,67 +812,31 @@ def sync_slow_movers(dry_run: bool = False,
 
 
 # ---------------------------------------------------------------------------
-# Product dimensions -> the Product Info database
+# Product dimensions -> a page in the Product Info database
 # ---------------------------------------------------------------------------
 # v2.67.276 — extract_dimensions.py crawled every Shopify product
 # image with Claude vision and cached the cross-section specs in the
 # product_dimensions table (one row per Shopify product/handle).
-# v2.67.278 — per James: Notion's "Product Info" database is the
-# single source of truth for everything product-related. So the
-# dimension data is written INTO that existing database as page
-# rows — NOT a separate database. We add the dimension columns to
-# Product Info on first run, then upsert each product as a row
-# keyed on the database's "Name" (title) column.
+# v2.67.279 — per James: the dimension data lives as a SINGLE PAGE
+# inside the Notion "Product Info" database, titled "Product
+# Dimensions". The page body holds one table — one row per product.
+# Re-runs find that page (a row in the database, located by title)
+# and rebuild its block content in place, so it's always a single,
+# current reference page rather than 290 scattered rows.
 PRODUCT_INFO_TITLE = "Product Info"
-PRODUCT_INFO_DB_KEY = "product_info"     # registry key for db ID
-PRODUCT_INFO_TITLE_PROP = "Name"         # the DB's title column
+PRODUCT_INFO_DB_KEY = "product_info"      # registry key for db ID
+PRODUCT_INFO_TITLE_PROP = "Name"          # the DB's title column
+PRODUCT_DIMS_PAGE_TITLE = "Product Dimensions"
 
-# The dimension columns we add to the Product Info database. The
-# title column ("Name") already exists and is NOT in here — a
-# database has exactly one title property.
-PRODUCT_DIM_COLUMNS = {
-    "Handle": {"rich_text": {}},
-    "Family": {"rich_text": {}},
-    "Outer width (mm)": {"number": {"format": "number"}},
-    "Outer height (mm)": {"number": {"format": "number"}},
-    "Channel width (mm)": {"number": {"format": "number"}},
-    "Channel depth (mm)": {"number": {"format": "number"}},
-    "Max strip width (mm)": {"number": {"format": "number"}},
-    "Wing width (mm)": {"number": {"format": "number"}},
-    "Wing count": {"number": {"format": "number"}},
-    "Mounting type": {"select": {"options": [
-        {"name": "surface", "color": "blue"},
-        {"name": "recessed", "color": "purple"},
-        {"name": "mud-in", "color": "orange"},
-        {"name": "corner", "color": "green"},
-        {"name": "pendant", "color": "pink"},
-        {"name": "unknown", "color": "gray"},
-    ]}},
-    "Profile shape": {"select": {"options": [
-        {"name": "U", "color": "blue"},
-        {"name": "square", "color": "green"},
-        {"name": "angled", "color": "orange"},
-        {"name": "round", "color": "purple"},
-        {"name": "oval", "color": "pink"},
-        {"name": "wing", "color": "yellow"},
-        {"name": "unknown", "color": "gray"},
-    ]}},
-    "Clip lips": {"checkbox": {}},
-    "Confidence": {"select": {"options": [
-        {"name": "high", "color": "green"},
-        {"name": "medium", "color": "yellow"},
-        {"name": "low", "color": "red"},
-    ]}},
-    "Has diagram": {"checkbox": {}},
-    "Notes": {"rich_text": {}},
-    "Source image": {"url": {}},
-    "Extracted": {"date": {}},
-}
+# Minimal create-schema — only used if the Product Info database
+# can't be found and must be created (normally it already exists).
+PRODUCT_INFO_CREATE_SCHEMA = {PRODUCT_INFO_TITLE_PROP: {"title": {}}}
 
-# Used only if the Product Info database can't be found and has to
-# be created from scratch (normally it already exists).
-PRODUCT_INFO_CREATE_SCHEMA = dict(
-    {PRODUCT_INFO_TITLE_PROP: {"title": {}}}, **PRODUCT_DIM_COLUMNS)
+# Columns of the in-page dimensions table, in order.
+DIM_TABLE_COLUMNS = [
+    "Product", "Handle", "Outer W×H (mm)", "Channel W×D (mm)",
+    "Max strip (mm)", "Mounting", "Shape", "Wings", "Notes",
+]
 
 # Columns that count as 'real' dimensional data — a row is worth
 # pushing if it has a diagram or at least one of these populated.
@@ -888,52 +852,105 @@ def _dim_row_has_data(r: Dict) -> bool:
                for c in _PRODUCT_DIM_VALUE_COLS)
 
 
-def _ensure_database_properties(db_id: str,
-                                 props: Dict[str, Dict],
-                                 cfg: Dict[str, str]) -> List[str]:
-    """Add any properties in `props` that don't already exist on
-    the database. Notion's PATCH /databases merges properties —
-    existing columns, their data, and rows are untouched. Returns
-    the list of column names that were added."""
-    meta = _request("GET", f"/databases/{db_id}", cfg=cfg)
-    existing = set((meta.get("properties") or {}).keys())
-    missing = {k: v for k, v in props.items() if k not in existing}
-    if not missing:
-        return []
-    _request("PATCH", f"/databases/{db_id}",
-              json_body={"properties": missing}, cfg=cfg)
-    added = sorted(missing)
-    log.info("Added %d new column(s) to %r: %s",
-              len(added), PRODUCT_INFO_TITLE, ", ".join(added))
-    return added
-
-
-def _sample_row_titles(db_id: str, title_prop: str,
-                        cfg: Dict[str, str],
-                        n: int = 12) -> List[str]:
-    """Return up to `n` existing row titles from a database — used
-    in dry-run to confirm name-matching before any write."""
+def _num_str(v) -> str:
+    """Format a dimension number tidily: 16.0 -> '16', 14.7 -> '14.7'."""
+    if v in (None, ""):
+        return ""
     try:
-        res = _request("POST", f"/databases/{db_id}/query",
-                         json_body={"page_size": n}, cfg=cfg)
-    except Exception as exc:  # noqa: BLE001
-        return [f"<query failed: {exc}>"]
-    out: List[str] = []
-    for row in res.get("results") or []:
-        tp = (row.get("properties") or {}).get(title_prop) or {}
-        out.append(_rich_text_to_plain(tp.get("title"))
-                   or "(untitled)")
-    return out
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f == int(f) else f"{f:g}"
+
+
+def _pair(a, b) -> str:
+    """'W × H' from two numbers; just one if the other is blank."""
+    sa, sb = _num_str(a), _num_str(b)
+    if sa and sb:
+        return f"{sa} × {sb}"
+    return sa or sb or ""
+
+
+def _wings_str(count, width) -> str:
+    """'2 × 20 mm' wing summary; blank when there are no wings."""
+    c, w = _num_str(count), _num_str(width)
+    if not c or c == "0":
+        return ""
+    return f"{c} × {w} mm" if w else c
+
+
+def _rt(text) -> List[Dict]:
+    """Build a Notion rich_text array from a plain string."""
+    s = ("" if text is None else str(text))[:1900]
+    return [{"type": "text", "text": {"content": s}}] if s else []
+
+
+def _table_row_block(cells: List[str]) -> Dict:
+    return {"type": "table_row",
+            "table_row": {"cells": [_rt(c) for c in cells]}}
+
+
+def _delete_block_children(block_id: str,
+                            cfg: Dict[str, str]) -> int:
+    """Delete every child block of a page/block, so a re-run can
+    rebuild content from scratch instead of stacking duplicates."""
+    ids: List[str] = []
+    cursor = None
+    while True:
+        path = (f"/blocks/{block_id}/children?page_size=100"
+                + (f"&start_cursor={cursor}" if cursor else ""))
+        body = _request("GET", path, cfg=cfg)
+        for b in body.get("results") or []:
+            if b.get("id"):
+                ids.append(b["id"])
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+    for bid in ids:
+        try:
+            _request("DELETE", f"/blocks/{bid}", cfg=cfg)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not delete block %s: %s", bid, exc)
+    return len(ids)
+
+
+def _append_children(parent_id: str, children: List[Dict],
+                      cfg: Dict[str, str]) -> List[Dict]:
+    """Append blocks to a page/block in batches of 100 (Notion's
+    per-request cap). Returns the created block objects."""
+    created: List[Dict] = []
+    for i in range(0, len(children), 100):
+        res = _request(
+            "PATCH", f"/blocks/{parent_id}/children",
+            json_body={"children": children[i:i + 100]}, cfg=cfg)
+        created.extend(res.get("results") or [])
+    return created
+
+
+def _dim_table_cells(r: Dict) -> List[str]:
+    """One product_dimensions row -> the ordered table cells."""
+    return [
+        r.get("title") or r.get("shopify_handle") or "",
+        r.get("shopify_handle") or "",
+        _pair(r.get("outer_width_mm"), r.get("outer_height_mm")),
+        _pair(r.get("channel_width_mm"), r.get("channel_depth_mm")),
+        _num_str(r.get("max_strip_width_mm")),
+        r.get("mounting_type") or "",
+        r.get("profile_shape") or "",
+        _wings_str(r.get("wing_count"), r.get("wing_width_mm")),
+        r.get("extra_notes") or "",
+    ]
 
 
 def sync_product_dimensions(dry_run: bool = False,
                              include_empty: bool = False,
                              limit: Optional[int] = None) -> Dict:
     """Write the product_dimensions table (vision-extracted Shopify
-    product specs) into the Notion "Product Info" database. Adds
-    the dimension columns to that database on first run, then
-    upserts each product as a row keyed on the "Name" column — so
-    re-runs update in place rather than duplicating.
+    product specs) into a single Notion page titled "Product
+    Dimensions", stored as a row inside the "Product Info"
+    database. The page body is one table — one row per product.
+    Re-runs locate that page and rebuild its content in place, so
+    it stays a single current reference page.
 
     Rows with no diagram and no dimensions are skipped unless
     include_empty=True."""
@@ -944,7 +961,7 @@ def sync_product_dimensions(dry_run: bool = False,
         return {"pushed": 0, "rows": 0, "error": str(exc)}
     if not rows:
         log.info("product_dimensions table is EMPTY — nothing to "
-                  "push. Run extract_dimensions.py first.")
+                  "write. Run extract_dimensions.py first.")
         return {"pushed": 0, "rows": 0}
     total = len(rows)
     rows = [dict(r) for r in rows]
@@ -954,90 +971,106 @@ def sync_product_dimensions(dry_run: bool = False,
               "dimensional data%s",
               total, len(rows),
               "" if include_empty
-              else " (empty rows skipped — --include-empty to "
-                    "push all)")
+              else " (empty rows skipped — --include-empty for all)")
     if not rows:
-        log.info("No rows with dimensional data to push.")
+        log.info("No rows with dimensional data to write.")
         return {"pushed": 0, "rows": 0}
-    # Most-complete rows first so a --limit'd test run is useful.
-    rows.sort(key=lambda r: -sum(
-        1 for c in _PRODUCT_DIM_VALUE_COLS
-        if r.get(c) not in (None, "")))
+    # Alphabetical by product name — browsable on the page.
+    rows.sort(key=lambda r: (r.get("title")
+                             or r.get("shopify_handle")
+                             or "").lower())
     if limit and len(rows) > limit:
-        log.info("Capping push to first %d of %d rows.",
+        log.info("Capping to first %d of %d rows.",
                   limit, len(rows))
         rows = rows[:limit]
+
+    if dry_run:
+        log.info("[dry-run] would write the %r page (a row in the "
+                  "%r database) with a %d-column table of %d "
+                  "product(s). Sample:",
+                  PRODUCT_DIMS_PAGE_TITLE, PRODUCT_INFO_TITLE,
+                  len(DIM_TABLE_COLUMNS), len(rows))
+        log.info("   %s", " | ".join(DIM_TABLE_COLUMNS))
+        for r in rows[:8]:
+            log.info("   %s", " | ".join(
+                (c[:40] for c in _dim_table_cells(r))))
+        return {"pushed": 0, "rows": len(rows), "dry_run": True}
+
     cfg = _config()
     # Resolve the Product Info database (title search finds it
-    # under the parent page; ID is then cached in the registry).
+    # under the parent page; ID is cached in the registry).
     db_id = find_or_create_database(
         PRODUCT_INFO_TITLE, PRODUCT_INFO_CREATE_SCHEMA, cfg,
         registry_name=PRODUCT_INFO_DB_KEY)
-    log.info("Target: %r database (%s), upsert keyed on %r.",
-              PRODUCT_INFO_TITLE, db_id, PRODUCT_INFO_TITLE_PROP)
+    # Find (or create) the single "Product Dimensions" page —
+    # a row in that database, located by its title.
+    page_id = query_database_by_title(
+        db_id, PRODUCT_INFO_TITLE_PROP,
+        PRODUCT_DIMS_PAGE_TITLE, cfg)
+    if page_id:
+        n = _delete_block_children(page_id, cfg)
+        log.info("Found existing %r page — cleared %d old "
+                  "block(s) to rebuild.",
+                  PRODUCT_DIMS_PAGE_TITLE, n)
+    else:
+        res = _request("POST", "/pages", json_body={
+            "parent": {"database_id": db_id},
+            "properties": {PRODUCT_INFO_TITLE_PROP: {
+                "title": _rt(PRODUCT_DIMS_PAGE_TITLE)}},
+        }, cfg=cfg)
+        page_id = res["id"]
+        log.info("Created %r page in the %r database.",
+                  PRODUCT_DIMS_PAGE_TITLE, PRODUCT_INFO_TITLE)
 
-    if dry_run:
-        existing_names = _sample_row_titles(
-            db_id, PRODUCT_INFO_TITLE_PROP, cfg, n=12)
-        log.info("Would add columns: %s",
-                  ", ".join(sorted(PRODUCT_DIM_COLUMNS)))
-        log.info("--- Sample EXISTING %r rows in the database: ---",
-                  PRODUCT_INFO_TITLE_PROP)
-        for nm in existing_names:
-            log.info("   • %s", nm)
-        log.info("--- Sample dimension titles to match/insert: ---")
-        for r in rows[:12]:
-            log.info("   • %s", r.get("title") or "(no title)")
-        log.info("[dry-run] would upsert %d row(s) keyed on %r. "
-                  "If the two lists above use the SAME naming, "
-                  "rows match in place; if not, new rows are "
-                  "added.", len(rows), PRODUCT_INFO_TITLE_PROP)
-        return {"pushed": 0, "rows": len(rows), "dry_run": True}
+    # Intro paragraph + the table. The table is created with just
+    # its header row; product rows are appended to it afterwards
+    # (Notion caps each request at 100 blocks).
+    today = datetime.date.today().isoformat()
+    intro = {
+        "type": "paragraph",
+        "paragraph": {"rich_text": _rt(
+            f"Cross-section dimensions for {len(rows)} LED channel "
+            f"/ profile products, extracted from Shopify spec "
+            f"diagrams. Outer = total external profile size; "
+            f"Channel = the LED-strip recess; values in mm. "
+            f"Last updated {today}.")},
+    }
+    table_block = {
+        "type": "table",
+        "table": {
+            "table_width": len(DIM_TABLE_COLUMNS),
+            "has_column_header": True,
+            "has_row_header": False,
+            "children": [_table_row_block(DIM_TABLE_COLUMNS)],
+        },
+    }
+    try:
+        created = _append_children(
+            page_id, [intro, table_block], cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Failed to write page header/table: %s", exc)
+        return {"pushed": 0, "rows": len(rows), "error": str(exc)}
+    table_id = next((b.get("id") for b in created
+                     if b.get("type") == "table"), None)
+    if not table_id:
+        log.error("Could not locate the created table block.")
+        return {"pushed": 0, "rows": len(rows),
+                "error": "table block id not found"}
 
-    # Ensure the dimension columns exist before writing to them.
-    _ensure_database_properties(db_id, PRODUCT_DIM_COLUMNS, cfg)
-
-    n_ok = 0
-    n_err = 0
-    for r in rows:
-        handle = (r.get("shopify_handle") or "").strip()
-        name = (r.get("title") or handle or "").strip()
-        if not name:
-            continue
-        props = {
-            "Handle": _p_text(handle),
-            "Family": _p_text(r.get("family")),
-            "Outer width (mm)": _p_num(r.get("outer_width_mm")),
-            "Outer height (mm)": _p_num(r.get("outer_height_mm")),
-            "Channel width (mm)": _p_num(
-                r.get("channel_width_mm")),
-            "Channel depth (mm)": _p_num(
-                r.get("channel_depth_mm")),
-            "Max strip width (mm)": _p_num(
-                r.get("max_strip_width_mm")),
-            "Wing width (mm)": _p_num(r.get("wing_width_mm")),
-            "Wing count": _p_num(r.get("wing_count")),
-            "Mounting type": _p_select(r.get("mounting_type")),
-            "Profile shape": _p_select(r.get("profile_shape")),
-            "Clip lips": _p_checkbox(r.get("has_clip_lips")),
-            "Confidence": _p_select(r.get("confidence")),
-            "Has diagram": _p_checkbox(r.get("has_diagram")),
-            "Notes": _p_text(r.get("extra_notes")),
-            "Source image": _p_url(r.get("source_image_url")),
-            "Extracted": _p_date(
-                str(r.get("extracted_at") or "")[:10]),
-        }
-        try:
-            upsert_row(db_id, PRODUCT_INFO_TITLE_PROP, name,
-                       props, cfg=cfg)
-            n_ok += 1
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Notion upsert failed for %s: %s",
-                          name, exc)
-            n_err += 1
-    log.info("Product-dimensions sync done: %d ok, %d errors",
-              n_ok, n_err)
-    return {"pushed": n_ok, "errors": n_err, "rows": len(rows)}
+    # Append every product as a table row (batched at 100/request).
+    data_rows = [_table_row_block(_dim_table_cells(r))
+                 for r in rows]
+    try:
+        _append_children(table_id, data_rows, cfg)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Row append failed: %s", exc)
+        return {"pushed": 0, "rows": len(rows), "error": str(exc)}
+    page_url = (
+        f"https://www.notion.so/{page_id.replace('-', '')}")
+    log.info("Wrote %d product(s) into the %r page: %s",
+              len(rows), PRODUCT_DIMS_PAGE_TITLE, page_url)
+    return {"pushed": len(rows), "rows": len(rows),
+            "page_url": page_url}
 
 
 # ---------------------------------------------------------------------------
