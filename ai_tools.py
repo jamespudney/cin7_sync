@@ -4780,10 +4780,13 @@ def get_slack_messages(engine_df: pd.DataFrame,
         params.append(f"%{user}%")
     if channel:
         # Match either channel_id or resolved channel name.
+        # Use alias m.channel_id — the outer query aliases
+        # slack_messages as m, so the bare table name isn't
+        # visible inside the correlated subquery.
         where_parts.append(
-            "(channel_id = ? OR EXISTS ("
+            "(m.channel_id = ? OR EXISTS ("
             "SELECT 1 FROM slack_channel_cursors c "
-            "WHERE c.channel_id = slack_messages.channel_id "
+            "WHERE c.channel_id = m.channel_id "
             "  AND LOWER(c.channel_name) = LOWER(?)))")
         params.extend([channel, channel.lstrip("#")])
 
