@@ -944,13 +944,18 @@ def _dim_table_cells(r: Dict) -> List[str]:
 
 def sync_product_dimensions(dry_run: bool = False,
                              include_empty: bool = False,
-                             limit: Optional[int] = None) -> Dict:
+                             limit: Optional[int] = None,
+                             rebuild: bool = False) -> Dict:
     """Write the product_dimensions table (vision-extracted Shopify
     product specs) into a single Notion page titled "Product
     Dimensions", stored as a row inside the "Product Info"
     database. The page body is one table — one row per product.
-    Re-runs locate that page and rebuild its content in place, so
-    it stays a single current reference page.
+
+    This is a SEED, not a recurring sync: Notion is the source of
+    truth for dimensions, so once the page exists this refuses to
+    touch it unless rebuild=True. That guards manual edits made in
+    Notion from being silently overwritten by stale crawl data.
+    Pass rebuild=True only for a deliberate full refresh.
 
     Rows with no diagram and no dimensions are skipped unless
     include_empty=True."""
@@ -1007,10 +1012,19 @@ def sync_product_dimensions(dry_run: bool = False,
     page_id = query_database_by_title(
         db_id, PRODUCT_INFO_TITLE_PROP,
         PRODUCT_DIMS_PAGE_TITLE, cfg)
+    if page_id and not rebuild:
+        log.warning(
+            "The %r page already exists. Notion is the source of "
+            "truth for dimensions — refusing to overwrite it and "
+            "risk wiping manual edits. Re-run with --rebuild only "
+            "if you deliberately want to replace the whole page "
+            "from the crawl data.", PRODUCT_DIMS_PAGE_TITLE)
+        return {"pushed": 0, "rows": len(rows),
+                "skipped": "page exists — use --rebuild"}
     if page_id:
         n = _delete_block_children(page_id, cfg)
-        log.info("Found existing %r page — cleared %d old "
-                  "block(s) to rebuild.",
+        log.info("Found existing %r page — --rebuild given, "
+                  "cleared %d old block(s).",
                   PRODUCT_DIMS_PAGE_TITLE, n)
     else:
         res = _request("POST", "/pages", json_body={
@@ -1099,7 +1113,8 @@ def cmd_product_dimensions(args) -> int:
     result = sync_product_dimensions(
         dry_run=bool(args.dry_run),
         include_empty=bool(args.include_empty),
-        limit=(int(limit) if limit else None))
+        limit=(int(limit) if limit else None),
+        rebuild=bool(getattr(args, "rebuild", False)))
     log.info("DONE: %s", result)
     return 0
 
@@ -1407,9 +1422,14 @@ def main() -> int:
     p_pd.add_argument("--verbose", action="store_true")
     p_pd.add_argument(
         "--include-empty", action="store_true",
-        help="Also push rows with no diagram and no dimensions.")
+        help="Also include rows with no diagram and no dimensions.")
     p_pd.add_argument("--limit", type=int, default=None,
-                        help="Cap pushed rows (most-complete first).")
+                        help="Cap rows written (for a test run).")
+    p_pd.add_argument(
+        "--rebuild", action="store_true",
+        help="Replace the Product Dimensions page even if it "
+              "already exists. WIPES any manual Notion edits — "
+              "only for a deliberate full refresh.")
     p_pd.set_defaults(func=cmd_product_dimensions)
     p_pb = sub.add_parser(
         "pull-playbooks",
