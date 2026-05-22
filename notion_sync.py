@@ -862,6 +862,147 @@ def cmd_clear_db_id(args) -> int:
     return 0
 
 
+def push_procedure_rule(title: str, content: str,
+                         category: str = "procedures",
+                         dry_run: bool = False) -> Dict:
+    """v2.67.274 — Create or update a procedure/rule page under the
+    Notion playbooks parent and immediately seed it into the local
+    kb_articles table so the AI can search it right away (without
+    waiting for the next 30-min pull-playbooks run).
+
+    The page is created as a child of NOTION_PLAYBOOKS_PARENT_ID (falls
+    back to NOTION_TEAM_PARENT_PAGE_ID if unset). Page content is a
+    single paragraph block. Idempotent: the pull-playbooks sync will
+    overwrite the kb_articles row on the next run with the same content,
+    but the seed here means it's searchable immediately."""
+    cfg = _config()
+    playbooks_parent = os.environ.get(
+        "NOTION_PLAYBOOKS_PARENT_ID", "").strip().replace("-", "")
+    parent_id = playbooks_parent or cfg["parent"]
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    if dry_run:
+        log.info("[DRY RUN] Would create Notion page '%s' under %s",
+                  title, parent_id)
+        log.info("[DRY RUN] Content:\n%s", content)
+        return {"status": "dry_run", "title": title}
+
+    # 1. Create or update the Notion page
+    # First check if a page with this title already exists as a child.
+    existing_id = None
+    try:
+        res = _request("POST",
+                        f"/search",
+                        json_body={"query": title,
+                                    "filter": {"value": "page",
+                                               "property": "object"}},
+                        cfg=cfg)
+        for item in (res.get("results") or []):
+            if item.get("object") != "page":
+                continue
+            parent_block = item.get("parent", {})
+            if parent_block.get("page_id", "").replace("-", "") != parent_id:
+                continue
+            # Check title matches
+            props = item.get("properties", {})
+            for _p in props.values():
+                _t = _p.get("title") or []
+                page_title = "".join(
+                    t.get("plain_text", "") for t in _t)
+                if page_title.strip().lower() == title.strip().lower():
+                    existing_id = item["id"].replace("-", "")
+                    break
+            if existing_id:
+                break
+    except Exception as exc:
+        log.warning("Notion page lookup failed: %s", exc)
+
+    paragraph_block = {
+        "object": "block",
+        "type": "paragraph",
+        "paragraph": {
+            "rich_text": [{"type": "text",
+                            "text": {"content": content[:2000]}}]
+        },
+    }
+    if existing_id:
+        # Update: append a new block (simplest approach — prepend the
+        # updated content; full replacement would need to delete all
+        # existing blocks first which is complex and risky).
+        try:
+            _request("PATCH",
+                      f"/blocks/{existing_id}/children",
+                      json_body={"children": [paragraph_block]},
+                      cfg=cfg)
+            notion_page_id = existing_id
+            log.info("Updated existing Notion page '%s' (%s)",
+                      title, notion_page_id)
+        except Exception as exc:
+            log.warning("Notion page update failed: %s", exc)
+            notion_page_id = existing_id
+    else:
+        try:
+            res = _request("POST", "/pages", json_body={
+                "parent": {"page_id": parent_id},
+                "properties": {
+                    "title": {"title": [{"type": "text",
+                                          "text": {"content": title}}]}
+                },
+                "children": [paragraph_block],
+            }, cfg=cfg)
+            notion_page_id = res.get("id", "").replace("-", "")
+            log.info("Created Notion page '%s' (%s)",
+                      title, notion_page_id)
+        except Exception as exc:
+            log.error("Notion page creation failed: %s", exc)
+            notion_page_id = ""
+
+    # 2. Seed into kb_articles immediately (don't wait 30-min pull).
+    notion_url = (
+        f"https://www.notion.so/{notion_page_id}"
+        if notion_page_id else "")
+    try:
+        db.upsert_kb_article(
+            page_id=notion_page_id or f"local_{title[:32]}",
+            title=title,
+            content_md=content,
+            url=notion_url,
+            notion_edited_at=now_iso,
+            category=category,
+        )
+        log.info("Seeded kb_articles: '%s' (category=%s)",
+                  title, category)
+    except Exception as exc:
+        log.warning("kb_articles seed failed: %s", exc)
+
+    return {
+        "status": "ok",
+        "title": title,
+        "notion_page_id": notion_page_id,
+        "notion_url": notion_url,
+        "category": category,
+    }
+
+
+def cmd_push_rule(args) -> int:
+    """v2.67.274 — Push a named procedure/rule to Notion + seed
+    it locally so the AI finds it immediately."""
+    _setup_log(args.verbose)
+    title = (args.title or "").strip()
+    content = (args.content or "").strip()
+    if not title or not content:
+        log.error("--title and --content are required")
+        return 1
+    result = push_procedure_rule(
+        title=title,
+        content=content,
+        category=(args.category or "procedures"),
+        dry_run=bool(args.dry_run))
+    log.info("DONE: %s", result)
+    return 0
+
+
 def cmd_check(args) -> int:
     """Smoke-test the Notion auth + parent-page access."""
     _setup_log(args.verbose)
@@ -927,6 +1068,20 @@ def main() -> int:
     p_cd.add_argument("--name", required=True)
     p_cd.add_argument("--verbose", action="store_true")
     p_cd.set_defaults(func=cmd_clear_db_id)
+    p_pr = sub.add_parser(
+        "push-rule",
+        help="Create/update a procedure rule page in Notion and "
+              "immediately seed it into the local AI knowledge base.")
+    p_pr.add_argument("--title", required=True,
+                       help="Page title, e.g. 'Rule: Always report "
+                             "warehouse bin location in stock queries'.")
+    p_pr.add_argument("--content", required=True,
+                       help="Full rule text (plain prose).")
+    p_pr.add_argument("--category", default="procedures",
+                       help="kb_articles category (default: procedures).")
+    p_pr.add_argument("--dry-run", action="store_true")
+    p_pr.add_argument("--verbose", action="store_true")
+    p_pr.set_defaults(func=cmd_push_rule)
     p_ck = sub.add_parser(
         "check", help="Verify auth and parent-page access.")
     p_ck.add_argument("--verbose", action="store_true")

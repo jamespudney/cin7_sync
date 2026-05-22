@@ -1055,7 +1055,7 @@ def find_products(engine_df: pd.DataFrame,
     if (engine_df is not None and not engine_df.empty
             and "SKU" in engine_df.columns):
         cols = ["SKU", "Name"] + [
-            c for c in ("OnHand", "Available")
+            c for c in ("OnHand", "Available", "Bin")
             if c in engine_df.columns]
         for r in engine_df[cols].to_dict(orient="records"):
             sku = str(r.get("SKU") or "").strip()
@@ -1147,6 +1147,8 @@ def find_products(engine_df: pd.DataFrame,
         # so cin7_row already has the field.
         # v2.67.23 — also propagate trend_flag (Stable / 📈 Trend /
         # 🎯 Project / 🔀 Mixed / 📉 Decline) for sales staff rating.
+        _bin = (cin7_row.get("Bin")
+                 or cin7_by_sku.get(sku, {}).get("Bin"))
         out.append({
             "sku": sku,
             "name": (cin7_row.get("Name")
@@ -1159,6 +1161,7 @@ def find_products(engine_df: pd.DataFrame,
             "source": "both",
             "stock": onhand_v,
             "stock_status": stock_status_v,
+            "bin": _bin or None,
             "classification": cin7_row.get("Classification"),
             "trend_flag": cin7_row.get("trend_flag"),
             "matched_in": fields_hit,

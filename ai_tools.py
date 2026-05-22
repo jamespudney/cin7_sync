@@ -1806,9 +1806,11 @@ def search_products(engine_df: pd.DataFrame,
     # v2.67.27 — surface the engine's actual signal columns so the
     # AI can read them directly instead of hoping for a synthesised
     # Classification field.
+    # v2.67.274 — include Bin (warehouse shelf location) so the AI
+    # always reports WHERE a SKU is stored alongside how much is on hand.
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
-        "OnHand", "TargetStock", "ReorderSuggested",
+        "OnHand", "Bin", "TargetStock", "ReorderSuggested",
         "trend_flag", "is_dormant", "excess_units",
         "effective_units_12mo",
     ] if c in df.columns]
@@ -1944,7 +1946,7 @@ def get_dead_stock(engine_df: pd.DataFrame,
             df = df[df["__sv"] >= min_value]
     cols = [c for c in [
         "SKU", "Name", "Family", "Classification",
-        "OnHand", "StockValue", "ABC",
+        "OnHand", "Bin", "StockValue", "ABC",
     ] if c in df.columns]
     df = df.sort_values(
         by=cols[0] if "OnHand" not in cols else "OnHand",
@@ -2693,7 +2695,7 @@ def search_products_by_text(engine_df: pd.DataFrame,
     # selling slow movers / declining stock.
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
-        "OnHand", "TargetStock", "ReorderSuggested",
+        "OnHand", "Bin", "TargetStock", "ReorderSuggested",
         "is_dormant", "effective_units_12mo", "excess_units",
         "is_non_master_tube", "trend_flag",
     ] if c in df.columns]

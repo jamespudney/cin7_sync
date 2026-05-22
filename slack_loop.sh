@@ -190,6 +190,7 @@ last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
 last_bom_sync_epoch=0      # v2.67.195 BOM sync (weekly)
+last_shopify_sync_epoch=0  # v2.67.274 Shopify content sync fallback
 
 while true; do
     now_epoch=$(date -u +%s)
@@ -479,6 +480,22 @@ while true; do
         last_notion_push_epoch=$(date -u +%s)
         _run_bg "notion_push_slow_movers" \
             "python notion_sync.py slow-movers"
+    fi
+
+    # v2.67.274 Shopify content-sync fallback. daily_sync.sh runs
+    # shopify_sync.py at 02:00 UTC but errors are swallowed and the
+    # AI assistant shows a stale-data banner if the sync falls behind.
+    # This block re-runs the sync from the Slack worker once per 24h
+    # so staleness can't exceed 24h even if daily_sync.sh misses it.
+    # Silently skipped when SHOPIFY_DOMAIN / SHOPIFY_ACCESS_TOKEN
+    # aren't set (same guard as daily_sync.sh).
+    seconds_since_shopify_sync=$(( now_epoch - last_shopify_sync_epoch ))
+    if [ "$seconds_since_shopify_sync" -ge 86400 ] \
+            && [ -n "${SHOPIFY_DOMAIN:-}" ] \
+            && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
+        last_shopify_sync_epoch=$(date -u +%s)
+        _run_bg "shopify_sync" \
+            "python shopify_sync.py"
     fi
 
     # v2.67.245 Stock-issue thread-reply poll. Slack's
