@@ -3,16 +3,31 @@
 # Declarative deploy config for Render. Render reads this file when you
 # connect the GitHub repo and creates the service described below.
 #
-# Single-service architecture
-# ---------------------------
-# Render disks can't be shared across services — each disk attaches to
-# exactly one service. So we run BOTH the Streamlit app AND the daily
-# sync loop inside one web service:
+# Two-service architecture
+# ------------------------
+#   wired4signs-app  (web service, srv-d7pm50pj2pic73bsfab0)
+#     Hosts the Streamlit dashboard + sync loop (start.sh).
+#     Has a 5 GB persistent disk at /data.
 #
-#   start.sh:
-#     1. starts sync_loop.sh as a background process (handles the daily
-#        02:00 UTC sync — sleeps until the target hour, runs sync, repeat)
-#     2. starts Streamlit in the foreground
+#   cin7-sync-slack-bot  (background worker, srv-d7u8vpd0lvsc73er0mvg)
+#     Runs slack_loop.sh: Slack AI bot + CIN7 write-backs + dropship
+#     tracking. No disk — reads shared Postgres DB.
+#
+# Shared env group
+# ----------------
+# Most env vars live in Render env group "cin7-shared"
+# (ID: evg-d887agnavr4c73e2v1ug).  Both services draw from this group.
+# To link the group to a service: Render Dashboard → Service →
+#   Environment → "Link environment group" → cin7-shared.
+#
+# The app service additionally sets these Streamlit/sync vars not in
+# the shared group:
+#   STREAMLIT_SERVER_HEADLESS, STREAMLIT_HOME,
+#   SYNC_HOUR_UTC, NEARSYNC_INTERVAL_MIN
+#
+# Render disks can't be shared across services — each disk attaches to
+# exactly one service. The app service owns /data; the worker reads
+# shared state via the Postgres DATABASE_URL.
 #
 # Streamlit must be the foreground process so Render's health check
 # can reach it on $PORT.
@@ -24,8 +39,7 @@
 #   - /data/.streamlit/cache/ (disk-persisted ABC engine + CSV caches)
 #
 # Secrets (CIN7 keys, IP token, app password) are NOT in this file.
-# They live in Render's encrypted env-var UI. Keys with `sync: false`
-# tell Render "don't sync from repo — prompt the operator on apply."
+# They live in Render's encrypted env-var UI / cin7-shared group.
 #
 # Custom domain: free `<service>.onrender.com` subdomain by default;
 # add a custom domain via Settings UI after first deploy works.
