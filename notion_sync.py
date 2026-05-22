@@ -1212,6 +1212,65 @@ def cmd_push_rule(args) -> int:
     return 0
 
 
+def cmd_inspect(args) -> int:
+    """v2.67.277 — list every child database + sub-page directly
+    under the parent page, with each database's column names and
+    row count. Use this to find the exact database to write into
+    before pointing a sync at it."""
+    _setup_log(args.verbose)
+    cfg = _config()
+    parent = cfg["parent"]
+    cursor = None
+    n_db = 0
+    n_pg = 0
+    print(f"\nChildren of parent page {parent}:")
+    print("=" * 64)
+    while True:
+        path = (f"/blocks/{parent}/children?page_size=100"
+                + (f"&start_cursor={cursor}" if cursor else ""))
+        body = _request("GET", path, cfg=cfg)
+        for b in body.get("results") or []:
+            t = b.get("type")
+            if t == "child_database":
+                n_db += 1
+                db_id = (b.get("id") or "")
+                title = ((b.get("child_database") or {})
+                         .get("title") or "(untitled)")
+                cols: List[str] = []
+                n_rows = "?"
+                try:
+                    meta = _request("GET", f"/databases/{db_id}",
+                                     cfg=cfg)
+                    cols = sorted((meta.get("properties")
+                                   or {}).keys())
+                    q = _request(
+                        "POST", f"/databases/{db_id}/query",
+                        json_body={"page_size": 1}, cfg=cfg)
+                    n_rows = ("1+" if q.get("results")
+                              else "0")
+                    if q.get("has_more"):
+                        n_rows = "many"
+                except Exception as exc:  # noqa: BLE001
+                    cols = [f"<could not read: {exc}>"]
+                print(f"\nDATABASE  {title!r}")
+                print(f"  id      : {db_id.replace('-', '')}")
+                print(f"  rows    : {n_rows}")
+                print(f"  columns : {', '.join(cols)}")
+            elif t == "child_page":
+                n_pg += 1
+                title = ((b.get("child_page") or {})
+                         .get("title") or "(untitled)")
+                print(f"\nSUB-PAGE  {title!r}")
+                print("  id      : "
+                      f"{(b.get('id') or '').replace('-', '')}")
+        if not body.get("has_more"):
+            break
+        cursor = body.get("next_cursor")
+    print("=" * 64)
+    print(f"Found {n_db} database(s) and {n_pg} sub-page(s).\n")
+    return 0
+
+
 def cmd_check(args) -> int:
     """Smoke-test the Notion auth + parent-page access."""
     _setup_log(args.verbose)
@@ -1303,6 +1362,12 @@ def main() -> int:
     p_pr.add_argument("--dry-run", action="store_true")
     p_pr.add_argument("--verbose", action="store_true")
     p_pr.set_defaults(func=cmd_push_rule)
+    p_in = sub.add_parser(
+        "inspect",
+        help="List child databases + sub-pages under the parent "
+              "page, with each database's columns and row count.")
+    p_in.add_argument("--verbose", action="store_true")
+    p_in.set_defaults(func=cmd_inspect)
     p_ck = sub.add_parser(
         "check", help="Verify auth and parent-page access.")
     p_ck.add_argument("--verbose", action="store_true")
