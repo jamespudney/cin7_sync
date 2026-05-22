@@ -3342,9 +3342,21 @@ def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
             continue
         try:
             more = pd.read_csv(p, low_memory=False)
-            base = pd.concat([base, more], ignore_index=True)
         except Exception:
             continue
+        # v2.67.275 — PO-level replacement: if the newer file has a
+        # fresher sync for a PurchaseID, drop ALL rows for that ID from
+        # the older file before merging. Without this, a PO that was
+        # synced in ORDERING state (in the 90d file) and then invoiced
+        # (captured in the 30d file with new prices/qty) would produce
+        # duplicate SKU rows — one ORDERING and one INVOICED per SKU —
+        # because the old dedup key included Price, which changed.
+        if "PurchaseID" in base.columns and "PurchaseID" in more.columns:
+            newer_pids = set(more["PurchaseID"].dropna().unique())
+            base = base[~base["PurchaseID"].isin(newer_pids)]
+        base = pd.concat([base, more], ignore_index=True)
+    # Final row-level dedup: catches any remaining duplicates within
+    # a single file (e.g. checkpoint replay edge cases).
     dedupe_cols = [c for c in
                     ["PurchaseID", "SKU", "Quantity", "OrderDate",
                      "OrderNumber", "Price"]
