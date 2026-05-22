@@ -716,9 +716,10 @@ def write_tracking_to_sale(sale_id: str,
     ship = first.setdefault("Ship", {})
     lines = ship.setdefault("Lines", [])
     lines.append(new_line)
-    # Make sure Ship.Status is at least AUTHORISED so CIN7
-    # processes the new line.
-    ship.setdefault("Status", "AUTHORISED")
+    # Force Ship.Status to AUTHORISED so CIN7 processes the new
+    # line. setdefault() would silently leave DRAFT unchanged,
+    # so assign directly.
+    ship["Status"] = "AUTHORISED"
 
     # 4. PUT the modified sale back
     try:

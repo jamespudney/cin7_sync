@@ -116,3 +116,7 @@ services:
         sync: false       # e.g. wired4signs.myshopify.com
       - key: SHOPIFY_ACCESS_TOKEN
         sync: false       # shpat_... from a custom app
+      # Dropship UPS tracking — channel where Slack Email app forwards
+      # UPS shipment notifications so the bot can parse and write to CIN7.
+      - key: SLACK_DROPSHIP_TRACKING_CHANNEL_ID
+        value: "C0B3KD6GBM3"
