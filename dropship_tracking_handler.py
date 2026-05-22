@@ -1,4 +1,4 @@
-"""dropship_tracking_handler.py (v2.67.272)
+"""dropship_tracking_handler.py (v2.67.273)
 ==============================================
 
 Parse UPS-style shipping notification emails forwarded into a
@@ -938,18 +938,26 @@ def handle_ups_email(msg: dict) -> Tuple[str, List[str]]:
     f = _email_payload(msg)
     if not f:
         return "", []
-    # v2.67.269 — UPS emails are HTML-only; Slack Email app leaves
-    # plain_text empty. Fallback chain:
-    #   1. plain_text  (populated for text/plain emails)
-    #   2. preview     (short Slack-generated snippet, rarely enough)
-    #   3. Download full email from url_private_download + parse MIME
-    #   4. msg.text    (message-level text, usually empty for email posts)
+    # v2.67.273 — UPS emails are HTML-only; Slack Email app leaves
+    # plain_text empty. Fallback chain (order matters):
+    #   1. plain_text  (populated for text/plain emails — rare for UPS)
+    #   2. Download full email from url_private_download + parse MIME
+    #      (reliable: gives us the full body with Ship To:, UPS Service:,
+    #       Weight: etc. that the sale-matcher and parser need)
+    #   3. preview  (Slack-generated 100-200 char snippet — often just
+    #      repeats the subject, not enough to find Ship To:)
+    #   4. msg.text (almost always empty for email-app posts)
+    #
+    # IMPORTANT: preview was tried before the download in v2.67.269-272
+    # but the preview is usually just the subject line (>50 chars) so it
+    # passed the gate and blocked the download, leaving us with no
+    # Ship To: info → sale match fails → no CIN7 write.
     subject = f.get("subject") or ""
     body = f.get("plain_text") or ""
     if not body or len(body) < 50:
-        body = f.get("preview") or ""
-    if not body or len(body) < 50:
         body = _fetch_email_body(f)
+    if not body or len(body) < 50:
+        body = f.get("preview") or ""
     if not body:
         body = msg.get("text") or ""
     parsed = parse_ups_email(body, subject=subject)
