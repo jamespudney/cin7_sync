@@ -1,11 +1,8 @@
 # Wired4Signs App Glossary
 
-_Single source of truth for the ABC engine's intelligence rules and the signals the app surfaces. Both the Streamlit dashboard and the Slack bot ground their answers in this glossary — the bot prepends it to every system prompt so its answers stay aligned with what the dashboard shows._
-
-_This file is a snapshot of `intelligence_glossary.GLOSSARY_MARKDOWN` in the codebase. To refresh after a code update, run `python notion_sync.py dump-glossary` on the Render shell._
+_Single source of truth for the ABC engine's intelligence rules and the signals the app surfaces. Generated from `intelligence_glossary.py`. To refresh: `python notion_sync.py dump-glossary`._
 
 ---
-
 #### ABC class
 Every SKU is ranked A / B / C on a hybrid score (60% of 12-month value
 rank + 40% of 12-month quantity rank):
@@ -129,7 +126,7 @@ For the full step-by-step math on any individual SKU, scroll to the
 **transparency panel** below the PO table and pick the SKU — the
 engine shows every input and how it got to the suggestion.
 
-#### Slow movers / dormancy
+#### Slow movers / dormancy (v2.67.36+)
 A SKU is **dormant** when its 90-day demand has dropped sharply
 versus its 12-month baseline (≈80% drop), AND it still has stock
 on hand. Computed by the engine on every recompute. Definitions:
@@ -141,16 +138,18 @@ on hand. Computed by the engine on every recompute. Definitions:
   Status column and a `⚠️ WAS slow-moving` auto-prefix in the
   Notes column. Auto-lifts after 90 days of sustained activity, or
   the buyer can dismiss manually from the Slow Movers page.
-- **A-class grace** — A-class SKUs with positive 12mo
+- **A-class grace (v2.67.48)** — A-class SKUs with positive 12mo
   demand are EXEMPT from dormancy flagging. Reasoning: A-class is
   by definition a steady-revenue mover; if the buyer over-bought
   to secure better pricing, recent sales naturally drop while
   stock is high — but the long-term pattern is unchanged. Flagging
-  these would discourage reordering of steady movers. The Ordering
-  page surfaces a 💼 note explaining the grace when an A-class
-  item's 90d activity is below threshold.
+  these would discourage reordering of steady movers. The grace
+  applies in both `_is_dormant` (base rule) and
+  `_refine_dormancy_by_class` (class-aware refinement). The
+  Ordering page surfaces a 💼 note explaining the grace when an
+  A-class item's 90d activity is below threshold.
 
-#### Overstock / excess
+#### Overstock / excess (v2.67.47+)
 - `excess_units` — units held beyond expected near-term demand.
   Two implementations:
   - **Naive (in `_abc_engine`)** — `max(0, OnHand - effective_units_12mo)`.
@@ -163,7 +162,7 @@ on hand. Computed by the engine on every recompute. Definitions:
 - `excess_value` — `excess_units × per-unit cost`. Cash that
   could be freed up by clearing the overstock down to target.
 
-#### 🪫 REMNANT flag
+#### 🪫 REMNANT flag (v2.67.31)
 Bulk-roll parent SKUs with `OnHand < 1.0` (less than one full
 roll's worth). The engine's slow/dormant signals don't capture
 "we have 0.4 of a 100m roll left" because per-foot child sales
@@ -193,7 +192,7 @@ sales staff ask "what warm white strips do we have?" the answer
 includes inline ⚠️/🔴/📦 flags so they know which items to
 push.
 
-#### parents_only filter
+#### parents_only filter (v2.67.22+)
 The AI Assistant's `find_products` and `search_products_by_text`
 tools default to `parents_only=true`, mirroring the Ordering
 page's PO-suggestion logic. Hides per-foot cuts and BOM
@@ -206,27 +205,27 @@ Warehouse shelf location for each SKU, pulled from `stock_on_hand`
 and surfaced through the AI Assistant's `get_sku_details`. Answers
 "where do we keep X?".
 
-#### PO Comments + Shipping notes
-The AI surfaces FIVE freeform text fields on every PO — each
+#### PO Comments + Shipping notes (v2.67.44, expanded v2.67.52)
+The AI now surfaces FIVE freeform text fields on every PO — each
 typed by the buyer for a different purpose:
 - **Comments** — top-level header free-text the buyer uses to
   record airfreight/seafreight or one-line ETA notes.
 - **Shipping notes** — attribute under the "Vendor purchase"
   attribute set, used for richer progress detail like "departed
   Shenzhen 2026-04-12, in customs".
-- **Memo** — the "Purchase Order Memo" big text box
+- **Memo** *(v2.67.52)* — the "Purchase Order Memo" big text box
   on the CIN7 PO form. The buyer's main instruction field for
   the entire order.
-- **Note** — separate top-level note field. CIN7
+- **Note** *(v2.67.52)* — separate top-level note field. CIN7
   sometimes uses this for status / blame, e.g. "shipped in error
   by supplier — original PO-XXXX cancelled".
-- **Terms** — payment terms (Net 30, Payment with
+- **Terms** *(v2.67.52)* — payment terms (Net 30, Payment with
   Order, etc.).
 All five flow through `get_incoming_stock` and `get_purchase_order`
 so AI shipment-status answers report every signal the buyer
 recorded.
 
-#### Sale-side freeform fields
+#### Sale-side freeform fields (v2.67.52)
 Sale orders have a parallel set of freeform fields the rep types
 into. `get_sale_order` surfaces all of them:
 - **Memo** — "Sale Order Memo" big text box. Rep's
@@ -239,10 +238,10 @@ into. `get_sale_order` surfaces all of them:
 - **CustomerReference** — customer's own PO# referencing this
   sale.
 
-#### Shopify order tracing
+#### Shopify order tracing (v2.67.55)
 CIN7 records sales from the Shopify channel with
 SourceChannel='Shopify' but doesn't carry the Shopify-side
-conversion fields. shopify_sync.py mirrors them locally so
+conversion fields. shopify_sync.py now mirrors them locally so
 the AI's `get_shopify_order` tool can answer "how did we get
 this conversion" questions:
 
@@ -263,7 +262,7 @@ When the AI sees `get_sale_order` return SourceChannel=Shopify,
 it proactively follows up with `get_shopify_order` for the
 joined view rather than "I have CIN7 data, check Shopify yourself".
 
-#### ShipStation integration
+#### ShipStation integration (v2.67.54)
 ShipStation shipment data feeds two places:
 - **AI Assistant** — `get_shipping_details(order_number /
   tracking_number / customer + date)` returns ship date, carrier,
@@ -272,9 +271,19 @@ ShipStation shipment data feeds two places:
   are flagged explicitly.
 - **Monthly Metrics** — the "Shipping Cost" row in the Margins
   block aggregates `shipmentCost` per month (excluding voided
-  shipments).
+  shipments). Pre-ShipStation months show 0; post-integration
+  months show real freight spend.
 
-#### Transaction lookup
+Setup:
+1. Set `SHIPSTATION_API_KEY` + `SHIPSTATION_API_SECRET` in env.
+2. One-time backfill: `python shipstation_sync.py full --days
+   1825` (5 years; 30-60 minutes for a busy account).
+3. NearSync (1-day) and Daily Sync (7-day) catch-ups run
+   automatically once env vars are set. NearSync keeps
+   shipments visible to the AI within 15 minutes of label
+   creation.
+
+#### Transaction lookup (v2.67.51)
 The AI Assistant can pull up specific CIN7 documents on demand.
 Three tools, picked by what kind of number the user mentions:
 - **`get_purchase_order(po_number=PO-XXXX)`** — full PO lookup.
@@ -287,9 +296,25 @@ Three tools, picked by what kind of number the user mentions:
   or "who ordered LED-V3060001-2 last week".
 - **`get_stock_adjustment(stocktake_number / date_from)`** —
   adjustment header lookup. Returns EffectiveDate / Status /
-  Reference.
+  Reference. Per-SKU line detail is NOT in the local sync;
+  the AI tells the user to view the line breakdown in CIN7.
 
-#### Cost basis chain — how the engine values stock
+#### Local sync windows (v2.67.51)
+The AI's transaction tools read from local CSVs the daily sync
+drops:
+- **Purchase lines** — 30-day rolling window (bumped from 7d in
+  v2.67.51 after PO-7109 was missed). The widest available window
+  file is used as the base, with newer 1-day files merged on top.
+- **Sale lines** — 30-day rolling window (bumped from 3d in
+  v2.67.43). Plus the 1825-day longest-history file when present.
+- **Stock adjustments** — 30-day window, headers only (no per-SKU
+  line detail in the bulk endpoint).
+- **Stock-on-hand `OnOrder` field** — the canonical PO total,
+  refreshed every NearSync (15-min). When `get_incoming_stock`
+  returns no PO lines but `OnOrder>0`, the tool flags this as a
+  data gap rather than claiming "no PO exists".
+
+#### Cost basis chain — how the engine values stock (v2.67.180)
 The engine values inventory at `OnHand × EffectiveUnitCost`.
 EffectiveUnitCost is resolved per SKU via a fall-back chain — the
 first hit wins:
@@ -322,9 +347,10 @@ and a delta caption when they diverge significantly).
 `target_stock × EffectiveUnitCost` per SKU. The dollar value of
 the engine's recommended on-hand level. Summed across masters,
 this is the **Optimum stock value** tile on the Ordering page
-and the target the glide-path projects toward.
+and the target the glide-path projects toward (v2.67.178 — no
+more hardcoded $600k constant).
 
-#### Optimum stock value (the glide-path target)
+#### Optimum stock value (the glide-path target, v2.67.178)
 **`sum(target_stock × EffectiveUnitCost across masters only)`**
 
 What working capital SHOULD be tied up at, per the engine. The
@@ -339,17 +365,54 @@ The optimum is masters-only because non-master variants
 (per-foot cuts) roll their demand up to the master; counting
 them would double-count.
 
-#### Slow Stock Cleared / Value (monthly metrics)
-Two rows in Monthly Metrics → Inventory:
+#### Excess, Understock & how the Ordering tiles reconcile (v2.67.282)
+The Ordering page headline has five tiles. They each measure a
+different thing, so they do NOT form a simple subtraction. How
+they relate:
+
+- **Current stock value** — CIN7 FIFO value summed across ALL
+  SKUs. No cost fallback. Ties to the Overview tile.
+- **Optimum stock value** — `sum(TargetValue)` across masters
+  only (cost fallbacks allowed).
+- **Excess (cash to free up)** — `sum(max(0, OnHandValue −
+  TargetValue))` across masters, PLUS dead non-master cuts at
+  full value. A GROSS figure: it floors every SKU at zero, so it
+  counts only SKUs OVER target and never nets the ones UNDER.
+- **Understock (cash to redeploy)** — `sum(max(0, TargetValue −
+  OnHandValue))` across masters. The half Excess omits: the
+  spend needed to bring under-target SKUs up to target.
+- **Dead stock** — a SUBSET of Excess (zero-demand SKUs still
+  holding stock), surfaced separately. Not additive.
+
+Exact reconciliation identity (master SKUs):
+`master_overstock − understock = master_onhand − optimum`.
+
+So **Excess is intentionally larger than Current − Optimum**:
+Current − Optimum is the NET over-position, Excess is the GROSS
+overstock before netting the under-stocked SKUs back in. Net
+working capital actually freed ≈ `Excess − Understock`. Current
+vs Optimum also differ in scope (all SKUs vs masters) and cost
+basis (CIN7 FIFO vs cost-chain fallbacks), so the tiles never
+tie to the exact dollar — the bridge caption under the tiles
+states the live numbers.
+
+#### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
+Two new rows in Monthly Metrics → Inventory:
 
 - **Slow Stock Cleared ($)** — sum of `Quantity × AverageCost`
   on sale_lines for SKUs in the current dormancy_warnings set,
   grouped by month. The **flow** metric: how much slow stock the
-  team moved each month. Going UP = team is winning.
+  team moved each month. Going UP = team is winning. Note: uses
+  the current dormancy set (snapshot), not the
+  was-dormant-at-that-time set — good enough for trend, slight
+  imprecision for very old months.
 - **Slow Stock Value (EOM)** — month-end value of slow stock on
   shelf, sourced from `slow_mover_value_snapshots` (engine
-  writes daily). The **state** metric: how much slow stock is
-  left to clear. Going DOWN = team is winning.
+  writes daily). Current month uses the live
+  `_compute_slow_stock_holding`. The **state** metric: how much
+  slow stock is left to clear. Going DOWN = team is winning.
+  Sparse for months before v2.67.36 (when the writer was added)
+  — that's expected; the row fills out forward.
 
 Both rows tie to the same dormancy set the Slow Movers page
 uses, so the figures across pages stay aligned.
@@ -359,8 +422,12 @@ True for SKUs that are children of a bulk-roll master (per-foot
 cuts, BOM derivatives). Their stock and demand roll up to the
 master. Most calculations filter `~is_non_master_tube` so they
 operate on parents + standalones only — avoids double-counting.
+You'll see this filter on the Ordering page (parents_only
+toggle), the Slow Movers page (auto-applied unless 'show all
+flagged' is on), and the Optimum / Excess / Dead-stock math on
+the headline tiles.
 
-#### Engine-snapshot writers (provenance)
+#### Engine-snapshot writers (provenance, v2.67.36+)
 The engine writes two persistence tables during each recompute:
 - **`sku_dormancy_log`** — one row per SKU that's ever been
   dormant. Tracks first_seen_dormant_at, last_seen_dormant_at,
@@ -369,4 +436,12 @@ The engine writes two persistence tables during each recompute:
 - **`slow_mover_value_snapshots`** — one row per
   snapshot_date with (skus_count, units_on_hand, value_on_shelf)
   across the filtered slow-stock universe. Powers the
-  "Slow Stock Value (EOM)" Monthly Metrics row.
+  "Slow Stock Value (EOM)" Monthly Metrics row and the MoM
+  caption on the Overview slow-mover tile.
+
+Both tables are write-through from the engine — the dashboard
+runs the engine (typically on Ordering or Overview page load),
+the engine writes these tables, and downstream pages read from
+them. After the v2.67.163 Postgres cutover both live in the
+shared Postgres DB so the worker (Slack bot) and web service
+read the same provenance.

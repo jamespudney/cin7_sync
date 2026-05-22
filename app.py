@@ -11209,6 +11209,31 @@ elif page == "Ordering":
         _row_excess_value, axis=1)
     total_excess_value = float(engine_df["row_excess_value"].sum())
 
+    # v2.67.282 — Understock counterpart. "Excess" floors every SKU
+    # at zero, so it only counts SKUs OVER target and never nets the
+    # ones UNDER it. Without this half the tiles look contradictory:
+    # Current − Optimum (a NET figure) never equals Excess (a GROSS
+    # one). Understock = master SKUs below TargetValue, summed — the
+    # cash you'd redeploy bringing them up to target.
+    def _row_understock_value(r):
+        if bool(r.get("is_non_master_tube")):
+            return 0.0  # non-masters roll up; target = 0
+        ohv = float(r.get("OnHandValue") or 0)
+        tv = float(r.get("TargetValue") or 0)
+        return max(0.0, tv - ohv)
+
+    engine_df["row_understock_value"] = engine_df.apply(
+        _row_understock_value, axis=1)
+    total_understock_value = float(
+        engine_df["row_understock_value"].sum())
+    # Master-only overstock for the EXACT reconciliation identity:
+    #   master_overstock − understock == master_onhand − optimum.
+    master_overstock_value = float(
+        engine_df.loc[~engine_df["is_non_master_tube"],
+                       "row_excess_value"].sum())
+    master_onhand_value = float(master_only["OnHandValue"].sum())
+    net_over_position = master_overstock_value - total_understock_value
+
     # Dead stock: zero effective demand AND physical stock held.
     # For masters, use the engine's Status flag. For non-masters,
     # also include them if they have physical stock but zero direct sales.
@@ -11246,7 +11271,7 @@ elif page == "Ordering":
         f"up to their masters)."
     )
 
-    oc1, oc2, oc3, oc4 = st.columns(4)
+    oc1, oc2, oc3, oc4, oc5 = st.columns(5)
     # v2.67.37 — headline now ties to Overview + Monthly Metrics.
     # Help text spells out the tie-out so the buyer trusts it.
     _fallback_delta = total_onhand_value_with_fallback - total_onhand_value
@@ -11275,7 +11300,16 @@ elif page == "Ordering":
                delta_color="inverse",
                help="OnHand beyond target stock, by SKU, summed. "
                     "The money sitting on shelves that doesn't need to be.")
-    oc4.metric("Dead stock (zero demand, holding stock)",
+    oc4.metric("Understock (cash to redeploy)",
+               _fmt_money(total_understock_value),
+               help="Master SKUs sitting BELOW target stock, by "
+                    "SKU, summed — the working capital you'd "
+                    "redeploy to bring them up to target. The "
+                    "counterpart to Excess: netting the two "
+                    "(Excess − Understock) gives your TRUE "
+                    "over-position, which Current − Optimum on "
+                    "its own doesn't reveal.")
+    oc5.metric("Dead stock (zero demand, holding stock)",
                _fmt_money(dead_value),
                help="Two buckets combined: "
                     "(1) MASTER SKUs with zero effective 12-month demand "
@@ -11284,6 +11318,30 @@ elif page == "Ordering":
                     "direct sales. "
                     "Non-masters that HAVE direct sales are treated as "
                     "working inventory, not dead.")
+
+    # v2.67.282 — reconciliation bridge so the five tiles read as
+    # one coherent story instead of looking contradictory.
+    st.caption(
+        ":triangular_ruler: **How the tiles reconcile** — "
+        f"**Excess ({_fmt_money(total_excess_value)})** is the "
+        f"GROSS cash recoverable by selling every over-target SKU "
+        f"down to target. **Understock "
+        f"({_fmt_money(total_understock_value)})** is what you'd "
+        f"re-spend bringing under-target SKUs UP to target. Across "
+        f"master SKUs: overstock "
+        f"{_fmt_money(master_overstock_value)} − understock "
+        f"{_fmt_money(total_understock_value)} = "
+        f"**{_fmt_money(net_over_position)}** genuinely tied up "
+        f"above target (this equals master on-hand "
+        f"{_fmt_money(master_onhand_value)} − Optimum). That is "
+        f"why Excess is larger than Current − Optimum "
+        f"({_fmt_money(total_onhand_value - total_target_value)}) "
+        f"— Excess never nets the under-stocked SKUs back in. "
+        f"Net working capital you could actually free ≈ "
+        f"**{_fmt_money(total_excess_value - total_understock_value)}**. "
+        f"Current value is higher again because it spans ALL SKUs "
+        f"at CIN7 FIFO cost, while Optimum / Excess / Understock "
+        f"are master-SKU figures using cost-chain fallbacks.")
 
     # v2.67.178 — Glide path to engine-derived optimum (replaces
     # the old hard-coded $600k target). The engine's Optimum tile

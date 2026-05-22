@@ -416,6 +416,37 @@ The optimum is masters-only because non-master variants
 (per-foot cuts) roll their demand up to the master; counting
 them would double-count.
 
+#### Excess, Understock & how the Ordering tiles reconcile (v2.67.282)
+The Ordering page headline has five tiles. They each measure a
+different thing, so they do NOT form a simple subtraction. How
+they relate:
+
+- **Current stock value** — CIN7 FIFO value summed across ALL
+  SKUs. No cost fallback. Ties to the Overview tile.
+- **Optimum stock value** — `sum(TargetValue)` across masters
+  only (cost fallbacks allowed).
+- **Excess (cash to free up)** — `sum(max(0, OnHandValue −
+  TargetValue))` across masters, PLUS dead non-master cuts at
+  full value. A GROSS figure: it floors every SKU at zero, so it
+  counts only SKUs OVER target and never nets the ones UNDER.
+- **Understock (cash to redeploy)** — `sum(max(0, TargetValue −
+  OnHandValue))` across masters. The half Excess omits: the
+  spend needed to bring under-target SKUs up to target.
+- **Dead stock** — a SUBSET of Excess (zero-demand SKUs still
+  holding stock), surfaced separately. Not additive.
+
+Exact reconciliation identity (master SKUs):
+`master_overstock − understock = master_onhand − optimum`.
+
+So **Excess is intentionally larger than Current − Optimum**:
+Current − Optimum is the NET over-position, Excess is the GROSS
+overstock before netting the under-stocked SKUs back in. Net
+working capital actually freed ≈ `Excess − Understock`. Current
+vs Optimum also differ in scope (all SKUs vs masters) and cost
+basis (CIN7 FIFO vs cost-chain fallbacks), so the tiles never
+tie to the exact dollar — the bridge caption under the tiles
+states the live numbers.
+
 #### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
 Two new rows in Monthly Metrics → Inventory:
 
