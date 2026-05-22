@@ -1888,6 +1888,23 @@ def all_product_dimensions() -> list:
     return [dict(r) for r in rows]
 
 
+def search_product_dimensions(query: str, limit: int = 10) -> list:
+    """Fuzzy lookup of product_dimensions by Shopify handle, product
+    title, or SKU family. Powers the AI assistant's
+    get_product_dimensions tool. Rows with a real spec diagram rank
+    first so the best data surfaces at the top."""
+    q = f"%{(query or '').strip().lower()}%"
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM product_dimensions "
+            "WHERE LOWER(shopify_handle) LIKE ? "
+            "   OR LOWER(title) LIKE ? "
+            "   OR LOWER(COALESCE(family, '')) LIKE ? "
+            "ORDER BY has_diagram DESC, title "
+            "LIMIT ?", (q, q, q, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def product_dimensions_handles() -> set:
     """Return set of Shopify handles already extracted (for skip-
     if-cached logic in extract_dimensions.py)."""

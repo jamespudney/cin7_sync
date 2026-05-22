@@ -186,6 +186,7 @@ last_si_escalate_epoch=0   # v2.67.144 stock-issue DM escalation
 last_si_replies_epoch=0    # v2.67.245 stock-issue thread-reply poll
 last_notion_pull_epoch=0   # v2.67.254 Notion playbook pull
 last_notion_push_epoch=0   # v2.67.254 Notion slow-movers push
+last_notion_dims_epoch=0   # v2.67.281 Notion product-dimensions pull
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
@@ -480,6 +481,21 @@ while true; do
         last_notion_push_epoch=$(date -u +%s)
         _run_bg "notion_push_slow_movers" \
             "python notion_sync.py slow-movers"
+    fi
+
+    # v2.67.281 Notion product-dimensions pull. Once a day, read
+    # the Notion 'Product Dimensions' page (the source of truth)
+    # back into the local product_dimensions table, so the AI
+    # assistant + Slack bot's get_product_dimensions tool answers
+    # from the current data — including any manual corrections
+    # made on the Notion page. Idempotent; silent skip when
+    # NOTION_INTEGRATION_SECRET isn't set.
+    seconds_since_notion_dims=$(( now_epoch - last_notion_dims_epoch ))
+    if [ "$seconds_since_notion_dims" -ge 86400 ] \
+            && [ -n "${NOTION_INTEGRATION_SECRET:-}" ]; then
+        last_notion_dims_epoch=$(date -u +%s)
+        _run_bg "notion_pull_dimensions" \
+            "python notion_sync.py pull-product-dimensions"
     fi
 
     # v2.67.274 Shopify content-sync fallback. daily_sync.sh runs

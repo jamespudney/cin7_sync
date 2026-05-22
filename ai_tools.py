@@ -1713,6 +1713,38 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["query"],
         },
     },
+    # v2.67.281 — product cross-section dimensions, sourced from
+    # the Notion "Product Dimensions" page (mirrored locally).
+    {
+        "name": "get_product_dimensions",
+        "description": (
+            "Look up the physical cross-section dimensions of an "
+            "LED channel / profile product: outer width & height, "
+            "the LED-strip channel (recess) width & depth, the max "
+            "strip width that fits, mounting type (surface / "
+            "mud-in / recessed / corner / pendant), profile shape, "
+            "and wing geometry. Use this whenever someone asks how "
+            "big a profile is, what size strip fits a channel, how "
+            "deep a channel is, or how a profile mounts. Search by "
+            "product name, model, Shopify handle, or SKU family. "
+            "All values are in millimetres. If nothing matches, "
+            "tell the user dimensions haven't been catalogued for "
+            "that product — do NOT guess or estimate dimensions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Product name, model, Shopify handle, or "
+                        "SKU family. Examples: 'Hide10', 'Slim8', "
+                        "'mud-in drywall channel', 'H7000200'."),
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -6135,6 +6167,61 @@ def search_team_playbooks(engine_df: pd.DataFrame,
     }
 
 
+def get_product_dimensions(engine_df: pd.DataFrame,
+                            sale_lines_df: pd.DataFrame,
+                            args: dict) -> dict:
+    """v2.67.281 — look up LED channel / profile cross-section
+    dimensions from the product_dimensions table. That table is
+    the local mirror of Notion's 'Product Dimensions' page (the
+    source of truth, refreshed by notion_sync pull-product-
+    dimensions). Accepts engine_df/sale_lines_df for a uniform
+    tool signature even though they're unused."""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    try:
+        rows = db.search_product_dimensions(query, limit=10)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"dimension lookup failed: {exc}"}
+    if not rows:
+        return {
+            "matched": 0,
+            "query": query,
+            "note": ("No product matched. Dimensions are "
+                     "catalogued only for LED channels/profiles "
+                     "whose Shopify spec diagram was extracted — "
+                     "do NOT guess or estimate dimensions; tell "
+                     "the user it hasn't been catalogued."),
+        }
+    out = []
+    for r in rows:
+        out.append({
+            "product": r.get("title"),
+            "handle": r.get("shopify_handle"),
+            "family": r.get("family"),
+            "outer_width_mm": r.get("outer_width_mm"),
+            "outer_height_mm": r.get("outer_height_mm"),
+            "channel_width_mm": r.get("channel_width_mm"),
+            "channel_depth_mm": r.get("channel_depth_mm"),
+            "max_strip_width_mm": r.get("max_strip_width_mm"),
+            "wing_count": r.get("wing_count"),
+            "wing_width_mm": r.get("wing_width_mm"),
+            "mounting_type": r.get("mounting_type"),
+            "profile_shape": r.get("profile_shape"),
+            "notes": r.get("extra_notes"),
+        })
+    return {
+        "matched": len(out),
+        "query": query,
+        "results": out,
+        "note": ("All values in millimetres. Outer = total "
+                 "external profile size; channel = the LED-strip "
+                 "recess. Source: the Notion 'Product Dimensions' "
+                 "page. If a value is null it wasn't on the spec "
+                 "diagram — say so rather than guessing."),
+    }
+
+
 TOOL_HANDLERS = {
     "search_products": search_products,
     "search_products_by_text": search_products_by_text,
@@ -6188,6 +6275,8 @@ TOOL_HANDLERS = {
     # v2.67.250 — Notion-backed playbook / FAQ search.
     # v2.67.261 — renamed from search_knowledge_base (name clash).
     "search_team_playbooks": search_team_playbooks,
+    # v2.67.281 — product cross-section dimensions.
+    "get_product_dimensions": get_product_dimensions,
 }
 
 

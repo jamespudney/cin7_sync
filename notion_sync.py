@@ -46,6 +46,7 @@ import glob
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -942,6 +943,71 @@ def _dim_table_cells(r: Dict) -> List[str]:
     ]
 
 
+# --- parsing the table back (pull from Notion) -----------------------
+def _parse_num(s) -> Optional[float]:
+    """Pull the first number out of a table cell ('14.7', '20 mm')."""
+    if s in (None, ""):
+        return None
+    m = re.search(r"-?\d+(?:\.\d+)?", str(s))
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_pair(s):
+    """'50.4 × 14.7' -> (50.4, 14.7); a lone value -> (v, None)."""
+    if s in (None, ""):
+        return None, None
+    parts = re.split(r"[×xX]", str(s))
+    a = _parse_num(parts[0]) if parts else None
+    b = _parse_num(parts[1]) if len(parts) > 1 else None
+    return a, b
+
+
+def _parse_wings(s):
+    """'2 × 20 mm' -> (2, 20.0); '2' -> (2, None); '' -> (None, None)."""
+    if s in (None, ""):
+        return None, None
+    parts = re.split(r"[×xX]", str(s))
+    cnt = _parse_num(parts[0]) if parts else None
+    wid = _parse_num(parts[1]) if len(parts) > 1 else None
+    return (int(cnt) if cnt is not None else None), wid
+
+
+def _parse_dim_table_row(vals: List[str]) -> Optional[Dict]:
+    """One Notion table row (cell strings, in DIM_TABLE_COLUMNS
+    order) -> a product_dimensions upsert dict. Keyed on the
+    Shopify handle; a row with no handle is skipped (can't upsert
+    safely without the natural key)."""
+    handle = (vals[1] or "").strip()
+    if not handle:
+        return None
+    ow, oh = _parse_pair(vals[2])
+    cw, cd = _parse_pair(vals[3])
+    wc, ww = _parse_wings(vals[7])
+    return {
+        "shopify_handle": handle,
+        "title": (vals[0] or handle).strip(),
+        "outer_width_mm": ow,
+        "outer_height_mm": oh,
+        "channel_width_mm": cw,
+        "channel_depth_mm": cd,
+        "max_strip_width_mm": _parse_num(vals[4]),
+        "mounting_type": (vals[5] or "").strip() or None,
+        "profile_shape": (vals[6] or "").strip() or None,
+        "wing_count": wc,
+        "wing_width_mm": ww,
+        "extra_notes": (vals[8] or "").strip() or None,
+        "has_diagram": 1,
+        "model_used": "notion-pull",
+        "extracted_at": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
+    }
+
+
 def sync_product_dimensions(dry_run: bool = False,
                              include_empty: bool = False,
                              limit: Optional[int] = None,
@@ -1087,6 +1153,95 @@ def sync_product_dimensions(dry_run: bool = False,
             "page_url": page_url}
 
 
+def pull_product_dimensions(dry_run: bool = False) -> Dict:
+    """Read the Notion "Product Dimensions" page table back into
+    the local product_dimensions table. Notion is the source of
+    truth — a dimension corrected on the Notion page flows back
+    here, so the AI assistant + Slack bot answer from the
+    corrected data.
+
+    Each parsed row is merged OVER the existing product_dimensions
+    row (by handle), so crawler-only fields the table doesn't
+    carry — raw_response, confidence, source image, family — are
+    preserved; only the Notion-visible columns are overwritten."""
+    cfg = _config()
+    db_id = find_or_create_database(
+        PRODUCT_INFO_TITLE, PRODUCT_INFO_CREATE_SCHEMA, cfg,
+        registry_name=PRODUCT_INFO_DB_KEY)
+    page_id = query_database_by_title(
+        db_id, PRODUCT_INFO_TITLE_PROP,
+        PRODUCT_DIMS_PAGE_TITLE, cfg)
+    if not page_id:
+        log.warning("No %r page in Notion yet — run "
+                     "'product-dimensions' to seed it first.",
+                     PRODUCT_DIMS_PAGE_TITLE)
+        return {"pulled": 0, "error": "page not found"}
+    # Locate the table block on the page, then read its rows.
+    blocks = _fetch_block_children(page_id, cfg)
+    table_id = next((b.get("id") for b in blocks
+                     if b.get("type") == "table"), None)
+    if not table_id:
+        log.warning("The %r page has no table block.",
+                     PRODUCT_DIMS_PAGE_TITLE)
+        return {"pulled": 0, "error": "no table"}
+    table_rows = _fetch_block_children(table_id, cfg)
+    parsed: List[Dict] = []
+    skipped = 0
+    for idx, tr in enumerate(table_rows):
+        if tr.get("type") != "table_row":
+            continue
+        cells = (tr.get("table_row") or {}).get("cells") or []
+        vals = [_rich_text_to_plain(c).strip() for c in cells]
+        # Skip the header row.
+        if idx == 0 or vals[:2] == ["Product", "Handle"]:
+            continue
+        if len(vals) < len(DIM_TABLE_COLUMNS):
+            skipped += 1
+            continue
+        rec = _parse_dim_table_row(vals)
+        if rec:
+            parsed.append(rec)
+        else:
+            skipped += 1
+    log.info("Read %d product row(s) from the Notion page "
+              "(%d skipped).", len(parsed), skipped)
+    if dry_run:
+        if parsed:
+            log.info("[dry-run] sample parsed row:\n%s",
+                      json.dumps(parsed[0], indent=2, default=str))
+        return {"pulled": 0, "parsed": len(parsed),
+                "dry_run": True}
+    if not parsed:
+        return {"pulled": 0, "parsed": 0}
+    # Load existing rows once so we merge rather than null-out the
+    # crawler-only columns the Notion table doesn't carry.
+    existing: Dict[str, Dict] = {}
+    try:
+        for r in db.all_product_dimensions():
+            h = (r.get("shopify_handle") or "").strip()
+            if h:
+                existing[h] = dict(r)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not preload product_dimensions: %s", exc)
+    n_ok = 0
+    n_err = 0
+    for rec in parsed:
+        try:
+            merged = dict(existing.get(rec["shopify_handle"], {}))
+            merged.update(rec)
+            merged.pop("id", None)
+            db.upsert_product_dimensions(merged)
+            n_ok += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("product_dimensions upsert failed for "
+                          "%s: %s", rec.get("shopify_handle"), exc)
+            n_err += 1
+    log.info("Pulled %d product dimension row(s) from Notion into "
+              "the app (%d error(s)).", n_ok, n_err)
+    return {"pulled": n_ok, "errors": n_err,
+            "parsed": len(parsed)}
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1115,6 +1270,13 @@ def cmd_product_dimensions(args) -> int:
         include_empty=bool(args.include_empty),
         limit=(int(limit) if limit else None),
         rebuild=bool(getattr(args, "rebuild", False)))
+    log.info("DONE: %s", result)
+    return 0
+
+
+def cmd_pull_product_dimensions(args) -> int:
+    _setup_log(args.verbose)
+    result = pull_product_dimensions(dry_run=bool(args.dry_run))
     log.info("DONE: %s", result)
     return 0
 
@@ -1431,6 +1593,15 @@ def main() -> int:
               "already exists. WIPES any manual Notion edits — "
               "only for a deliberate full refresh.")
     p_pd.set_defaults(func=cmd_product_dimensions)
+    p_pp = sub.add_parser(
+        "pull-product-dimensions",
+        help="Read the Notion 'Product Dimensions' page back into "
+              "the local product_dimensions table, so the AI "
+              "assistant + bot answer from the source-of-truth "
+              "page (incl. manual corrections).")
+    p_pp.add_argument("--dry-run", action="store_true")
+    p_pp.add_argument("--verbose", action="store_true")
+    p_pp.set_defaults(func=cmd_pull_product_dimensions)
     p_pb = sub.add_parser(
         "pull-playbooks",
         help="Mirror playbook child-pages from Notion into "
