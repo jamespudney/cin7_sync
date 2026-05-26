@@ -16530,14 +16530,31 @@ elif page == "Monthly Metrics":
             "Keep it punchy — paste-to-Slack length.",
             "",
         ]
-        for section in ["Sales", "Margins", "Customers", "Inventory"]:
-            llm_md_lines.append(f"## {section}")
+        # v2.67.299 — markdown export was iterating the old
+        # hardcoded ["Sales","Margins","Customers","Inventory"]
+        # section list, so after the v2.67.298 rename to the
+        # numbered Viktor-style sections every table came out
+        # empty in the export. Now uses the same _section_order +
+        # catch-all loop the on-page renderer uses, so the export
+        # always mirrors what's on the page.
+        _md_section_order = _section_order + [
+            s for s in (r["Section"] for r in rows)
+            if s not in _section_order]
+        _md_seen: set = set()
+        for section in _md_section_order:
+            if section in _md_seen:
+                continue
+            _md_seen.add(section)
             sect_rows = [r for r in rows if r["Section"] == section]
+            if not sect_rows:
+                continue
+            llm_md_lines.append(f"## {section}")
             # Table header
             headers = ["Metric"] + list(month_labels) + (
                 ["YTD", "Avg"] if show_ytd else [])
             llm_md_lines.append("| " + " | ".join(headers) + " |")
-            llm_md_lines.append("|" + "|".join(["---"] * len(headers)) + "|")
+            llm_md_lines.append(
+                "|" + "|".join(["---"] * len(headers)) + "|")
             for r in sect_rows:
                 vals = [_fmt_cell(v, r["Format"]) for v in r["Values"]]
                 if show_ytd:
@@ -16548,7 +16565,8 @@ elif page == "Monthly Metrics":
                     vals.append(_fmt_cell(
                         table_df.at[idx, "Avg"], r["Format"]))
                 llm_md_lines.append(
-                    "| " + r["Metric"] + " | " + " | ".join(vals) + " |")
+                    "| " + r["Metric"] + " | " + " | ".join(vals)
+                    + " |")
             llm_md_lines.append("")
 
         llm_markdown = "\n".join(llm_md_lines)
