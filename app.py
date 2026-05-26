@@ -16140,35 +16140,52 @@ elif page == "Monthly Metrics":
             sl_prod = sl_prod.assign(SalesRepresentative=_filled)
         # ===== 5 · Revenue by Channel [Cin7/DEAR] ================
         # ===== 9 · Order Counts [Cin7/DEAR] ======================
-        # Per Viktor's PDF layout: bucket SalesRep into Shopify,
-        # B2B/Direct, Amazon, eBay (so the report tells the channel
-        # story instead of a long list of individual reps), and
-        # produce BOTH revenue and order-count rows for each.
-        # Net Sales (QB 400) is shown alongside for side-by-side
-        # reconciliation against QB.
-        if "SalesRepresentative" in sl_prod.columns:
-            _sr_norm = (sl_prod["SalesRepresentative"]
-                         .fillna("").astype(str).str.strip())
-            _slp_rev = sl_prod.assign(_rep=_sr_norm)
-            # Channel groups (case-insensitive on the rep name).
-            def _channel_of(rep: str) -> str:
-                up = (rep or "").upper().strip()
-                if up == "SHOPIFY":
-                    return "Shopify"
-                if up == "AMAZON":
-                    return "Amazon"
-                if up == "EBAY":
-                    return "eBay"
-                if not up:
-                    return ""
-                return "B2B / Direct"
-            _slp_rev = _slp_rev.assign(
-                _chan=_slp_rev["_rep"].map(_channel_of))
-            # Revenue per channel × month — sum of product line
-            # Totals (already filtered to non-shipping, non-voided).
+        # v2.67.300 — channel bucketing was previously SalesRep-only,
+        # but CIN7 leaves SalesRep BLANK on Shopify orders (it's
+        # only set for Amazon / eBay marketplace orders and for
+        # phone/B2B sales tied to a staff rep). That made the
+        # Shopify channel row always $0. The right signal is
+        # `SourceChannel`, which CIN7 sets on every sale from its
+        # integration source — we then fall back to SalesRep for
+        # marketplace orders that route through a non-marketplace
+        # SourceChannel, and finally B2B/Direct for anything else.
+        # Both signals are already on sl_prod (no header join
+        # needed) — Shopify revenue now populates back to month 1.
+        def _channel_of_row(sc_val, sr_val) -> str:
+            sc = (str(sc_val) if sc_val is not None
+                  else "").strip().lower()
+            sr = (str(sr_val) if sr_val is not None
+                  else "").strip().upper()
+            # SourceChannel is the primary signal (set by CIN7's
+            # integration for every sale).
+            if "shopify" in sc:
+                return "Shopify"
+            if "amazon" in sc or sr == "AMAZON":
+                return "Amazon"
+            if "ebay" in sc or sr == "EBAY":
+                return "eBay"
+            if sr == "SHOPIFY":
+                return "Shopify"
+            # Everything else (no SourceChannel match, no
+            # marketplace SalesRep) = direct entry / phone / B2B.
+            return "B2B / Direct"
+
+        _has_sc = "SourceChannel" in sl_prod.columns
+        _has_sr = "SalesRepresentative" in sl_prod.columns
+        if _has_sc or _has_sr:
+            _sc_col = (sl_prod["SourceChannel"] if _has_sc
+                       else pd.Series([""] * len(sl_prod),
+                                       index=sl_prod.index))
+            _sr_col = (sl_prod["SalesRepresentative"] if _has_sr
+                       else pd.Series([""] * len(sl_prod),
+                                       index=sl_prod.index))
+            _chans = pd.Series(
+                [_channel_of_row(sc, sr)
+                 for sc, sr in zip(_sc_col, _sr_col)],
+                index=sl_prod.index)
+            _slp_rev = sl_prod.assign(_chan=_chans)
             _rev_by_chan_month = _slp_rev.groupby(
                 ["MonthKey", "_chan"])["Total"].sum()
-            # Orders per channel × month — distinct SaleIDs.
             _orders_by_chan_month = _slp_rev.groupby(
                 ["MonthKey", "_chan"])["SaleID"].nunique()
 
