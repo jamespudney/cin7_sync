@@ -15824,26 +15824,42 @@ elif page == "Monthly Metrics":
         def _per_month(fn):
             return [fn(m) for m in months]
 
-        # v2.67.297 — section layout cleanup.
-        # The 'Sales' section now leads with QB-canonical rows so
-        # the buyer / finance see the source-of-truth figures first.
-        # CIN7-derived equivalents (Sales / COGS / GP) are demoted
-        # to a 'Reconciliation' section at the bottom for variance
-        # spotting only. Pre-cleanup the page interleaved CIN7 and
-        # QB versions of the same metric — confusing for anyone
-        # using it for commissions.
+        # v2.67.298 — Adopted Viktor's PDF report layout (Wired4Signs
+        # USA — Monthly Financial Report). Page-1 sections (App
+        # data) come first, then page-2 canonical financials
+        # (QuickBooks + Cin7/DEAR + Shopify). Source tag in every
+        # section header so finance and commissions know at a
+        # glance which system each number comes from.
 
-        # SALES — activity counts from CIN7 (only source).
-        _row("Sales", "# of Monthly Orders",
+        # ===== 1 · Sales Overview [App] ============================
+        # Live CIN7 sale_lines — operational view. Canonical QB-
+        # grounded equivalents live in section 6 below.
+        _row("1. Sales Overview [App]", "Sales $",
+             _per_month(lambda m: _get(sales_per_month, m)))
+        _row("1. Sales Overview [App]", "Sales $ with Tax",
+             _per_month(lambda m: _get(sales_per_month, m)
+                                   + _get(tax_per_month, m)))
+        _row("1. Sales Overview [App]", "# Orders",
              _per_month(lambda m: _get(orders_per_month, m)),
              fmt="int")
-        _row("Sales", "Quantity",
+        _row("1. Sales Overview [App]", "Quantity Sold",
              _per_month(lambda m: _get(quantity_per_month, m)),
              fmt="int")
-        _row("Sales", "Discounts",
+        _row("1. Sales Overview [App]", "COGS",
+             _per_month(lambda m: _get(cogs_per_month, m)))
+        _row("1. Sales Overview [App]", "Discounts",
              _per_month(lambda m: -abs(_get(discount_per_month, m))))
-        _row("Sales", "Tax $",
+        _row("1. Sales Overview [App]", "Tax $",
              _per_month(lambda m: _get(tax_per_month, m)))
+        _row("1. Sales Overview [App]", "Gross Profit",
+             _per_month(lambda m: _get(sales_per_month, m)
+                                   - _get(cogs_per_month, m)))
+        _row("1. Sales Overview [App]", "GP %",
+             _per_month(lambda m: (
+                 (_get(sales_per_month, m) - _get(cogs_per_month, m))
+                 / _get(sales_per_month, m) * 100
+                 if _get(sales_per_month, m) else 0.0)),
+             fmt="pct")
 
         # ------------------------------------------------------
         # v2.67.292 — QuickBooks-canonical rows. The Viktor audit
@@ -15871,60 +15887,17 @@ elif page == "Monthly Metrics":
         def _qb_has_data(cat):
             return any(_qb(m, cat) for m in months)
 
-        # QB-canonical Sales — leads the Sales section (top of
-        # display). When QB data isn't loaded yet these rows are
-        # silently skipped; CIN7 Sales below in Reconciliation
-        # still gives the buyer something to look at.
-        if _qb_has_data("sales"):
-            _row("Sales", "Sales $ ✅ QB canonical (acc 400)",
-                 _per_month(lambda m: _qb(m, "sales")))
-        if _qb_has_data("cogs"):
-            _row("Sales", "COGS ✅ QB canonical (acc 500)",
-                 _per_month(lambda m: _qb(m, "cogs")))
-        if _qb_has_data("sales") and _qb_has_data("cogs"):
-            _row("Sales", "Gross Profit ✅ QB canonical",
-                 _per_month(lambda m: _qb(m, "sales")
-                                       - _qb(m, "cogs")))
-            _row("Sales", "GP % ✅ QB canonical",
-                 _per_month(lambda m: (
-                     (_qb(m, "sales") - _qb(m, "cogs"))
-                     / _qb(m, "sales") * 100
-                     if _qb(m, "sales") else 0.0)),
-                 fmt="pct")
+        # QB-canonical Sales and a Reconciliation block used to
+        # live here (pre-v2.67.298). They've moved into sections 6
+        # (Sales & Adjustments) and 7 (Cost & Profitability) below,
+        # matching Viktor's report layout — leaving the App view
+        # (section 1 above) unduplicated.
 
-        # RECONCILIATION (CIN7 vs QB) — secondary view used for
-        # spotting drift. Live operational figures from CIN7
-        # sale_lines, alongside the variance against QB canonical.
-        _row("Reconciliation (CIN7 vs QB)", "CIN7 Sales $",
-             _per_month(lambda m: _get(sales_per_month, m)))
-        _row("Reconciliation (CIN7 vs QB)", "CIN7 Sales $ with Tax",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   + _get(tax_per_month, m)))
-        _row("Reconciliation (CIN7 vs QB)", "CIN7 COGS",
-             _per_month(lambda m: _get(cogs_per_month, m)))
-        _row("Reconciliation (CIN7 vs QB)", "CIN7 Gross Profit",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   - _get(cogs_per_month, m)))
-        _row("Reconciliation (CIN7 vs QB)", "CIN7 GP %",
-             _per_month(lambda m: (
-                 (_get(sales_per_month, m) - _get(cogs_per_month, m))
-                 / _get(sales_per_month, m) * 100
-                 if _get(sales_per_month, m) else 0.0)),
-             fmt="pct")
-        if _qb_has_data("sales"):
-            _row("Reconciliation (CIN7 vs QB)",
-                 "Sales variance (CIN7 − QB) — should trend to 0",
-                 _per_month(lambda m: _get(sales_per_month, m)
-                                       - _qb(m, "sales")))
-
-        # SHIPPING / MARGINS — canonical QB rows lead, the
-        # CIN7-derived equivalents drop to "Shipping operational"
-        # at the bottom as diagnostic-only data (the header-delta
-        # method overstates by 27-218% per Viktor's audit, and the
-        # ShipStation side is parcel-only). Pre-cleanup these were
-        # all interleaved in a single "Margins" section.
-        _row("Shipping operational (diagnostic)",
-             "CIN7 Shipping Charged (header-delta, ⚠️ inflated)",
+        # ===== 2 · Margins & Purchasing [App] =====================
+        # CIN7 + ShipStation operational P&L for shipping, plus AOV
+        # and purchase activity. QB-canonical shipping detail
+        # (acc 405 / 694) is in section 8.
+        _row("2. Margins & Purchasing [App]", "Shipping Charged",
              _per_month(lambda m: float(
                  ship_charged_per_month.get(m, 0) or 0)))
         # v2.67.55c — populate the TRUE Shipping Cost row.
@@ -16002,81 +15975,132 @@ elif page == "Monthly Metrics":
         # passes pd.Period objects from `months`. Lookup never
         # matched → every month showed $0 even after the data was
         # correct. str(period) -> 'YYYY-MM' converts safely.
-        _row("Shipping operational (diagnostic)", _ship_cost_label,
+        _row("2. Margins & Purchasing [App]", "Shipping Cost",
              _per_month(lambda m: float(
                  _ship_cost_per_month.get(str(m), 0) or 0)))
+        _row("2. Margins & Purchasing [App]", "Shipping Margin",
+             _per_month(lambda m: (
+                 float(ship_charged_per_month.get(m, 0) or 0)
+                 - float(_ship_cost_per_month.get(str(m), 0)
+                          or 0))))
+        _row("2. Margins & Purchasing [App]", "Avg Order Value",
+             _per_month(lambda m: (
+                 _get(sales_per_month, m) / _get(orders_per_month, m)
+                 if _get(orders_per_month, m) else 0.0)))
+        _row("2. Margins & Purchasing [App]", "# of Purchases",
+             _per_month(lambda m: _get(po_per_month, m)),
+             fmt="int")
+        _row("2. Margins & Purchasing [App]", "Purchase $",
+             _per_month(lambda m: _get(po_spend_per_month, m)))
 
-        # v2.67.292 — QB shipping rows. Symmetric source of truth:
-        # acc 405 (Sales - Shipping) for charged + acc 694
-        # (Shipping-Out) for cost. Removes the LTL-in-charged-but-
-        # not-in-cost asymmetry that inflated the CIN7 row by 27-
-        # 218% every month per Viktor's audit.
-        # v2.67.297 — promoted to a dedicated "Shipping" section
-        # that renders ABOVE the operational diagnostic version.
+        # ===== 8 · Shipping Detail [QuickBooks] ==================
+        # QB-canonical shipping P&L. Symmetric (acc 405 Sales-
+        # Shipping income vs acc 694 Shipping-Out cost) — no LTL
+        # gap. Margin % added so the buyer sees the percentage
+        # alongside the dollar figure.
         if _qb_has_data("shipping_charged"):
-            _row("Shipping", "Shipping Charged ✅ QB canonical (acc 405)",
+            _row("8. Shipping Detail [QuickBooks]",
+                 "Shipping Charged (QB 405)",
                  _per_month(lambda m: _qb(m, "shipping_charged")))
         if _qb_has_data("shipping_cost"):
-            _row("Shipping", "Shipping Cost ✅ QB canonical (acc 694)",
+            _row("8. Shipping Detail [QuickBooks]",
+                 "Shipping-Out Cost (QB 694)",
                  _per_month(lambda m: _qb(m, "shipping_cost")))
         if (_qb_has_data("shipping_charged")
                 and _qb_has_data("shipping_cost")):
-            _row("Shipping", "Shipping Margin ✅ QB canonical "
-                 "(acc 405 − acc 694)",
+            _row("8. Shipping Detail [QuickBooks]",
+                 "Shipping Margin",
                  _per_month(lambda m: _qb(m, "shipping_charged")
                                        - _qb(m, "shipping_cost")))
+            _row("8. Shipping Detail [QuickBooks]", "Margin %",
+                 _per_month(lambda m: (
+                     (_qb(m, "shipping_charged")
+                      - _qb(m, "shipping_cost"))
+                     / _qb(m, "shipping_charged") * 100
+                     if _qb(m, "shipping_charged") else 0.0)),
+                 fmt="pct")
 
-        # v2.67.294 — QB P&L Detail section (option C from the
-        # audit follow-up). Surfaces the broader QB summary rows
-        # alongside the narrow product-only canonical view above,
-        # so finance can reconcile against the full QB report
-        # without leaving the page.
+        # ===== 6 · Sales & Adjustments [QuickBooks] ==============
+        # Top-of-P&L revenue ladder per Viktor's layout:
+        #   Gross Sales (est.) = Net + Discounts
+        #   − Discounts (CIN7 proxy)
+        #   = Net Sales (QB 400)
+        #   + Shipping Income (QB 405)
+        #   = Total Revenue (QB Total Income)
+        if _qb_has_data("sales"):
+            _row("6. Sales & Adjustments [QuickBooks]",
+                 "Gross Sales (est.)",
+                 _per_month(lambda m: _qb(m, "sales")
+                                       + abs(_get(
+                                           discount_per_month, m))))
+            _row("6. Sales & Adjustments [QuickBooks]",
+                 "Less: Discounts (CIN7 — proxy for Shopify)",
+                 _per_month(lambda m: abs(_get(
+                     discount_per_month, m))))
+            _row("6. Sales & Adjustments [QuickBooks]",
+                 "Net Sales (QB 400)",
+                 _per_month(lambda m: _qb(m, "sales")))
+        if _qb_has_data("shipping_charged"):
+            _row("6. Sales & Adjustments [QuickBooks]",
+                 "Shipping Income (QB 405)",
+                 _per_month(lambda m: _qb(m, "shipping_charged")))
         if _qb_has_data("total_income"):
-            _row("QB P&L Detail", "Total Income (QB)",
+            _row("6. Sales & Adjustments [QuickBooks]",
+                 "Total Revenue (QB Total Income)",
                  _per_month(lambda m: _qb(m, "total_income")))
-        # v2.67.295 — acc#403 is a small misc Amazon ledger account
-        # (e.g. -$3.71 for Apr 2026); the REAL Amazon channel
-        # revenue is booked to acc#400 and split by SalesRep on the
-        # CIN7 sale (see "Channel (CIN7 by SalesRep)" section
-        # below). Showing acc#403 as "Amazon sales" was misleading.
-        if _qb_has_data("amazon_sales"):
-            _row("QB P&L Detail",
-                 "  Acc 403 misc (NOT the Amazon channel — see "
-                 "SalesRep rows below)",
-                 _per_month(lambda m: _qb(m, "amazon_sales")))
-        if _qb_has_data("sundry_income"):
-            _row("QB P&L Detail", "  Sundry income (billable exps)",
-                 _per_month(lambda m: _qb(m, "sundry_income")))
-        if _qb_has_data("total_cogs"):
-            _row("QB P&L Detail",
-                 "Total COGS (QB — acc 500 + 502 + 550)",
-                 _per_month(lambda m: _qb(m, "total_cogs")))
+
+        # ===== 7 · Cost & Profitability [QuickBooks] =============
+        # Full QB P&L bottom — Product COGS, Amazon fees, Inv adj,
+        # Total COGS, Gross Profit, GP %, OpEx, Operating Profit,
+        # Op Margin %, Net Income. The complete picture commission
+        # base will eventually freeze against.
+        if _qb_has_data("cogs"):
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Product COGS (QB 500)",
+                 _per_month(lambda m: _qb(m, "cogs")))
         if _qb_has_data("cogs_amazon_fees"):
-            _row("QB P&L Detail", "  Amazon fees (acc 502)",
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Amazon Fees (QB 502)",
                  _per_month(lambda m: _qb(m, "cogs_amazon_fees")))
         if _qb_has_data("inventory_adjustment"):
-            _row("QB P&L Detail", "  Inventory adjustment (acc 550)",
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Inventory Adj (QB 550)",
                  _per_month(lambda m: _qb(m, "inventory_adjustment")))
-        if _qb_has_data("packaging_cost"):
-            _row("QB P&L Detail",
-                 "  Packaging & consumables (acc 690)",
-                 _per_month(lambda m: _qb(m, "packaging_cost")))
-        if _qb_has_data("shipping_in"):
-            _row("QB P&L Detail", "  Shipping-in / inbound (acc 692)",
-                 _per_month(lambda m: _qb(m, "shipping_in")))
+        if _qb_has_data("total_cogs"):
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Total COGS",
+                 _per_month(lambda m: _qb(m, "total_cogs")))
         if _qb_has_data("qb_gross_profit"):
-            _row("QB P&L Detail",
-                 "QB Gross Profit (Total Income − Total COGS)",
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Gross Profit",
                  _per_month(lambda m: _qb(m, "qb_gross_profit")))
+            if _qb_has_data("total_income"):
+                _row("7. Cost & Profitability [QuickBooks]",
+                     "GP %",
+                     _per_month(lambda m: (
+                         _qb(m, "qb_gross_profit")
+                         / _qb(m, "total_income") * 100
+                         if _qb(m, "total_income") else 0.0)),
+                     fmt="pct")
         if _qb_has_data("qb_total_expenses"):
-            _row("QB P&L Detail", "Total Expenses (QB)",
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Total OpEx",
                  _per_month(lambda m: _qb(m, "qb_total_expenses")))
         if _qb_has_data("qb_net_operating_income"):
-            _row("QB P&L Detail",
-                 "QB Net Operating Income",
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Operating Profit",
                  _per_month(lambda m: _qb(m, "qb_net_operating_income")))
+            if _qb_has_data("total_income"):
+                _row("7. Cost & Profitability [QuickBooks]",
+                     "Op Margin %",
+                     _per_month(lambda m: (
+                         _qb(m, "qb_net_operating_income")
+                         / _qb(m, "total_income") * 100
+                         if _qb(m, "total_income") else 0.0)),
+                     fmt="pct")
         if _qb_has_data("qb_net_income"):
-            _row("QB P&L Detail", "QB Net Income (bottom line)",
+            _row("7. Cost & Profitability [QuickBooks]",
+                 "Net Income (QB)",
                  _per_month(lambda m: _qb(m, "qb_net_income")))
 
         # v2.67.295 — Channel rows from CIN7 SalesRep field.
@@ -16114,76 +16138,94 @@ elif page == "Monthly Metrics":
             _filled = sl_prod["SalesRepresentative"].fillna(
                 sl_prod["SaleID"].map(_rep_map))
             sl_prod = sl_prod.assign(SalesRepresentative=_filled)
+        # ===== 5 · Revenue by Channel [Cin7/DEAR] ================
+        # ===== 9 · Order Counts [Cin7/DEAR] ======================
+        # Per Viktor's PDF layout: bucket SalesRep into Shopify,
+        # B2B/Direct, Amazon, eBay (so the report tells the channel
+        # story instead of a long list of individual reps), and
+        # produce BOTH revenue and order-count rows for each.
+        # Net Sales (QB 400) is shown alongside for side-by-side
+        # reconciliation against QB.
         if "SalesRepresentative" in sl_prod.columns:
             _sr_norm = (sl_prod["SalesRepresentative"]
                          .fillna("").astype(str).str.strip())
-            _slp = sl_prod.assign(_rep=_sr_norm)
-            _slp = _slp[_slp["_rep"] != ""]
-            if not _slp.empty:
-                _rep_per_month = _slp.groupby(
-                    ["MonthKey", "_rep"])["Total"].sum()
-                _rep_totals = (
-                    _slp.groupby("_rep")["Total"].sum())
-                # Material reps only (any rep with > $500 absolute
-                # 14-month volume is worth a row). Sort by total
-                # descending so biggest reps appear first.
-                _material_reps = _rep_totals[
-                    _rep_totals.abs() >= 500].sort_values(
-                        ascending=False).index.tolist()[:25]
-                for _rep in _material_reps:
-                    _row("Channel (CIN7 by SalesRep)",
-                         f"  {_rep}",
-                         _per_month(
-                             lambda m, r=_rep: float(
-                                 _rep_per_month.get((m, r), 0)
-                                 or 0)))
-                # Total of marketplace reps (uppercase single-word
-                # patterns like AMAZON / EBAY / WALMART / ETSY are
-                # the marketplaces; staff names are mixed-case).
-                _marketplace_names = {"AMAZON", "EBAY", "WALMART",
-                                       "ETSY", "SHOPIFY"}
-                _mkt_in_data = [r for r in _material_reps
-                                if r.upper() in _marketplace_names]
-                if _mkt_in_data:
-                    _row("Channel (CIN7 by SalesRep)",
-                         f"Marketplace total ({', '.join(_mkt_in_data)})",
-                         _per_month(
-                             lambda m: sum(
-                                 float(_rep_per_month.get((m, r),
-                                                            0) or 0)
-                                 for r in _mkt_in_data)))
+            _slp_rev = sl_prod.assign(_rep=_sr_norm)
+            # Channel groups (case-insensitive on the rep name).
+            def _channel_of(rep: str) -> str:
+                up = (rep or "").upper().strip()
+                if up == "SHOPIFY":
+                    return "Shopify"
+                if up == "AMAZON":
+                    return "Amazon"
+                if up == "EBAY":
+                    return "eBay"
+                if not up:
+                    return ""
+                return "B2B / Direct"
+            _slp_rev = _slp_rev.assign(
+                _chan=_slp_rev["_rep"].map(_channel_of))
+            # Revenue per channel × month — sum of product line
+            # Totals (already filtered to non-shipping, non-voided).
+            _rev_by_chan_month = _slp_rev.groupby(
+                ["MonthKey", "_chan"])["Total"].sum()
+            # Orders per channel × month — distinct SaleIDs.
+            _orders_by_chan_month = _slp_rev.groupby(
+                ["MonthKey", "_chan"])["SaleID"].nunique()
 
-        # v2.67.297 — "Line Contribution Margin" was a duplicate of
-        # Gross Profit (identical formula sales − COGS); removed to
-        # stop confusing the buyer. AOV moves up into Sales next to
-        # # Orders; purchase metrics get their own "Operations"
-        # section.
-        _row("Sales", "Average Order Value",
-             _per_month(lambda m: (
-                 _get(sales_per_month, m) / _get(orders_per_month, m)
-                 if _get(orders_per_month, m) else 0.0)))
-        _row("Operations", "# of Purchases",
-             _per_month(lambda m: _get(po_per_month, m)),
-             fmt="int")
-        _row("Operations", "Purchase $",
-             _per_month(lambda m: _get(po_spend_per_month, m)))
+            _channels_in_order = [
+                "Shopify", "B2B / Direct", "Amazon", "eBay"]
+            for _chan in _channels_in_order:
+                _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
+                     _per_month(
+                         lambda m, c=_chan: float(
+                             _rev_by_chan_month.get((m, c), 0)
+                             or 0)))
+            _row("5. Revenue by Channel [Cin7/DEAR]",
+                 "Total (CIN7)",
+                 _per_month(
+                     lambda m: float(sum(
+                         _rev_by_chan_month.get((m, c), 0) or 0
+                         for c in _channels_in_order))))
+            if _qb_has_data("sales"):
+                _row("5. Revenue by Channel [Cin7/DEAR]",
+                     "Net Sales (QB 400)",
+                     _per_month(lambda m: _qb(m, "sales")))
 
-        # CUSTOMERS
-        _row("Customers", "# of New Customers",
+            for _chan in _channels_in_order:
+                _row("9. Order Counts [Cin7/DEAR]",
+                     f"{_chan} Orders",
+                     _per_month(
+                         lambda m, c=_chan: int(
+                             _orders_by_chan_month.get((m, c), 0)
+                             or 0)),
+                     fmt="int")
+            _row("9. Order Counts [Cin7/DEAR]", "Total Orders",
+                 _per_month(
+                     lambda m: int(sum(
+                         _orders_by_chan_month.get((m, c), 0) or 0
+                         for c in _channels_in_order))),
+                 fmt="int")
+
+        # v2.67.298 — AOV, # of Purchases, Purchase $ all moved
+        # up into section 2 (Margins & Purchasing [App]) above.
+        # The duplicate stubs that used to live here were removed.
+
+        # ===== 3 · Customer Metrics [App] ========================
+        # Renamed to match Viktor's labels:
+        # - "Running Customer Count" (Viktor's term — kept even
+        #   though it's a cumulative ever-bought count; ambiguity
+        #   is documented in the methodology expander).
+        # - "Lost Customers (3mo)" — drops the trailing "silent".
+        _row("3. Customer Metrics [App]", "New Customers",
              _per_month(lambda m: int(new_customers.get(m, 0))),
              fmt="int")
-        # v2.67.290 — renamed from "Running Customer Count" because
-        # the previous label implied "active" whereas this is a
-        # cumulative ever-bought count. Easy Insight likely showed
-        # active-in-last-N-months; this is a different (also valid)
-        # metric. Methodology expander above explains the change.
-        _row("Customers", "Cumulative Customers (ever bought)",
+        _row("3. Customer Metrics [App]", "Running Customer Count",
              _per_month(_running_customers),
              fmt="int")
-        _row("Customers", "# of Lost Customers (3mo silent)",
+        _row("3. Customer Metrics [App]", "Lost Customers (3mo)",
              _per_month(_lost_customers),
              fmt="int")
-        _row("Customers", "Repeat Customer %",
+        _row("3. Customer Metrics [App]", "Repeat Customer %",
              _per_month(_repeat_customer_pct),
              fmt="pct")
 
@@ -16259,11 +16301,11 @@ elif page == "Monthly Metrics":
             begin_v = end_of_month_inv.get(m - 1, end_v)
             return (begin_v + end_v) / 2.0
 
-        _row("Inventory", "Average Inventory Value",
+        _row("4. Inventory [App]", "Avg Inventory Value",
              _per_month(_avg_inv))
 
         # Stock turn = annualised COGS / avg inventory (per month)
-        _row("Inventory", "Stock Turn Rate (annualised)",
+        _row("4. Inventory [App]", "Stock Turn (annualised)",
              _per_month(lambda m: (
                  (_get(cogs_per_month, m) * 12) / _avg_inv(m)
                  if _avg_inv(m) else 0.0)),
@@ -16303,7 +16345,7 @@ elif page == "Monthly Metrics":
                 .sum())
         else:
             _slow_sold_per_month = pd.Series(dtype=float)
-        _row("Inventory", "Slow Stock Cleared ($)",
+        _row("4. Inventory [App]", "Slow Stock Cleared",
              _per_month(lambda m: _get(
                  _slow_sold_per_month, m)))
 
@@ -16341,7 +16383,7 @@ elif page == "Monthly Metrics":
                 _live_holding.get("value_held") or 0)
         except Exception:
             pass
-        _row("Inventory", "Slow Stock Value (EOM)",
+        _row("4. Inventory [App]", "Slow Stock Value (EOM)",
              _per_month(lambda m: _snap_by_month.get(m, 0.0)))
 
         # --- Render as a DataFrame -----------------------------------
@@ -16414,16 +16456,20 @@ elif page == "Monthly Metrics":
         # below), so adding a new section in code doesn't require
         # touching this list — just leaves the ordering up to call
         # order if it's not explicitly placed.
+        # v2.67.298 — section order follows Viktor's PDF report:
+        # page-1 sections (App data) at the top, page-2 sections
+        # (canonical financials) below. Each section is tagged with
+        # its source system in the header.
         _section_order = [
-            "Sales",
-            "Shipping",
-            "QB P&L Detail",
-            "Channel (CIN7 by SalesRep)",
-            "Operations",
-            "Reconciliation (CIN7 vs QB)",
-            "Shipping operational (diagnostic)",
-            "Customers",
-            "Inventory",
+            "1. Sales Overview [App]",
+            "2. Margins & Purchasing [App]",
+            "3. Customer Metrics [App]",
+            "4. Inventory [App]",
+            "5. Revenue by Channel [Cin7/DEAR]",
+            "6. Sales & Adjustments [QuickBooks]",
+            "7. Cost & Profitability [QuickBooks]",
+            "8. Shipping Detail [QuickBooks]",
+            "9. Order Counts [Cin7/DEAR]",
         ]
         _seen_sections: list = []
         for section in _section_order:
