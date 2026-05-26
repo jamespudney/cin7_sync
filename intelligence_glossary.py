@@ -563,6 +563,63 @@ For commissions: **the QB rows are the canonical figures.** The
 CIN7-derived rows are the live operational view, useful for
 spotting variance.
 
+#### Monthly Metrics — canonical source-of-truth definitions (v2.67.301)
+Following the May 2026 cross-system audit (App vs QB vs DEAR vs
+Shopify vs ShipStation), the *role* of each metric is locked so
+future debates don't re-open. The numbers themselves are
+unchanged — this section names which row to use for which
+purpose.
+
+**Sales — three canonical roles.** Same data, three uses:
+- **Operational Sales** = Section 1 "Sales $ [App]" (CIN7
+  sale_lines). For KPIs, commissions, dashboards, MoM trend.
+- **Accounting Revenue** = Section 6 "Net Sales (QB 400)"
+  (QuickBooks acc 400). For P&L, accountant, tax, banking.
+- **Gross Marketplace Revenue** = Section 6 "Gross Sales (est.)"
+  (Net Sales + Discounts). For marketing / conversion / discount
+  rate tracking.
+
+**Discounts.** Current source: CIN7 line-level discount column
+(~$8-15k/mo). Per the audit this is a PROXY and undercounts the
+true Shopify discount activity (coupons, automatic promotions,
+compare-at, shipping discounts, draft adjustments) by 60-70% —
+Shopify's real total is ~$20-45k/mo. Pending integration:
+`shopify_discounts.py` will swap the row to the Shopify Admin
+API total. Until then the discounts row is a floor estimate.
+
+**GP %.** Two views, both authoritative:
+- **Operational GP %** = Section 1 (CIN7 product margin).
+- **Accounting GP %** = Section 7 (QB Total Income − Total COGS).
+Within 1-3% most months. July 2025 has a 7-pt gap (67% App vs 74%
+QB) attributed to month-end COGS posting timing — the month-close
+snapshot project will freeze the figure to remove this drift.
+
+**Freight normalisation.** Section 8 (QB Shipping Detail, acc 405
+vs acc 694) is canonical and symmetric. Section 2 (Margins &
+Purchasing [App]) is operational: CIN7 header-delta charged +
+ShipStation parcel cost — asymmetric (charged includes LTL,
+cost is parcel-only), so it over-states margin by ~$3-34k/mo.
+Mar 2026 had a duplicate UPS bill + double-counted ACH; the
+adjusted figure (~$49,851) is used in the page vs Viktor's raw
+$78,750.
+
+**Credits / returns / voided sales.** Excluded upstream:
+`Status IN ('VOIDED','CREDITED','CANCELLED','CANCELED')` filter
+on CIN7 sale_lines before any aggregation. QB acc 400 is already
+net of returns. Both sides agree on "booked-and-kept sales only".
+
+**Marketplace fees / inventory adjustments.** QB classifies as
+COGS (acc 502 Amazon Fees, acc 550 Inventory Adjustment).
+Section 7 Total COGS includes them; Section 1 *COGS (App)* does
+not (CIN7's per-line AverageCost only). The ~$5-15k/mo gap is
+this design choice — narrow product COGS for buyer reporting,
+broad Total COGS for accounting reconciliation.
+
+**Confidence levels per the audit** (subject to the snapshot +
+Shopify-discounts projects):
+Revenue 90% · GP% 92% · Inventory 95% · Orders 95% ·
+Freight 80% · Discounts 70% · Operating Profit 85%.
+
 #### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
 Two new rows in Monthly Metrics → Inventory:
 
