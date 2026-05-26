@@ -528,13 +528,15 @@ purpose.
   (Net Sales + Discounts). For marketing / conversion / discount
   rate tracking.
 
-**Discounts.** Current source: CIN7 line-level discount column
-(~$8-15k/mo). Per the audit this is a PROXY and undercounts the
-true Shopify discount activity (coupons, automatic promotions,
-compare-at, shipping discounts, draft adjustments) by 60-70% —
-Shopify's real total is ~$20-45k/mo. Pending integration:
-`shopify_discounts.py` will swap the row to the Shopify Admin
-API total. Until then the discounts row is a floor estimate.
+**Discounts.** Sourced from `shopify_monthly_discounts` table
+(populated by `python shopify_discounts.py sync` daily). The
+Shopify Admin API's order.total_discounts is the single source
+of truth — captures coupons, automatic promotions, compare-at
+markdowns, shipping discounts, draft-order adjustments. The
+page row auto-falls-back to the CIN7 line-discount proxy when
+the Shopify table is empty (pre-sync state), so the row always
+has a value. Cancelled Shopify orders are excluded; refunded
+orders are kept (discount was applied at sale time).
 
 **GP %.** Two views, both authoritative:
 - **Operational GP %** = Section 1 (CIN7 product margin).

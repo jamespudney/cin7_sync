@@ -16179,20 +16179,44 @@ elif page == "Monthly Metrics":
         # ===== 6 · Sales & Adjustments [QuickBooks] ==============
         # Top-of-P&L revenue ladder per Viktor's layout:
         #   Gross Sales (est.) = Net + Discounts
-        #   − Discounts (CIN7 proxy)
+        #   − Discounts (Shopify API; falls back to CIN7 proxy
+        #                 when Shopify discount data is missing)
         #   = Net Sales (QB 400)
         #   + Shipping Income (QB 405)
         #   = Total Revenue (QB Total Income)
+        # v2.67.303 — Discounts row now sources from Shopify
+        # Admin API (`shopify_monthly_discounts` table) when
+        # populated. Pre-fix it used the CIN7 line-discount proxy
+        # which undercounted by 60-70% (audit). Run
+        # `python shopify_discounts.py sync` to populate; the row
+        # auto-switches sources once data lands.
+        try:
+            _shopify_disc = db.all_shopify_monthly_discounts() or {}
+        except Exception:  # noqa: BLE001
+            _shopify_disc = {}
+
+        def _discounts_for(m):
+            """Shopify API value if we have it; CIN7 proxy if not."""
+            k = str(m)
+            v = _shopify_disc.get(k)
+            if v is not None and float(v) > 0:
+                return float(v)
+            return abs(_get(discount_per_month, m))
+
+        _disc_label = (
+            "Less: Discounts (Shopify Admin API)"
+            if _shopify_disc
+            else "Less: Discounts (CIN7 — proxy until Shopify "
+                  "sync runs)")
+
         if _qb_has_data("sales"):
             _row("6. Sales & Adjustments [QuickBooks]",
                  "Gross Sales (est.)",
                  _per_month(lambda m: _qb(m, "sales")
-                                       + abs(_get(
-                                           discount_per_month, m))))
+                                       + _discounts_for(m)))
             _row("6. Sales & Adjustments [QuickBooks]",
-                 "Less: Discounts (CIN7 — proxy for Shopify)",
-                 _per_month(lambda m: abs(_get(
-                     discount_per_month, m))))
+                 _disc_label,
+                 _per_month(_discounts_for))
             _row("6. Sales & Adjustments [QuickBooks]",
                  "Net Sales (QB 400)",
                  _per_month(lambda m: _qb(m, "sales")))

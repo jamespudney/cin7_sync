@@ -204,6 +204,20 @@ CREATE TABLE IF NOT EXISTS supplier_holidays (
 CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
     ON supplier_holidays(supplier_name);
 
+-- v2.67.303 — Shopify Admin API discount totals by month. The
+-- CIN7-derived discount line on Monthly Metrics Section 6 was a
+-- proxy that undercounted by 60-70% per the May 2026 audit
+-- (~$10k/mo vs Shopify's real ~$25-45k/mo). Shopify is the
+-- source of truth for coupons / automatic promos / compare-at /
+-- shipping discounts / draft adjustments — pulled daily via
+-- shopify_discounts.py.
+CREATE TABLE IF NOT EXISTS shopify_monthly_discounts (
+    month             TEXT PRIMARY KEY,        -- 'YYYY-MM'
+    total_discounts   REAL NOT NULL,
+    order_count       INTEGER NOT NULL,
+    synced_at         TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- v2.67.302 — persistent user sessions. Pre-fix, every Render deploy
 -- reset every Streamlit worker's session_state and forced staff to
 -- re-pick their name and click Sign In again, multiple times per
@@ -3687,6 +3701,16 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
           ON supplier_holidays(supplier_name);
       """),
+    # v2.67.303 — Shopify Admin API monthly discount totals.
+    ("shopify_monthly_discounts_table",
+      """
+      CREATE TABLE IF NOT EXISTS shopify_monthly_discounts (
+          month             TEXT PRIMARY KEY,
+          total_discounts   DOUBLE PRECISION NOT NULL,
+          order_count       INTEGER NOT NULL,
+          synced_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
     # v2.67.302 — persistent user sessions across worker deploys.
     ("user_sessions_table",
       """
@@ -4496,6 +4520,51 @@ def get_ip_lead_times() -> dict:
         rows = c.execute(
             "SELECT * FROM ip_lead_times").fetchall()
     return {r["sku"]: dict(r) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Shopify monthly discounts (v2.67.303)
+# ---------------------------------------------------------------------------
+def upsert_shopify_monthly_discounts(month: str,
+                                       total_discounts: float,
+                                       order_count: int) -> None:
+    """Upsert one (month, total_discounts, order_count) row. Month
+    is 'YYYY-MM'. total_discounts is the SUM of all
+    Shopify `total_discounts` values on orders created that month
+    excluding cancelled. Coupons + auto promos + shipping discounts
+    + line-level discounts + draft adjustments all roll into this."""
+    if not month:
+        return
+    with connect() as c:
+        c.execute(
+            "INSERT INTO shopify_monthly_discounts "
+            "(month, total_discounts, order_count, synced_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(month) DO UPDATE SET "
+            "  total_discounts = excluded.total_discounts, "
+            "  order_count = excluded.order_count, "
+            "  synced_at = datetime('now')",
+            (month, float(total_discounts), int(order_count)))
+
+
+def get_shopify_monthly_discounts(month: str) -> Optional[Dict]:
+    """Return one month's row or None."""
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM shopify_monthly_discounts "
+            "WHERE month = ?", (month,)).fetchone()
+    return dict(row) if row else None
+
+
+def all_shopify_monthly_discounts() -> Dict[str, float]:
+    """Return {month: total_discounts} — used by the Monthly
+    Metrics page to populate Section 6's discount row."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT month, total_discounts FROM "
+            "shopify_monthly_discounts").fetchall()
+    return {r["month"]: float(r["total_discounts"] or 0)
+            for r in rows}
 
 
 # ---------------------------------------------------------------------------

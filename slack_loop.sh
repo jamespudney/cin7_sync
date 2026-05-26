@@ -189,6 +189,7 @@ last_notion_push_epoch=0   # v2.67.254 Notion slow-movers push
 last_notion_dims_epoch=0   # v2.67.281 Notion product-dimensions pull
 last_ip_lead_times_epoch=0 # v2.67.285 IP observed lead-times pull
 last_qbo_pl_epoch=0        # v2.67.292 QBO Profit & Loss pull
+last_shopify_disc_epoch=0  # v2.67.303 Shopify monthly discounts
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
@@ -531,6 +532,20 @@ while true; do
         last_qbo_pl_epoch=$(date -u +%s)
         _run_bg "qbo_monthly_pl" \
             "python qbo_monthly_pl.py sync"
+    fi
+
+    # v2.67.303 Shopify monthly discounts. Daily. Pulls Shopify
+    # Admin API orders for the trailing 14 months and aggregates
+    # total_discounts by month — replaces the CIN7 line-discount
+    # proxy in Monthly Metrics Section 6 (which undercount by
+    # 60-70%). Silent skip if Shopify creds aren't set.
+    seconds_since_shopify_disc=$(( now_epoch - last_shopify_disc_epoch ))
+    if [ "$seconds_since_shopify_disc" -ge 86400 ] \
+            && [ -n "${SHOPIFY_DOMAIN:-}" ] \
+            && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
+        last_shopify_disc_epoch=$(date -u +%s)
+        _run_bg "shopify_discounts" \
+            "python shopify_discounts.py sync"
     fi
 
     # v2.67.274 Shopify content-sync fallback. daily_sync.sh runs
