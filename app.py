@@ -15824,33 +15824,26 @@ elif page == "Monthly Metrics":
         def _per_month(fn):
             return [fn(m) for m in months]
 
-        # SALES
-        _row("Sales", "Sales $",
-             _per_month(lambda m: _get(sales_per_month, m)))
-        _row("Sales", "Sales $ with Tax",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   + _get(tax_per_month, m)))
+        # v2.67.297 — section layout cleanup.
+        # The 'Sales' section now leads with QB-canonical rows so
+        # the buyer / finance see the source-of-truth figures first.
+        # CIN7-derived equivalents (Sales / COGS / GP) are demoted
+        # to a 'Reconciliation' section at the bottom for variance
+        # spotting only. Pre-cleanup the page interleaved CIN7 and
+        # QB versions of the same metric — confusing for anyone
+        # using it for commissions.
+
+        # SALES — activity counts from CIN7 (only source).
         _row("Sales", "# of Monthly Orders",
              _per_month(lambda m: _get(orders_per_month, m)),
              fmt="int")
         _row("Sales", "Quantity",
              _per_month(lambda m: _get(quantity_per_month, m)),
              fmt="int")
-        _row("Sales", "COGS",
-             _per_month(lambda m: _get(cogs_per_month, m)))
         _row("Sales", "Discounts",
              _per_month(lambda m: -abs(_get(discount_per_month, m))))
         _row("Sales", "Tax $",
              _per_month(lambda m: _get(tax_per_month, m)))
-        _row("Sales", "Gross Profit",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   - _get(cogs_per_month, m)))
-        _row("Sales", "GP %",
-             _per_month(lambda m: (
-                 (_get(sales_per_month, m) - _get(cogs_per_month, m))
-                 / _get(sales_per_month, m) * 100
-                 if _get(sales_per_month, m) else 0.0)),
-             fmt="pct")
 
         # ------------------------------------------------------
         # v2.67.292 — QuickBooks-canonical rows. The Viktor audit
@@ -15878,30 +15871,60 @@ elif page == "Monthly Metrics":
         def _qb_has_data(cat):
             return any(_qb(m, cat) for m in months)
 
+        # QB-canonical Sales — leads the Sales section (top of
+        # display). When QB data isn't loaded yet these rows are
+        # silently skipped; CIN7 Sales below in Reconciliation
+        # still gives the buyer something to look at.
         if _qb_has_data("sales"):
-            _row("Sales", "QB Sales $ ✅ canonical (acc 400)",
+            _row("Sales", "Sales $ ✅ QB canonical (acc 400)",
                  _per_month(lambda m: _qb(m, "sales")))
         if _qb_has_data("cogs"):
-            _row("Sales", "QB COGS ✅ canonical (acc 500)",
+            _row("Sales", "COGS ✅ QB canonical (acc 500)",
                  _per_month(lambda m: _qb(m, "cogs")))
         if _qb_has_data("sales") and _qb_has_data("cogs"):
-            _row("Sales", "QB Gross Profit ✅ canonical",
+            _row("Sales", "Gross Profit ✅ QB canonical",
                  _per_month(lambda m: _qb(m, "sales")
                                        - _qb(m, "cogs")))
-            _row("Sales", "QB GP % ✅ canonical",
+            _row("Sales", "GP % ✅ QB canonical",
                  _per_month(lambda m: (
                      (_qb(m, "sales") - _qb(m, "cogs"))
                      / _qb(m, "sales") * 100
                      if _qb(m, "sales") else 0.0)),
                  fmt="pct")
-            # Variance row — how far off is CIN7 vs QB?
-            _row("Sales",
+
+        # RECONCILIATION (CIN7 vs QB) — secondary view used for
+        # spotting drift. Live operational figures from CIN7
+        # sale_lines, alongside the variance against QB canonical.
+        _row("Reconciliation (CIN7 vs QB)", "CIN7 Sales $",
+             _per_month(lambda m: _get(sales_per_month, m)))
+        _row("Reconciliation (CIN7 vs QB)", "CIN7 Sales $ with Tax",
+             _per_month(lambda m: _get(sales_per_month, m)
+                                   + _get(tax_per_month, m)))
+        _row("Reconciliation (CIN7 vs QB)", "CIN7 COGS",
+             _per_month(lambda m: _get(cogs_per_month, m)))
+        _row("Reconciliation (CIN7 vs QB)", "CIN7 Gross Profit",
+             _per_month(lambda m: _get(sales_per_month, m)
+                                   - _get(cogs_per_month, m)))
+        _row("Reconciliation (CIN7 vs QB)", "CIN7 GP %",
+             _per_month(lambda m: (
+                 (_get(sales_per_month, m) - _get(cogs_per_month, m))
+                 / _get(sales_per_month, m) * 100
+                 if _get(sales_per_month, m) else 0.0)),
+             fmt="pct")
+        if _qb_has_data("sales"):
+            _row("Reconciliation (CIN7 vs QB)",
                  "Sales variance (CIN7 − QB) — should trend to 0",
                  _per_month(lambda m: _get(sales_per_month, m)
                                        - _qb(m, "sales")))
 
-        # MARGINS
-        _row("Margins", "Shipping Charged",
+        # SHIPPING / MARGINS — canonical QB rows lead, the
+        # CIN7-derived equivalents drop to "Shipping operational"
+        # at the bottom as diagnostic-only data (the header-delta
+        # method overstates by 27-218% per Viktor's audit, and the
+        # ShipStation side is parcel-only). Pre-cleanup these were
+        # all interleaved in a single "Margins" section.
+        _row("Shipping operational (diagnostic)",
+             "CIN7 Shipping Charged (header-delta, ⚠️ inflated)",
              _per_month(lambda m: float(
                  ship_charged_per_month.get(m, 0) or 0)))
         # v2.67.55c — populate the TRUE Shipping Cost row.
@@ -15979,7 +16002,7 @@ elif page == "Monthly Metrics":
         # passes pd.Period objects from `months`. Lookup never
         # matched → every month showed $0 even after the data was
         # correct. str(period) -> 'YYYY-MM' converts safely.
-        _row("Margins", _ship_cost_label,
+        _row("Shipping operational (diagnostic)", _ship_cost_label,
              _per_month(lambda m: float(
                  _ship_cost_per_month.get(str(m), 0) or 0)))
 
@@ -15988,15 +16011,18 @@ elif page == "Monthly Metrics":
         # (Shipping-Out) for cost. Removes the LTL-in-charged-but-
         # not-in-cost asymmetry that inflated the CIN7 row by 27-
         # 218% every month per Viktor's audit.
+        # v2.67.297 — promoted to a dedicated "Shipping" section
+        # that renders ABOVE the operational diagnostic version.
         if _qb_has_data("shipping_charged"):
-            _row("Margins", "QB Shipping Charged ✅ canonical (acc 405)",
+            _row("Shipping", "Shipping Charged ✅ QB canonical (acc 405)",
                  _per_month(lambda m: _qb(m, "shipping_charged")))
         if _qb_has_data("shipping_cost"):
-            _row("Margins", "QB Shipping Cost ✅ canonical (acc 694)",
+            _row("Shipping", "Shipping Cost ✅ QB canonical (acc 694)",
                  _per_month(lambda m: _qb(m, "shipping_cost")))
         if (_qb_has_data("shipping_charged")
                 and _qb_has_data("shipping_cost")):
-            _row("Margins", "QB Shipping Margin (acc 405 − acc 694)",
+            _row("Shipping", "Shipping Margin ✅ QB canonical "
+                 "(acc 405 − acc 694)",
                  _per_month(lambda m: _qb(m, "shipping_charged")
                                        - _qb(m, "shipping_cost")))
 
@@ -16127,17 +16153,19 @@ elif page == "Monthly Metrics":
                                                             0) or 0)
                                  for r in _mkt_in_data)))
 
-        _row("Margins", "Line Contribution Margin",
-             _per_month(lambda m: _get(sales_per_month, m)
-                                   - _get(cogs_per_month, m)))
-        _row("Margins", "Average Order Value",
+        # v2.67.297 — "Line Contribution Margin" was a duplicate of
+        # Gross Profit (identical formula sales − COGS); removed to
+        # stop confusing the buyer. AOV moves up into Sales next to
+        # # Orders; purchase metrics get their own "Operations"
+        # section.
+        _row("Sales", "Average Order Value",
              _per_month(lambda m: (
                  _get(sales_per_month, m) / _get(orders_per_month, m)
                  if _get(orders_per_month, m) else 0.0)))
-        _row("Margins", "# of Purchases",
+        _row("Operations", "# of Purchases",
              _per_month(lambda m: _get(po_per_month, m)),
              fmt="int")
-        _row("Margins", "Purchase $",
+        _row("Operations", "Purchase $",
              _per_month(lambda m: _get(po_spend_per_month, m)))
 
         # CUSTOMERS
@@ -16379,8 +16407,46 @@ elif page == "Monthly Metrics":
                         display_table.at[idx, lbl], r["Format"])
 
         # --- Render per-section ------------------------------------
-        for section in ["Sales", "Margins", "Customers", "Inventory"]:
-            sect_df = display_table[display_table["Section"] == section]
+        # v2.67.297 — explicit section ordering puts QB-canonical
+        # views at the top, drill-downs in the middle, and the
+        # CIN7-derived reconciliation view at the bottom. Any
+        # section not in the list still renders (catch-all loop
+        # below), so adding a new section in code doesn't require
+        # touching this list — just leaves the ordering up to call
+        # order if it's not explicitly placed.
+        _section_order = [
+            "Sales",
+            "Shipping",
+            "QB P&L Detail",
+            "Channel (CIN7 by SalesRep)",
+            "Operations",
+            "Reconciliation (CIN7 vs QB)",
+            "Shipping operational (diagnostic)",
+            "Customers",
+            "Inventory",
+        ]
+        _seen_sections: list = []
+        for section in _section_order:
+            sect_df = display_table[
+                display_table["Section"] == section]
+            if sect_df.empty:
+                continue
+            _seen_sections.append(section)
+            st.subheader(f":small_blue_diamond: {section}")
+            st.dataframe(
+                sect_df.drop(columns=["Section"]).set_index("Metric"),
+                width="stretch",
+                height=38 * (len(sect_df) + 1) + 10,
+            )
+        # Catch-all: render any section not in the explicit order
+        # (in call-order of first appearance), so a future code
+        # change adding a section doesn't accidentally make rows
+        # invisible.
+        for section in display_table["Section"].drop_duplicates():
+            if section in _seen_sections:
+                continue
+            sect_df = display_table[
+                display_table["Section"] == section]
             if sect_df.empty:
                 continue
             st.subheader(f":small_blue_diamond: {section}")
