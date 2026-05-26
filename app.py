@@ -11165,15 +11165,44 @@ elif page == "Ordering":
             "calc_trace": trace,
         }
 
-    # Apply the target/reorder computation
-    applied = engine_df.apply(_compute_target_and_reorder, axis=1)
-    engine_df["target_stock"] = applied.apply(lambda x: x["target_stock"])
-    engine_df["reorder_qty"] = applied.apply(lambda x: x["reorder_qty"])
-    engine_df["lead_time_days"] = applied.apply(lambda x: x["lead_time_days"])
-    engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
-    engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
-    engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
-    engine_df["calc_trace"] = applied.apply(lambda x: x["calc_trace"])
+    # v2.67.289 — skip the apply when nothing changed. engine_df
+    # is cached via @st.cache_resource — Streamlit returns the
+    # SAME DataFrame object across renders until the cache is
+    # invalidated, so any columns we added on a previous render
+    # are still present. If supp_configs / closures / IP lead
+    # times / today are all unchanged, the apply would produce
+    # identical values — skipping it removes the 10k-row markdown
+    # rebuild that was spiking memory and crashing Render on every
+    # navigation, holiday save, and cadence save.
+    _reorder_cols = ("target_stock", "reorder_qty", "lead_time_days",
+                       "freight_mode", "excess_units", "excess_value",
+                       "calc_trace")
+    try:
+        _cache_sig = json.dumps({
+            "supp": supp_configs,
+            "clos": closures_by_supplier,
+            "ip_lt": ip_lead_times_by_sku,
+            "today": _today_for_engine.isoformat(),
+        }, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        _cache_sig = None  # never hit on dict-of-simple-types
+    _have_columns = all(c in engine_df.columns for c in _reorder_cols)
+    _sig_unchanged = (
+        _cache_sig is not None
+        and st.session_state.get("_reorder_apply_sig") == _cache_sig)
+    if _have_columns and _sig_unchanged:
+        pass  # cache hit — engine_df already has these columns
+    else:
+        applied = engine_df.apply(_compute_target_and_reorder, axis=1)
+        engine_df["target_stock"] = applied.apply(lambda x: x["target_stock"])
+        engine_df["reorder_qty"] = applied.apply(lambda x: x["reorder_qty"])
+        engine_df["lead_time_days"] = applied.apply(lambda x: x["lead_time_days"])
+        engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
+        engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
+        engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
+        engine_df["calc_trace"] = applied.apply(lambda x: x["calc_trace"])
+        if _cache_sig is not None:
+            st.session_state["_reorder_apply_sig"] = _cache_sig
 
     # Dropship override: these SKUs are order-on-demand. Zero the target
     # and reorder, override Status badge, leave everything else (sales
@@ -11864,7 +11893,13 @@ elif page == "Ordering":
                     dropship_default=1 if ds_default else 0,
                     actor=actor_o,
                 )
-                _safe_cache_clear()
+                # v2.67.289 — NO _safe_cache_clear() here.
+                # db.all_supplier_configs() is an uncached direct
+                # DB read, so the engine picks up the new cadence
+                # on the next render automatically. A global cache
+                # clear evicts the ABC engine + every other frame,
+                # which causes a rebuild on top of still-resident
+                # caches and crashes Render's 2GB memory ceiling.
                 st.success(f"Saved config for {cfg_supplier}")
                 st.rerun()
 
