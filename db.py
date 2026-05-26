@@ -204,6 +204,24 @@ CREATE TABLE IF NOT EXISTS supplier_holidays (
 CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
     ON supplier_holidays(supplier_name);
 
+-- v2.67.302 — persistent user sessions. Pre-fix, every Render deploy
+-- reset every Streamlit worker's session_state and forced staff to
+-- re-pick their name and click Sign In again, multiple times per
+-- day during active development. Sessions now live in Postgres
+-- (survives deploys) and are keyed by a random token stored in the
+-- browser URL. 24h sliding expiry — refreshed on every access, so
+-- active users never have to re-sign in. Idle >24h triggers a
+-- fresh sign-in. Stored token = URL-safe random 32 bytes.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    token           TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL,
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    expires_at      TIMESTAMP NOT NULL,
+    last_used_at    TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_expires
+    ON user_sessions(expires_at);
+
 -- v2.67.285 — observed actual lead times pulled from Inventory
 -- Planner. Per-SKU; IP tracks the real elapsed time between PO
 -- placement and receipt (avg_lead_time). The reorder engine
@@ -3669,6 +3687,22 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
           ON supplier_holidays(supplier_name);
       """),
+    # v2.67.302 — persistent user sessions across worker deploys.
+    ("user_sessions_table",
+      """
+      CREATE TABLE IF NOT EXISTS user_sessions (
+          token         TEXT PRIMARY KEY,
+          user_id       INTEGER NOT NULL,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          expires_at    TIMESTAMPTZ NOT NULL,
+          last_used_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("user_sessions_expires_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_user_sessions_expires
+          ON user_sessions(expires_at);
+      """),
     # v2.67.285 — observed actual lead times from Inventory Planner.
     ("ip_lead_times_table",
       """
@@ -6362,6 +6396,92 @@ def is_super_admin(display_name: str = "", role: str = "") -> bool:
     env_names = {n.strip().lower()
                     for n in env_raw.split(",") if n.strip()}
     return name_lc in env_names
+
+
+# ---------------------------------------------------------------------------
+# User sessions (v2.67.302) — survive worker restarts / deploys
+# ---------------------------------------------------------------------------
+def _new_session_token() -> str:
+    """URL-safe random token (43 chars, 256 bits of entropy)."""
+    import secrets
+    return secrets.token_urlsafe(32)
+
+
+def create_user_session(user_id: int,
+                         ttl_hours: int = 24) -> str:
+    """Create a fresh login session for `user_id` and return the
+    token (caller stashes it in the browser URL via st.query_params).
+    24-hour TTL by default; the validate_user_session call below
+    extends it on every page view, so an active user stays signed
+    in indefinitely."""
+    token = _new_session_token()
+    with connect() as c:
+        c.execute(
+            "INSERT INTO user_sessions "
+            "(token, user_id, expires_at) VALUES "
+            "(?, ?, datetime('now', '+' || ? || ' hours'))",
+            (token, int(user_id), int(ttl_hours)))
+    return token
+
+
+def validate_user_session(token: str,
+                           renew_hours: int = 24
+                           ) -> Optional[Dict]:
+    """Check the token. If valid and not expired, return the
+    user dict and SLIDING-RENEW the expiry to (now + renew_hours).
+    Returns None if the token is unknown or expired."""
+    if not token:
+        return None
+    with connect() as c:
+        row = c.execute(
+            "SELECT s.token, s.user_id, s.expires_at, "
+            "       u.display_name, u.role, u.email, "
+            "       u.default_page, u.active "
+            "FROM user_sessions s "
+            "JOIN users u ON u.user_id = s.user_id "
+            "WHERE s.token = ? "
+            "  AND s.expires_at > datetime('now') "
+            "  AND u.active = 1",
+            (token,)).fetchone()
+        if not row:
+            return None
+        # Sliding renewal — push expiry forward, refresh last_used.
+        c.execute(
+            "UPDATE user_sessions SET "
+            "  expires_at = datetime('now', '+' || ? || ' hours'), "
+            "  last_used_at = datetime('now') "
+            "WHERE token = ?",
+            (int(renew_hours), token))
+    return {
+        "user_id": int(row["user_id"]),
+        "display_name": row["display_name"],
+        "role": row["role"],
+        "email": row["email"],
+        "default_page": row["default_page"],
+        "active": bool(row["active"]),
+    }
+
+
+def revoke_user_session(token: str) -> None:
+    """Delete a session token (sign-out)."""
+    if not token:
+        return
+    with connect() as c:
+        c.execute("DELETE FROM user_sessions WHERE token = ?",
+                  (token,))
+
+
+def cleanup_expired_user_sessions() -> int:
+    """Housekeeping — drop expired session rows. Safe to call
+    on every page load (cheap; rows are removed by the index)."""
+    try:
+        with connect() as c:
+            cur = c.execute(
+                "DELETE FROM user_sessions "
+                "WHERE expires_at <= datetime('now')")
+            return int(cur.rowcount or 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def get_user_by_name(display_name: str) -> Optional[sqlite3.Row]:

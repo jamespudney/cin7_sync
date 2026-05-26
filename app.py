@@ -2310,6 +2310,46 @@ with st.sidebar:
         _user_rows = []
     _existing_names = [r["display_name"] for r in _user_rows]
 
+    # v2.67.302 — persistent sign-in across Render deploys.
+    # Streamlit's session_state lives in the worker process, so
+    # every push wiped everyone's sign-in. Now: on sign-in we mint
+    # a 24h server-side session token (stored in Postgres) and put
+    # it in the URL as `?sid=...`. On every page load (worker
+    # restart included), we read that token, validate against the
+    # DB, and silently restore session_state if it's still valid.
+    # 24h expiry is SLIDING — refreshed on every access, so an
+    # active user stays signed in indefinitely.
+    try:
+        _sid_from_url = (st.query_params.get("sid") or "").strip()
+    except Exception:  # noqa: BLE001
+        _sid_from_url = ""
+    if (_sid_from_url
+            and not st.session_state.get("current_user")):
+        try:
+            _restored = db.validate_user_session(_sid_from_url)
+        except Exception:  # noqa: BLE001
+            _restored = None
+        if _restored:
+            st.session_state["current_user_id"] = (
+                _restored["user_id"])
+            st.session_state["current_user"] = (
+                _restored["display_name"])
+            st.session_state["current_user_profile"] = _restored
+            st.session_state["_session_token"] = _sid_from_url
+        else:
+            # Token in URL but invalid / expired — strip it so the
+            # user just sees the sign-in picker, not an error.
+            try:
+                del st.query_params["sid"]
+            except Exception:  # noqa: BLE001
+                pass
+    # Periodically prune expired rows (cheap — single DELETE
+    # bounded by the index). Best-effort.
+    try:
+        db.cleanup_expired_user_sessions()
+    except Exception:  # noqa: BLE001
+        pass
+
     _signed_in_name = st.session_state.get("current_user") or ""
     if _signed_in_name and _signed_in_name in _existing_names:
         # Already signed in this session — show selected profile + a
@@ -2322,9 +2362,24 @@ with st.sidebar:
             f"(`{_role}`)")
         if st.button("Sign out", key="_signout_btn",
                       width="stretch"):
+            # v2.67.302 — revoke the persistent session token AND
+            # clear the URL param, otherwise a refresh would
+            # silently restore the just-signed-out user.
+            try:
+                _tok = st.session_state.get("_session_token") or ""
+                if _tok:
+                    db.revoke_user_session(_tok)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if "sid" in st.query_params:
+                    del st.query_params["sid"]
+            except Exception:  # noqa: BLE001
+                pass
             for _k in ("current_user",
                         "current_user_id",
                         "current_user_profile",
+                        "_session_token",
                         "_signin_pending_name",
                         "_default_page_consumed"):
                 st.session_state.pop(_k, None)
@@ -2375,6 +2430,21 @@ with st.sidebar:
                                 _user["display_name"])
                             st.session_state["current_user_profile"] = (
                                 _profile_dict)
+                            # v2.67.302 — mint a 24h server-side
+                            # session token and stash it in the
+                            # URL so the user stays signed in
+                            # across worker restarts / deploys.
+                            try:
+                                _tok = db.create_user_session(
+                                    int(_user["user_id"]))
+                                st.session_state[
+                                    "_session_token"] = _tok
+                                st.query_params["sid"] = _tok
+                            except Exception:  # noqa: BLE001
+                                # Don't block sign-in if the token
+                                # mint fails; user is still signed
+                                # in via session_state for this tab.
+                                pass
                             # Audit the sign-in itself so we know who
                             # was active when.
                             try:
@@ -2460,6 +2530,16 @@ with st.sidebar:
                                 _user["display_name"])
                             st.session_state["current_user_profile"] = (
                                 _profile_dict)
+                            # v2.67.302 — same persistent-session
+                            # token mint as the sign-in path.
+                            try:
+                                _tok = db.create_user_session(
+                                    int(_user["user_id"]))
+                                st.session_state[
+                                    "_session_token"] = _tok
+                                st.query_params["sid"] = _tok
+                            except Exception:  # noqa: BLE001
+                                pass
                             try:
                                 with db.connect() as _c:
                                     _c.execute(
