@@ -186,6 +186,24 @@ CREATE TABLE IF NOT EXISTS sku_supplier_overrides (
     note            TEXT
 );
 
+-- v2.67.284 — supplier holiday / shutdown periods. Each row is a
+-- known closure (e.g. summer shutdown, Chinese New Year, public
+-- holidays). The reorder engine looks at the upcoming lead-time +
+-- cadence window and adds any closed days to the target cover, so
+-- an order placed before a shutdown automatically bridges it.
+-- Multiple periods per supplier are supported (just add more rows).
+CREATE TABLE IF NOT EXISTS supplier_holidays (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    supplier_name   TEXT    NOT NULL,
+    start_date      DATE    NOT NULL,
+    end_date        DATE    NOT NULL,
+    label           TEXT,
+    created_by      TEXT,
+    created_at      TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
+    ON supplier_holidays(supplier_name);
+
 -- Critical components per tube family. Team-designated components that
 -- we want to track closely (e.g. Yukon mounting plate used across many
 -- tubes and has long supplier lead time). Shown prominently on LED Tubes
@@ -3572,6 +3590,26 @@ _PG_POST_CUTOVER_TABLES = [
     ("supplier_config_add_order_cadence_days",
       "ALTER TABLE supplier_config "
       "ADD COLUMN IF NOT EXISTS order_cadence_days INTEGER;"),
+    # v2.67.284 — supplier holiday / shutdown periods. Multiple
+    # rows per supplier; the reorder engine adds the overlap with
+    # the upcoming lead-time + cadence window to the target cover.
+    ("supplier_holidays_table",
+      """
+      CREATE TABLE IF NOT EXISTS supplier_holidays (
+          id              SERIAL PRIMARY KEY,
+          supplier_name   TEXT NOT NULL,
+          start_date      DATE NOT NULL,
+          end_date        DATE NOT NULL,
+          label           TEXT,
+          created_by      TEXT,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("supplier_holidays_index",
+      """
+      CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
+          ON supplier_holidays(supplier_name);
+      """),
     # v2.67.211 — QuickBooks Online connection table.
     ("qbo_connection",
       """
@@ -4195,6 +4233,77 @@ def all_supplier_configs() -> dict:
     with connect() as c:
         rows = c.execute("SELECT * FROM supplier_config").fetchall()
     return {r["supplier_name"]: dict(r) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Supplier holidays / shutdowns (v2.67.284)
+# ---------------------------------------------------------------------------
+def _iso_date(value) -> str:
+    """Coerce a date or ISO string to YYYY-MM-DD for DB storage."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    s = str(value)
+    return s[:10]
+
+
+def add_supplier_holiday(supplier_name: str,
+                          start_date,
+                          end_date,
+                          label: str = "",
+                          actor: str = "") -> int:
+    """Insert a new supplier closure period. Returns the new row id."""
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO supplier_holidays "
+            "(supplier_name, start_date, end_date, label, created_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (supplier_name, _iso_date(start_date),
+             _iso_date(end_date), label or "", actor or ""))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("supplier_holiday.add", actor, supplier_name,
+             f"{_iso_date(start_date)} → {_iso_date(end_date)} "
+             f"({label or ''})"))
+        return int(cur.lastrowid or 0)
+
+
+def delete_supplier_holiday(holiday_id: int,
+                              actor: str = "") -> None:
+    """Remove a closure period by id."""
+    with connect() as c:
+        c.execute("DELETE FROM supplier_holidays WHERE id = ?",
+                   (int(holiday_id),))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("supplier_holiday.delete", actor,
+             str(holiday_id), ""))
+
+
+def get_supplier_holidays(supplier_name: str) -> list:
+    """All closure periods for one supplier, oldest first."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM supplier_holidays "
+            "WHERE supplier_name = ? "
+            "ORDER BY start_date", (supplier_name,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def all_supplier_holidays_by_supplier() -> dict:
+    """{supplier_name: [closure_dicts]} — single fetch for the
+    reorder engine to look up closures per-supplier without N
+    queries."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM supplier_holidays "
+            "ORDER BY supplier_name, start_date").fetchall()
+    out: dict = {}
+    for r in rows:
+        d = dict(r)
+        out.setdefault(d["supplier_name"], []).append(d)
+    return out
 
 
 def set_supplier_pricing(

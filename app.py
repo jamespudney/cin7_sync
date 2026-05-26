@@ -10705,6 +10705,55 @@ elif page == "Ordering":
 
     # --- Apply per-supplier config to compute targets ------------------
     supp_configs = db.all_supplier_configs()
+    # v2.67.284 — load supplier holidays once for the engine
+    # (closures used per-row inside _compute_target_and_reorder).
+    closures_by_supplier = db.all_supplier_holidays_by_supplier()
+    _today_for_engine = datetime.date.today()
+
+    def _format_iso_weeks_range(start, end):
+        """'Wk 32' for a same-week span, 'Wk 32-34' otherwise."""
+        ws = start.isocalendar()[1]
+        we = end.isocalendar()[1]
+        return f"Wk {ws}" if ws == we else f"Wk {ws}-{we}"
+
+    def _closure_days_in_window(closures, win_start, win_end):
+        """Count distinct CLOSED days within [win_start, win_end]
+        across all of a supplier's closure periods, plus a
+        per-closure detail list for the buyer's explanation."""
+        if not closures:
+            return 0, []
+        closed = set()
+        matched = []
+        for cl in closures:
+            s = cl.get("start_date")
+            e = cl.get("end_date")
+            if isinstance(s, str):
+                try:
+                    s = datetime.date.fromisoformat(s[:10])
+                except ValueError:
+                    continue
+            if isinstance(e, str):
+                try:
+                    e = datetime.date.fromisoformat(e[:10])
+                except ValueError:
+                    continue
+            if s is None or e is None:
+                continue
+            os_ = max(s, win_start)
+            oe = min(e, win_end)
+            if os_ > oe:
+                continue
+            d = os_
+            while d <= oe:
+                closed.add(d)
+                d += datetime.timedelta(days=1)
+            matched.append({
+                "start_date": s,
+                "end_date": e,
+                "label": (cl.get("label") or "").strip(),
+                "overlap_days": (oe - os_).days + 1,
+            })
+        return len(closed), matched
 
     def _compute_target_and_reorder(row: pd.Series) -> dict:
         """Return dict with target_stock, reorder_qty, lead_time_used,
@@ -10770,7 +10819,17 @@ elif page == "Ordering":
         lt_demand = avg_daily * lead_time_days
         safety = lt_demand * (safety_pct / 100.0)
         review_demand = avg_daily * review_days
-        target = lt_demand + safety + review_demand
+        # v2.67.284 — supplier holiday cover. Any days the supplier
+        # is closed within the upcoming lead-time + cadence window
+        # get added to the target as extra cover, so an order
+        # placed before a known shutdown automatically bridges it.
+        window_end = _today_for_engine + datetime.timedelta(
+            days=int(lead_time_days + review_days))
+        closure_days, matched_closures = _closure_days_in_window(
+            closures_by_supplier.get(supplier or "", []),
+            _today_for_engine, window_end)
+        holiday_cover = avg_daily * closure_days
+        target = lt_demand + safety + review_demand + holiday_cover
         onhand = row["OnHand"]
         allocated = float(row.get("Allocated") or 0)
         available = float(row.get("Available") or 0)
@@ -11015,8 +11074,25 @@ elif page == "Ordering":
             f"= {safety:.1f} units\n\n"
             f"**Review-period demand**: {avg_daily:.2f} × {review_days} "
             f"= {review_demand:.1f} units\n\n"
-            f"**Target stock**: {lt_demand:.1f} + {safety:.1f} + "
-            f"{review_demand:.1f} = **{target:.1f} units**\n\n"
+            + (
+                f"**Holiday cover**: +{closure_days}d ("
+                + "; ".join(
+                    f"{(m['label'] or 'closure')} "
+                    f"({_format_iso_weeks_range(m['start_date'], m['end_date'])}: "
+                    f"{m['start_date']}→{m['end_date']}, "
+                    f"{m['overlap_days']}d in window)"
+                    for m in matched_closures
+                )
+                + f") → +{holiday_cover:.1f} units — "
+                  f"the supplier is shut for part of this order's "
+                  f"cover window, so we carry the closed days as "
+                  f"extra stock to bridge it.\n\n"
+                if closure_days > 0 else ""
+            )
+            + f"**Target stock**: {lt_demand:.1f} + {safety:.1f} + "
+            f"{review_demand:.1f}"
+            + (f" + {holiday_cover:.1f}" if closure_days > 0 else "")
+            + f" = **{target:.1f} units**\n\n"
             f"**Current position**:\n"
             f"- OnHand: {onhand:.0f} physical units\n"
             f"- Allocated (reserved for open picks): {allocated:.0f}\n"
@@ -11576,6 +11652,117 @@ elif page == "Ordering":
                 "biggest single lever for freeing cash tied up in "
                 "stock; the per-SKU reorder explanation shows the "
                 "effect.")
+
+            # ------------------------------------------------------
+            # v2.67.284 — supplier holiday closures
+            # ------------------------------------------------------
+            # Buyers can add as many closure periods as they need
+            # (summer shutdowns, Chinese New Year, public holidays).
+            # The reorder engine adds any closed days within an
+            # order's cover window to the target, so an order
+            # placed before a shutdown auto-bridges it. ISO week
+            # numbers are shown next to dates because that's how
+            # buyers and European suppliers think.
+            st.markdown("**Holiday closures** — periods this "
+                         "supplier is shut")
+            st.caption(
+                ":information_source: The reorder engine adds the "
+                "closed days within an order's cover window to the "
+                "target — so an order placed before a shutdown "
+                "auto-bridges it. The per-SKU reorder explanation "
+                "names the closure (e.g. *'Topmet closed Wk 32–34: "
+                "+14 units cover'*).")
+
+            # --- Existing closures (read + delete) ----------------
+            existing_closures = db.get_supplier_holidays(cfg_supplier)
+            today_d = datetime.date.today()
+            this_week = today_d.isocalendar()[1]
+            st.caption(f"Today is **{today_d.isoformat()}** "
+                         f"(Wk {this_week}).")
+            if existing_closures:
+                hdr = st.columns([2, 2, 1, 4, 1])
+                hdr[0].markdown("**Start**")
+                hdr[1].markdown("**End**")
+                hdr[2].markdown("**Weeks**")
+                hdr[3].markdown("**Label**")
+                hdr[4].markdown("**·**")
+                for hol in existing_closures:
+                    s = hol.get("start_date")
+                    e = hol.get("end_date")
+                    if isinstance(s, str):
+                        try:
+                            s = datetime.date.fromisoformat(s[:10])
+                        except ValueError:
+                            continue
+                    if isinstance(e, str):
+                        try:
+                            e = datetime.date.fromisoformat(e[:10])
+                        except ValueError:
+                            continue
+                    ws = s.isocalendar()[1]
+                    we = e.isocalendar()[1]
+                    wk_str = (f"Wk {ws}" if ws == we
+                              else f"Wk {ws}-{we}")
+                    row_cols = st.columns([2, 2, 1, 4, 1])
+                    row_cols[0].write(s.isoformat())
+                    row_cols[1].write(e.isoformat())
+                    row_cols[2].write(wk_str)
+                    row_cols[3].write(hol.get("label") or "—")
+                    if row_cols[4].button(
+                            "🗑", key=f"del_hol_{hol['id']}",
+                            help="Remove this closure"):
+                        db.delete_supplier_holiday(
+                            int(hol["id"]), actor=actor_o)
+                        _safe_cache_clear()
+                        st.rerun()
+            else:
+                st.caption("No closures recorded for this supplier "
+                             "yet. Add one below.")
+
+            # --- Add closure form ---------------------------------
+            with st.form(
+                    f"add_holiday_{cfg_supplier}",
+                    clear_on_submit=True):
+                fc = st.columns([2, 2, 1, 3, 1])
+                new_start = fc[0].date_input(
+                    "Closure start",
+                    value=today_d,
+                    key=f"hol_start_{cfg_supplier}",
+                )
+                new_end = fc[1].date_input(
+                    "Closure end",
+                    value=today_d,
+                    key=f"hol_end_{cfg_supplier}",
+                )
+                # Live week preview — buyer sees the ISO week range
+                # update as they pick dates (rerun on submit; this
+                # shows the *current* selection's weeks).
+                _ws = new_start.isocalendar()[1]
+                _we = new_end.isocalendar()[1]
+                _wk_preview = (f"Wk {_ws}" if _ws == _we
+                                else f"Wk {_ws}-{_we}")
+                fc[2].write(_wk_preview)
+                new_label = fc[3].text_input(
+                    "Label",
+                    placeholder="e.g. summer shutdown",
+                    key=f"hol_label_{cfg_supplier}",
+                )
+                submitted = fc[4].form_submit_button(
+                    "Add", type="primary")
+                if submitted:
+                    if new_end < new_start:
+                        st.error("End date is before start date.")
+                    else:
+                        db.add_supplier_holiday(
+                            cfg_supplier,
+                            new_start, new_end,
+                            label=(new_label or "").strip(),
+                            actor=actor_o)
+                        _safe_cache_clear()
+                        st.success(
+                            f"Added closure: {new_start} → "
+                            f"{new_end} ({_wk_preview})")
+                        st.rerun()
 
             # 100%-dropship supplier toggle — covers Gyford-type suppliers
             # where every SKU is order-on-demand (we never stock any of it).

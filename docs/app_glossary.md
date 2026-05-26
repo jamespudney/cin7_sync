@@ -396,6 +396,39 @@ basis (CIN7 FIFO vs cost-chain fallbacks), so the tiles never
 tie to the exact dollar — the bridge caption under the tiles
 states the live numbers.
 
+#### Reorder engine: cadence + holiday cover (v2.67.283-284)
+The reorder engine's target stock is built from four components,
+in this order:
+
+`target = lead_time_demand + safety_stock + review_period_demand
+         + holiday_cover`
+
+- **Lead-time demand** = `avg_daily × lead_time_days`. The stock
+  needed to cover demand while the next order is in transit.
+- **Safety stock** = `lead_time_demand × safety_pct`. ABC class
+  drives this (A=30%, B=20%, C=15% by default). This is the only
+  thing ABC class controls now — it no longer touches the review
+  period (see below).
+- **Review-period demand** = `avg_daily × review_days`, where
+  **`review_days = supplier.order_cadence_days` when set** (the
+  real reorder cadence), otherwise the legacy ABC-class default.
+  This is the single biggest cashflow lever: if you reorder a
+  supplier weekly, set their cadence to 7 — each order then
+  carries only 7d of next-cycle stock instead of 30-45d. Set in
+  Supplier settings → "Order cadence (days)".
+- **Holiday cover** = `avg_daily × closure_days_in_window`,
+  where `closure_days` is the count of days within the upcoming
+  `lead_time + review` window that overlap any of the supplier's
+  recorded closure periods (`supplier_holidays` table, edited
+  per-supplier in Supplier settings). Multiple closure periods
+  per supplier are supported. ISO week numbers ("Wk 32–34") are
+  shown for buyer convenience.
+
+Each per-SKU reorder explanation in the Ordering page names the
+basis for each term — so when the engine suggests fewer units
+than before, the buyer can see exactly why ("you reorder Topmet
+every 7d", "Topmet closed Wk 32–34: +14d cover").
+
 #### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
 Two new rows in Monthly Metrics → Inventory:
 
