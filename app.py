@@ -15447,6 +15447,86 @@ elif page == "Monthly Metrics":
         "report. Every number is live from CIN7 data."
     )
 
+    # v2.67.290 — methodology disclosure. Sales-team commissions are
+    # paid off this report, so every formula needs to be visible to
+    # the buyer / finance and frozen in plain language. Surfacing
+    # the known caveats here too: historical COGS re-costing, the
+    # shipping-margin asymmetry, and the modelled inventory curve.
+    with st.expander(":scroll: Methodology & known caveats "
+                       "(read before relying on figures for "
+                       "commissions)", expanded=False):
+        st.markdown(
+            "**Sales $** = sum of product-line `Total` "
+            "(ex-tax, ex-shipping). Voided / credited / cancelled "
+            "SaleIDs are excluded. Source: CIN7 `sale_lines`.\n\n"
+            "**COGS** = `Quantity × AverageCost` on product lines. "
+            "⚠️ **Historical re-costing**: CIN7's `AverageCost` on "
+            "a sale line is the *current* moving average — it can "
+            "drift as later PO receipts change the average. For "
+            "commission purposes a month should be frozen at "
+            "month-close (snapshot pending; current page reads "
+            "live CIN7 data so old months can shift).\n\n"
+            "**Gross Profit** = Sales $ − COGS. **GP %** = "
+            "Gross Profit / Sales $.\n\n"
+            "**Average Order Value** = Sales $ / # of Monthly "
+            "Orders. Numerator is product sales only "
+            "(ex-shipping, ex-tax); denominator is distinct "
+            "`SaleID` across all lines on the invoice. Voided / "
+            "credited orders are excluded — this is why AOV is "
+            "higher than Easy Insight, which counted those.\n\n"
+            "**Shipping Charged** = header-delta method: "
+            "`InvoiceAmount − product line totals − Tax`, "
+            "clipped ≥0. Captures **every dollar of non-product "
+            "freight income** — parcel, LTL, handling, fuel "
+            "surcharges, anything on the invoice.\n\n"
+            "**Shipping Cost (ShipStation parcel only)** = "
+            "`ShipmentCost` from ShipStation labels, summed by "
+            "month. ⚠️ **Asymmetric vs Shipping Charged**: this "
+            "captures ONLY carrier-billed parcel labels "
+            "(UPS / FedEx / USPS). **LTL and freight-truck "
+            "shipments are NOT in this number**, but their charged "
+            "side IS in Shipping Charged via the header delta. "
+            "So Shipping Margin is over-stated for any month with "
+            "LTL activity. Do not commission on shipping margin "
+            "until this is reconciled.\n\n"
+            "**Cumulative Customers (ever bought)** = distinct "
+            "`CustomerID` count of everyone whose first purchase "
+            "is on/before the month. Monotonic — only grows. "
+            "Different from Easy Insight's \"active in last N "
+            "months\" — different metric, both valid.\n\n"
+            "**Repeat Customer %** = of distinct customers who "
+            "bought in month m, what share had a purchase in any "
+            "earlier month.\n\n"
+            "**Average Inventory Value** = ⚠️ **modelled, not "
+            "measured**. The page walks COGS and purchases back "
+            "from today's stock value to estimate prior months, "
+            "with damping applied because the raw walk-back "
+            "drifts due to landed-cost differences between sale "
+            "AverageCost and PO Total. For audit-grade history we "
+            "need month-end snapshots (not yet implemented).\n\n"
+            "**Stock Turn Rate (annualised)** = (COGS × 12) / "
+            "Average Inventory Value.\n\n"
+            "**Slow Stock Cleared ($)** = `Quantity × AverageCost` "
+            "for SKUs currently in the dormancy_warnings set, "
+            "grouped by month. Uses CURRENT dormancy set (not "
+            "as-of-month) — good for trend, slight imprecision "
+            "for very old months.\n\n"
+            "**Slow Stock Value (EOM)** = month-end value of "
+            "slow stock on shelf, from `slow_mover_value_"
+            "snapshots`. Current month uses the live engine "
+            "calc. Sparse for months before May 2026 — that's "
+            "expected.\n\n"
+            "**Channel filter**: defaults to `(All channels)`. "
+            "Easy Insight may have filtered to Shopify-only — "
+            "that's a different scope; toggle here to match.\n\n"
+            "---\n\n"
+            ":bulb: **For commissions**: GP $ and GP % on this "
+            "page are the canonical numbers, but a month is not "
+            "frozen until month-end snapshots are added. Until "
+            "then, run commissions promptly after month-close to "
+            "minimise drift from CIN7 re-costing."
+        )
+
     # v2.67.88 — debug panel for shipments DataFrame state. Prints
     # what the page actually sees at render time. Once the cache /
     # loader chain is healthy this can be removed; until then it's
@@ -15793,7 +15873,12 @@ elif page == "Monthly Metrics":
             _ship_cost_label = (
                 "Shipping Cost (⚠️ stale CSV — re-sync needed)")
         elif _ship_cost_per_month:
-            _ship_cost_label = "Shipping Cost (ShipStation)"
+            # v2.67.290 — make it explicit the cost side is parcel
+            # only. Shipping Charged uses the header-delta and
+            # captures LTL too, so the margin row is asymmetric.
+            _ship_cost_label = (
+                "Shipping Cost (ShipStation parcel only — "
+                "⚠️ LTL not included)")
         else:
             _ship_cost_label = (
                 "Shipping Cost (ShipStation pending — set "
@@ -15823,7 +15908,12 @@ elif page == "Monthly Metrics":
         _row("Customers", "# of New Customers",
              _per_month(lambda m: int(new_customers.get(m, 0))),
              fmt="int")
-        _row("Customers", "Running Customer Count",
+        # v2.67.290 — renamed from "Running Customer Count" because
+        # the previous label implied "active" whereas this is a
+        # cumulative ever-bought count. Easy Insight likely showed
+        # active-in-last-N-months; this is a different (also valid)
+        # metric. Methodology expander above explains the change.
+        _row("Customers", "Cumulative Customers (ever bought)",
              _per_month(_running_customers),
              fmt="int")
         _row("Customers", "# of Lost Customers (3mo silent)",

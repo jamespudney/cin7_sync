@@ -440,6 +440,50 @@ basis for each term — so when the engine suggests fewer units
 than before, the buyer can see exactly why ("you reorder Topmet
 every 7d", "Topmet closed Wk 32–34: +14d cover").
 
+#### Monthly Metrics — formulas & commission caveats (v2.67.290)
+The Monthly Metrics page is the commission base, so every metric
+needs to be auditable. The full methodology lives in an in-app
+expander on that page; the headline definitions:
+
+- **Sales $** = `sum(product line Total)` ex-tax, ex-shipping,
+  excluding voided / credited / cancelled SaleIDs.
+- **COGS** = `sum(Quantity × AverageCost)` on product lines.
+  ⚠️ CIN7's `AverageCost` re-costs as later receipts change
+  the moving average — historical months can drift over time.
+  For commissions, run them promptly after month-close, or
+  snapshot the figure at month-close (snapshot table is a
+  pending project).
+- **Gross Profit** = Sales − COGS. **GP %** = GP / Sales.
+- **Average Order Value** = Sales $ / # of Monthly Orders.
+  Numerator is product sales only; denominator counts distinct
+  SaleIDs (excluding voided/credited). Higher than Easy
+  Insight's AOV because we drop voided/credited.
+- **Shipping Charged** = header-delta `InvoiceAmount − lines −
+  Tax`, clipped ≥0. Captures parcel + LTL + handling +
+  surcharges.
+- **Shipping Cost (ShipStation parcel only)** = ShipStation
+  `ShipmentCost` sum by month. ⚠️ **Parcel only** — LTL is
+  not captured. So `Shipping Charged − Shipping Cost` over-
+  states shipping margin for any month with LTL. Do not
+  commission on shipping margin until reconciled.
+- **Cumulative Customers (ever bought)** = monotonic count of
+  customers whose first purchase is ≤ month m. Renamed from
+  "Running Customer Count" (v2.67.290) because the previous
+  label implied active. Easy Insight's similar-looking metric
+  was "active in last N months" — that's a different scope.
+- **Repeat Customer %** = of distinct customers buying in
+  month m, share who had any prior-month purchase.
+- **Average Inventory Value** = ⚠️ **modelled estimate**, not
+  a measurement. The page walks COGS / purchases back from
+  today's snapshot, with damping (raw walk-back drifts due to
+  landed-cost mismatch between sale AverageCost and PO Total).
+  For audit-grade history, we need month-end snapshots.
+- **Stock Turn Rate (annualised)** = (COGS × 12) / Avg Inv.
+
+For commissions: GP $ and GP % are canonical; the shipping
+margin row and historical-COGS drift are the two unreconciled
+items. Both are surfaced as warnings on the page.
+
 #### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
 Two new rows in Monthly Metrics → Inventory:
 
