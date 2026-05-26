@@ -4494,6 +4494,55 @@ def upsert_qbo_monthly_pl(month: str,
              float(amount)))
 
 
+def batch_upsert_qbo_monthly_pl(rows: list) -> int:
+    """v2.67.293 — bulk upsert variant. Opens ONE DB connection and
+    executes every upsert inside it instead of per-row connecting.
+    The per-row variant above took 8 minutes for 868 rows on the
+    Render Postgres because each `with connect()` paid connection
+    setup latency; this version completes in seconds.
+
+    `rows` is a list of dicts with keys: month, account_id,
+    account_number, account_name, amount, account_type,
+    parent_account_id. Returns the number of rows actually written
+    (skipping any with missing month or account_name)."""
+    if not rows:
+        return 0
+    sql = (
+        "INSERT INTO qbo_monthly_pl "
+        "(month, account_id, account_number, account_name, "
+        " account_type, parent_account_id, amount, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(month, account_id, account_name) DO UPDATE "
+        "SET account_number = excluded.account_number, "
+        "    account_type = excluded.account_type, "
+        "    parent_account_id = excluded.parent_account_id, "
+        "    amount = excluded.amount, "
+        "    synced_at = datetime('now')")
+    n = 0
+    with connect() as c:
+        for r in rows:
+            month = (r.get("month") or "").strip()
+            name = (r.get("account_name") or "").strip()
+            if not month or not name:
+                continue
+            try:
+                c.execute(sql, (
+                    month,
+                    r.get("account_id") or "",
+                    r.get("account_number"),
+                    name,
+                    r.get("account_type"),
+                    r.get("parent_account_id"),
+                    float(r.get("amount") or 0)))
+                n += 1
+            except Exception:  # noqa: BLE001
+                # Single-row failure: continue with the rest.
+                # The per-row helper above does the same; here we
+                # don't want one bad row to blow up the batch.
+                continue
+    return n
+
+
 def get_qbo_monthly_pl(start_month: Optional[str] = None,
                        end_month: Optional[str] = None) -> list:
     """Return all qbo_monthly_pl rows, optionally bounded by month

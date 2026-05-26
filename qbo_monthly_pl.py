@@ -314,28 +314,28 @@ def cmd_sync(args) -> int:
     if seeded:
         log.info("Seeded %d default account mappings.", seeded)
 
-    n_ok = 0
-    n_err = 0
+    # v2.67.293 — use the batch upsert. 868 rows over 868 separate
+    # DB connections took 8 minutes on Render Postgres; batching
+    # them under one connection drops that to seconds.
+    payload = []
     for (month, acct_id, name, section, parent, amount) in tuples:
         meta = acct_meta.get(acct_id or "") or {}
-        try:
-            db.upsert_qbo_monthly_pl(
-                month=month,
-                account_id=acct_id,
-                account_number=meta.get("number") or None,
-                account_name=name,
-                amount=amount,
-                account_type=meta.get("type") or section,
-                parent_account_id=parent)
-            n_ok += 1
-        except Exception as exc:  # noqa: BLE001
-            log.warning("upsert failed for %s/%s: %s",
-                          month, name, exc)
-            n_err += 1
+        payload.append({
+            "month": month,
+            "account_id": acct_id,
+            "account_number": meta.get("number") or None,
+            "account_name": name,
+            "amount": amount,
+            "account_type": meta.get("type") or section,
+            "parent_account_id": parent,
+        })
+    log.info("Bulk-writing %d row(s) to qbo_monthly_pl...",
+              len(payload))
+    n_ok = db.batch_upsert_qbo_monthly_pl(payload)
 
     log.info("=" * 60)
-    log.info("Wrote %d row(s) (%d error(s)) to qbo_monthly_pl.",
-              n_ok, n_err)
+    log.info("Wrote %d / %d row(s) to qbo_monthly_pl.",
+              n_ok, len(payload))
     return 0
 
 
