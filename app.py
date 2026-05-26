@@ -15549,7 +15549,22 @@ elif page == "Monthly Metrics":
             "the CIN7-derived figure is from QB — should trend "
             "toward zero as reconciliation completes.\n\n"
             "When QB rows are missing, run "
-            "`python qbo_monthly_pl.py sync` to refresh."
+            "`python qbo_monthly_pl.py sync` to refresh.\n\n"
+            "---\n\n"
+            "**:satellite: Channel rows (CIN7 by SalesRep, "
+            "v2.67.295)** — the rows under *Channel (CIN7 by "
+            "SalesRep)* split revenue by the `SalesRepresentative` "
+            "field on each CIN7 sale order. Amazon marketplace "
+            "orders come in with SalesRep = `AMAZON`; eBay = "
+            "`EBAY`; Shopify B2C usually = `SHOPIFY`; staff names "
+            "appear for direct/phone sales. **This is the TRUE "
+            "channel split** — real Amazon revenue is booked to "
+            "acc#400 in QB and only distinguishable by SalesRep, "
+            "not by chart-of-accounts number (acc#403 is a small "
+            "misc Amazon ledger, not the channel).\n\n"
+            "Rows only appear once you re-run the CIN7 sales sync "
+            "(`python cin7_sync.py salelines --days 730`) — older "
+            "CSVs lack the SalesRepresentative column."
         )
 
     # v2.67.88 — debug panel for shipments DataFrame state. Prints
@@ -15990,8 +16005,15 @@ elif page == "Monthly Metrics":
         if _qb_has_data("total_income"):
             _row("QB P&L Detail", "Total Income (QB)",
                  _per_month(lambda m: _qb(m, "total_income")))
+        # v2.67.295 — acc#403 is a small misc Amazon ledger account
+        # (e.g. -$3.71 for Apr 2026); the REAL Amazon channel
+        # revenue is booked to acc#400 and split by SalesRep on the
+        # CIN7 sale (see "Channel (CIN7 by SalesRep)" section
+        # below). Showing acc#403 as "Amazon sales" was misleading.
         if _qb_has_data("amazon_sales"):
-            _row("QB P&L Detail", "  Amazon sales (acc 403)",
+            _row("QB P&L Detail",
+                 "  Acc 403 misc (NOT the Amazon channel — see "
+                 "SalesRep rows below)",
                  _per_month(lambda m: _qb(m, "amazon_sales")))
         if _qb_has_data("sundry_income"):
             _row("QB P&L Detail", "  Sundry income (billable exps)",
@@ -16027,6 +16049,52 @@ elif page == "Monthly Metrics":
         if _qb_has_data("qb_net_income"):
             _row("QB P&L Detail", "QB Net Income (bottom line)",
                  _per_month(lambda m: _qb(m, "qb_net_income")))
+
+        # v2.67.295 — Channel rows from CIN7 SalesRep field.
+        # Amazon / eBay / Shopify / individual reps come in on the
+        # `SalesRepresentative` column (denormalised onto sale_lines
+        # by cin7_sync.py). This is the TRUE channel split — real
+        # Amazon revenue lives in acc#400 by SalesRep, not acc#403.
+        # Column may be absent on pre-v2.67.295 CSVs; the section
+        # silently skips in that case (re-sync to populate).
+        if "SalesRepresentative" in sl_prod.columns:
+            _sr_norm = (sl_prod["SalesRepresentative"]
+                         .fillna("").astype(str).str.strip())
+            _slp = sl_prod.assign(_rep=_sr_norm)
+            _slp = _slp[_slp["_rep"] != ""]
+            if not _slp.empty:
+                _rep_per_month = _slp.groupby(
+                    ["MonthKey", "_rep"])["Total"].sum()
+                _rep_totals = (
+                    _slp.groupby("_rep")["Total"].sum())
+                # Material reps only (any rep with > $500 absolute
+                # 14-month volume is worth a row). Sort by total
+                # descending so biggest reps appear first.
+                _material_reps = _rep_totals[
+                    _rep_totals.abs() >= 500].sort_values(
+                        ascending=False).index.tolist()[:25]
+                for _rep in _material_reps:
+                    _row("Channel (CIN7 by SalesRep)",
+                         f"  {_rep}",
+                         _per_month(
+                             lambda m, r=_rep: float(
+                                 _rep_per_month.get((m, r), 0)
+                                 or 0)))
+                # Total of marketplace reps (uppercase single-word
+                # patterns like AMAZON / EBAY / WALMART / ETSY are
+                # the marketplaces; staff names are mixed-case).
+                _marketplace_names = {"AMAZON", "EBAY", "WALMART",
+                                       "ETSY", "SHOPIFY"}
+                _mkt_in_data = [r for r in _material_reps
+                                if r.upper() in _marketplace_names]
+                if _mkt_in_data:
+                    _row("Channel (CIN7 by SalesRep)",
+                         f"Marketplace total ({', '.join(_mkt_in_data)})",
+                         _per_month(
+                             lambda m: sum(
+                                 float(_rep_per_month.get((m, r),
+                                                            0) or 0)
+                                 for r in _mkt_in_data)))
 
         _row("Margins", "Line Contribution Margin",
              _per_month(lambda m: _get(sales_per_month, m)

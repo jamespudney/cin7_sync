@@ -610,6 +610,17 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
     order_date = header.get("OrderDate") or detail.get("OrderDate")
     source = header.get("SourceChannel") or detail.get("SourceChannel")
     sale_type = header.get("Type") or detail.get("Type")
+    # v2.67.295 — capture SalesRepresentative for marketplace
+    # segmentation. CIN7 Core sets this to 'AMAZON' / 'EBAY' /
+    # 'SHOPIFY' / a real staff name on the sale header, depending
+    # on origin. Denormalised onto every line so the Monthly
+    # Metrics page can group revenue by rep without joining back
+    # to the headers CSV. Real Amazon revenue lives here (in CIN7
+    # / QB acc 400), NOT in QB acc 403 (which is a small misc
+    # ledger). Reference: Joe Caballero SO-56856 screenshot
+    # (Amazon marketplace order with SalesRep = "AMAZON").
+    sales_rep = (header.get("SalesRepresentative")
+                 or detail.get("SalesRepresentative"))
     # v2.67.52 — capture freeform sale-side text fields so the AI's
     # get_sale_order tool can surface what the rep typed (build
     # instructions, customer PO #, delivery requirements). Same
@@ -637,6 +648,10 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Status": status,
                 "SaleType": sale_type,
                 "SourceChannel": source,
+                # v2.67.295 — SalesRepresentative denormalised
+                # so the Monthly Metrics page can split revenue
+                # by AMAZON / EBAY / SHOPIFY / individual reps.
+                "SalesRepresentative": sales_rep,
                 "Customer": cust,
                 "CustomerID": cust_id,
                 "LocationID": loc_id,
@@ -683,6 +698,9 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Status": status,
                 "SaleType": sale_type,
                 "SourceChannel": source,
+                # v2.67.295 — propagate SalesRep onto charge lines
+                # too so per-rep totals include freight/handling.
+                "SalesRepresentative": sales_rep,
                 "Customer": cust,
                 "CustomerID": cust_id,
                 "LocationID": loc_id,
@@ -718,6 +736,8 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Status": status,
                 "SaleType": sale_type,
                 "SourceChannel": source,
+                # v2.67.295 — SalesRep on the order-only fallback.
+                "SalesRepresentative": sales_rep,
                 "Customer": cust,
                 "CustomerID": cust_id,
                 "LocationID": loc_id,
@@ -750,6 +770,8 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
                 "Status": status,
                 "SaleType": sale_type,
                 "SourceChannel": source,
+                # v2.67.295 — SalesRep on order-level charges too.
+                "SalesRepresentative": sales_rep,
                 "Customer": cust,
                 "CustomerID": cust_id,
                 "LocationID": loc_id,
