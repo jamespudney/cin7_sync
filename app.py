@@ -15562,9 +15562,12 @@ elif page == "Monthly Metrics":
             "acc#400 in QB and only distinguishable by SalesRep, "
             "not by chart-of-accounts number (acc#403 is a small "
             "misc Amazon ledger, not the channel).\n\n"
-            "Rows only appear once you re-run the CIN7 sales sync "
-            "(`python cin7_sync.py salelines --days 730`) — older "
-            "CSVs lack the SalesRepresentative column."
+            "v2.67.296 — works against the existing 5-year sales-"
+            "headers data without any re-sync. The header CSV "
+            "already carries `SalesRepresentative` on every sale; "
+            "the page joins it onto sale_lines via SaleID at load "
+            "time. Future sale_lines syncs (post-v2.67.295) carry "
+            "the column natively."
         )
 
     # v2.67.88 — debug panel for shipments DataFrame state. Prints
@@ -16052,11 +16055,39 @@ elif page == "Monthly Metrics":
 
         # v2.67.295 — Channel rows from CIN7 SalesRep field.
         # Amazon / eBay / Shopify / individual reps come in on the
-        # `SalesRepresentative` column (denormalised onto sale_lines
-        # by cin7_sync.py). This is the TRUE channel split — real
-        # Amazon revenue lives in acc#400 by SalesRep, not acc#403.
-        # Column may be absent on pre-v2.67.295 CSVs; the section
-        # silently skips in that case (re-sync to populate).
+        # `SalesRepresentative` column. v2.67.296 — enrich sl_prod
+        # from the sales-headers CSV at load time (we already have
+        # 5 years of headers locally; the saleList endpoint
+        # populates SalesRepresentative on every sale). Avoids a
+        # multi-hour re-pull of sale_lines just to backfill this
+        # single column. New sale_lines syncs (post-v2.67.295)
+        # carry the column natively; this just fills the gap for
+        # historical CSVs.
+        if ("SalesRepresentative" not in sl_prod.columns
+                and not _sales_hdr.empty
+                and "SaleID" in sl_prod.columns
+                and "SalesRepresentative" in _sales_hdr.columns):
+            _rep_map = (_sales_hdr
+                .dropna(subset=["SaleID"])
+                .drop_duplicates("SaleID")
+                .set_index("SaleID")["SalesRepresentative"]
+                .to_dict())
+            sl_prod = sl_prod.assign(
+                SalesRepresentative=sl_prod["SaleID"].map(_rep_map))
+        elif ("SalesRepresentative" in sl_prod.columns
+                and not _sales_hdr.empty
+                and "SalesRepresentative" in _sales_hdr.columns
+                and "SaleID" in sl_prod.columns):
+            # Column exists but may be empty on rows that came in
+            # before v2.67.295 — fill nulls from the header map.
+            _rep_map = (_sales_hdr
+                .dropna(subset=["SaleID"])
+                .drop_duplicates("SaleID")
+                .set_index("SaleID")["SalesRepresentative"]
+                .to_dict())
+            _filled = sl_prod["SalesRepresentative"].fillna(
+                sl_prod["SaleID"].map(_rep_map))
+            sl_prod = sl_prod.assign(SalesRepresentative=_filled)
         if "SalesRepresentative" in sl_prod.columns:
             _sr_norm = (sl_prod["SalesRepresentative"]
                          .fillna("").astype(str).str.strip())
