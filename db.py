@@ -4565,37 +4565,55 @@ def get_qbo_monthly_pl(start_month: Optional[str] = None,
 
 
 def qbo_monthly_pl_summary_by_category(
-        category_to_account_numbers: dict) -> dict:
+        category_to_mapping: dict) -> dict:
     """Aggregate qbo_monthly_pl rows by category and month.
 
-    category_to_account_numbers: {category_name: [account_number, ...]}
+    category_to_mapping: {category_name: {'account_numbers': [...],
+                                          'account_names': [...]}}
+        — or for backward-compat, {category_name: [account_number...]}
+        which is treated as account_numbers only.
+
     Returns: {month: {category_name: amount}}.
 
-    Accounts not in any mapping are ignored. Negative amounts
-    (refunds / contra-revenue) are summed naturally."""
-    if not category_to_account_numbers:
+    v2.67.294 — extended to allow account-name matching too, so QB
+    subtotal rows like 'Total Income' / 'Total Cost of Goods Sold'
+    (which have no AcctNum) can be captured as their own categories.
+    An account can match MULTIPLE categories (e.g. acc#500 can live
+    in BOTH 'cogs' and 'total_cogs' if both mappings include it)."""
+    if not category_to_mapping:
         return {}
-    # Build a reverse lookup: account_number → category.
-    rev: dict = {}
-    for cat, nums in category_to_account_numbers.items():
-        for n in (nums or []):
-            rev[str(n).strip()] = cat
-    if not rev:
+    # Normalise each category's mapping into (number_set, name_set).
+    cat_specs: dict = {}
+    for cat, m in category_to_mapping.items():
+        if isinstance(m, dict):
+            nums = m.get("account_numbers") or []
+            names = m.get("account_names") or []
+        else:
+            nums, names = list(m or []), []
+        cat_specs[cat] = (
+            {str(n).strip() for n in nums if str(n).strip()},
+            {str(n).strip().lower() for n in names
+             if str(n).strip()},
+        )
+    if not cat_specs:
         return {}
     out: dict = {}
     with connect() as c:
         rows = c.execute(
-            "SELECT month, account_number, amount FROM "
-            "qbo_monthly_pl WHERE account_number IS NOT NULL").fetchall()
+            "SELECT month, account_number, account_name, amount "
+            "FROM qbo_monthly_pl").fetchall()
     for r in rows:
         d = dict(r)
-        cat = rev.get(str(d.get("account_number") or "").strip())
-        if not cat:
-            continue
+        num = str(d.get("account_number") or "").strip()
+        name = str(d.get("account_name") or "").strip().lower()
+        amount = float(d.get("amount") or 0)
         month = d.get("month") or ""
-        out.setdefault(month, {})
-        out[month][cat] = out[month].get(cat, 0.0) + float(
-            d.get("amount") or 0)
+        if not month:
+            continue
+        for cat, (num_set, name_set) in cat_specs.items():
+            if (num and num in num_set) or (name and name in name_set):
+                out.setdefault(month, {})
+                out[month][cat] = out[month].get(cat, 0.0) + amount
     return out
 
 
@@ -4647,11 +4665,74 @@ def set_qbo_account_mapping(category: str,
 
 # Pre-seed default mappings on first read so the page works out of
 # the box for W4S's chart of accounts (per Viktor's audit).
+# v2.67.294 — extended to include broader QB summary rows so the
+# Monthly Metrics page can show both the narrow product-only view
+# AND the QB-canonical "Total Income / Total COGS / Net Income"
+# view side by side. Each entry below is (account_numbers,
+# account_names, notes). Either matcher is sufficient.
 _DEFAULT_QBO_MAPPINGS = {
-    "sales":            ["400"],
-    "shipping_charged": ["405"],
-    "cogs":             ["500"],
-    "shipping_cost":    ["694"],
+    # Narrow product-only views (existing).
+    "sales": (
+        ["400"], [],
+        "Product sales only (acc 400). Matches the buyer-team view."),
+    "shipping_charged": (
+        ["405"], [],
+        "Acc 405 Sales - Shipping. Customer-facing freight income."),
+    "cogs": (
+        ["500"], [],
+        "Acc 500 product COGS only. Excludes Amazon fees + "
+        "inventory adjustments."),
+    "shipping_cost": (
+        ["694"], [],
+        "Acc 694 Shipping-Out. Parcel + freight billed out."),
+    # Broader QB-canonical views (v2.67.294, option C).
+    "total_income": (
+        [], ["Total Income"],
+        "QB's own 'Total Income' summary row. Sales + shipping "
+        "income + sundry / billable expense income."),
+    "total_cogs": (
+        ["500", "502", "550"], ["Total Cost of Goods Sold"],
+        "QB's 'Total COGS' (acc 500 + 502 Amazon fees + 550 "
+        "inventory adjustments). Matches QB's GP calculation."),
+    "qb_gross_profit": (
+        [], ["Gross Profit"],
+        "QB's own 'Gross Profit' summary row (Total Income − "
+        "Total COGS). Compare with our app's GP for variance."),
+    "qb_total_expenses": (
+        [], ["Total Expenses"],
+        "QB's 'Total Expenses' summary row (all operating "
+        "expenses, ex COGS)."),
+    "qb_net_operating_income": (
+        [], ["Net Operating Income"],
+        "QB's 'Net Operating Income' summary row "
+        "(Gross Profit − Total Expenses)."),
+    "qb_net_income": (
+        [], ["Net Income"],
+        "QB's bottom-line 'Net Income' summary row."),
+    # Granular cost / income components for visibility.
+    "amazon_sales": (
+        ["403"], [],
+        "Acc 403 Sales - Amazon (separate from main sales line)."),
+    "cogs_amazon_fees": (
+        ["502"], [],
+        "Acc 502 COGS - Amazon Fees."),
+    "inventory_adjustment": (
+        ["550"], [],
+        "Acc 550 Inventory Adjustment — write-offs / write-ons."),
+    "sundry_income": (
+        [], ["Sundry Income - Billable Exps",
+              "Billable Expense Income"],
+        "Sundry billable-expense income (no account number on "
+        "the P&L)."),
+    "packaging_cost": (
+        ["690"], [],
+        "Acc 690 Shipping - Packaging & Consumables. Real cost "
+        "of fulfilling but not on the carrier label."),
+    "shipping_in": (
+        ["692"], [],
+        "Acc 692 Shipping-In. Inbound freight (usually "
+        "capitalised into COGS but tracked separately for "
+        "visibility)."),
 }
 
 
@@ -4660,12 +4741,20 @@ def seed_default_qbo_account_mappings(actor: str = "system") -> int:
     Returns the count of mappings created."""
     existing = get_qbo_account_mappings()
     n = 0
-    for cat, nums in _DEFAULT_QBO_MAPPINGS.items():
+    for cat, spec in _DEFAULT_QBO_MAPPINGS.items():
         if cat in existing:
             continue
-        set_qbo_account_mapping(cat, account_numbers=nums,
-                                 notes="Default (W4S chart of accounts)",
-                                 actor=actor)
+        if isinstance(spec, tuple):
+            nums, names, notes = spec
+        else:
+            # legacy: bare list of account numbers
+            nums, names, notes = spec, [], "Default (W4S)"
+        set_qbo_account_mapping(
+            cat,
+            account_numbers=nums,
+            account_names=names,
+            notes=notes,
+            actor=actor)
         n += 1
     return n
 

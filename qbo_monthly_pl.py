@@ -356,15 +356,32 @@ def cmd_show(args) -> int:
                   r.get("account_number") or "-",
                   (r.get("account_name") or "")[:40],
                   float(r.get("amount") or 0))
-    # Summary by category
+    # Summary by category — passes the FULL mapping dict so both
+    # account_numbers and account_names matchers fire.
     mappings = db.get_qbo_account_mappings()
     if mappings:
         log.info("\nCategory summary (per mapping config):")
-        cat_to_nums = {cat: m.get("account_numbers", [])
-                       for cat, m in mappings.items()}
-        by_cat = db.qbo_monthly_pl_summary_by_category(cat_to_nums)
-        for cat, amt in (by_cat.get(args.month, {}) or {}).items():
-            log.info("  %-20s $%.2f", cat, amt)
+        by_cat = db.qbo_monthly_pl_summary_by_category(mappings)
+        for cat, amt in sorted(
+                (by_cat.get(args.month, {}) or {}).items()):
+            log.info("  %-25s $%.2f", cat, amt)
+    return 0
+
+
+def cmd_seed_mappings(args) -> int:
+    """Install / refresh the default qbo_account_mappings for any
+    category not already configured. Safe to re-run — existing
+    categories aren't overwritten."""
+    _setup_log(args.verbose)
+    n = db.seed_default_qbo_account_mappings(
+        actor="qbo_monthly_pl.seed-mappings")
+    log.info("Seeded %d new mapping(s).", n)
+    log.info("Current mappings:")
+    for cat, m in sorted(db.get_qbo_account_mappings().items()):
+        nums = ", ".join(m.get("account_numbers") or []) or "—"
+        names = ", ".join(m.get("account_names") or []) or "—"
+        log.info("  %-30s nums=[%s]  names=[%s]",
+                  cat, nums, names)
     return 0
 
 
@@ -390,6 +407,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                       help="'YYYY-MM' month to inspect.")
     sh.add_argument("--verbose", action="store_true")
     sh.set_defaults(func=cmd_show)
+
+    sm = sub.add_parser(
+        "seed-mappings",
+        help="Insert default qbo_account_mappings for any category "
+              "not yet configured. Idempotent — existing categories "
+              "are left untouched.")
+    sm.add_argument("--verbose", action="store_true")
+    sm.set_defaults(func=cmd_seed_mappings)
 
     args = p.parse_args(argv)
     return args.func(args)

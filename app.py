@@ -15842,14 +15842,14 @@ elif page == "Monthly Metrics":
         # QB is the reconciled financial source of truth — when
         # available, treat it as canonical and show CIN7 as
         # parallel "operational" data. Pulled by qbo_monthly_pl.py.
+        # v2.67.294 — pass the FULL mapping dict (numbers + names)
+        # so QB subtotal rows like "Total Income" / "Total COGS" /
+        # "Net Income" (which have no AcctNum) get captured too.
         # ------------------------------------------------------
         try:
             _qbo_mappings = db.get_qbo_account_mappings() or {}
-            _cat_to_nums = {
-                cat: m.get("account_numbers", [])
-                for cat, m in _qbo_mappings.items()}
             _qb_by_month = db.qbo_monthly_pl_summary_by_category(
-                _cat_to_nums) if _cat_to_nums else {}
+                _qbo_mappings) if _qbo_mappings else {}
         except Exception:  # noqa: BLE001
             _qb_by_month = {}
 
@@ -15981,6 +15981,52 @@ elif page == "Monthly Metrics":
             _row("Margins", "QB Shipping Margin (acc 405 − acc 694)",
                  _per_month(lambda m: _qb(m, "shipping_charged")
                                        - _qb(m, "shipping_cost")))
+
+        # v2.67.294 — QB P&L Detail section (option C from the
+        # audit follow-up). Surfaces the broader QB summary rows
+        # alongside the narrow product-only canonical view above,
+        # so finance can reconcile against the full QB report
+        # without leaving the page.
+        if _qb_has_data("total_income"):
+            _row("QB P&L Detail", "Total Income (QB)",
+                 _per_month(lambda m: _qb(m, "total_income")))
+        if _qb_has_data("amazon_sales"):
+            _row("QB P&L Detail", "  Amazon sales (acc 403)",
+                 _per_month(lambda m: _qb(m, "amazon_sales")))
+        if _qb_has_data("sundry_income"):
+            _row("QB P&L Detail", "  Sundry income (billable exps)",
+                 _per_month(lambda m: _qb(m, "sundry_income")))
+        if _qb_has_data("total_cogs"):
+            _row("QB P&L Detail",
+                 "Total COGS (QB — acc 500 + 502 + 550)",
+                 _per_month(lambda m: _qb(m, "total_cogs")))
+        if _qb_has_data("cogs_amazon_fees"):
+            _row("QB P&L Detail", "  Amazon fees (acc 502)",
+                 _per_month(lambda m: _qb(m, "cogs_amazon_fees")))
+        if _qb_has_data("inventory_adjustment"):
+            _row("QB P&L Detail", "  Inventory adjustment (acc 550)",
+                 _per_month(lambda m: _qb(m, "inventory_adjustment")))
+        if _qb_has_data("packaging_cost"):
+            _row("QB P&L Detail",
+                 "  Packaging & consumables (acc 690)",
+                 _per_month(lambda m: _qb(m, "packaging_cost")))
+        if _qb_has_data("shipping_in"):
+            _row("QB P&L Detail", "  Shipping-in / inbound (acc 692)",
+                 _per_month(lambda m: _qb(m, "shipping_in")))
+        if _qb_has_data("qb_gross_profit"):
+            _row("QB P&L Detail",
+                 "QB Gross Profit (Total Income − Total COGS)",
+                 _per_month(lambda m: _qb(m, "qb_gross_profit")))
+        if _qb_has_data("qb_total_expenses"):
+            _row("QB P&L Detail", "Total Expenses (QB)",
+                 _per_month(lambda m: _qb(m, "qb_total_expenses")))
+        if _qb_has_data("qb_net_operating_income"):
+            _row("QB P&L Detail",
+                 "QB Net Operating Income",
+                 _per_month(lambda m: _qb(m, "qb_net_operating_income")))
+        if _qb_has_data("qb_net_income"):
+            _row("QB P&L Detail", "QB Net Income (bottom line)",
+                 _per_month(lambda m: _qb(m, "qb_net_income")))
 
         _row("Margins", "Line Contribution Margin",
              _per_month(lambda m: _get(sales_per_month, m)
