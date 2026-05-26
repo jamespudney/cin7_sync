@@ -204,6 +204,23 @@ CREATE TABLE IF NOT EXISTS supplier_holidays (
 CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
     ON supplier_holidays(supplier_name);
 
+-- v2.67.285 — observed actual lead times pulled from Inventory
+-- Planner. Per-SKU; IP tracks the real elapsed time between PO
+-- placement and receipt (avg_lead_time). The reorder engine
+-- prefers this over the supplier_config default — observed beats
+-- a stale 35-day default every time.
+CREATE TABLE IF NOT EXISTS ip_lead_times (
+    sku                       TEXT    PRIMARY KEY,
+    observed_lead_time_days   INTEGER,           -- IP avg_lead_time
+    configured_lead_time_days INTEGER,           -- IP lead_time setting
+    vendor_name               TEXT,
+    sales_velocity1           REAL,              -- IP daily velocity
+    last_received_at          TEXT,
+    synced_at                 TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ip_lead_times_vendor
+    ON ip_lead_times(vendor_name);
+
 -- Critical components per tube family. Team-designated components that
 -- we want to track closely (e.g. Yukon mounting plate used across many
 -- tubes and has long supplier lead time). Shown prominently on LED Tubes
@@ -3610,6 +3627,24 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS idx_supplier_holidays_supplier
           ON supplier_holidays(supplier_name);
       """),
+    # v2.67.285 — observed actual lead times from Inventory Planner.
+    ("ip_lead_times_table",
+      """
+      CREATE TABLE IF NOT EXISTS ip_lead_times (
+          sku                       TEXT PRIMARY KEY,
+          observed_lead_time_days   INTEGER,
+          configured_lead_time_days INTEGER,
+          vendor_name               TEXT,
+          sales_velocity1           REAL,
+          last_received_at          TEXT,
+          synced_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("ip_lead_times_index",
+      """
+      CREATE INDEX IF NOT EXISTS idx_ip_lead_times_vendor
+          ON ip_lead_times(vendor_name);
+      """),
     # v2.67.211 — QuickBooks Online connection table.
     ("qbo_connection",
       """
@@ -4304,6 +4339,49 @@ def all_supplier_holidays_by_supplier() -> dict:
         d = dict(r)
         out.setdefault(d["supplier_name"], []).append(d)
     return out
+
+
+# ---------------------------------------------------------------------------
+# IP observed lead times (v2.67.285)
+# ---------------------------------------------------------------------------
+def upsert_ip_lead_time(sku: str,
+                         observed_lead_time_days: Optional[int],
+                         configured_lead_time_days: Optional[int],
+                         vendor_name: Optional[str] = None,
+                         sales_velocity1: Optional[float] = None,
+                         last_received_at: Optional[str] = None) -> None:
+    """Insert/update one IP-observed lead-time record, keyed on SKU."""
+    if not sku:
+        return
+    with connect() as c:
+        c.execute(
+            "INSERT INTO ip_lead_times "
+            "(sku, observed_lead_time_days, "
+            " configured_lead_time_days, vendor_name, "
+            " sales_velocity1, last_received_at, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(sku) DO UPDATE SET "
+            "  observed_lead_time_days = "
+            "    excluded.observed_lead_time_days, "
+            "  configured_lead_time_days = "
+            "    excluded.configured_lead_time_days, "
+            "  vendor_name = excluded.vendor_name, "
+            "  sales_velocity1 = excluded.sales_velocity1, "
+            "  last_received_at = excluded.last_received_at, "
+            "  synced_at = datetime('now')",
+            (sku, observed_lead_time_days,
+             configured_lead_time_days, vendor_name,
+             sales_velocity1, last_received_at))
+
+
+def get_ip_lead_times() -> dict:
+    """{sku: dict(observed_lead_time_days, configured_lead_time_days,
+    vendor_name, ...)} — the reorder engine's lookup for observed
+    actual lead times."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM ip_lead_times").fetchall()
+    return {r["sku"]: dict(r) for r in rows}
 
 
 def set_supplier_pricing(

@@ -10708,6 +10708,13 @@ elif page == "Ordering":
     # v2.67.284 — load supplier holidays once for the engine
     # (closures used per-row inside _compute_target_and_reorder).
     closures_by_supplier = db.all_supplier_holidays_by_supplier()
+    # v2.67.285 — observed actual lead times from Inventory Planner.
+    # Refreshed weekly by ip_lead_times.py. The engine prefers these
+    # (sane-clamped) over the supplier_config defaults.
+    try:
+        ip_lead_times_by_sku = db.get_ip_lead_times()
+    except Exception:  # noqa: BLE001
+        ip_lead_times_by_sku = {}
     _today_for_engine = datetime.date.today()
 
     def _format_iso_weeks_range(start, end):
@@ -10784,6 +10791,25 @@ elif page == "Ordering":
         else:
             lead_time_days = lt_sea
             freight_mode_used = "sea"
+
+        # v2.67.285 — prefer IP's observed actual lead time when
+        # we have one. IP literally measures PO-to-receipt time
+        # (avg_lead_time) — that's the real lead time, not a
+        # default. Sane clamp to [3, 120] days so a noisy sample
+        # (e.g. a single freak shipment) can't break ordering.
+        _sku_for_lt = str(row.get("SKU") or "")
+        _ip_row = ip_lead_times_by_sku.get(_sku_for_lt) or {}
+        _obs_lt = _ip_row.get("observed_lead_time_days")
+        _conf_lt_ip = _ip_row.get("configured_lead_time_days")
+        lead_time_basis_from_ip = None
+        if _obs_lt and 3 <= int(_obs_lt) <= 120:
+            lead_time_days = int(_obs_lt)
+            freight_mode_used = "IP observed actual"
+            lead_time_basis_from_ip = "observed"
+        elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
+            lead_time_days = int(_conf_lt_ip)
+            freight_mode_used = "IP configured"
+            lead_time_basis_from_ip = "configured"
 
         # Safety factor by class
         abc = row.get("ABC") or "C"
@@ -11060,12 +11086,25 @@ elif page == "Ordering":
 
         trace = "".join(demand_lines) + (
             f"**Lead time**: {lead_time_days} days "
-            f"({freight_mode_used}) "
-            + (f"— SKU length {length_mm}mm > "
-               f"{air_max_len}mm air max, forced sea\n\n"
-               if (air_eligible_default and air_max_len
-                   and length_mm is not None and length_mm > air_max_len)
-               else "\n\n")
+            f"({freight_mode_used})"
+            + (
+                " — IP's measured average PO-to-receipt time for "
+                "this SKU; overrides the supplier-config default "
+                "with the real number.\n\n"
+                if lead_time_basis_from_ip == "observed"
+                else " — IP's configured lead-time setting for "
+                      "this SKU; overrides the supplier-config "
+                      "default.\n\n"
+                if lead_time_basis_from_ip == "configured"
+                else (
+                    f" — SKU length {length_mm}mm > {air_max_len}mm "
+                    f"air max, forced sea\n\n"
+                    if (air_eligible_default and air_max_len
+                        and length_mm is not None
+                        and length_mm > air_max_len)
+                    else "\n\n"
+                )
+            )
             + f"**ABC class**: {abc} → safety {safety_pct:.0f}%\n\n"
             f"**Review period**: {review_days}d — {review_basis}\n\n"
             f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "

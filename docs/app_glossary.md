@@ -396,7 +396,7 @@ basis (CIN7 FIFO vs cost-chain fallbacks), so the tiles never
 tie to the exact dollar — the bridge caption under the tiles
 states the live numbers.
 
-#### Reorder engine: cadence + holiday cover (v2.67.283-284)
+#### Reorder engine: cadence + holiday cover + IP lead times (v2.67.283-285)
 The reorder engine's target stock is built from four components,
 in this order:
 
@@ -405,6 +405,17 @@ in this order:
 
 - **Lead-time demand** = `avg_daily × lead_time_days`. The stock
   needed to cover demand while the next order is in transit.
+  `lead_time_days` priority (v2.67.285):
+    1. **IP observed actual** — `ip_lead_times.observed_lead_time_days`
+       (IP's `avg_lead_time`, the real measured PO-to-receipt
+       time). Sane-clamped to 3-120 days. Refreshed weekly by
+       `ip_lead_times.py sync`. This is the canonical lead time.
+    2. **IP configured** — `ip_lead_times.configured_lead_time_days`
+       (IP's lead_time setting). Used if no observed value.
+    3. **Supplier config** — `lead_time_air_days` if SKU air-
+       eligible (within `air_max_length_mm`), else
+       `lead_time_sea_days`. Fallback for SKUs not in IP.
+    4. **Hard default** — 35 days. Only reached if nothing else.
 - **Safety stock** = `lead_time_demand × safety_pct`. ABC class
   drives this (A=30%, B=20%, C=15% by default). This is the only
   thing ABC class controls now — it no longer touches the review

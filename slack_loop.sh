@@ -187,6 +187,7 @@ last_si_replies_epoch=0    # v2.67.245 stock-issue thread-reply poll
 last_notion_pull_epoch=0   # v2.67.254 Notion playbook pull
 last_notion_push_epoch=0   # v2.67.254 Notion slow-movers push
 last_notion_dims_epoch=0   # v2.67.281 Notion product-dimensions pull
+last_ip_lead_times_epoch=0 # v2.67.285 IP observed lead-times pull
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
@@ -496,6 +497,23 @@ while true; do
         last_notion_dims_epoch=$(date -u +%s)
         _run_bg "notion_pull_dimensions" \
             "python notion_sync.py pull-product-dimensions"
+    fi
+
+    # v2.67.285 IP observed lead-times pull. Weekly. Walks every
+    # IP variant and captures the observed (avg_lead_time) and
+    # configured lead time per SKU into the local ip_lead_times
+    # table. The reorder engine then prefers these over the
+    # supplier_config defaults — the biggest single waste-removal
+    # cashflow lever, because IP measures real PO-to-receipt time
+    # whereas our default was 35-day sea on unconfigured suppliers.
+    # Silent skip if IP creds aren't set.
+    seconds_since_ip_lt=$(( now_epoch - last_ip_lead_times_epoch ))
+    if [ "$seconds_since_ip_lt" -ge 604800 ] \
+            && [ -n "${IP_API_KEY:-}" ] \
+            && [ -n "${IP_ACCOUNT:-}" ]; then
+        last_ip_lead_times_epoch=$(date -u +%s)
+        _run_bg "ip_lead_times_sync" \
+            "python ip_lead_times.py sync"
     fi
 
     # v2.67.274 Shopify content-sync fallback. daily_sync.sh runs
