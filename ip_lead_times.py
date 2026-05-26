@@ -62,8 +62,16 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 cin7-sync/1.0"
 )
 # Minimal fields — smaller payload, fewer socket timeouts on a 12k-
-# variant walk.
-FIELDS = "id,connections,warehouse"
+# variant walk. IP's field allowlist needs dot-notation to pull
+# nested warehouse sub-fields; otherwise `warehouse` returns just
+# the warehouse-id stub and lead_time/avg_lead_time are missing.
+FIELDS = (
+    "id,connections,"
+    "warehouse.lead_time,"
+    "warehouse.avg_lead_time,"
+    "warehouse.forecast_description,"
+    "warehouse.last_received_at_time"
+)
 
 log = logging.getLogger("ip_lead_times")
 
