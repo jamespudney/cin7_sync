@@ -971,20 +971,12 @@ customers = load("customers")
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    # v2.67.4 — version banner trimmed. The full per-version detail
-    # was eating most of the sidebar; keep one short line here, push
-    # the history into a collapsible expander so it's still discover-
-    # able but folded by default. For full provenance: `git log`.
-    st.caption(
-        "🟢 v2.67.116 — Klaviyo `page[size]` removal. Klaviyo's URL "
-        "parser was interpreting page[size]=100 as a non-existent "
-        "'page_size' attribute and returning HTTP 400 on every "
-        "campaigns + metrics call. v2.67.107's paginated fix had "
-        "this bug; v2.67.116 drops the param entirely. Klaviyo "
-        "defaults to a sensible page size; we paginate via the "
-        "cursor-based links.next URL it returns.")
-    # v2.67.52's full description is in the Recent versions expander
-    # below. Keeping the headline short here per v2.67.4 design.
+    # v2.67.291 — version banner moved to the BOTTOM of the sidebar
+    # (see APP_VERSION line further down). The old multi-line
+    # changelog at the top consumed prime UX space and tended to go
+    # stale; the current deploy is now shown as a small caption
+    # below the navigation, and the per-version detail still lives
+    # in the "Recent versions" expander further down.
     # v2.67.36 — engine cache age indicator. Reads the mtime of
     # Streamlit's persisted cache directory. Mostly informational —
     # if it shows an age in seconds you know the warmer is running;
@@ -6996,6 +6988,16 @@ def _get_engine_df() -> "pd.DataFrame":
         return pd.DataFrame()
     return _abc_engine(
         products, stock, sale_lines, purchase_lines)
+
+
+# v2.67.291 — version chip at the BOTTOM of the sidebar. Streamlit
+# appends sidebar elements in call order, and the main `with st.
+# sidebar:` block above has already finished, so this lands after
+# the navigation, sign-out, Recent versions expander — out of the
+# prime UX space at the top. Update the string with each release.
+st.sidebar.caption(
+    "ㅤ\n\n"
+    ":small_blue_diamond: **v2.67.291** · deployed 2026-05-26")
 
 
 if page == "Overview":
