@@ -11752,7 +11752,15 @@ elif page == "Ordering":
                             help="Remove this closure"):
                         db.delete_supplier_holiday(
                             int(hol["id"]), actor=actor_o)
-                        _safe_cache_clear()
+                        # v2.67.288 — NO _safe_cache_clear() here.
+                        # db.get_supplier_holidays() and
+                        # db.all_supplier_holidays_by_supplier() are
+                        # uncached direct reads — they pick up the
+                        # change on the next render. A global cache
+                        # clear evicts the ABC engine + every other
+                        # cached frame, which forces an expensive
+                        # rebuild on top of the still-resident old
+                        # caches and triggers Render memory crashes.
                         st.rerun()
             else:
                 st.caption("No closures recorded for this supplier "
@@ -11797,7 +11805,12 @@ elif page == "Ordering":
                             new_start, new_end,
                             label=(new_label or "").strip(),
                             actor=actor_o)
-                        _safe_cache_clear()
+                        # v2.67.288 — NO _safe_cache_clear() here.
+                        # The closure list is read directly from
+                        # the DB on every render; clearing every
+                        # cache forced engine + apply to rebuild
+                        # while the old caches were still resident,
+                        # doubling memory and crashing Render.
                         st.success(
                             f"Added closure: {new_start} → "
                             f"{new_end} ({_wk_preview})")
