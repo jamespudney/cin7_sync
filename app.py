@@ -20,7 +20,7 @@ from __future__ import annotations
 import glob
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Optional
 
@@ -10715,7 +10715,7 @@ elif page == "Ordering":
         ip_lead_times_by_sku = db.get_ip_lead_times()
     except Exception:  # noqa: BLE001
         ip_lead_times_by_sku = {}
-    _today_for_engine = datetime.date.today()
+    _today_for_engine = date.today()
 
     def _format_iso_weeks_range(start, end):
         """'Wk 32' for a same-week span, 'Wk 32-34' otherwise."""
@@ -10736,12 +10736,12 @@ elif page == "Ordering":
             e = cl.get("end_date")
             if isinstance(s, str):
                 try:
-                    s = datetime.date.fromisoformat(s[:10])
+                    s = date.fromisoformat(s[:10])
                 except ValueError:
                     continue
             if isinstance(e, str):
                 try:
-                    e = datetime.date.fromisoformat(e[:10])
+                    e = date.fromisoformat(e[:10])
                 except ValueError:
                     continue
             if s is None or e is None:
@@ -10753,7 +10753,7 @@ elif page == "Ordering":
             d = os_
             while d <= oe:
                 closed.add(d)
-                d += datetime.timedelta(days=1)
+                d += timedelta(days=1)
             matched.append({
                 "start_date": s,
                 "end_date": e,
@@ -10849,7 +10849,7 @@ elif page == "Ordering":
         # is closed within the upcoming lead-time + cadence window
         # get added to the target as extra cover, so an order
         # placed before a known shutdown automatically bridges it.
-        window_end = _today_for_engine + datetime.timedelta(
+        window_end = _today_for_engine + timedelta(
             days=int(lead_time_days + review_days))
         closure_days, matched_closures = _closure_days_in_window(
             closures_by_supplier.get(supplier or "", []),
@@ -11714,7 +11714,7 @@ elif page == "Ordering":
 
             # --- Existing closures (read + delete) ----------------
             existing_closures = db.get_supplier_holidays(cfg_supplier)
-            today_d = datetime.date.today()
+            today_d = date.today()
             this_week = today_d.isocalendar()[1]
             st.caption(f"Today is **{today_d.isoformat()}** "
                          f"(Wk {this_week}).")
@@ -11730,12 +11730,12 @@ elif page == "Ordering":
                     e = hol.get("end_date")
                     if isinstance(s, str):
                         try:
-                            s = datetime.date.fromisoformat(s[:10])
+                            s = date.fromisoformat(s[:10])
                         except ValueError:
                             continue
                     if isinstance(e, str):
                         try:
-                            e = datetime.date.fromisoformat(e[:10])
+                            e = date.fromisoformat(e[:10])
                         except ValueError:
                             continue
                     ws = s.isocalendar()[1]
