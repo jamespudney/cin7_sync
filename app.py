@@ -15526,7 +15526,30 @@ elif page == "Monthly Metrics":
             "page are the canonical numbers, but a month is not "
             "frozen until month-end snapshots are added. Until "
             "then, run commissions promptly after month-close to "
-            "minimise drift from CIN7 re-costing."
+            "minimise drift from CIN7 re-costing.\n\n"
+            "---\n\n"
+            "**:white_check_mark: QuickBooks-canonical rows "
+            "(v2.67.292)** — the rows marked *\"QB ... ✅ canonical\"* "
+            "in the Sales and Margins sections come from "
+            "QuickBooks Online directly (the `ProfitAndLoss` "
+            "report, by month, accrual basis), pulled by "
+            "`qbo_monthly_pl.py`. They override the CIN7-derived "
+            "numbers as the **single source of truth for finance "
+            "/ commission reporting** because QB is the reconciled "
+            "ledger.\n\n"
+            "Account mapping (W4S chart of accounts):\n"
+            "- **QB Sales $** ← account `400` (Sales)\n"
+            "- **QB COGS** ← account `500` (Cost of Goods Sold)\n"
+            "- **QB Shipping Charged** ← account `405` "
+            "(Sales - Shipping)\n"
+            "- **QB Shipping Cost** ← account `694` (Shipping-Out)\n\n"
+            "The mapping is editable in `qbo_account_mappings` if "
+            "your chart of accounts uses different numbers. The "
+            "**Sales variance (CIN7 − QB)** row shows how far off "
+            "the CIN7-derived figure is from QB — should trend "
+            "toward zero as reconciliation completes.\n\n"
+            "When QB rows are missing, run "
+            "`python qbo_monthly_pl.py sync` to refresh."
         )
 
     # v2.67.88 — debug panel for shipments DataFrame state. Prints
@@ -15811,6 +15834,54 @@ elif page == "Monthly Metrics":
                  if _get(sales_per_month, m) else 0.0)),
              fmt="pct")
 
+        # ------------------------------------------------------
+        # v2.67.292 — QuickBooks-canonical rows. The Viktor audit
+        # (May 2026) found CIN7-derived figures drift materially
+        # from QB actuals (shipping charged 27-218% over, COGS up
+        # to 27% over for older months, Dec 25 sales gap $45k).
+        # QB is the reconciled financial source of truth — when
+        # available, treat it as canonical and show CIN7 as
+        # parallel "operational" data. Pulled by qbo_monthly_pl.py.
+        # ------------------------------------------------------
+        try:
+            _qbo_mappings = db.get_qbo_account_mappings() or {}
+            _cat_to_nums = {
+                cat: m.get("account_numbers", [])
+                for cat, m in _qbo_mappings.items()}
+            _qb_by_month = db.qbo_monthly_pl_summary_by_category(
+                _cat_to_nums) if _cat_to_nums else {}
+        except Exception:  # noqa: BLE001
+            _qb_by_month = {}
+
+        def _qb(m, cat):
+            return float((_qb_by_month.get(str(m)) or {}).get(
+                cat, 0.0) or 0.0)
+
+        def _qb_has_data(cat):
+            return any(_qb(m, cat) for m in months)
+
+        if _qb_has_data("sales"):
+            _row("Sales", "QB Sales $ ✅ canonical (acc 400)",
+                 _per_month(lambda m: _qb(m, "sales")))
+        if _qb_has_data("cogs"):
+            _row("Sales", "QB COGS ✅ canonical (acc 500)",
+                 _per_month(lambda m: _qb(m, "cogs")))
+        if _qb_has_data("sales") and _qb_has_data("cogs"):
+            _row("Sales", "QB Gross Profit ✅ canonical",
+                 _per_month(lambda m: _qb(m, "sales")
+                                       - _qb(m, "cogs")))
+            _row("Sales", "QB GP % ✅ canonical",
+                 _per_month(lambda m: (
+                     (_qb(m, "sales") - _qb(m, "cogs"))
+                     / _qb(m, "sales") * 100
+                     if _qb(m, "sales") else 0.0)),
+                 fmt="pct")
+            # Variance row — how far off is CIN7 vs QB?
+            _row("Sales",
+                 "Sales variance (CIN7 − QB) — should trend to 0",
+                 _per_month(lambda m: _get(sales_per_month, m)
+                                       - _qb(m, "sales")))
+
         # MARGINS
         _row("Margins", "Shipping Charged",
              _per_month(lambda m: float(
@@ -15893,6 +15964,24 @@ elif page == "Monthly Metrics":
         _row("Margins", _ship_cost_label,
              _per_month(lambda m: float(
                  _ship_cost_per_month.get(str(m), 0) or 0)))
+
+        # v2.67.292 — QB shipping rows. Symmetric source of truth:
+        # acc 405 (Sales - Shipping) for charged + acc 694
+        # (Shipping-Out) for cost. Removes the LTL-in-charged-but-
+        # not-in-cost asymmetry that inflated the CIN7 row by 27-
+        # 218% every month per Viktor's audit.
+        if _qb_has_data("shipping_charged"):
+            _row("Margins", "QB Shipping Charged ✅ canonical (acc 405)",
+                 _per_month(lambda m: _qb(m, "shipping_charged")))
+        if _qb_has_data("shipping_cost"):
+            _row("Margins", "QB Shipping Cost ✅ canonical (acc 694)",
+                 _per_month(lambda m: _qb(m, "shipping_cost")))
+        if (_qb_has_data("shipping_charged")
+                and _qb_has_data("shipping_cost")):
+            _row("Margins", "QB Shipping Margin (acc 405 − acc 694)",
+                 _per_month(lambda m: _qb(m, "shipping_charged")
+                                       - _qb(m, "shipping_cost")))
+
         _row("Margins", "Line Contribution Margin",
              _per_month(lambda m: _get(sales_per_month, m)
                                    - _get(cogs_per_month, m)))

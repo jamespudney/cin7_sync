@@ -188,6 +188,7 @@ last_notion_pull_epoch=0   # v2.67.254 Notion playbook pull
 last_notion_push_epoch=0   # v2.67.254 Notion slow-movers push
 last_notion_dims_epoch=0   # v2.67.281 Notion product-dimensions pull
 last_ip_lead_times_epoch=0 # v2.67.285 IP observed lead-times pull
+last_qbo_pl_epoch=0        # v2.67.292 QBO Profit & Loss pull
 last_si_morning_epoch=0    # v2.67.144 stock-issue morning summary
 last_si_morning_date=""    # one-summary-per-day idempotency
 last_ship_margin_epoch=0   # v2.67.152 shipping margin monitor
@@ -514,6 +515,22 @@ while true; do
         last_ip_lead_times_epoch=$(date -u +%s)
         _run_bg "ip_lead_times_sync" \
             "python ip_lead_times.py sync"
+    fi
+
+    # v2.67.292 QBO Profit & Loss by month. Daily. Pulls the last
+    # 14 months of P&L from QuickBooks (the reconciled financial
+    # ledger) and stores per-month / per-account amounts in
+    # qbo_monthly_pl. The Monthly Metrics page then displays the
+    # QB-canonical Sales / COGS / Shipping rows alongside the
+    # CIN7-derived ones — Viktor's cross-system audit found
+    # CIN7-derived figures drift 27-218% on shipping and up to
+    # 27% on historical COGS. Idempotent; silent skip if QBO
+    # isn't connected yet.
+    seconds_since_qbo_pl=$(( now_epoch - last_qbo_pl_epoch ))
+    if [ "$seconds_since_qbo_pl" -ge 86400 ]; then
+        last_qbo_pl_epoch=$(date -u +%s)
+        _run_bg "qbo_monthly_pl" \
+            "python qbo_monthly_pl.py sync"
     fi
 
     # v2.67.274 Shopify content-sync fallback. daily_sync.sh runs

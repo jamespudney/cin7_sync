@@ -484,6 +484,34 @@ For commissions: GP $ and GP % are canonical; the shipping
 margin row and historical-COGS drift are the two unreconciled
 items. Both are surfaced as warnings on the page.
 
+#### Monthly Metrics — QB-canonical rows (v2.67.292)
+QuickBooks Online is the reconciled financial source of truth.
+The Viktor cross-system audit (May 2026) found CIN7-derived
+figures drift materially from QB actuals — shipping charged
+27-218% over QB every month, historical COGS up to 27% over,
+Dec 2025 sales gap of -$45k (a journal entry CIN7 didn't surface).
+
+The Monthly Metrics page now pulls QB Profit & Loss by month
+(via `qbo_monthly_pl.py`) and shows QB-canonical rows alongside
+the CIN7-derived ones:
+
+- **QB Sales $** ← account `400` Sales
+- **QB COGS** ← account `500` Cost of Goods Sold
+- **QB Gross Profit / GP %** ← derived from above
+- **QB Shipping Charged** ← account `405` Sales - Shipping
+- **QB Shipping Cost** ← account `694` Shipping-Out
+- **QB Shipping Margin** ← 405 − 694 (symmetric, no LTL gap)
+- **Sales variance (CIN7 − QB)** — should trend to zero as
+  reconciliation completes
+
+The mapping lives in `qbo_account_mappings` (editable) so other
+companies with different chart-of-accounts numbers can adapt
+without code changes. The sync runs daily from `slack_loop.sh`.
+
+For commissions: **the QB rows are the canonical figures.** The
+CIN7-derived rows are the live operational view, useful for
+spotting variance.
+
 #### Slow Stock Cleared / Value (monthly metrics, v2.67.178)
 Two new rows in Monthly Metrics → Inventory:
 

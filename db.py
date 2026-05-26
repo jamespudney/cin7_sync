@@ -221,6 +221,48 @@ CREATE TABLE IF NOT EXISTS ip_lead_times (
 CREATE INDEX IF NOT EXISTS idx_ip_lead_times_vendor
     ON ip_lead_times(vendor_name);
 
+-- v2.67.292 — QuickBooks Online Profit & Loss data by month.
+-- The Monthly Metrics page treats CIN7-derived figures as
+-- "operational" and QB account values as canonical, because the
+-- Viktor cross-system audit found:
+--   • Shipping Charged inflated 27-218% vs QB acc 405 every month
+--   • Historical COGS drifting up to 27% vs QB acc 500
+--   • Dec 2025 sales gap of -$45k (journal entry not in CIN7)
+-- Reading from this table lets the page show QB alongside CIN7 so
+-- finance / commissions reference the reconciled financials.
+CREATE TABLE IF NOT EXISTS qbo_monthly_pl (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    month           TEXT NOT NULL,        -- 'YYYY-MM'
+    account_id      TEXT,                  -- QBO Id (preferred match)
+    account_number  TEXT,                  -- chart-of-accounts num
+                                           -- (e.g. '400', '500')
+    account_name    TEXT NOT NULL,
+    account_type    TEXT,                  -- Income/Expense/CoGS
+    parent_account_id TEXT,
+    amount          REAL NOT NULL,
+    synced_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(month, account_id, account_name)
+);
+CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_month
+    ON qbo_monthly_pl(month);
+CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_acctnum
+    ON qbo_monthly_pl(account_number);
+
+-- v2.67.292 — canonical mapping from a Monthly Metrics "category"
+-- (sales / cogs / shipping_charged / shipping_cost / etc.) to one
+-- or more QBO accounts. Pre-seeded with W4S's chart of accounts
+-- (per Viktor's audit) but editable in the Methodology UI so other
+-- companies can adapt without code changes.
+CREATE TABLE IF NOT EXISTS qbo_account_mappings (
+    category        TEXT PRIMARY KEY,      -- e.g. 'sales', 'cogs'
+    account_numbers TEXT,                  -- CSV: '400,401,402'
+    account_names   TEXT,                  -- CSV fallback when no
+                                           -- account number on chart
+    notes           TEXT,
+    set_by          TEXT,
+    set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Critical components per tube family. Team-designated components that
 -- we want to track closely (e.g. Yukon mounting plate used across many
 -- tubes and has long supplier lead time). Shown prominently on LED Tubes
@@ -3645,6 +3687,44 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS idx_ip_lead_times_vendor
           ON ip_lead_times(vendor_name);
       """),
+    # v2.67.292 — QBO Profit & Loss by month + account-mapping
+    # config. Canonical financial source for Monthly Metrics.
+    ("qbo_monthly_pl_table",
+      """
+      CREATE TABLE IF NOT EXISTS qbo_monthly_pl (
+          id              SERIAL PRIMARY KEY,
+          month           TEXT NOT NULL,
+          account_id      TEXT,
+          account_number  TEXT,
+          account_name    TEXT NOT NULL,
+          account_type    TEXT,
+          parent_account_id TEXT,
+          amount          DOUBLE PRECISION NOT NULL,
+          synced_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(month, account_id, account_name)
+      );
+      """),
+    ("qbo_monthly_pl_month_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_month
+          ON qbo_monthly_pl(month);
+      """),
+    ("qbo_monthly_pl_acctnum_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_acctnum
+          ON qbo_monthly_pl(account_number);
+      """),
+    ("qbo_account_mappings_table",
+      """
+      CREATE TABLE IF NOT EXISTS qbo_account_mappings (
+          category        TEXT PRIMARY KEY,
+          account_numbers TEXT,
+          account_names   TEXT,
+          notes           TEXT,
+          set_by          TEXT,
+          set_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
     # v2.67.211 — QuickBooks Online connection table.
     ("qbo_connection",
       """
@@ -4382,6 +4462,163 @@ def get_ip_lead_times() -> dict:
         rows = c.execute(
             "SELECT * FROM ip_lead_times").fetchall()
     return {r["sku"]: dict(r) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# QBO monthly P&L + account mappings (v2.67.292)
+# ---------------------------------------------------------------------------
+def upsert_qbo_monthly_pl(month: str,
+                          account_id: Optional[str],
+                          account_number: Optional[str],
+                          account_name: str,
+                          amount: float,
+                          account_type: Optional[str] = None,
+                          parent_account_id: Optional[str] = None) -> None:
+    """Insert/update one (month, account) → amount row from QBO."""
+    if not month or not account_name:
+        return
+    with connect() as c:
+        c.execute(
+            "INSERT INTO qbo_monthly_pl "
+            "(month, account_id, account_number, account_name, "
+            " account_type, parent_account_id, amount, synced_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+            "ON CONFLICT(month, account_id, account_name) DO UPDATE "
+            "SET account_number = excluded.account_number, "
+            "    account_type = excluded.account_type, "
+            "    parent_account_id = excluded.parent_account_id, "
+            "    amount = excluded.amount, "
+            "    synced_at = datetime('now')",
+            (month, account_id or "", account_number,
+             account_name, account_type, parent_account_id,
+             float(amount)))
+
+
+def get_qbo_monthly_pl(start_month: Optional[str] = None,
+                       end_month: Optional[str] = None) -> list:
+    """Return all qbo_monthly_pl rows, optionally bounded by month
+    range (inclusive). Months are 'YYYY-MM' strings."""
+    sql = "SELECT * FROM qbo_monthly_pl"
+    clauses: list = []
+    params: list = []
+    if start_month:
+        clauses.append("month >= ?")
+        params.append(start_month)
+    if end_month:
+        clauses.append("month <= ?")
+        params.append(end_month)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY month, account_number, account_name"
+    with connect() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def qbo_monthly_pl_summary_by_category(
+        category_to_account_numbers: dict) -> dict:
+    """Aggregate qbo_monthly_pl rows by category and month.
+
+    category_to_account_numbers: {category_name: [account_number, ...]}
+    Returns: {month: {category_name: amount}}.
+
+    Accounts not in any mapping are ignored. Negative amounts
+    (refunds / contra-revenue) are summed naturally."""
+    if not category_to_account_numbers:
+        return {}
+    # Build a reverse lookup: account_number → category.
+    rev: dict = {}
+    for cat, nums in category_to_account_numbers.items():
+        for n in (nums or []):
+            rev[str(n).strip()] = cat
+    if not rev:
+        return {}
+    out: dict = {}
+    with connect() as c:
+        rows = c.execute(
+            "SELECT month, account_number, amount FROM "
+            "qbo_monthly_pl WHERE account_number IS NOT NULL").fetchall()
+    for r in rows:
+        d = dict(r)
+        cat = rev.get(str(d.get("account_number") or "").strip())
+        if not cat:
+            continue
+        month = d.get("month") or ""
+        out.setdefault(month, {})
+        out[month][cat] = out[month].get(cat, 0.0) + float(
+            d.get("amount") or 0)
+    return out
+
+
+def get_qbo_account_mappings() -> dict:
+    """{category: {'account_numbers': [...], 'account_names': [...]}}
+    — the canonical mapping config (editable per company)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM qbo_account_mappings").fetchall()
+    out: dict = {}
+    for r in rows:
+        d = dict(r)
+        nums = [x.strip() for x in (d.get("account_numbers") or ""
+                                     ).split(",") if x.strip()]
+        names = [x.strip() for x in (d.get("account_names") or ""
+                                      ).split(",") if x.strip()]
+        out[d["category"]] = {
+            "account_numbers": nums,
+            "account_names": names,
+            "notes": d.get("notes") or "",
+        }
+    return out
+
+
+def set_qbo_account_mapping(category: str,
+                             account_numbers: Optional[list] = None,
+                             account_names: Optional[list] = None,
+                             notes: str = "",
+                             actor: str = "") -> None:
+    """Upsert a category → account mapping. Pass account_numbers and/
+    or account_names as lists; they're stored as comma-separated."""
+    nums_csv = ",".join(str(n).strip() for n in (account_numbers or [])
+                        if str(n).strip())
+    names_csv = ",".join(str(n).strip() for n in (account_names or [])
+                         if str(n).strip())
+    with connect() as c:
+        c.execute(
+            "INSERT INTO qbo_account_mappings "
+            "(category, account_numbers, account_names, notes, "
+            " set_by) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(category) DO UPDATE SET "
+            "    account_numbers = excluded.account_numbers, "
+            "    account_names = excluded.account_names, "
+            "    notes = excluded.notes, "
+            "    set_by = excluded.set_by, "
+            "    set_at = datetime('now')",
+            (category, nums_csv, names_csv, notes, actor))
+
+
+# Pre-seed default mappings on first read so the page works out of
+# the box for W4S's chart of accounts (per Viktor's audit).
+_DEFAULT_QBO_MAPPINGS = {
+    "sales":            ["400"],
+    "shipping_charged": ["405"],
+    "cogs":             ["500"],
+    "shipping_cost":    ["694"],
+}
+
+
+def seed_default_qbo_account_mappings(actor: str = "system") -> int:
+    """Insert default mappings for any category not yet set.
+    Returns the count of mappings created."""
+    existing = get_qbo_account_mappings()
+    n = 0
+    for cat, nums in _DEFAULT_QBO_MAPPINGS.items():
+        if cat in existing:
+            continue
+        set_qbo_account_mapping(cat, account_numbers=nums,
+                                 notes="Default (W4S chart of accounts)",
+                                 actor=actor)
+        n += 1
+    return n
 
 
 def set_supplier_pricing(
