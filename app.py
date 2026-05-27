@@ -5652,46 +5652,59 @@ def _abc_engine(products: pd.DataFrame,
                                          "Available", "OnOrder",
                                          "StockOnHand"])
 
-    # 3b. Unfulfilled sale demand per SKU — only the BACKORDERED bucket.
+    # 3b. Open-authorised demand per SKU — total line qty across every
+    # AUTHORISED-but-not-yet-shipped sale. ORDERED + BACKORDERED. We
+    # subtract the Allocated column from this further down to derive
+    # the truly-unfulfilled portion (what's NOT yet reserved against
+    # current stock).
     #
-    # v2.67.306 — narrowed from ("BACKORDERED", "ORDERED", "ORDERING")
-    # to ("BACKORDERED",) only. Per CIN7's own docs
-    # (dearinventory.apib §SaleStatesList):
+    # Status taxonomy per CIN7 docs (dearinventory.apib §SaleStatesList):
     #   • ORDERED    = "OrderStatus = AUTHORISED, all products in sale
     #                   order are in stock, no backordering" → every
-    #                   line is already in Allocated, already netted
-    #                   out of Available. Counting it again =
-    #                   double-subtract.
-    #   • BACKORDERED = "at least one product in sale order has been
-    #                   backordered" → the genuine unfulfilled bucket;
-    #                   NOT in Allocated, so we add it back as a debit.
-    #   • ORDERING    = OrderStatus = DRAFT → not authorised, no stock
-    #                   impact, speculative demand → exclude.
+    #                   line is reserved against current stock and
+    #                   shows up in the Allocated column.
+    #   • BACKORDERED = "OrderStatus = AUTHORISED, at least one product
+    #                   has been backordered" → SOME portion of the
+    #                   sale's lines is allocated, the rest is genuine
+    #                   unfulfilled demand. The Status field is sale-
+    #                   level, so every line on a BACKORDERED sale
+    #                   carries Status="BACKORDERED" — we cannot tell
+    #                   from the saved line data which lines are
+    #                   allocated vs short.
+    #   • ORDERING    = OrderStatus = DRAFT → not authorised, no
+    #                   allocation impact, speculative demand → exclude.
     #   • PICKING / PICKED / PACKING / PACKED / SHIPPING → already
     #                   reserved or in flight, in Allocated, exclude.
     #
-    # NB: each sale_line's Status is the SALE-level status (inherited
-    # from the sale header), NOT a line-level flag. So a BACKORDERED
-    # sale where only 1 of 5 lines was actually short still contributes
-    # all 5 line qtys here — a small over-count, but FAR smaller than
-    # the v2.67.305-and-earlier over-count which captured every line
-    # of every fully-allocated ORDERED sale (i.e. most of the open book).
-    # IP and CIN7 both compute the deficit straight off Available, which
-    # is why our numbers matched theirs once ORDERED stopped double-
-    # subtracting (LEDWIRIS4100-120-5m: 29 → ~16, matching IP).
-    UNFULFILLED_STATUSES = ("BACKORDERED",)
-    unfulfilled_by_sku = {}
+    # Version history (LEDWIRIS4100-120-5m as the test case):
+    # • Pre-v2.67.306: included all of (ORDERED, BACKORDERED, ORDERING)
+    #   in `unfulfilled` and subtracted from Available. Available already
+    #   nets Allocated, so this double-counted by every line of every
+    #   ORDERED sale. Engine said reorder = 29, IP said 16.
+    # • v2.67.306: narrowed to BACKORDERED-only. Cleared the cross-
+    #   status double-count, but BACKORDERED-status SALES still
+    #   contribute all their line qty — including the partially-
+    #   allocated portion. Same SKU still showed reorder = 29 because
+    #   its open demand sits in partially-allocated BACKORDERED sales.
+    # • v2.67.309: collect AUTHORISED-open line qty (BACKORDERED +
+    #   ORDERED), then later compute `unfulfilled = max(0, open_qty −
+    #   Allocated)`. Cleanly handles all cases — ORDERED contributes
+    #   zero (line qty == Allocated portion), BACKORDERED contributes
+    #   only the un-allocated remainder.
+    OPEN_AUTHORISED_STATUSES = ("BACKORDERED", "ORDERED")
+    open_line_qty_by_sku = {}
     if "Status" in sale_lines.columns:
-        unful_lines = sale_lines[sale_lines["Status"]
-                                   .astype(str).str.upper()
-                                   .isin(UNFULFILLED_STATUSES)].copy()
-        unful_lines["Quantity"] = _to_num(
-            unful_lines["Quantity"]).fillna(0)
-        ug = unful_lines.groupby("SKU")["Quantity"].sum()
-        unfulfilled_by_sku = ug.to_dict()
+        open_lines = sale_lines[sale_lines["Status"]
+                                  .astype(str).str.upper()
+                                  .isin(OPEN_AUTHORISED_STATUSES)].copy()
+        open_lines["Quantity"] = _to_num(
+            open_lines["Quantity"]).fillna(0)
+        open_line_qty_by_sku = (
+            open_lines.groupby("SKU")["Quantity"].sum().to_dict())
 
     # 3c. Apply unfulfilled-order lookup to the main frame later
-    # (defer until df is built).
+    # (defer until df is built — unfulfilled = max(0, open_qty −
+    # Allocated) needs both numbers on the row at the same time).
 
     # 4. Supplier per SKU using 4-tier resolution:
     # override > CIN7 native Suppliers > PO history > family default > unassigned
@@ -5812,9 +5825,18 @@ def _abc_engine(products: pd.DataFrame,
         df["top_cust_name"] = ""
     df["top_cust_name"] = df["top_cust_name"].fillna("")
 
-    # Unfulfilled open orders per SKU
-    df["unfulfilled"] = df["SKU"].apply(
-        lambda s: float(unfulfilled_by_sku.get(s, 0))).fillna(0)
+    # Unfulfilled open orders per SKU.
+    # v2.67.309 — `open_authorised_qty` is total AUTHORISED-but-not-
+    # shipped line qty (ORDERED + BACKORDERED). The Allocated column
+    # already holds the portion of that demand reserved against
+    # current stock, so the TRULY unfulfilled portion (what we still
+    # need to satisfy with future receipts) is the residual. Clip to
+    # 0 because brief sync-window misalignment can make Allocated
+    # momentarily exceed open lines.
+    df["open_authorised_qty"] = df["SKU"].apply(
+        lambda s: float(open_line_qty_by_sku.get(s, 0))).fillna(0)
+    df["unfulfilled"] = (
+        df["open_authorised_qty"] - df["Allocated"]).clip(lower=0)
 
     # v2.67.307 — compute supplier + tier together. SupplierTier feeds
     # the Ordering-page assignment-audit expander so staff can see
@@ -7136,7 +7158,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.308** · deployed 2026-05-27")
+    "🔹 **v2.67.309** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -11003,13 +11025,23 @@ elif page == "Ordering":
         on_order = row["OnOrder"]
         unfulfilled = float(row.get("unfulfilled") or 0)
         # Effective position = what we'll actually have for future demand.
-        # Available already nets Allocated. We subtract `unfulfilled`,
-        # which (as of v2.67.306) is the BACKORDERED-only bucket — the
-        # genuine demand that couldn't be allocated against stock and
-        # so isn't reflected in Allocated. Older code also subtracted
-        # ORDERED + ORDERING here, which double-counted every line of
-        # every fully-allocated sale and inflated reorder suggestions
-        # by ~50-100% on slow-moving SKUs with backorder history.
+        #
+        # Available already nets Allocated (CIN7's calc:
+        # Available = OnHand - Allocated). Allocated covers the portion
+        # of open AUTHORISED demand that's reserved against current
+        # stock.
+        #
+        # `unfulfilled` (as of v2.67.309) is the residual: open
+        # AUTHORISED line qty (BACKORDERED + ORDERED) MINUS Allocated,
+        # clipped at 0. So we're subtracting only the demand that's
+        # NOT yet reflected in Allocated — the true backlog.
+        #
+        # Walk-through for LEDWIRIS4100-120-5m at the time of fix:
+        #   open_authorised_qty ≈ 21, Allocated ≈ 14
+        #   → unfulfilled = max(0, 21 − 14) = 7
+        #   → effective_pos = Available + OnOrder − 7
+        # Prior to v2.67.309 we subtracted the full 21, double-counting
+        # the 14 already in Allocated.
         effective_pos = available + on_order - unfulfilled
         shortfall = max(0, target - effective_pos)
 
@@ -11282,8 +11314,9 @@ elif page == "Ordering":
             f"- Allocated (reserved for open picks): {allocated:.0f}\n"
             f"- Available (OnHand - Allocated + phantom): {available:.0f}\n"
             f"- OnOrder (incoming POs): {on_order:.0f}\n"
-            f"- Unfulfilled sale orders "
-            f"(BACKORDERED only — ORDERED is already in Allocated): "
+            f"- Open authorised demand (BACKORDERED + ORDERED line qty): "
+            f"{float(row.get('open_authorised_qty') or 0):.0f}\n"
+            f"- Unfulfilled (= open authorised − Allocated, clipped ≥ 0): "
             f"{unfulfilled:.0f}\n"
             f"- **Effective position**: {available:.0f} + {on_order:.0f} "
             f"- {unfulfilled:.0f} = **{effective_pos:.0f}**\n\n"
