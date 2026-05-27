@@ -7201,7 +7201,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.310** · deployed 2026-05-27")
+    "🔹 **v2.67.311** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -12989,8 +12989,31 @@ elif page == "Ordering":
         ],
     }
 
-    with st.expander(":gear: Column layout — drag to reorder, drag to hide",
-                      expanded=False):
+    # v2.67.311 — column editor moved out of st.expander. Custom
+    # Streamlit components (streamlit-sortables uses an iframe via
+    # components.v1) fail to render inside st.expander — the iframe's
+    # auto-resize handshake runs while the expander is display:none on
+    # the initial render, and the iframe stays clamped at 0px height
+    # even after the user expands the section. The visible symptom
+    # James 2026-05-27: the green "Drag-and-drop mode active" banner
+    # appears (import succeeded), then the preview text and column
+    # widths table render below, but the red sortable blocks
+    # themselves never show up. Same code works the moment it's
+    # taken out of an expander. Moved to a button-toggled
+    # st.container(border=True) which is a normal flow div, so the
+    # iframe always mounts in a visible parent on first render.
+    _col_editor_key = f"_show_col_editor_{sel_sup}"
+    _col_editor_shown = bool(st.session_state.get(_col_editor_key, False))
+    if st.button(
+        "⚙️ Column layout — hide" if _col_editor_shown
+        else "⚙️ Column layout — drag to reorder, drag to hide",
+        key=f"_col_layout_toggle_{sel_sup}",
+    ):
+        st.session_state[_col_editor_key] = not _col_editor_shown
+        st.rerun()
+
+    if st.session_state.get(_col_editor_key, False):
+      with st.container(border=True):
         # --- Runtime diagnostic -------------------------------------------
         # Shows which mode is actually running in THIS Streamlit process.
         # If you see red here, the drag UI won't work and the fallback
