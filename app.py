@@ -5652,12 +5652,34 @@ def _abc_engine(products: pd.DataFrame,
                                          "Available", "OnOrder",
                                          "StockOnHand"])
 
-    # 3b. Unfulfilled sale demand per SKU — backorders + open ordered
-    # Not yet shipped; eats into future stock position.
-    # Excludes ESTIMATING (pre-quote) and PICKING/PICKED/PACKING (those
-    # are typically already in Allocated, so double-counting to be
-    # avoided).
-    UNFULFILLED_STATUSES = ("BACKORDERED", "ORDERED", "ORDERING")
+    # 3b. Unfulfilled sale demand per SKU — only the BACKORDERED bucket.
+    #
+    # v2.67.306 — narrowed from ("BACKORDERED", "ORDERED", "ORDERING")
+    # to ("BACKORDERED",) only. Per CIN7's own docs
+    # (dearinventory.apib §SaleStatesList):
+    #   • ORDERED    = "OrderStatus = AUTHORISED, all products in sale
+    #                   order are in stock, no backordering" → every
+    #                   line is already in Allocated, already netted
+    #                   out of Available. Counting it again =
+    #                   double-subtract.
+    #   • BACKORDERED = "at least one product in sale order has been
+    #                   backordered" → the genuine unfulfilled bucket;
+    #                   NOT in Allocated, so we add it back as a debit.
+    #   • ORDERING    = OrderStatus = DRAFT → not authorised, no stock
+    #                   impact, speculative demand → exclude.
+    #   • PICKING / PICKED / PACKING / PACKED / SHIPPING → already
+    #                   reserved or in flight, in Allocated, exclude.
+    #
+    # NB: each sale_line's Status is the SALE-level status (inherited
+    # from the sale header), NOT a line-level flag. So a BACKORDERED
+    # sale where only 1 of 5 lines was actually short still contributes
+    # all 5 line qtys here — a small over-count, but FAR smaller than
+    # the v2.67.305-and-earlier over-count which captured every line
+    # of every fully-allocated ORDERED sale (i.e. most of the open book).
+    # IP and CIN7 both compute the deficit straight off Available, which
+    # is why our numbers matched theirs once ORDERED stopped double-
+    # subtracting (LEDWIRIS4100-120-5m: 29 → ~16, matching IP).
+    UNFULFILLED_STATUSES = ("BACKORDERED",)
     unfulfilled_by_sku = {}
     if "Status" in sale_lines.columns:
         unful_lines = sale_lines[sale_lines["Status"]
@@ -7077,7 +7099,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.291** · deployed 2026-05-26")
+    "🔹 **v2.67.306** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -10944,9 +10966,13 @@ elif page == "Ordering":
         on_order = row["OnOrder"]
         unfulfilled = float(row.get("unfulfilled") or 0)
         # Effective position = what we'll actually have for future demand.
-        # Available already nets Allocated. Subtract unfulfilled open
-        # orders (BACKORDERED + ORDERED + ORDERING statuses) which aren't
-        # yet reflected in Allocated.
+        # Available already nets Allocated. We subtract `unfulfilled`,
+        # which (as of v2.67.306) is the BACKORDERED-only bucket — the
+        # genuine demand that couldn't be allocated against stock and
+        # so isn't reflected in Allocated. Older code also subtracted
+        # ORDERED + ORDERING here, which double-counted every line of
+        # every fully-allocated sale and inflated reorder suggestions
+        # by ~50-100% on slow-moving SKUs with backorder history.
         effective_pos = available + on_order - unfulfilled
         shortfall = max(0, target - effective_pos)
 
@@ -11220,7 +11246,8 @@ elif page == "Ordering":
             f"- Available (OnHand - Allocated + phantom): {available:.0f}\n"
             f"- OnOrder (incoming POs): {on_order:.0f}\n"
             f"- Unfulfilled sale orders "
-            f"(BACKORDERED/ORDERED/ORDERING): {unfulfilled:.0f}\n"
+            f"(BACKORDERED only — ORDERED is already in Allocated): "
+            f"{unfulfilled:.0f}\n"
             f"- **Effective position**: {available:.0f} + {on_order:.0f} "
             f"- {unfulfilled:.0f} = **{effective_pos:.0f}**\n\n"
             f"**Suggested reorder**: max(0, {target:.1f} - "
