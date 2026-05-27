@@ -6950,32 +6950,33 @@ def _abc_engine(products: pd.DataFrame,
         if cur == "Stable":
             eff_12mo = float(r.get("effective_units_12mo") or 0)
             abc = str(r.get("ABC") or "C").strip().upper()
+            u45 = float(r.get("units_45d") or 0)
             u90 = float(r.get("units_90d") or 0)
-            # v2.67.315 — A-class grace requires RECENT activity.
-            # A genuinely-steady A-class mover always has some sales
-            # in the last 90 days; a stale A-class (units_90d == 0,
-            # eff_12mo > 0) is just historic revenue ranking and
-            # should NOT block project-pattern detection.
-            # Example: LEDFLEX180R-24V-5 (41 units 12mo, all > 90d
-            # ago, ABC=A) was being blocked by the v2.67.314
-            # blanket A-class exemption and stayed Stable + reorder 8
-            # even though zero sales in 6 months.
-            # A-class WITH recent activity still gets the grace —
-            # avoids demoting a $500 fixture that sold last month
-            # plus an over-bought B/C-class with current OnHand.
-            if abc == "A" and u90 > 0:
-                return cur
-            # Low-volume case (v2.67.310) — under 1 unit/month avg.
+            # v2.67.316 — Low-volume case checked FIRST, before any
+            # ABC grace. A SKU with under 12 units sold in 12mo is
+            # not a steady mover by any definition — A-class label
+            # there is just stale historical revenue ranking, not a
+            # reason to keep the engine auto-suggesting reorders.
+            # Example: LEDWFLEX180R-24v-5m had 5 units in 12mo, ABC=A,
+            # and was staying Stable because v2.67.315 A-grace fired
+            # before the low-volume check.
             if 0 < eff_12mo < 12:
                 return "🎯 Project"
-            # v2.67.314 — sporadic / single-buyer case. The above
-            # threshold (<12/yr) catches genuinely tiny SKUs but
-            # misses ones like LEDWFLEX120R-24v-5m: 54 units in
-            # 12mo, but ALL 54 from one customer across two sales.
-            # That's project-driven by definition, regardless of
-            # total units. Signal: `top_cust_units_12mo` covers the
-            # top customer's full 12mo share; if it's ≥ 50% of the
-            # SKU's effective demand, it's a project pattern.
+            # v2.67.316 — A-class grace tightened from u90>0 to u45>0.
+            # The 45-day window is the real "recently active" signal;
+            # u90 includes the 45-90 day residual which often contains
+            # the tail of a project that just ended.
+            # Examples: LEDFLEX60B-24V-5 had u45=0 but u90≈0.6 — a
+            # single residual sale 60 days ago, NOT ongoing demand.
+            # Old gate (u90>0) preserved grace; new gate (u45>0) lets
+            # the project paths below fire correctly.
+            if abc == "A" and u45 > 0:
+                return cur
+            # v2.67.314 — sporadic / single-buyer case. The low-volume
+            # threshold catches genuinely tiny SKUs but misses ones
+            # like LEDWFLEX120R-24v-5m: 54 units in 12mo, but ALL 54
+            # from one customer across two sales. That's project-
+            # driven by definition, regardless of total units.
             if eff_12mo > 0:
                 top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
                 if top_u_12mo / eff_12mo >= 0.5:
@@ -7248,7 +7249,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.315** · deployed 2026-05-27")
+    "🔹 **v2.67.316** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -11196,9 +11197,25 @@ elif page == "Ordering":
         # hasn't moved in 90 days, "recovery" doesn't apply — there's
         # nothing to recover to. Boosting based on stale 12mo demand
         # would defeat the dormancy detection.
+        #
+        # v2.67.316 — ALSO skip for 🎯 Project SKUs. The boost uses
+        # `avg_daily_base` (the unadjusted 12mo rate) deliberately, to
+        # ignore the project-customer's spike and recover to a "broad
+        # baseline". But for project SKUs there IS no broad baseline —
+        # all the historical demand IS the project customer's contribution.
+        # So the boost recreates the over-reorder the velocity override
+        # was meant to prevent. James 2026-05-27: LEDFLEX180R-24V-5
+        # was flagged Project correctly but still suggested 8 units
+        # because of this boost path. Buyer can manually order 1 unit
+        # for shelf presence if they want it (matching James's stated
+        # policy).
         stockout_boost_applied = False
         is_dormant_row = bool(row.get("is_dormant", False))
-        if effective_pos <= 0 and not is_dormant_row:
+        is_project_row = (str(row.get("trend_flag") or "")
+                          == "🎯 Project")
+        if (effective_pos <= 0
+                and not is_dormant_row
+                and not is_project_row):
             base_avg = float(row.get("avg_daily_base") or 0) or avg_daily
             recovery_days = int(
                 cfg.get("stockout_min_cover_days") or 60)
