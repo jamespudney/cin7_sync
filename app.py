@@ -2358,7 +2358,7 @@ with st.sidebar:
                     or {})
         _role = _profile.get("role", "sales")
         st.success(
-            f":bust_in_silhouette: **{_signed_in_name}** "
+            f"👤 **{_signed_in_name}** "
             f"(`{_role}`)")
         if st.button("Sign out", key="_signout_btn",
                       width="stretch"):
@@ -2954,7 +2954,7 @@ with st.sidebar:
                                 "to match cabinet install', etc.",
                     height=60)
                 _ds_submit = st.form_submit_button(
-                    ":floppy_disk: Save signal", type="primary",
+                    "💾 Save signal", type="primary",
                     use_container_width=True)
             if _ds_submit:
                 # Use whatever's in the SKU text input — exact match
@@ -4229,14 +4229,14 @@ def render_demand_breakdown(
             if _sub_candidate_count > 0 else ""
         )
         st.error(
-            f":scroll: **{_ip_alts_with_stock} predecessor / migration-"
+            f"📜 **{_ip_alts_with_stock} predecessor / migration-"
             f"linked SKU{'s' if _ip_alts_with_stock != 1 else ''} still "
             f"holding stock!**  \n"
             f"Per IP's migration history, "
             f"{'these have' if _ip_alts_with_stock != 1 else 'this has'} "
             f"residual inventory you can consume "
             f"before reordering this SKU. "
-            f"**Scroll down to the :scroll: Migration history section** "
+            f"**Scroll down to the 📜 Migration history section** "
             f"to review.{_heur_extra}"
         )
     elif _sub_candidate_count > 0:
@@ -4310,7 +4310,7 @@ def render_demand_breakdown(
                         + "  \n".join(bits))
                 if migration_candidates:
                     st.warning(
-                        ":scroll: **Likely predecessor"
+                        "📜 **Likely predecessor"
                         f"{'s' if len(migration_candidates) != 1 else ''}: "
                         f"{', '.join(f'`{c}`' for c in migration_candidates)}**  \n"
                         f"The note implies this SKU has replaced "
@@ -4445,7 +4445,7 @@ def render_demand_breakdown(
             f"{'s' if _n_preds_with_data != 1 else ''} with sales history"
             if _n_preds_with_data > 0 else "")
         st.markdown(
-            f"#### :chart_with_upwards_trend: Family monthly demand — "
+            f"#### 📈 Family monthly demand — "
             f"master-roll equivalents (last 12 months){_pred_suffix}")
         st.caption(
             "Each SKU's units are multiplied by its BOM ratio (and "
@@ -4541,7 +4541,7 @@ def render_demand_breakdown(
     if _ip_fwd_alts or _ip_rev_alts:
         if _ip_fwd_alts:
             st.markdown(
-                f"#### :scroll: Replaces {len(_ip_fwd_alts)} predecessor"
+                f"#### 📜 Replaces {len(_ip_fwd_alts)} predecessor"
                 f"{'s' if len(_ip_fwd_alts) != 1 else ''} "
                 "(migration history)")
             st.caption(
@@ -4679,7 +4679,7 @@ def render_demand_breakdown(
             _total_contrib = sum(
                 float(r["Contributes to this"]) for r in _indirect_rows)
             st.markdown(
-                f"#### :link: Indirect predecessors via BOM "
+                f"#### 🔗 Indirect predecessors via BOM "
                 f"({len(_indirect_rows)} — contributing "
                 f"{_total_contrib:.0f} units)")
             st.caption(
@@ -4773,7 +4773,7 @@ def render_demand_breakdown(
             key=f"inline_add_pred_note_{sku}",
             placeholder="Why this migration?")
         save_disabled_inline = (not inline_pred or inline_pred == str(sku))
-        if st.button(":floppy_disk: Save predecessor",
+        if st.button("💾 Save predecessor",
                       key=f"inline_add_pred_save_{sku}",
                       disabled=save_disabled_inline,
                       type="primary"):
@@ -4874,7 +4874,7 @@ def render_demand_breakdown(
                 "same product probably are. **Check specs before treating "
                 "any row here as a real alternative.**  \n"
                 "For curated, authoritative substitution decisions, see "
-                "the :scroll: Migration history section above, the "
+                "the 📜 Migration history section above, the "
                 ":white_check_mark: CIN7-confirmed alternatives section "
                 "above (if populated), or set up entries via the "
                 "Migrations page / CIN7's Alternative Product attribute.")
@@ -7077,7 +7077,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    ":small_blue_diamond: **v2.67.291** · deployed 2026-05-26")
+    "🔹 **v2.67.291** · deployed 2026-05-26")
 
 
 if page == "Overview":
@@ -8125,7 +8125,7 @@ elif page == "LED Tubes":
     # So master-tube demand = SUM over variants of (variant_demand × source_fraction)
     # where the variant's rule points at this master's length.
     if include_migrations:
-        st.markdown("#### :chart_with_upwards_trend: Projected MASTER TUBE "
+        st.markdown("#### 📈 Projected MASTER TUBE "
                      f"demand — what we order from supplier")
         st.caption(
             f"One row per master tube (purchased from supplier per rule "
@@ -8992,7 +8992,7 @@ elif page == "LED Tubes":
             )
 
     # --- Yukon mounting plate tracker (dedicated spot) -------------------
-    st.markdown("### :triangular_ruler: Yukon mounting plate — Minalex")
+    st.markdown("### 📐 Yukon mounting plate — Minalex")
     st.caption(
         "LED-YUKON-* SKUs supplied by Minalex, with BOM-driven consumption "
         "aggregated from every tube that uses them. Build a draft Minalex "
@@ -9267,7 +9267,7 @@ elif page == "LED Tubes":
                     "overrides.")
 
     # --- Critical components (team-designated) ---------------------------
-    st.markdown("### :rotating_light: Critical components per family")
+    st.markdown("### 🚨 Critical components per family")
     st.caption(
         "Team-designated components to watch per tube family (e.g. Yukon "
         "mounting plate used across Sierra38 + Sierra65; Oslo heat plate "
@@ -9502,7 +9502,7 @@ elif page == "LED Tubes":
         ]
         if not yukon_rows.empty:
             st.warning(
-                ":rotating_light: **Yukon component flags:** "
+                "🚨 **Yukon component flags:** "
                 + ", ".join(yukon_rows["ComponentSKU"].tolist())
                 + " — watch these closely given the long supplier lead time "
                   "you mentioned. Projected consumption accumulates demand "
@@ -9593,7 +9593,7 @@ elif page == "Supplier Pricing":
                     "Unit", options=["ft", "m", "unit", "pcs"],
                     key="p_unit")
             p_note = st.text_input("Note (optional)", key="p_note")
-            if st.button(":floppy_disk: Save tier row",
+            if st.button("💾 Save tier row",
                           key="p_save", type="primary",
                           disabled=not (p_family and p_color and p_supplier)):
                 db.set_family_color_pricing(
@@ -9677,7 +9677,7 @@ elif page == "Supplier Pricing":
                     "Description",
                     value="Color change setup fee",
                     key="f_desc")
-            if st.button(":floppy_disk: Save fee",
+            if st.button("💾 Save fee",
                           key="f_save", type="primary",
                           disabled=not (f_family and f_supplier)):
                 db.set_family_setup_fee(
@@ -9752,7 +9752,7 @@ elif page == "Supplier Pricing":
                     "Auto-pad if savings > (0 = ask)",
                     min_value=0.0, value=0.0, step=100.0,
                     key="r_auto_pad")
-            if st.button(":floppy_disk: Save rule",
+            if st.button("💾 Save rule",
                           key="r_save", type="primary",
                           disabled=not (r_family and r_supplier)):
                 db.set_family_pricing_rule(
@@ -9814,7 +9814,7 @@ elif page == "Supplier Pricing":
                     min_value=0.0, value=0.0, step=1.0,
                     key="pq_moq")
             pq_note = st.text_input("Note", key="pq_note")
-            if st.button(":floppy_disk: Save pack",
+            if st.button("💾 Save pack",
                           key="pq_save", type="primary",
                           disabled=not pq_sku):
                 db.set_sku_pack(
@@ -9922,7 +9922,7 @@ elif page == "Migrations":
     #   - Auto-tube-rule (set by the LED Tubes page when it auto-proposes
     #     SMOKIES → SIERRA family successors)
     # All paths lead through db.set_migration() so audit/log is consistent.
-    st.header(":scroll: Migrations registry")
+    st.header("📜 Migrations registry")
     st.caption(
         "Predecessor → successor mappings. The reorder engine uses these "
         "to roll a retiring SKU's historical sales into its successor's "
@@ -10045,7 +10045,7 @@ elif page == "Migrations":
                 placeholder="Why this migration? Any caveats?")
         save_disabled = (not new_retiring or not new_successor
                           or new_retiring == new_successor)
-        if st.button(":floppy_disk: Save migration",
+        if st.button("💾 Save migration",
                       key="mig_new_save",
                       disabled=save_disabled,
                       type="primary"):
@@ -10122,7 +10122,7 @@ elif page == "Migrations":
 
     # ---- Master table -----------------------------------------------
     if all_migs:
-        st.markdown(f"#### :scroll: All {len(all_migs)} migrations")
+        st.markdown(f"#### 📜 All {len(all_migs)} migrations")
         rows = []
         for m in all_migs:
             ret = str(m.get("retiring_sku") or "")
@@ -10220,7 +10220,7 @@ elif page == "Migrations":
                     "Note",
                     value=str(existing.get("note") or ""),
                     key="mig_edit_note")
-                if st.button(":floppy_disk: Save changes",
+                if st.button("💾 Save changes",
                               key="mig_edit_save",
                               type="primary"):
                     actor = (st.session_state.get("current_user")
@@ -10652,7 +10652,7 @@ elif page == "Sales Recent":
 # ---------------------------------------------------------------------------
 
 elif page == "Ordering":
-    st.header(":shopping_trolley: Ordering — ABC-driven reorder workbench")
+    st.header("🛒 Ordering — ABC-driven reorder workbench")
     st.caption(
         "Unified buying workspace. ABC classification on 12-month velocity. "
         "Supplier-first workflow with freight-mode-aware lead times, "
@@ -11565,7 +11565,7 @@ elif page == "Ordering":
     # v2.67.282 — reconciliation bridge so the five tiles read as
     # one coherent story instead of looking contradictory.
     st.caption(
-        ":triangular_ruler: **How the tiles reconcile** — "
+        "📐 **How the tiles reconcile** — "
         f"**Excess ({_fmt_money(total_excess_value)})** is the "
         f"GROSS cash recoverable by selling every over-target SKU "
         f"down to target. **Understock "
@@ -12947,7 +12947,7 @@ elif page == "Ordering":
                     _picked_widths[_k] = _v
 
         lb1, lb2, lb3 = st.columns([1, 1, 3])
-        if lb1.button(":floppy_disk: Save layout + widths",
+        if lb1.button("💾 Save layout + widths",
                        key=f"save_layout_{_layout_user}",
                        type="primary",
                        use_container_width=True):
@@ -13000,7 +13000,7 @@ elif page == "Ordering":
                          "Excess cleanup",
             label_visibility="collapsed",
         )
-        if sp2.button(":floppy_disk: Save as preset",
+        if sp2.button("💾 Save as preset",
                        key=f"preset_save_btn_{_layout_user}",
                        disabled=not (preset_save_name.strip()
                                      and preview_keys),
@@ -13587,7 +13587,7 @@ elif page == "Ordering":
                 )
                 if not pid:
                     wc3.caption(":x: No CIN7 ID")
-                elif wc3.button(":outbox_tray: Write to CIN7",
+                elif wc3.button("📤 Write to CIN7",
                                    key=f"write_cin7_ds_{sku_p}",
                                    type="primary"):
                     actor = st.session_state.get(
@@ -13974,7 +13974,7 @@ elif page == "Ordering":
                     "to save them durably.")
         with _q2:
             if st.button(
-                    ":floppy_disk: Save qty drafts",
+                    "💾 Save qty drafts",
                     key=f"save_qty_drafts_{sel_sup}",
                     type="primary",
                     disabled=(not _qty_edits) or (not _draft_can_edit),
@@ -14005,7 +14005,7 @@ elif page == "Ordering":
     sec1, sec2 = st.columns([1, 3])
     save_disabled = (not _new_exclusions) and (not _changed_notes) \
         and (not _ds_add) and (not _ds_remove)
-    if sec1.button(":floppy_disk: Save edits",
+    if sec1.button("💾 Save edits",
                     key=f"save_po_edits_{sel_sup}",
                     type="primary",
                     disabled=save_disabled,
@@ -14298,7 +14298,7 @@ elif page == "Ordering":
                 + "."
             )
             with st.expander(
-                f":eyes: Preview the {len(picks)} auto-fill items",
+                f"👀 Preview the {len(picks)} auto-fill items",
                 expanded=False,
             ):
                 _af_show = picks_df[["SKU", "Name", "days_to_reorder",
@@ -14565,7 +14565,7 @@ elif page == "Ordering":
                                         "resolved_supplier") or {})
                                 if _resolved_sup:
                                     st.warning(
-                                        f":bust_in_silhouette: **Resolved "
+                                        f"👤 **Resolved "
                                         f"supplier:** "
                                         f"`{_resolved_sup.get('Name')}` "
                                         f"(CIN7 ID `{_resolved_sup.get('ID')}`). "
@@ -15098,7 +15098,7 @@ elif page == "Ordering":
     # applied inside the ABC engine via FAMILY_MIGRATION_RULES + this
     # per-SKU override table.
     with st.expander(
-        ":link: Sales-history migrations (retiring → successor)",
+        "🔗 Sales-history migrations (retiring → successor)",
         expanded=False,
     ):
         st.caption(
@@ -15190,7 +15190,7 @@ elif page == "Ordering":
         row_detail = s_df[s_df["SKU"] == pick_sku].iloc[0]
 
         # --- Monthly sales chart for this SKU ---
-        st.markdown(f"#### :chart_with_upwards_trend: {pick_sku} — sales history")
+        st.markdown(f"#### 📈 {pick_sku} — sales history")
         chart_cols = st.columns([1, 5])
         chart_window = chart_cols[0].radio(
             "Window", ["12 months", "24 months"],
@@ -15534,7 +15534,7 @@ elif page == "Monthly Metrics":
     # the buyer / finance and frozen in plain language. Surfacing
     # the known caveats here too: historical COGS re-costing, the
     # shipping-margin asymmetry, and the modelled inventory curve.
-    with st.expander(":scroll: Methodology & known caveats "
+    with st.expander("📜 Methodology & known caveats "
                        "(read before relying on figures for "
                        "commissions)", expanded=False):
         st.markdown(
@@ -16675,7 +16675,7 @@ elif page == "Monthly Metrics":
             if sect_df.empty:
                 continue
             _seen_sections.append(section)
-            st.subheader(f":small_blue_diamond: {section}")
+            st.subheader(f"🔹 {section}")
             st.dataframe(
                 sect_df.drop(columns=["Section"]).set_index("Metric"),
                 width="stretch",
@@ -16692,7 +16692,7 @@ elif page == "Monthly Metrics":
                 display_table["Section"] == section]
             if sect_df.empty:
                 continue
-            st.subheader(f":small_blue_diamond: {section}")
+            st.subheader(f"🔹 {section}")
             st.dataframe(
                 sect_df.drop(columns=["Section"]).set_index("Metric"),
                 width="stretch",
@@ -16700,7 +16700,7 @@ elif page == "Monthly Metrics":
             )
 
         # --- Exports -------------------------------------------------
-        st.subheader(":outbox_tray: Exports")
+        st.subheader("📤 Exports")
         e1, e2, e3 = st.columns(3)
 
         csv_df = table_df.copy()
@@ -17301,7 +17301,7 @@ elif page == "Product Detail":
 
         if boms.empty:
             st.caption(
-                ":link: **BOM structure not yet synced.** Parent/child "
+                "🔗 **BOM structure not yet synced.** Parent/child "
                 "relationships will appear here after running "
                 "`python cin7_sync.py boms` (takes ~2 hours for ~4,500 "
                 "BOM products)."
@@ -17406,7 +17406,7 @@ elif page == "Product Detail":
         # Sourcing rule (AdditionalAttribute1) — parsed
         rule = parse_sourcing_rule(prod_row.get("AdditionalAttribute1"))
         if rule["RuleCode"] or rule["Logic"]:
-            st.markdown("#### :scroll: Sourcing rule")
+            st.markdown("#### 📜 Sourcing rule")
             sc1, sc2, sc3, sc4 = st.columns(4)
             sc1.metric("Rule", rule["RuleCode"] or "—")
             sc2.metric("Type",
@@ -17694,7 +17694,7 @@ elif page == "Product Detail":
                 st.dataframe(by_sup, width="stretch")
 
         # --- Stock level history (reconstructed) ----------------------------
-        st.markdown("### :chart_with_downwards_trend: Stock level history (reconstructed)")
+        st.markdown("### 📉 Stock level history (reconstructed)")
 
         current_onhand = float(sku_stock["OnHand"].sum()) if not sku_stock.empty else 0.0
 
@@ -18385,7 +18385,7 @@ elif page == "Kits & Fixtures":
 
 
     # --- Product affinity: what sells together ---------------------------
-    st.markdown("### :link: Frequently bought together — candidate bundles")
+    st.markdown("### 🔗 Frequently bought together — candidate bundles")
     st.caption(
         "Groups of 2, 3, or 4 SKUs that appear together in the same order "
         "unusually often. High lift + high count = strong candidate to "
@@ -20861,7 +20861,7 @@ elif page == "Slow Movers":
 # ---------------------------------------------------------------------------
 
 elif page == "My Profile":
-    st.header(":bust_in_silhouette: My Profile")
+    st.header("👤 My Profile")
     st.caption(
         "Your profile is loaded automatically when you sign in. "
         "Edit your role, default landing page, or email below. "
@@ -20912,7 +20912,7 @@ elif page == "My Profile":
                 help="When you sign in, jump straight to this page "
                      "instead of Overview.")
             _save_profile = st.form_submit_button(
-                ":floppy_disk: Save profile",
+                "💾 Save profile",
                 type="primary", width="stretch")
 
         if _save_profile:
@@ -21000,7 +21000,7 @@ elif page == "My Profile":
                 st.session_state["_slack_oauth_state"] = _state
                 _auth_url = _slack_oauth_ui.build_authorize_url(_state)
                 st.markdown(
-                    f"[:link: **Connect Slack** "
+                    f"[🔗 **Connect Slack** "
                     f"(opens Slack to authorise)]({_auth_url})")
                 st.caption(
                     "Required Slack-app config (one-time, see "
@@ -21382,7 +21382,7 @@ elif page == "AI Feedback":
                             key=f"_fb_conf_{_aid}")
 
                         _save_alias = st.form_submit_button(
-                            ":floppy_disk: Save rule",
+                            "💾 Save rule",
                             type="primary",
                             use_container_width=True,
                             disabled=_rt_disabled)
@@ -21962,7 +21962,7 @@ elif page == "Demand Signals":
             )
 
             save_col, info_col = st.columns([1, 4])
-            if save_col.button(":floppy_disk: Save changes",
+            if save_col.button("💾 Save changes",
                                 type="primary",
                                 width="stretch"):
                 _actor = (st.session_state.get("current_user", "")
@@ -22287,7 +22287,7 @@ elif page == "Cashflow":
                     _qbo_auth_url = _qbo_oauth.build_authorize_url(
                         _qbo_state)
                     st.markdown(
-                        f"[:link: **Connect QuickBooks Online** "
+                        f"[🔗 **Connect QuickBooks Online** "
                         f"(opens Intuit to authorise)]"
                         f"({_qbo_auth_url})")
                     st.caption(
@@ -22474,7 +22474,7 @@ elif page == "Cashflow":
             if _acl < 0:
                 _alerts.append((
                     "error",
-                    f":rotating_light: Projected cash shortfall "
+                    f"🚨 Projected cash shortfall "
                     f"— week of {_w.strftime('%d %b')} closes at "
                     f"{_fmt_money(_acl)}."))
                 break
@@ -22682,7 +22682,7 @@ elif page == "Cashflow":
                 },
             )
 
-            if st.button(":floppy_disk: Save payables changes",
+            if st.button("💾 Save payables changes",
                          key="_cf_save_payables", type="primary"):
                 _n_updated = 0
                 _n_approved = 0
@@ -23238,7 +23238,7 @@ elif page == "Cashflow":
             for c in _cf_wcol},
     )
 
-    if st.button(":floppy_disk: Save forecast changes",
+    if st.button("💾 Save forecast changes",
                  key="_cf_save_forecast", type="primary"):
         _label2key = {lbl: rk for rk, lbl in _cf_rows}
         _n_cells = 0
@@ -23406,7 +23406,7 @@ elif page == "Cashflow":
                          "this range yet.")
     if _min_close < 0:
         st.error(
-            ":rotating_light: Projection dips **below zero** — "
+            "🚨 Projection dips **below zero** — "
             "the forecast shows a cash shortfall. Review the "
             "weeks above.")
 
