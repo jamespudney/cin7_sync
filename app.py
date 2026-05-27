@@ -5749,14 +5749,45 @@ def _abc_engine(products: pd.DataFrame,
             sup_by_sku_local[sku] = grp.sort_values(
                 "Total", ascending=False)["Supplier"].iloc[0]
 
-    def _resolve_sup(sku: str, category: str) -> str:
+    # v2.67.307 — fast SKU→Name dict so the family-rule tier can call
+    # _parse_tube_sku without re-iterating the products frame per SKU.
+    product_name_by_sku = {}
+    if "SKU" in products.columns and "Name" in products.columns:
+        for _, _p in products.iterrows():
+            _sku = _p.get("SKU")
+            if _sku:
+                product_name_by_sku[_sku] = str(_p.get("Name") or "")
+
+    def _resolve_sup_with_tier(sku: str) -> tuple:
+        """Return (supplier_name, tier_name).
+        Tier in {'override','cin7-native','family-rule','po-history',
+        'unassigned'} — exposed so the Ordering-page diagnostic can show
+        WHY each SKU lands where it does.
+
+        v2.67.307 fixed a long-standing bug: `fam_assignments_local` was
+        loaded but never consulted. Family rules (e.g. all SIERRA38
+        masters → Reeves) had been silently ignored since the assignment
+        table was added. Now slotted in BETWEEN CIN7-native and PO
+        history — CIN7-native still wins because that's the single
+        source of truth we want staff to maintain (matches IP)."""
         if sku in sku_overrides_local:
-            return sku_overrides_local[sku]
+            return sku_overrides_local[sku], "override"
         if sku in cin7_supplier_local:
-            return cin7_supplier_local[sku]
+            return cin7_supplier_local[sku], "cin7-native"
+        if fam_assignments_local:
+            tube_rec = _parse_tube_sku(
+                sku, product_name_by_sku.get(sku, ""))
+            if tube_rec:
+                fam = tube_rec.get("Family")
+                if fam and fam in fam_assignments_local:
+                    return fam_assignments_local[fam], "family-rule"
         if sku in sup_by_sku_local:
-            return sup_by_sku_local[sku]
-        return "(unassigned)"
+            return sup_by_sku_local[sku], "po-history"
+        return "(unassigned)", "unassigned"
+
+    def _resolve_sup(sku: str, category: str) -> str:
+        """Backwards-compat wrapper — returns just the supplier name."""
+        return _resolve_sup_with_tier(sku)[0]
 
     # 5. Merge everything
     df = prods.merge(vel, on="SKU", how="left")
@@ -5785,7 +5816,13 @@ def _abc_engine(products: pd.DataFrame,
     df["unfulfilled"] = df["SKU"].apply(
         lambda s: float(unfulfilled_by_sku.get(s, 0))).fillna(0)
 
-    df["Supplier"] = df["SKU"].apply(lambda s: _resolve_sup(s, ""))
+    # v2.67.307 — compute supplier + tier together. SupplierTier feeds
+    # the Ordering-page assignment-audit expander so staff can see
+    # which resolution rule (override / cin7-native / family-rule /
+    # po-history / unassigned) put each SKU into its current bucket.
+    _sup_tier_pairs = df["SKU"].apply(_resolve_sup_with_tier)
+    df["Supplier"] = _sup_tier_pairs.apply(lambda t: t[0])
+    df["SupplierTier"] = _sup_tier_pairs.apply(lambda t: t[1])
 
     # 5b. Apply MIGRATION demand — retiring SKUs' sales roll into successors
     # (same logic used on LED Tubes page). Saved mappings take priority;
@@ -7099,7 +7136,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.306** · deployed 2026-05-27")
+    "🔹 **v2.67.307** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -12057,6 +12094,120 @@ elif page == "Ordering":
                     })
                 st.dataframe(pd.DataFrame(cfg_rows),
                              width="stretch", hide_index=True)
+
+    # --- Supplier-assignment audit (v2.67.307) -------------------------
+    # James 2026-05-27: "IP says these need replenishment but most are
+    # not even reflected under Neonica demand list in our system."
+    #
+    # Root cause for non-tube SKUs (NICHO, HR-MAX, KRAV, IRIS…) is that
+    # CIN7's product.Suppliers field isn't set → our `cin7_supplier_local`
+    # tier finds nothing → resolution falls through PO history into
+    # "(unassigned)". The fix is to set Supplier in CIN7 (single source
+    # of truth, matches IP). This expander shows where the gap is so
+    # staff know exactly which products to touch.
+    if "SupplierTier" in engine_df.columns:
+        # IP vendor map — pulled from ip_lead_times.vendor_name (what IP
+        # has assigned per SKU). This is the ground truth we compare to.
+        _ip_vendor_by_sku = {
+            s: (v or {}).get("vendor_name") or ""
+            for s, v in (ip_lead_times_by_sku or {}).items()
+        }
+        # Build the audit frame for every SKU with EITHER:
+        #   • an IP vendor assigned (i.e. IP knows where this comes from), OR
+        #   • a non-zero reorder suggestion in our engine
+        # — i.e. items that actually matter for the buying workflow.
+        _audit_src = engine_df[[
+            "SKU", "Name", "Supplier", "SupplierTier",
+            "reorder_qty", "ABC", "is_non_master_tube",
+        ]].copy()
+        _audit_src["IPVendor"] = _audit_src["SKU"].map(_ip_vendor_by_sku).fillna("")
+        _audit_src = _audit_src[
+            (_audit_src["IPVendor"] != "")
+            | (_audit_src["reorder_qty"] > 0)
+        ].copy()
+
+        def _audit_status(row):
+            ours = (row["Supplier"] or "").strip()
+            ip = (row["IPVendor"] or "").strip()
+            if not ip and ours == "(unassigned)":
+                return "⚠️ unassigned both sides"
+            if not ip:
+                return "ℹ️ IP has no vendor"
+            if ours == "(unassigned)":
+                return "❌ missing in ours"
+            if ours.lower() == ip.lower():
+                return "✅ match"
+            return "❌ mismatch"
+
+        _audit_src["Status"] = _audit_src.apply(_audit_status, axis=1)
+        # Buyer-friendly order: mismatches / unassigned first.
+        _status_order = {
+            "❌ missing in ours": 0,
+            "❌ mismatch": 1,
+            "⚠️ unassigned both sides": 2,
+            "ℹ️ IP has no vendor": 3,
+            "✅ match": 4,
+        }
+        _audit_src["_o"] = _audit_src["Status"].map(_status_order).fillna(9)
+        _audit_src = _audit_src.sort_values(
+            ["_o", "reorder_qty"], ascending=[True, False]).drop(columns="_o")
+
+        _n_missing = int((_audit_src["Status"] == "❌ missing in ours").sum())
+        _n_mismatch = int((_audit_src["Status"] == "❌ mismatch").sum())
+        _n_match = int((_audit_src["Status"] == "✅ match").sum())
+        _hdr = (
+            f"🔍 Supplier-assignment audit — "
+            f"{_n_missing} missing in ours, {_n_mismatch} mismatched, "
+            f"{_n_match} matched"
+        )
+        with st.expander(_hdr, expanded=False):
+            st.caption(
+                "Compares Inventory Planner's per-SKU `vendor_name` "
+                "(what IP reports against) with our `Supplier` bucket "
+                "(resolved via override → CIN7-native → family-rule → "
+                "PO history → unassigned). Source of truth going "
+                "forward: **CIN7 product Suppliers field** — once set, "
+                "our sync picks it up automatically and IP stays in sync.\n\n"
+                "Filter to a specific IP vendor (e.g. Neonica) to see "
+                "which SKUs IP knows about but our app hasn't bucketed "
+                "yet. Those are the products to open in CIN7 and set "
+                "Supplier on."
+            )
+            _ip_vendors_in_view = sorted(
+                {v for v in _audit_src["IPVendor"].unique() if v})
+            _vendor_pick = st.selectbox(
+                "Filter by IP vendor",
+                ["(all)"] + _ip_vendors_in_view,
+                key="ord_audit_ip_vendor",
+            )
+            _status_pick = st.multiselect(
+                "Show statuses",
+                list(_status_order.keys()),
+                default=[
+                    "❌ missing in ours",
+                    "❌ mismatch",
+                    "⚠️ unassigned both sides",
+                ],
+                key="ord_audit_status",
+            )
+            _view = _audit_src.copy()
+            if _vendor_pick != "(all)":
+                _view = _view[_view["IPVendor"] == _vendor_pick]
+            if _status_pick:
+                _view = _view[_view["Status"].isin(_status_pick)]
+            st.dataframe(
+                _view[[
+                    "SKU", "Name", "IPVendor", "Supplier",
+                    "SupplierTier", "Status", "reorder_qty", "ABC",
+                ]].rename(columns={
+                    "IPVendor": "IP vendor (truth)",
+                    "Supplier": "Our bucket",
+                    "SupplierTier": "Tier hit",
+                    "reorder_qty": "Reorder (ours)",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
 
     # --- Supplier-focused view -----------------------------------------
     st.markdown("### :clipboard: Draft PO — by supplier")
