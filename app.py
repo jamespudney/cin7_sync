@@ -6950,31 +6950,55 @@ def _abc_engine(products: pd.DataFrame,
         if cur == "Stable":
             eff_12mo = float(r.get("effective_units_12mo") or 0)
             abc = str(r.get("ABC") or "C").strip().upper()
-            # Low-volume = under 1 unit/month average AND not A-class
-            # (A-class with low units is usually a high-priced steady
-            # mover, e.g. a $500 fixture sold twice a year — different
-            # animal from a $5 strip cut sold twice a year).
-            if 0 < eff_12mo < 12 and abc != "A":
+            if abc == "A":
+                # A-class with low units is usually a high-priced
+                # steady mover (e.g. a $500 fixture sold twice a
+                # year). Don't demote.
+                return cur
+            # Low-volume case (v2.67.310) — under 1 unit/month avg.
+            if 0 < eff_12mo < 12:
                 return "🎯 Project"
+            # v2.67.314 — sporadic / single-buyer case. The above
+            # threshold (<12/yr) catches genuinely tiny SKUs but
+            # misses ones like LEDWFLEX120R-24v-5m: 54 units in
+            # 12mo, but ALL 54 from one customer across two sales.
+            # That's project-driven by definition, regardless of
+            # total units. Signal: `top_cust_units_12mo` covers the
+            # top customer's full 12mo share; if it's ≥ 50% of the
+            # SKU's effective demand, it's a project pattern.
+            if eff_12mo > 0:
+                top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
+                if top_u_12mo / eff_12mo >= 0.5:
+                    return "🎯 Project"
         return cur
 
     df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)
 
-    # v2.67.310 — track WHY a SKU is Project so the trace can render
-    # the right explanation. _trend_flag at line 5594 detects the
-    # concentrated-spike case (high momentum + few buyers); the
-    # promotion above adds the low-volume case (eff_12mo < 12 and
-    # not A-class). Default empty for non-Project rows.
+    # v2.67.310 + v2.67.314 — track WHY a SKU is Project so the trace
+    # can render the right explanation:
+    #   • "concentrated"           — _trend_flag detected a recent
+    #                                spike (units_45d ≥ 3) where one
+    #                                buyer took most of it. Default
+    #                                from the _trend_flag rules.
+    #   • "low-volume"             — eff_12mo < 12 and no recent
+    #                                spike. Promoted by v2.67.310.
+    #   • "sporadic-single-buyer"  — eff_12mo ≥ 12 but top customer
+    #                                took ≥ 50% across the whole
+    #                                year. Promoted by v2.67.314.
     def _project_reason(r):
         if r.get("trend_flag") != "🎯 Project":
             return ""
         eff_12mo = float(r.get("effective_units_12mo") or 0)
         u45 = float(r.get("units_45d") or 0)
-        # Low-volume case: eff_12mo low AND no recent spike to speak
-        # of (units_45d < 3 means _trend_flag returned "Stable" and
-        # the promotion above is what set us to Project).
+        top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
+        # Reasons checked in priority order. Promotion (Stable → Project)
+        # only runs when units_45d < 3, so the promotion-set reasons
+        # don't overlap with concentrated.
         if 0 < eff_12mo < 12 and u45 < 3:
             return "low-volume"
+        if (eff_12mo > 0 and u45 < 3
+                and top_u_12mo / max(eff_12mo, 1) >= 0.5):
+            return "sporadic-single-buyer"
         return "concentrated"
 
     df["project_reason"] = df.apply(_project_reason, axis=1)
@@ -7201,7 +7225,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.313** · deployed 2026-05-27")
+    "🔹 **v2.67.314** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -11288,26 +11312,46 @@ elif page == "Ordering":
                 )
             elif _tf == "🎯 Project":
                 _topu = float(row.get("top_cust_units_12mo") or 0)
+                _topname = str(row.get("top_cust_name") or "—")[:40]
                 _preason = str(row.get("project_reason") or "concentrated")
+                _eff_lv = float(row.get("effective_units_12mo") or 0)
+                _share = (_topu / _eff_lv * 100) if _eff_lv > 0 else 0
                 if _preason == "low-volume":
-                    _eff_lv = float(row.get("effective_units_12mo") or 0)
                     demand_lines.append(
                         f"- **Low-volume Project** — only "
                         f"**{_eff_lv:.0f} units in 12mo** total (<1/mo "
                         f"avg). Not dormant (a sale landed inside the "
                         f"90d window) but too sparse to call Stable. "
-                        f"Treated as project demand: subtracting the "
-                        f"top customer's 12mo contribution "
-                        f"(**{_topu:.0f} units**) before annualising, "
-                        f"because the rest is sporadic one-offs that "
-                        f"shouldn't drive reorder.\n"
+                        f"Treated as project demand: subtracting top "
+                        f"customer **{_topname}**'s 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
+                        f"effective demand) before annualising — the "
+                        f"rest is sporadic one-offs that shouldn't "
+                        f"drive reorder.\n"
+                    )
+                elif _preason == "sporadic-single-buyer":
+                    demand_lines.append(
+                        f"- **Sporadic single-buyer Project** — "
+                        f"**{_eff_lv:.0f} units in 12mo** total, but "
+                        f"top customer **{_topname}** took "
+                        f"**{_topu:.0f} units ({_share:.0f}%)** of "
+                        f"that. Few transactions clustered to one "
+                        f"buyer = project pattern even though the "
+                        f"unit count looks decent. Velocity override: "
+                        f"subtracting the top customer's 12mo "
+                        f"contribution before annualising, leaving a "
+                        f"near-zero baseline so the engine doesn't "
+                        f"auto-restock against demand that's unlikely "
+                        f"to repeat.\n"
                     )
                 else:
                     demand_lines.append(
                         "- **Velocity override**: subtracting top "
-                        f"customer's 12mo contribution (**{_topu:.0f} units**) "
-                        "before annualising, because the spike is "
-                        "concentrated to one buyer — unlikely to repeat.\n"
+                        f"customer **{_topname}**'s 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
+                        f"effective demand) before annualising, "
+                        "because the spike is concentrated to one "
+                        "buyer — unlikely to repeat.\n"
                     )
             demand_lines.append(
                 f"- **Effective total**: {direct_u:.0f} - {mig_out:.0f} "
