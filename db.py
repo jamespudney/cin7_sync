@@ -5011,7 +5011,10 @@ def get_column_layout(user: str, view: str) -> Optional[List[str]]:
     user = (user or "").strip().lower() or "default"
     with connect() as c:
         row = c.execute(
-            "SELECT columns_csv FROM ui_prefs WHERE user = ? AND view = ?",
+            # v2.67.313 — `user` and `view` are reserved in Postgres;
+            # double-quoted identifiers work in both SQLite & Postgres.
+            'SELECT columns_csv FROM ui_prefs '
+            'WHERE "user" = ? AND "view" = ?',
             (user, view),
         ).fetchone()
     if not row or not row["columns_csv"]:
@@ -5028,9 +5031,9 @@ def save_column_layout(user: str, view: str, columns: List[str]) -> None:
     with connect() as c:
         c.execute(
             """
-            INSERT INTO ui_prefs (user, view, columns_csv, updated_at)
+            INSERT INTO ui_prefs ("user", "view", columns_csv, updated_at)
             VALUES (?, ?, ?, datetime('now'))
-            ON CONFLICT(user, view) DO UPDATE SET
+            ON CONFLICT("user", "view") DO UPDATE SET
               columns_csv = excluded.columns_csv,
               updated_at  = datetime('now')
             """,
@@ -5056,7 +5059,8 @@ def get_column_widths(user: str, view: str) -> dict:
     user = (user or "").strip().lower() or "default"
     with connect() as c:
         row = c.execute(
-            "SELECT widths_csv FROM ui_prefs WHERE user = ? AND view = ?",
+            'SELECT widths_csv FROM ui_prefs '
+            'WHERE "user" = ? AND "view" = ?',
             (user, view),
         ).fetchone()
     if not row or not row["widths_csv"]:
@@ -5086,15 +5090,16 @@ def save_column_widths(user: str, view: str, widths: dict) -> None:
     with connect() as c:
         # Ensure row exists first; keep columns_csv untouched if it's already set
         existing = c.execute(
-            "SELECT columns_csv FROM ui_prefs WHERE user = ? AND view = ?",
+            'SELECT columns_csv FROM ui_prefs '
+            'WHERE "user" = ? AND "view" = ?',
             (user, view),
         ).fetchone()
         cols_val = existing["columns_csv"] if existing else ""
         c.execute(
             """
-            INSERT INTO ui_prefs (user, view, columns_csv, widths_csv, updated_at)
+            INSERT INTO ui_prefs ("user", "view", columns_csv, widths_csv, updated_at)
             VALUES (?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(user, view) DO UPDATE SET
+            ON CONFLICT("user", "view") DO UPDATE SET
               widths_csv = excluded.widths_csv,
               updated_at = datetime('now')
             """,
@@ -5112,7 +5117,7 @@ def reset_column_layout(user: str, view: str) -> None:
     user = (user or "").strip().lower() or "default"
     with connect() as c:
         c.execute(
-            "DELETE FROM ui_prefs WHERE user = ? AND view = ?",
+            'DELETE FROM ui_prefs WHERE "user" = ? AND "view" = ?',
             (user, view),
         )
         c.execute(
@@ -5145,10 +5150,10 @@ def save_user_preset(user: str, view: str, name: str,
     with connect() as c:
         c.execute(
             """
-            INSERT INTO ui_presets (user, view, name, columns_csv,
+            INSERT INTO ui_presets ("user", "view", name, columns_csv,
                                      widths_csv, created_at)
             VALUES (?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(user, view, name) DO UPDATE SET
+            ON CONFLICT("user", "view", name) DO UPDATE SET
               columns_csv = excluded.columns_csv,
               widths_csv  = excluded.widths_csv,
               created_at  = datetime('now')
@@ -5169,9 +5174,9 @@ def list_user_presets(user: str, view: str) -> List[dict]:
     out: List[dict] = []
     with connect() as c:
         rows = c.execute(
-            "SELECT name, columns_csv, widths_csv, created_at "
-            "FROM ui_presets WHERE user = ? AND view = ? "
-            "ORDER BY created_at DESC",
+            'SELECT name, columns_csv, widths_csv, created_at '
+            'FROM ui_presets WHERE "user" = ? AND "view" = ? '
+            'ORDER BY created_at DESC',
             (user, view),
         ).fetchall()
     for r in rows:
@@ -5206,8 +5211,8 @@ def delete_user_preset(user: str, view: str, name: str) -> None:
     user = (user or "").strip().lower() or "default"
     with connect() as c:
         c.execute(
-            "DELETE FROM ui_presets "
-            "WHERE user = ? AND view = ? AND name = ?",
+            'DELETE FROM ui_presets '
+            'WHERE "user" = ? AND "view" = ? AND name = ?',
             (user, view, name),
         )
         c.execute(
