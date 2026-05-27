@@ -1877,6 +1877,39 @@ def get_sku_details(engine_df: pd.DataFrame,
     mig_chain = _get_migration_chain_for_sku(sku)
     if mig_chain:
         detail["migration_chain"] = mig_chain
+    # v2.67.308 — guidance for the assistant on which demand field to
+    # quote. `units_12mo` is direct invoice-line sum; `effective_units_
+    # 12mo` adds tube-rollup-in + migrated-in and is the CANONICAL
+    # demand signal (what ABC ranking, target_stock, reorder math all
+    # use). For non-master tube variants `units_12mo` reads near-zero
+    # by design (demand sits on the master) — assistant must use
+    # effective_units_12mo OR walk to the master via migration_chain.
+    _dir = float(detail.get("units_12mo") or 0)
+    _eff = float(detail.get("effective_units_12mo") or 0)
+    _is_nmt = bool(detail.get("is_non_master_tube") or False)
+    _notes = []
+    if _is_nmt:
+        _notes.append(
+            "is_non_master_tube=True — direct units_12mo is near-zero by "
+            "design (demand rolled up to master). Report demand from the "
+            "master SKU (see migration_chain) instead.")
+    if _eff > 0 and _dir > 0:
+        _ratio = max(_eff, _dir) / max(min(_eff, _dir), 1)
+        if _ratio >= 2.0:
+            _notes.append(
+                f"effective_units_12mo ({_eff:.0f}) and units_12mo "
+                f"({_dir:.0f}) disagree by {_ratio:.1f}x — use the "
+                f"`effective_units_12mo` field as the canonical demand. "
+                f"`units_12mo` is the raw direct-sale-line sum only.")
+    _abc = str(detail.get("ABC") or "").upper()
+    _rev = float(detail.get("rev_12mo") or 0)
+    if _abc == "A" and _rev < 5000:
+        _notes.append(
+            f"ABC=A but rev_12mo=${_rev:.0f}. A-class typically means "
+            f"top-80% revenue rank — this is internally inconsistent. "
+            f"Don't quote ABC=A as a fact without verifying.")
+    if _notes:
+        detail["assistant_notes"] = _notes
     return detail
 
 
@@ -1895,8 +1928,17 @@ def get_velocity(engine_df: pd.DataFrame,
         return {"error": "Sale lines missing InvoiceDate column."}
     sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+    # v2.67.308 — exclude CREDITED/VOIDED/CANCELLED so this matches the
+    # engine's NET demand calc (engine drops these at app.py:5459-5462;
+    # get_velocity historically did not, so a SKU with a big credit memo
+    # could read inflated here vs. the engine's units_12mo).
     in_window = sl[(sl["SKU"].astype(str) == sku)
                     & (sl["InvoiceDate"] >= cutoff)]
+    if "Status" in in_window.columns:
+        _excluded = ("CREDITED", "VOIDED", "CANCELLED")
+        in_window = in_window[
+            ~in_window["Status"].astype(str).str.upper().isin(_excluded)
+        ]
     result = {
         "sku": sku,
         "window_days": days,
@@ -1913,6 +1955,72 @@ def get_velocity(engine_df: pd.DataFrame,
         "last_sale": (in_window["InvoiceDate"].max().strftime("%Y-%m-%d")
                       if not in_window.empty else None),
     }
+
+    # v2.67.308 — surface the engine's canonical demand signals so the
+    # assistant can never report a raw invoice-line sum without seeing
+    # what the engine thinks. Andrew flagged LED-G2000620-2 as "94 in May
+    # vs ~200/mo avg" — assistant replied "60 units in 12mo · A-class ·
+    # Trend" which is internally inconsistent (60 units × ~$15 ≠ A-class
+    # revenue rank). Most likely causes when raw-sum and engine signals
+    # disagree:
+    #   • Tube/MP variant → demand rolled up to master SKU
+    #   • Retiring SKU → demand migrated to successor
+    #   • CREDITED/VOIDED lines (now excluded above, but historical data
+    #     may have edge cases)
+    #   • UOM mismatch between invoice and stock
+    # The engine's effective_units_12mo is the CANONICAL demand number.
+    if engine_df is not None and not engine_df.empty:
+        eng_row = engine_df[engine_df["SKU"].astype(str) == sku]
+        if not eng_row.empty:
+            eng = eng_row.iloc[0]
+            _eng_eff = float(eng.get("effective_units_12mo") or 0)
+            _eng_dir = float(eng.get("units_12mo") or 0)
+            result["engine_signals"] = {
+                "ABC": str(eng.get("ABC") or ""),
+                "trend_flag": str(eng.get("trend_flag") or ""),
+                "is_dormant": bool(eng.get("is_dormant", False)),
+                "is_non_master_tube": bool(
+                    eng.get("is_non_master_tube", False)),
+                "units_12mo_direct": _eng_dir,
+                "effective_units_12mo": _eng_eff,
+                "units_45d": float(eng.get("units_45d") or 0),
+                "units_prior_45d": float(eng.get("units_prior_45d") or 0),
+                "excess_units": float(eng.get("excess_units") or 0),
+                "migrated_in": float(eng.get("migrated_in") or 0),
+                "migrated_out": float(eng.get("migrated_out") or 0),
+                "tube_rollup_in": float(eng.get("tube_rollup_in") or 0),
+            }
+            # Consistency check — only meaningful when window is ~12mo.
+            if 300 <= days <= 400 and _eng_eff > 0:
+                _sold = result["units_sold"]
+                _ratio_hi = max(_eng_eff, _sold) / max(min(_eng_eff, _sold), 1)
+                if _ratio_hi >= 2.0:
+                    result["consistency_warning"] = (
+                        f"Raw invoice-line sum for this SKU "
+                        f"({_sold:.0f} units in last {days}d) disagrees "
+                        f"with the engine's effective_units_12mo "
+                        f"({_eng_eff:.0f}) by {_ratio_hi:.1f}x. The "
+                        f"engine number is canonical — it accounts for "
+                        f"tube-rollup ({eng.get('tube_rollup_in') or 0:g}), "
+                        f"migration in/out "
+                        f"({eng.get('migrated_in') or 0:g}/"
+                        f"{eng.get('migrated_out') or 0:g}), and status "
+                        f"exclusions. Report effective_units_12mo as the "
+                        f"demand figure; mention the raw sum only if the "
+                        f"user is asking specifically about invoiced lines."
+                    )
+            # Internal-consistency check on the engine row itself.
+            # A-class with very low effective demand is a red flag — report
+            # it so the assistant doesn't repeat both numbers as fact.
+            _abc = str(eng.get("ABC") or "").upper()
+            _rev = float(eng.get("rev_12mo") or 0)
+            if _abc == "A" and _rev < 5000:
+                result.setdefault("internal_warnings", []).append(
+                    f"ABC=A but rev_12mo=${_rev:.0f} — A-class typically "
+                    f"means top-80% revenue rank, so this likely indicates "
+                    f"stale ABC computation or a data anomaly. Don't "
+                    f"present ABC=A as a fact without checking."
+                )
 
     # Time-bucketed breakdown — the UI looks for `chart_data` and
     # renders an inline st.line_chart when present.
