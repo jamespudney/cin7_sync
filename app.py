@@ -10664,7 +10664,7 @@ elif page == "Ordering":
     # Keep terminology single-sourced here so edits propagate via search.
     # ------------------------------------------------------------------
     with st.expander(
-        ":book: How to read this page — glossary & methodology",
+        "📖 How to read this page — glossary & methodology",
         expanded=False,
     ):
         # v2.67.49 — single-source glossary. Edit at the top of
@@ -11501,18 +11501,27 @@ elif page == "Ordering":
     cat_c = cov.get("category-median", 0)
     unk_c = cov.get("unknown", 0)
 
-    st.caption(
-        f":information_source: **Cost basis coverage (masters, "
-        f"drives Optimum)**: "
-        f"direct CIN7 cost on **{direct_c:,}**; "
-        f"family-median fallback on {fam_c:,}; "
-        f"category-median fallback on {cat_c:,}; "
-        f"no cost info (contribute $0 to Optimum) on **{unk_c:,}**.  |  "
-        f"**Scope note**: Current value sums across all "
-        f"{len(engine_df):,} SKUs (real physical dollars); Optimum "
-        f"across {len(master_only):,} masters only (non-masters roll "
-        f"up to their masters)."
-    )
+    # v2.67.305 — tucked into a collapsed expander. Pre-cleanup
+    # the cost-basis caption sat between the section header and
+    # the five metric tiles as a wall of small grey text, making
+    # the page feel busy and pushing the tiles below the fold on
+    # smaller laptops. Staff don't need this detail at first
+    # glance — it's a finance-trust note. One click to expand.
+    with st.expander(
+            "ℹ️ Cost basis coverage & scope notes",
+            expanded=False):
+        st.markdown(
+            f"**Cost basis coverage (masters, drives Optimum)**: "
+            f"direct CIN7 cost on **{direct_c:,}**; "
+            f"family-median fallback on {fam_c:,}; "
+            f"category-median fallback on {cat_c:,}; "
+            f"no cost info (contribute $0 to Optimum) on "
+            f"**{unk_c:,}**.\n\n"
+            f"**Scope note**: Current value sums across all "
+            f"{len(engine_df):,} SKUs (real physical dollars); "
+            f"Optimum across {len(master_only):,} masters only "
+            f"(non-masters roll up to their masters)."
+        )
 
     oc1, oc2, oc3, oc4, oc5 = st.columns(5)
     # v2.67.37 — headline now ties to Overview + Monthly Metrics.
@@ -11562,29 +11571,40 @@ elif page == "Ordering":
                     "Non-masters that HAVE direct sales are treated as "
                     "working inventory, not dead.")
 
-    # v2.67.282 — reconciliation bridge so the five tiles read as
-    # one coherent story instead of looking contradictory.
-    st.caption(
-        "📐 **How the tiles reconcile** — "
-        f"**Excess ({_fmt_money(total_excess_value)})** is the "
-        f"GROSS cash recoverable by selling every over-target SKU "
-        f"down to target. **Understock "
-        f"({_fmt_money(total_understock_value)})** is what you'd "
-        f"re-spend bringing under-target SKUs UP to target. Across "
-        f"master SKUs: overstock "
-        f"{_fmt_money(master_overstock_value)} − understock "
-        f"{_fmt_money(total_understock_value)} = "
-        f"**{_fmt_money(net_over_position)}** genuinely tied up "
-        f"above target (this equals master on-hand "
-        f"{_fmt_money(master_onhand_value)} − Optimum). That is "
-        f"why Excess is larger than Current − Optimum "
-        f"({_fmt_money(total_onhand_value - total_target_value)}) "
-        f"— Excess never nets the under-stocked SKUs back in. "
-        f"Net working capital you could actually free ≈ "
-        f"**{_fmt_money(total_excess_value - total_understock_value)}**. "
-        f"Current value is higher again because it spans ALL SKUs "
-        f"at CIN7 FIFO cost, while Optimum / Excess / Understock "
-        f"are master-SKU figures using cost-chain fallbacks.")
+    # v2.67.305 — reconciliation moved into a collapsed expander.
+    # Pre-cleanup this was 6+ lines of small math text directly
+    # under the tile row — useful for finance, noise for buying
+    # staff. Top-line takeaway lives in the expander label so the
+    # reader sees the key number without expanding.
+    _net_cash_freeable = (
+        total_excess_value - total_understock_value)
+    with st.expander(
+            f"📐 How these tiles reconcile · net cash you "
+            f"could actually free ≈ "
+            f"{_fmt_money(_net_cash_freeable)}",
+            expanded=False):
+        st.markdown(
+            f"**Excess ({_fmt_money(total_excess_value)})** is "
+            f"the GROSS cash recoverable by selling every "
+            f"over-target SKU down to target. **Understock "
+            f"({_fmt_money(total_understock_value)})** is what "
+            f"you'd re-spend bringing under-target SKUs UP to "
+            f"target.\n\n"
+            f"Across master SKUs: overstock "
+            f"{_fmt_money(master_overstock_value)} − understock "
+            f"{_fmt_money(total_understock_value)} = "
+            f"**{_fmt_money(net_over_position)}** genuinely tied "
+            f"up above target (this equals master on-hand "
+            f"{_fmt_money(master_onhand_value)} − Optimum).\n\n"
+            f"That's why Excess is larger than Current − Optimum "
+            f"({_fmt_money(total_onhand_value - total_target_value)}) "
+            f"— Excess never nets the under-stocked SKUs back in. "
+            f"**Net working capital you could actually free ≈ "
+            f"{_fmt_money(_net_cash_freeable)}**.\n\n"
+            f"Current value is higher again because it spans ALL "
+            f"SKUs at CIN7 FIFO cost, while Optimum / Excess / "
+            f"Understock are master-SKU figures using cost-chain "
+            f"fallbacks.")
 
     # v2.67.178 — Glide path to engine-derived optimum (replaces
     # the old hard-coded $600k target). The engine's Optimum tile
@@ -20499,7 +20519,7 @@ elif page == "Slow Movers":
     # parents_only, etc.) are documented in one place and referenced
     # from every page that exposes them.
     with st.expander(
-            ":book: How to read this page — glossary & methodology",
+            "📖 How to read this page — glossary & methodology",
             expanded=False):
         st.markdown(GLOSSARY_MARKDOWN)
 
