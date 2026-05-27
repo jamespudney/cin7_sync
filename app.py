@@ -6950,10 +6950,20 @@ def _abc_engine(products: pd.DataFrame,
         if cur == "Stable":
             eff_12mo = float(r.get("effective_units_12mo") or 0)
             abc = str(r.get("ABC") or "C").strip().upper()
-            if abc == "A":
-                # A-class with low units is usually a high-priced
-                # steady mover (e.g. a $500 fixture sold twice a
-                # year). Don't demote.
+            u90 = float(r.get("units_90d") or 0)
+            # v2.67.315 — A-class grace requires RECENT activity.
+            # A genuinely-steady A-class mover always has some sales
+            # in the last 90 days; a stale A-class (units_90d == 0,
+            # eff_12mo > 0) is just historic revenue ranking and
+            # should NOT block project-pattern detection.
+            # Example: LEDFLEX180R-24V-5 (41 units 12mo, all > 90d
+            # ago, ABC=A) was being blocked by the v2.67.314
+            # blanket A-class exemption and stayed Stable + reorder 8
+            # even though zero sales in 6 months.
+            # A-class WITH recent activity still gets the grace —
+            # avoids demoting a $500 fixture that sold last month
+            # plus an over-bought B/C-class with current OnHand.
+            if abc == "A" and u90 > 0:
                 return cur
             # Low-volume case (v2.67.310) — under 1 unit/month avg.
             if 0 < eff_12mo < 12:
@@ -6970,6 +6980,13 @@ def _abc_engine(products: pd.DataFrame,
                 top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
                 if top_u_12mo / eff_12mo >= 0.5:
                     return "🎯 Project"
+            # v2.67.315 — pure "no recent activity" case. Catches
+            # SKUs with diversified buyers historically but zero
+            # sales in the last 90 days. eff_12mo > 0 but u90 == 0
+            # means the last quarter has been silent — too sparse
+            # for "Stable" regardless of unit count or buyer mix.
+            if eff_12mo > 0 and u90 == 0:
+                return "🎯 Project"
         return cur
 
     df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)
@@ -6990,6 +7007,7 @@ def _abc_engine(products: pd.DataFrame,
             return ""
         eff_12mo = float(r.get("effective_units_12mo") or 0)
         u45 = float(r.get("units_45d") or 0)
+        u90 = float(r.get("units_90d") or 0)
         top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
         # Reasons checked in priority order. Promotion (Stable → Project)
         # only runs when units_45d < 3, so the promotion-set reasons
@@ -6999,6 +7017,11 @@ def _abc_engine(products: pd.DataFrame,
         if (eff_12mo > 0 and u45 < 3
                 and top_u_12mo / max(eff_12mo, 1) >= 0.5):
             return "sporadic-single-buyer"
+        # v2.67.315 — no-recent-activity fallback (last 90d empty
+        # but 12mo has sales). Distinct from low-volume / sporadic
+        # because the buyer mix may have been diversified historically.
+        if eff_12mo > 0 and u90 == 0 and u45 < 3:
+            return "stale-12mo"
         return "concentrated"
 
     df["project_reason"] = df.apply(_project_reason, axis=1)
@@ -7225,7 +7248,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.314** · deployed 2026-05-27")
+    "🔹 **v2.67.315** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -11328,6 +11351,23 @@ elif page == "Ordering":
                         f"effective demand) before annualising — the "
                         f"rest is sporadic one-offs that shouldn't "
                         f"drive reorder.\n"
+                    )
+                elif _preason == "stale-12mo":
+                    demand_lines.append(
+                        f"- **Stale 12mo Project** — "
+                        f"**{_eff_lv:.0f} units in 12mo** total but "
+                        f"**zero sales in the last 90 days**. The "
+                        f"historic activity isn't a baseline you "
+                        f"can plan against — it was project work "
+                        f"that's now ended. Velocity override: "
+                        f"subtracting top customer "
+                        f"**{_topname}**'s 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
+                        f"effective demand) before annualising, so "
+                        f"the engine doesn't auto-restock against "
+                        f"already-fulfilled project demand. If a "
+                        f"new project lands, override the suggested "
+                        f"qty manually.\n"
                     )
                 elif _preason == "sporadic-single-buyer":
                     demand_lines.append(
