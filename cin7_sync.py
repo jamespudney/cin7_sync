@@ -264,56 +264,80 @@ class Cin7Client:
         return self.put("sale", sale_body)
 
     def get_purchase(self, ref: str) -> Optional[Dict[str, Any]]:
-        """v2.67.196 — Fetch a full Purchase object live from
-        CIN7. Accepts either:
-          • a UUID (passed as ID parameter)
-          • a PO number like "PO-7160" or "7160" (passed as
-            OrderNumber parameter — CIN7 accepts both prefixed
-            and bare numeric forms)
+        """v2.67.312 — Fetch a full Purchase object live from CIN7.
+        Accepts either:
+          • a UUID (queried via /purchase?ID=<uuid>)
+          • a PO number like "PO-7213" or "7213" (looked up via
+            /purchaseList?Search=PO-7213 to find the UUID, then
+            fetched via /purchase?ID=<uuid> for full Order+Lines)
+
+        BUG HISTORY: v2.67.196-v2.67.311 passed OrderNumber directly
+        to /purchase, but per CIN7 docs (dearinventory.apib §Purchase
+        line 13604) the /purchase endpoint ONLY accepts the ID
+        parameter — OrderNumber is undocumented and silently returns
+        nothing useful. Code then looked for the wrong response key
+        (PurchaseOrderList / Purchases) when the actual key in the
+        /purchaseList response is `PurchaseList`. Net effect: PO-by-
+        number lookups always failed silently, with the
+        get_purchase_live AI tool blaming "propagation lag".
+
+        James 2026-05-27 — the bot replied to PO-7213 commentary with
+        "PO isn't returning from CIN7, wait 2-3 minutes" because of
+        this. The PO existed as a DRAFT; we just never queried the
+        right endpoint to see drafts. /purchaseList returns ALL
+        statuses including DRAFT, so this fix unlocks draft-PO
+        commentary which is the most valuable moment to intervene
+        (before AUTHORISED is hit).
 
         Used by get_purchase_live AI tool when the local
-        purchase_lines CSV doesn't have a freshly-created PO
-        yet. Returns None on failure (logs the error so the
-        caller can surface a useful message)."""
+        purchase_lines CSV doesn't have a freshly-created PO yet.
+        Returns None on failure (logs the error so the caller can
+        surface a useful message)."""
         if not ref:
             return None
-        # UUIDs are 36 chars with hyphens; PO numbers are short
-        # or start with 'PO-'. Crude heuristic.
+        # UUIDs are 36 chars with hyphens; PO numbers are short or
+        # start with 'PO-'.
         is_uuid = (len(ref) >= 32 and "-" in ref
                       and not ref.upper().startswith("PO-"))
         try:
             if is_uuid:
                 return self.get("purchase", params={"ID": ref})
-            # Order-number lookup. CIN7 returns a list under
-            # /purchase when queried by OrderNumber.
+            # PO-number lookup: /purchaseList?Search=<PO-NNNN> to
+            # find the UUID, then /purchase?ID=<uuid> for full
+            # Order+Lines detail. /purchaseList returns headers
+            # only and the response key is `PurchaseList`. Search
+            # matches OrderNumber substring (per CIN7 docs at line
+            # 13298) across all statuses including DRAFT.
             ref_norm = ref.strip().upper().lstrip("PO-")
+            search_term = f"PO-{ref_norm}"
             resp = self.get(
-                "purchase",
-                params={"OrderNumber": f"PO-{ref_norm}"})
-            # CIN7 may return:
-            #   - a dict with PurchaseOrderList containing matches
-            #   - a list directly
-            #   - a single dict (when ID is passed)
+                "purchaseList",
+                params={"Search": search_term, "Limit": 50})
+            items = []
             if isinstance(resp, dict):
-                items = (resp.get("PurchaseOrderList")
+                # `PurchaseList` is the documented key. Defensive
+                # fallbacks kept for any account shape variation.
+                items = (resp.get("PurchaseList")
+                            or resp.get("PurchaseOrderList")
                             or resp.get("Purchases")
-                            or [resp])
+                            or [])
             elif isinstance(resp, list):
                 items = resp
-            else:
-                items = []
             for it in items:
                 if not isinstance(it, dict):
                     continue
                 ord_n = str(it.get("OrderNumber") or "").upper()
                 if ord_n.lstrip("PO-") == ref_norm:
-                    # If the search returned a thin header,
-                    # follow up with an ID lookup for full
-                    # detail.
                     pid = it.get("ID")
-                    if pid and not it.get("Order"):
+                    if pid:
+                        # Always follow up with /purchase?ID=<uuid>
+                        # for the full Order+Lines structure.
+                        # /purchaseList returns header summary only.
                         return self.get("purchase",
                                             params={"ID": pid})
+                    # Defensive: missing ID — return the thin
+                    # header so the caller at least gets the
+                    # status/supplier/dates, even without lines.
                     return it
             return None
         except Exception as exc:

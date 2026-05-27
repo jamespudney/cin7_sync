@@ -4114,9 +4114,19 @@ def get_purchase_live(engine_df: pd.DataFrame,
     if not isinstance(purchase, dict) or not purchase:
         return {
             "matched": 0,
-            "note": (f"CIN7 returned nothing for {po_ref}. "
-                      f"PO may not exist or was just created and "
-                      f"is still being processed."),
+            "note": (
+                f"CIN7 /purchaseList?Search={po_ref} returned no "
+                f"match. v2.67.312 — this lookup uses the correct "
+                f"endpoint and DOES return DRAFT POs (the prior "
+                f"endpoint silently skipped drafts), so a missing "
+                f"result now genuinely means the PO doesn't exist "
+                f"in CIN7. Don't tell the user to 'wait 2-3 "
+                f"minutes for propagation' — that was a wrong "
+                f"guess in the old code. Instead, ask them to "
+                f"double-check the PO number, confirm it was "
+                f"actually saved (not just opened-but-not-saved "
+                f"in CIN7's UI), or check whether it was voided/"
+                f"deleted."),
         }
 
     # Extract lines + enrich with current OnHand.
