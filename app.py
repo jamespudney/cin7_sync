@@ -7249,7 +7249,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.316** · deployed 2026-05-27")
+    "🔹 **v2.67.317** · deployed 2026-05-27")
 
 
 if page == "Overview":
@@ -8531,11 +8531,49 @@ elif page == "LED Tubes":
         # Show ALL masters (even zero-demand) so buyer sees the full set.
         rows = []
         window_days = window_months * 30.437
+
+        # v2.67.317 — reuse the ABC engine's reorder methodology for
+        # tube masters so this page matches the Ordering page (one
+        # source of truth). The engine already processes every master
+        # tube SKU with full trend / dormancy / Project detection and
+        # stores a trend-ADJUSTED avg_daily on engine_df:
+        #   • Dormant master → avg_daily = 0
+        #   • 🎯 Project master → avg_daily with the top customer's
+        #     12mo contribution subtracted (sporadic project demand
+        #     doesn't drive reorder)
+        #   • Stable → effective_units_12mo / 365
+        # By driving the tube reorder off the engine's avg_daily instead
+        # of the page-local total/window_days, tube reorders inherit the
+        # same methodology. The tube page has NO stockout-recovery boost
+        # (it never did), so nothing re-inflates the suppressed rate.
+        # READ-ONLY: _get_engine_df() returns the shared cached frame;
+        # we only build a lookup, never assign columns onto it.
+        _eng_tube = _get_engine_df()
+        _eng_by_sku: dict = {}
+        if not _eng_tube.empty and "SKU" in _eng_tube.columns:
+            _eng_dedup = _eng_tube.drop_duplicates(subset=["SKU"])
+            _eng_by_sku = _eng_dedup.set_index(
+                _eng_dedup["SKU"].astype(str)).to_dict("index")
+
         for k, info in master_rows.items():
             total = info["own_consumption"] + info["migrated_consumption"]
             supplier = _resolve_supplier(info["MasterSKU"], info["Family"])
 
-            avg_daily = total / max(window_days, 1)
+            # v2.67.317 — prefer the engine's trend-adjusted avg_daily +
+            # signals. Fall back to the window-based rate only when the
+            # master isn't in engine_df (defensive — e.g. a master with
+            # no engine row yet on a cold cache).
+            _er = _eng_by_sku.get(str(info["MasterSKU"]))
+            if _er is not None:
+                avg_daily = float(_er.get("avg_daily") or 0)
+                tube_trend = str(_er.get("trend_flag") or "Stable")
+                tube_is_dormant = bool(_er.get("is_dormant", False))
+                tube_abc = str(_er.get("ABC") or "—")
+            else:
+                avg_daily = total / max(window_days, 1)
+                tube_trend = "Stable"
+                tube_is_dormant = False
+                tube_abc = "—"
             lead_time_demand = avg_daily * lead_time_days
             review_demand = avg_daily * (review_weeks * 7)
             safety_stock = lead_time_demand * (safety_factor / 100.0)
@@ -8544,7 +8582,16 @@ elif page == "LED Tubes":
             shortfall = max(0, target_stock - onhand)
             reorder_qty = int(round(shortfall))
 
-            if total == 0:
+            # v2.67.317 — status reflects the engine's trend signal first
+            # so a Project/Dormant master reads as such instead of a
+            # misleading "🟢 OK" (which it would, since avg_daily≈0 makes
+            # the lead-time thresholds ~0). reorder_qty is already ~0 for
+            # these, matching the Ordering page.
+            if tube_is_dormant:
+                status = "💤 Dormant"
+            elif tube_trend == "🎯 Project":
+                status = "🎯 Project"
+            elif total == 0:
                 status = "⚪ No demand"
             elif onhand < lead_time_demand:
                 status = "🔴 Reorder now"
@@ -8594,7 +8641,13 @@ elif page == "LED Tubes":
                      if days_of_cover is not None else None),
                 "Target": int(round(target_stock)),
                 "Suggested reorder": reorder_qty,
+                "Trend": tube_trend,
                 "Status": status,
+                # v2.67.317 — engine ABC (global, stable) instead of the
+                # page-local top-70% cut which changes with the family
+                # filter. Overrides the post-hoc local calc below for any
+                # master present in engine_df.
+                "_EngineABC": tube_abc,
                 "# SKUs": len(info["consumer_skus"]),
                 "From (retiring)":
                     ", ".join(info["migrated_from"])[:120],
@@ -8603,7 +8656,14 @@ elif page == "LED Tubes":
             })
         proj_df = pd.DataFrame(rows)
 
-        # --- ABC classification (Class A = top 70% of cost-weighted demand) ---
+        # --- ABC classification -------------------------------------------
+        # v2.67.317 — prefer the engine's global ABC (the same class the
+        # Ordering page and safety/review percentages key off). The old
+        # page-local top-70% cost-weighted cut was computed over only the
+        # masters in the current family filter, so a master's class
+        # shifted when the buyer changed the multiselect — unstable and
+        # inconsistent with the rest of the app. Local top-70% kept ONLY
+        # as a fallback for masters absent from engine_df.
         if not proj_df.empty and proj_df["_RevProxy"].sum() > 0:
             sorted_by_rev = proj_df.sort_values(
                 "_RevProxy", ascending=False).copy()
@@ -8619,12 +8679,19 @@ elif page == "LED Tubes":
                 else:
                     abc.append("C")
             sorted_by_rev["ABC"] = abc
-            # Merge ABC back into proj_df on Master SKU
             abc_map = dict(zip(sorted_by_rev["Master SKU"],
                                sorted_by_rev["ABC"]))
-            proj_df["ABC"] = proj_df["Master SKU"].map(abc_map).fillna("—")
+            _local_abc = proj_df["Master SKU"].map(abc_map).fillna("—")
         else:
-            proj_df["ABC"] = "—"
+            _local_abc = pd.Series("—", index=proj_df.index)
+        # Engine ABC wins where present (not "—"); else the local cut.
+        if "_EngineABC" in proj_df.columns:
+            proj_df["ABC"] = [
+                eng if (eng and eng != "—") else loc
+                for eng, loc in zip(proj_df["_EngineABC"], _local_abc)
+            ]
+        else:
+            proj_df["ABC"] = _local_abc
 
         # Default sort: supplier, then reorder qty desc
         proj_df = proj_df.sort_values(
@@ -8881,6 +8948,7 @@ elif page == "LED Tubes":
             # Only show the columns the buyer actually edits/uses
             buyer_cols = [
                 "Master SKU", "Family", "Color", "Length", "ABC",
+                "Trend",
                 "Rule", "Sales mix",
                 "Bare sold", "via MP", "via cuts", "Migrated",
                 f"Total needed ({window_months}mo)", "/month",
@@ -8992,6 +9060,15 @@ elif page == "LED Tubes":
                 "Edit 'Order qty' and 'Include?' columns below. "
                 "Line value auto-recomputes on save."
             )
+            st.caption(
+                "ℹ️ **Suggested reorder uses the ABC engine's "
+                "trailing-12-month methodology** (same as the Ordering "
+                "page) — including 🎯 Project / 💤 Dormant suppression, "
+                "so sporadic/project tubes won't be over-ordered. The "
+                "window selector above only changes the demand-breakdown "
+                "columns (Total needed / per-month), not the reorder qty. "
+                "Override 'Order qty' manually for any shelf-stock buys."
+            )
 
             edited = st.data_editor(
                 editor_df,
@@ -9017,6 +9094,13 @@ elif page == "LED Tubes":
                     "Length": st.column_config.TextColumn(disabled=True),
                     "ABC": st.column_config.TextColumn(disabled=True,
                                                          width="small"),
+                    "Trend": st.column_config.TextColumn(
+                        "Trend", disabled=True, width="small",
+                        help="Engine trend signal (same as the Ordering "
+                             "page): 🎯 Project / 💤 Dormant / 📈 Trend / "
+                             "📉 Decline / Stable. Project & Dormant "
+                             "masters get a suppressed reorder — order "
+                             "manually if you want shelf stock."),
                     "Rule": st.column_config.TextColumn(disabled=True,
                                                           width="small"),
                     "Sales mix": st.column_config.TextColumn(
@@ -9131,7 +9215,10 @@ elif page == "LED Tubes":
 
             # Expander: full per-master detail across all suppliers
             with st.expander("Show per-master detail across ALL suppliers"):
-                proj_display = proj_df.drop(columns=["_RevProxy", "_AvgCost"])
+                proj_display = proj_df.drop(
+                    columns=[c for c in ["_RevProxy", "_AvgCost",
+                                         "_EngineABC"]
+                             if c in proj_df.columns])
                 st.dataframe(proj_display, width="stretch", hide_index=True,
                              height=500,
                              column_config={
