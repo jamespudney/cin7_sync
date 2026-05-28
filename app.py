@@ -7249,7 +7249,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.317** · deployed 2026-05-27")
+    "🔹 **v2.67.318** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -11737,6 +11737,20 @@ elif page == "Ordering":
             base = "⚪ No demand, no stock"
         elif eff == 0 and onhand > 0:
             base = "💀 Dead stock"
+        # v2.67.318 — out of stock but sold this year → Reorder now,
+        # FULL STOP. Previously a 🎯 Project / 💤 Dormant SKU with
+        # OnHand=0 fell through to "🟢 On target" because its
+        # avg_daily / target_stock are suppressed to ~0 (so every
+        # threshold below evaluated false). That mislabelled out-of-
+        # stock project items as healthy AND — since "On target"
+        # isn't in the default status filter — hid them from the
+        # supplier view entirely. James 2026-05-28: Neonica's neon/
+        # profile products (now Project, OnHand 0) vanished from the
+        # Neonica reorder view. An out-of-stock item with 12mo demand
+        # always deserves the buyer's eye, even if the engine suggests
+        # 0 (the buyer decides whether to manually order, e.g. 1 roll).
+        elif onhand <= 0:
+            base = "🔴 Reorder now"
         elif onhand < (r.get("avg_daily") or 0) * (
                 r.get("lead_time_days") or 0):
             base = "🔴 Reorder now"
@@ -12345,6 +12359,15 @@ elif page == "Ordering":
                 # clear evicts the ABC engine + every other frame,
                 # which causes a rebuild on top of still-resident
                 # caches and crashes Render's 2GB memory ceiling.
+                # v2.67.318 — explicitly drop the reorder cache-skip
+                # signature so the NEXT render is GUARANTEED to re-run
+                # _compute_target_and_reorder with the new config. The
+                # signature already includes supp_configs (so it would
+                # recompute anyway), but James 2026-05-28 reported
+                # config saves seeming not to recompute — this removes
+                # any doubt. It only forces ONE reorder apply (~10k
+                # rows), NOT a cache eviction, so no memory spike.
+                st.session_state.pop("_reorder_apply_sig", None)
                 st.success(f"Saved config for {cfg_supplier}")
                 st.rerun()
 
@@ -12910,8 +12933,20 @@ elif page == "Ordering":
         _is_dropship = s_df["SKU"].astype(str).isin(dropship_skus)
         _has_any_demand = s_df.get(
             "effective_units_12mo", pd.Series(dtype=float)).fillna(0) > 0
-        keep_mask = (s_df["reorder_qty"] > 0) | (
-            _is_dropship & _has_any_demand
+        # v2.67.318 — also keep OUT-OF-STOCK items that sold this year
+        # even when the engine suggests 0. These are almost all 🎯 Project
+        # / 💤 Dormant SKUs whose reorder was (correctly) suppressed —
+        # but the buyer still needs to SEE them to decide whether to
+        # manually order (e.g. 1 roll of a project neon for shelf
+        # presence). Without this, the methodology fixes (v2.67.310-317)
+        # made every project SKU vanish from its supplier's view, which
+        # is what James hit with Neonica's neon/profile products.
+        _out_of_stock = s_df.get(
+            "OnHand", pd.Series(dtype=float)).fillna(0) <= 0
+        keep_mask = (
+            (s_df["reorder_qty"] > 0)
+            | (_is_dropship & _has_any_demand)
+            | (_out_of_stock & _has_any_demand)
         )
         s_df = s_df[keep_mask]
     s_df = s_df.sort_values(["reorder_qty"], ascending=False)
