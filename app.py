@@ -7252,7 +7252,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.323** · deployed 2026-05-28")
+    "🔹 **v2.67.324** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -11768,6 +11768,83 @@ elif page == "Ordering":
         return f"❗ {base}" if once_slow else base
     engine_df["Status"] = engine_df.apply(_status, axis=1)
 
+    # --- Clickable-SKU → product-detail popup (v2.67.324) -------------
+    # James 2026-05-28: SKUs in the ordering tables should be
+    # hyperlinked to a product-detail window. The ordering grids are
+    # editable st.data_editor widgets (which can't emit a per-cell
+    # click), so each row carries a LinkColumn pointing at
+    # `?inspect=<SKU>`. Clicking reruns the app with that query param;
+    # we catch it here, clear it immediately (so the dialog's X / a
+    # refresh don't reopen it), and pop a modal showing the engine
+    # row's key signals + the full reorder trace. Editor edits persist
+    # across the rerun (kept in session_state).
+    def _render_sku_detail(_sku: str) -> None:
+        _hit = engine_df[engine_df["SKU"].astype(str) == str(_sku)]
+        if _hit.empty:
+            st.warning(f"No engine data for `{_sku}`.")
+            return
+        _r = _hit.iloc[0]
+        st.markdown(f"#### {_sku}")
+        st.caption(str(_r.get("Name") or ""))
+        _m = st.columns(3)
+        _m[0].metric("ABC", str(_r.get("ABC") or "—"))
+        _m[1].metric("Trend", str(_r.get("trend_flag") or "Stable"))
+        _m[2].metric("Status", str(_r.get("Status") or "—"))
+        _s = st.columns(4)
+        _s[0].metric("OnHand", f"{float(_r.get('OnHand') or 0):.0f}")
+        _s[1].metric("Available", f"{float(_r.get('Available') or 0):.0f}")
+        _s[2].metric("OnOrder", f"{float(_r.get('OnOrder') or 0):.0f}")
+        _s[3].metric("Backorder", f"{float(_r.get('unfulfilled') or 0):.0f}")
+        _d = st.columns(4)
+        _d[0].metric("12mo units",
+                     f"{float(_r.get('effective_units_12mo') or 0):.0f}")
+        _d[1].metric("45d units", f"{float(_r.get('units_45d') or 0):.0f}")
+        _d[2].metric("Customers 12mo",
+                     f"{int(_r.get('customers_12mo') or 0)}")
+        _d[3].metric("Suggested reorder",
+                     f"{float(_r.get('reorder_qty') or 0):.0f}")
+        st.markdown(
+            f"**Supplier:** {_r.get('Supplier') or '—'}  \n"
+            f"**Last 6 months:** {_r.get('last_6mo_series') or '—'}  \n"
+            f"**Target stock:** {float(_r.get('target_stock') or 0):.0f}"
+            f"  ·  **Lead time:** "
+            f"{float(_r.get('lead_time_days') or 0):.0f}d "
+            f"({_r.get('freight_mode') or '—'})"
+        )
+        _trace = _r.get("calc_trace")
+        if isinstance(_trace, str) and _trace.strip():
+            with st.expander("Full reorder math", expanded=False):
+                st.markdown(_trace)
+        st.caption(
+            "For the complete drill-through (BOM, full sales/PO history) "
+            f"open the **Product Detail** page and search `{_sku}`.")
+
+    _inspect_sku = (st.query_params.get("inspect") or "").strip()
+    if _inspect_sku:
+        # Clear immediately: dialog renders THIS run; any later rerun
+        # (incl. clicking the modal's X) won't re-trigger it → clean close.
+        try:
+            del st.query_params["inspect"]
+        except Exception:  # noqa: BLE001
+            pass
+        _dialog_factory = (getattr(st, "dialog", None)
+                           or getattr(st, "experimental_dialog", None))
+        if _dialog_factory is not None:
+            try:
+                @_dialog_factory(f"Product detail — {_inspect_sku}")
+                def _sku_inspect_dialog():
+                    _render_sku_detail(_inspect_sku)
+                    if st.button("Close", key="_close_inspect"):
+                        st.rerun()
+                _sku_inspect_dialog()
+            except Exception:  # noqa: BLE001
+                # Any dialog-API incompatibility → inline fallback.
+                with st.container(border=True):
+                    _render_sku_detail(_inspect_sku)
+        else:
+            with st.container(border=True):
+                _render_sku_detail(_inspect_sku)
+
     # --- Top-of-page stock optimisation headline -----------------------
     st.markdown("### :moneybag: Stock optimisation overview")
 
@@ -14297,6 +14374,20 @@ elif page == "Ordering":
                     st.success(f"Reactivated {sku_a}. Refreshing…")
                     st.rerun()
 
+    # v2.67.324 — leading clickable-SKU column. Value is a relative URL
+    # (?inspect=<SKU>); the LinkColumn's display_text regex shows the
+    # SKU itself, so it reads as a clickable SKU. Kept separate from the
+    # data "SKU" column so the PO-building downstream still reads raw
+    # SKUs. Clicking opens the product-detail modal (handled at the top
+    # of this page via the `inspect` query param).
+    if "SKU" in editable.columns and "🔍 SKU" not in editable.columns:
+        editable.insert(
+            0, "🔍 SKU",
+            "?inspect=" + editable["SKU"].astype(str))
+        _po_col_cfg["🔍 SKU"] = st.column_config.LinkColumn(
+            "🔍 SKU", display_text=r"inspect=(.+)$", width="small",
+            help="Click to open this product's detail in a popup.")
+
     edited = st.data_editor(
         editable,
         width="stretch", hide_index=True, height=500,
@@ -15580,6 +15671,12 @@ elif page == "Ordering":
                          "Add?"]
             show_cols = [c for c in show_cols if c in upc.columns]
             upc_view = upc[show_cols].sort_values("days_to_reorder")
+            # v2.67.324 — leading clickable-SKU column (same as the main
+            # editor): opens the product-detail popup via ?inspect=<SKU>.
+            upc_view = upc_view.copy()
+            upc_view.insert(
+                0, "🔍 SKU",
+                "?inspect=" + upc_view["SKU"].astype(str))
 
             # Use a unique key so editing here doesn't clash with the
             # main PO editor's state.
@@ -15588,6 +15685,10 @@ elif page == "Ordering":
                 width="stretch", hide_index=True, height=350,
                 key=f"upcoming_editor_{sel_sup}_{upcoming_window}",
                 column_config={
+                    "🔍 SKU": st.column_config.LinkColumn(
+                        "🔍 SKU", display_text=r"inspect=(.+)$",
+                        width="small",
+                        help="Click to open this product's detail popup."),
                     "Add?": st.column_config.CheckboxColumn(
                         "✓ Add to PO",
                         help="Tick + click 'Add ticked items' below. "
