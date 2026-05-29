@@ -3723,6 +3723,16 @@ def _build_bom_indexes(boms_df: pd.DataFrame) -> dict:
         comp = row.get("ComponentSKU")
         if not asm or not comp:
             continue
+        # v2.67.327 — skip self-referential BOM rows (AssemblySKU ==
+        # ComponentSKU). A SKU can't be its own component; if CIN7's
+        # BOM data contains such a row it makes the SKU both a "master"
+        # and its own "child", so every demand rollup
+        # (monthly trend buckets, 45d/90d units, customers) does
+        # `buckets[X] += buckets[X] × ratio` and DOUBLES the SKU's own
+        # sales. James 2026-05-28: LED-NEON-FLEX-SUPER-SLIM-ST showed
+        # its 6-month sales duplicated (a real 12 reading as 24).
+        if str(asm) == str(comp):
+            continue
         parents_of.setdefault(asm, []).append({
             "ComponentSKU": comp,
             "ComponentName": row.get("ComponentName"),
@@ -6537,6 +6547,10 @@ def _abc_engine(products: pd.DataFrame,
         _succ = str(_m.get("successor_sku") or "")
         if not _ret or not _succ:
             continue
+        # v2.67.327 — a SKU migrating to itself would double its own
+        # buckets (dest[succ] += src[ret] with ret==succ).
+        if _ret == _succ:
+            continue
         _share = float(_m.get("share_pct") or 100) / 100.0
         if _share <= 0:
             continue
@@ -6601,6 +6615,10 @@ def _abc_engine(products: pd.DataFrame,
         _ret = str(_m.get("retiring_sku") or "")
         _succ = str(_m.get("successor_sku") or "")
         if not _ret or not _succ:
+            continue
+        # v2.67.327 — a SKU migrating to itself would double its own
+        # buckets (dest[succ] += src[ret] with ret==succ).
+        if _ret == _succ:
             continue
         _share = float(_m.get("share_pct") or 100) / 100.0
         if _share <= 0:
@@ -6671,6 +6689,10 @@ def _abc_engine(products: pd.DataFrame,
         _ret = str(_m.get("retiring_sku") or "")
         _succ = str(_m.get("successor_sku") or "")
         if not _ret or not _succ:
+            continue
+        # v2.67.327 — a SKU migrating to itself would double its own
+        # buckets (dest[succ] += src[ret] with ret==succ).
+        if _ret == _succ:
             continue
         _share = float(_m.get("share_pct") or 100) / 100.0
         if _share <= 0:
@@ -7257,7 +7279,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.326** · deployed 2026-05-28")
+    "🔹 **v2.67.327** · deployed 2026-05-28")
 
 
 if page == "Overview":
