@@ -4983,6 +4983,19 @@ def all_sku_supplier_overrides() -> dict:
     return {r["sku"]: r["supplier_name"] for r in rows}
 
 
+def clear_sku_supplier(sku: str, actor: str = "") -> None:
+    """v2.67.321 — remove a per-SKU supplier override so the SKU falls
+    back to CIN7-native / family-rule / PO-history resolution."""
+    with connect() as c:
+        c.execute(
+            "DELETE FROM sku_supplier_overrides WHERE sku = ?", (sku,))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("sku_supplier.clear", actor, sku, ""),
+        )
+
+
 def clear_critical_component(cid: int, actor: str) -> None:
     with connect() as c:
         row = c.execute(

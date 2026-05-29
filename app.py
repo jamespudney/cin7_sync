@@ -7252,7 +7252,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.320** · deployed 2026-05-28")
+    "🔹 **v2.67.321** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -12402,119 +12402,111 @@ elif page == "Ordering":
                 st.dataframe(pd.DataFrame(cfg_rows),
                              width="stretch", hide_index=True)
 
-    # --- Supplier-assignment audit (v2.67.307) -------------------------
-    # James 2026-05-27: "IP says these need replenishment but most are
-    # not even reflected under Neonica demand list in our system."
+    # --- Assign products to a supplier (v2.67.321) ---------------------
+    # Replaces the old read-only "supplier-assignment audit" (removed —
+    # James 2026-05-28: "the audit is useless, it does not work"). It
+    # only DIAGNOSED the gap and gave no way to fix it; worse, the only
+    # per-SKU override UI was on the LED Tubes page with a TUBE-ONLY SKU
+    # picker, so non-tube products (LED-POLI-MOUNT, LED-HR-MAX-2,
+    # LED-NEON-FLEX-NICHO-*, etc. — Neonica's neon/profile range) could
+    # never be assigned through the app at all. That's why they never
+    # appeared under "Neonica Polska Sp. z o.o.".
     #
-    # Root cause for non-tube SKUs (NICHO, HR-MAX, KRAV, IRIS…) is that
-    # CIN7's product.Suppliers field isn't set → our `cin7_supplier_local`
-    # tier finds nothing → resolution falls through PO history into
-    # "(unassigned)". The fix is to set Supplier in CIN7 (single source
-    # of truth, matches IP). This expander shows where the gap is so
-    # staff know exactly which products to touch.
-    if "SupplierTier" in engine_df.columns:
-        # IP vendor map — pulled from ip_lead_times.vendor_name (what IP
-        # has assigned per SKU). This is the ground truth we compare to.
-        _ip_vendor_by_sku = {
-            s: (v or {}).get("vendor_name") or ""
-            for s, v in (ip_lead_times_by_sku or {}).items()
-        }
-        # Build the audit frame for every SKU with EITHER:
-        #   • an IP vendor assigned (i.e. IP knows where this comes from), OR
-        #   • a non-zero reorder suggestion in our engine
-        # — i.e. items that actually matter for the buying workflow.
-        _audit_src = engine_df[[
-            "SKU", "Name", "Supplier", "SupplierTier",
-            "reorder_qty", "ABC", "is_non_master_tube",
-        ]].copy()
-        _audit_src["IPVendor"] = _audit_src["SKU"].map(_ip_vendor_by_sku).fillna("")
-        _audit_src = _audit_src[
-            (_audit_src["IPVendor"] != "")
-            | (_audit_src["reorder_qty"] > 0)
-        ].copy()
-
-        def _audit_status(row):
-            ours = (row["Supplier"] or "").strip()
-            ip = (row["IPVendor"] or "").strip()
-            if not ip and ours == "(unassigned)":
-                return "⚠️ unassigned both sides"
-            if not ip:
-                return "ℹ️ IP has no vendor"
-            if ours == "(unassigned)":
-                return "❌ missing in ours"
-            if ours.lower() == ip.lower():
-                return "✅ match"
-            return "❌ mismatch"
-
-        _audit_src["Status"] = _audit_src.apply(_audit_status, axis=1)
-        # Buyer-friendly order: mismatches / unassigned first.
-        _status_order = {
-            "❌ missing in ours": 0,
-            "❌ mismatch": 1,
-            "⚠️ unassigned both sides": 2,
-            "ℹ️ IP has no vendor": 3,
-            "✅ match": 4,
-        }
-        _audit_src["_o"] = _audit_src["Status"].map(_status_order).fillna(9)
-        _audit_src = _audit_src.sort_values(
-            ["_o", "reorder_qty"], ascending=[True, False]).drop(columns="_o")
-
-        _n_missing = int((_audit_src["Status"] == "❌ missing in ours").sum())
-        _n_mismatch = int((_audit_src["Status"] == "❌ mismatch").sum())
-        _n_match = int((_audit_src["Status"] == "✅ match").sum())
-        _hdr = (
-            f"🔍 Supplier-assignment audit — "
-            f"{_n_missing} missing in ours, {_n_mismatch} mismatched, "
-            f"{_n_match} matched"
-        )
-        with st.expander(_hdr, expanded=False):
-            st.caption(
-                "Compares Inventory Planner's per-SKU `vendor_name` "
-                "(what IP reports against) with our `Supplier` bucket "
-                "(resolved via override → CIN7-native → family-rule → "
-                "PO history → unassigned). Source of truth going "
-                "forward: **CIN7 product Suppliers field** — once set, "
-                "our sync picks it up automatically and IP stays in sync.\n\n"
-                "Filter to a specific IP vendor (e.g. Neonica) to see "
-                "which SKUs IP knows about but our app hasn't bucketed "
-                "yet. Those are the products to open in CIN7 and set "
-                "Supplier on."
+    # This tool writes per-SKU overrides — the TOP resolution tier
+    # (override > CIN7-native > family-rule > PO-history > unassigned) —
+    # so pasted SKUs land under the chosen supplier IMMEDIATELY,
+    # regardless of CIN7 product-master or PO-history state. Paste,
+    # pick, Assign.
+    with st.expander("🏷️ Assign products to a supplier", expanded=False):
+        _actor_assign = st.session_state.get("current_user", "").strip()
+        if not _actor_assign:
+            st.caption("Enter your name in the sidebar to assign suppliers.")
+        else:
+            # Supplier options: master file + already-resolved buckets +
+            # existing overrides.
+            _known_sups = set()
+            if not suppliers.empty and "Name" in suppliers.columns:
+                _known_sups.update(
+                    suppliers["Name"].dropna().astype(str).tolist())
+            _known_sups.update(
+                s for s in engine_df["Supplier"].unique()
+                if s and s != "(unassigned)")
+            _known_sups.update(db.all_sku_supplier_overrides().values())
+            _known_sups = sorted(x for x in _known_sups if x)
+            st.markdown(
+                "Paste one or more **SKUs** (one per line), pick the "
+                "**supplier**, and Assign. This sets a per-SKU override — "
+                "the highest-priority rule — so the products show under "
+                "that supplier's reorder view immediately, even if CIN7's "
+                "product record or PO history says otherwise."
             )
-            _ip_vendors_in_view = sorted(
-                {v for v in _audit_src["IPVendor"].unique() if v})
-            _vendor_pick = st.selectbox(
-                "Filter by IP vendor",
-                ["(all)"] + _ip_vendors_in_view,
-                key="ord_audit_ip_vendor",
+            ac1, ac2 = st.columns([2, 2])
+            _sku_paste = ac1.text_area(
+                "SKUs (one per line)", height=170,
+                key="bulk_assign_skus",
+                placeholder=("LED-POLI-MOUNT\nLED-HR-MAX-2\n"
+                             "LED-NEON-FLEX-NICHO-3000K-1"),
             )
-            _status_pick = st.multiselect(
-                "Show statuses",
-                list(_status_order.keys()),
-                default=[
-                    "❌ missing in ours",
-                    "❌ mismatch",
-                    "⚠️ unassigned both sides",
-                ],
-                key="ord_audit_status",
-            )
-            _view = _audit_src.copy()
-            if _vendor_pick != "(all)":
-                _view = _view[_view["IPVendor"] == _vendor_pick]
-            if _status_pick:
-                _view = _view[_view["Status"].isin(_status_pick)]
-            st.dataframe(
-                _view[[
-                    "SKU", "Name", "IPVendor", "Supplier",
-                    "SupplierTier", "Status", "reorder_qty", "ABC",
-                ]].rename(columns={
-                    "IPVendor": "IP vendor (truth)",
-                    "Supplier": "Our bucket",
-                    "SupplierTier": "Tier hit",
-                    "reorder_qty": "Reorder (ours)",
-                }),
-                hide_index=True,
-                use_container_width=True,
-            )
+            _sup_choice = (ac2.selectbox(
+                "Supplier", _known_sups, key="bulk_assign_supplier")
+                if _known_sups else None)
+            _assign_note = ac2.text_input(
+                "Note (optional)", key="bulk_assign_note",
+                placeholder="e.g. Neonica neon/profile range")
+            if ac2.button(
+                "Assign these SKUs", key="bulk_assign_go", type="primary",
+                disabled=not (_sku_paste.strip() and _sup_choice),
+            ):
+                _skus = [s.strip() for s in _sku_paste.splitlines()
+                         if s.strip()]
+                _valid = set(engine_df["SKU"].astype(str))
+                _done, _unknown = [], []
+                for _sk in _skus:
+                    if _sk in _valid:
+                        db.set_sku_supplier(
+                            _sk, _sup_choice, _actor_assign, _assign_note)
+                        _done.append(_sk)
+                    else:
+                        _unknown.append(_sk)
+                if _done:
+                    st.success(
+                        f"Assigned {len(_done)} SKU(s) to "
+                        f"**{_sup_choice}**. Rebuilding engine…")
+                if _unknown:
+                    st.warning(
+                        "Not found in the catalog (check spelling — the "
+                        "SKU must match exactly): " + ", ".join(_unknown))
+                if _done:
+                    # Override is read at engine-compute time, so the
+                    # engine must rebuild for the new bucket to appear.
+                    st.session_state.pop("_reorder_apply_sig", None)
+                    try:
+                        _get_engine_df.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    st.rerun()
+            # Current overrides + clear control.
+            _curr_over = db.all_sku_supplier_overrides()
+            if _curr_over:
+                st.markdown("**Current per-SKU overrides**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [{"SKU": k, "Supplier": v}
+                         for k, v in sorted(_curr_over.items())]),
+                    hide_index=True, use_container_width=True, height=200)
+                cc1, cc2 = st.columns([2, 1])
+                _clear_pick = cc1.selectbox(
+                    "Clear an override", ["—"] + sorted(_curr_over.keys()),
+                    key="bulk_clear_pick")
+                if cc2.button("Clear override", key="bulk_clear_go",
+                               disabled=(_clear_pick == "—")):
+                    db.clear_sku_supplier(_clear_pick, _actor_assign)
+                    st.session_state.pop("_reorder_apply_sig", None)
+                    try:
+                        _get_engine_df.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    st.rerun()
 
     # --- Supplier-focused view -----------------------------------------
     st.markdown("### :clipboard: Draft PO — by supplier")
