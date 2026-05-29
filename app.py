@@ -7252,7 +7252,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.322** · deployed 2026-05-28")
+    "🔹 **v2.67.323** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -15573,6 +15573,7 @@ elif page == "Ordering":
             upc["Add?"] = False
 
             show_cols = ["SKU", "Name", "ABC", "trend_flag",
+                         "last_6mo_series",
                          "OnHand", "OnOrder", "eff_pos",
                          "target_stock", "days_to_reorder",
                          "avg_daily", "Suggest", "POCost", "Line $",
@@ -15602,6 +15603,11 @@ elif page == "Ordering":
                         disabled=True, width="small"),
                     "trend_flag": st.column_config.TextColumn(
                         "📈 Trend", disabled=True, width="small"),
+                    "last_6mo_series": st.column_config.TextColumn(
+                        "Last 6 months", disabled=True, width="medium",
+                        help="Units sold each of the last 6 months — "
+                             "oldest on the left, newest on the right. "
+                             "Same column as the main reorder table."),
                     "OnHand": st.column_config.NumberColumn(
                         disabled=True, format="%.0f"),
                     "OnOrder": st.column_config.NumberColumn(
