@@ -5652,59 +5652,19 @@ def _abc_engine(products: pd.DataFrame,
                                          "Available", "OnOrder",
                                          "StockOnHand"])
 
-    # 3b. Open-authorised demand per SKU — total line qty across every
-    # AUTHORISED-but-not-yet-shipped sale. ORDERED + BACKORDERED. We
-    # subtract the Allocated column from this further down to derive
-    # the truly-unfulfilled portion (what's NOT yet reserved against
-    # current stock).
+    # 3b. Backorder per SKU is read straight off CIN7's stock snapshot
+    # (Allocated − OnHand), computed once `df` is built — see the
+    # `df["unfulfilled"]` line below. We no longer derive it from open
+    # sale-line quantities.
     #
-    # Status taxonomy per CIN7 docs (dearinventory.apib §SaleStatesList):
-    #   • ORDERED    = "OrderStatus = AUTHORISED, all products in sale
-    #                   order are in stock, no backordering" → every
-    #                   line is reserved against current stock and
-    #                   shows up in the Allocated column.
-    #   • BACKORDERED = "OrderStatus = AUTHORISED, at least one product
-    #                   has been backordered" → SOME portion of the
-    #                   sale's lines is allocated, the rest is genuine
-    #                   unfulfilled demand. The Status field is sale-
-    #                   level, so every line on a BACKORDERED sale
-    #                   carries Status="BACKORDERED" — we cannot tell
-    #                   from the saved line data which lines are
-    #                   allocated vs short.
-    #   • ORDERING    = OrderStatus = DRAFT → not authorised, no
-    #                   allocation impact, speculative demand → exclude.
-    #   • PICKING / PICKED / PACKING / PACKED / SHIPPING → already
-    #                   reserved or in flight, in Allocated, exclude.
-    #
-    # Version history (LEDWIRIS4100-120-5m as the test case):
-    # • Pre-v2.67.306: included all of (ORDERED, BACKORDERED, ORDERING)
-    #   in `unfulfilled` and subtracted from Available. Available already
-    #   nets Allocated, so this double-counted by every line of every
-    #   ORDERED sale. Engine said reorder = 29, IP said 16.
-    # • v2.67.306: narrowed to BACKORDERED-only. Cleared the cross-
-    #   status double-count, but BACKORDERED-status SALES still
-    #   contribute all their line qty — including the partially-
-    #   allocated portion. Same SKU still showed reorder = 29 because
-    #   its open demand sits in partially-allocated BACKORDERED sales.
-    # • v2.67.309: collect AUTHORISED-open line qty (BACKORDERED +
-    #   ORDERED), then later compute `unfulfilled = max(0, open_qty −
-    #   Allocated)`. Cleanly handles all cases — ORDERED contributes
-    #   zero (line qty == Allocated portion), BACKORDERED contributes
-    #   only the un-allocated remainder.
-    OPEN_AUTHORISED_STATUSES = ("BACKORDERED", "ORDERED")
-    open_line_qty_by_sku = {}
-    if "Status" in sale_lines.columns:
-        open_lines = sale_lines[sale_lines["Status"]
-                                  .astype(str).str.upper()
-                                  .isin(OPEN_AUTHORISED_STATUSES)].copy()
-        open_lines["Quantity"] = _to_num(
-            open_lines["Quantity"]).fillna(0)
-        open_line_qty_by_sku = (
-            open_lines.groupby("SKU")["Quantity"].sum().to_dict())
-
-    # 3c. Apply unfulfilled-order lookup to the main frame later
-    # (defer until df is built — unfulfilled = max(0, open_qty −
-    # Allocated) needs both numbers on the row at the same time).
+    # v2.67.319 — removed the open-sale-line aggregation
+    # (OPEN_AUTHORISED_STATUSES / open_line_qty_by_sku) that fed the
+    # v2.67.306-309 formulas. Summing BACKORDERED/ORDERED line
+    # quantities never reconciled with CIN7's stock ledger (it gave 14
+    # for LEDWIRIS4100-120-5m where CIN7 shows 7), because a sale_line's
+    # Status is the SALE-level status and the line qty is the ORDERED
+    # qty, not the unfulfilled portion. CIN7's own backorder figure is
+    # the over-allocation on the stock record, so we use that directly.
 
     # 4. Supplier per SKU using 4-tier resolution:
     # override > CIN7 native Suppliers > PO history > family default > unassigned
@@ -5825,18 +5785,33 @@ def _abc_engine(products: pd.DataFrame,
         df["top_cust_name"] = ""
     df["top_cust_name"] = df["top_cust_name"].fillna("")
 
-    # Unfulfilled open orders per SKU.
-    # v2.67.309 — `open_authorised_qty` is total AUTHORISED-but-not-
-    # shipped line qty (ORDERED + BACKORDERED). The Allocated column
-    # already holds the portion of that demand reserved against
-    # current stock, so the TRULY unfulfilled portion (what we still
-    # need to satisfy with future receipts) is the residual. Clip to
-    # 0 because brief sync-window misalignment can make Allocated
-    # momentarily exceed open lines.
-    df["open_authorised_qty"] = df["SKU"].apply(
-        lambda s: float(open_line_qty_by_sku.get(s, 0))).fillna(0)
-    df["unfulfilled"] = (
-        df["open_authorised_qty"] - df["Allocated"]).clip(lower=0)
+    # Backorder per SKU — use CIN7's OWN stock snapshot, not a sale-line
+    # derivation.
+    #
+    # v2.67.319 — CIN7's "on backorder" for a SKU is exactly the
+    # over-allocation: how much has been committed (Allocated) beyond
+    # what's physically on the shelf (OnHand). That is
+    #   max(0, Allocated − OnHand)   ==   max(0, −Available)
+    # because Available = OnHand − Allocated. For LEDWIRIS4100-120-5m
+    # the snapshot is OnHand 0, Allocated 7, Available −7 → backorder 7,
+    # matching what CIN7 shows.
+    #
+    # Why the previous approaches were wrong (James 2026-05-28: "app
+    # shows 14, CIN7 shows 7"):
+    #   • v2.67.305-: summed BACKORDERED+ORDERED+ORDERING line qty.
+    #   • v2.67.306: BACKORDERED-only line qty.
+    #   • v2.67.309: max(0, (BACKORDERED+ORDERED line qty) − Allocated).
+    # All three derive backorder from open SALE-LINE quantities, which
+    # don't reconcile with the stock ledger — for this SKU they summed
+    # to 21, so 21 − 7 = 14, double what CIN7 reports. The stock
+    # snapshot (OnHand / Allocated / Available) IS the ledger CIN7 shows
+    # the user, so we read backorder straight off it. Engine-wide fix,
+    # not SKU-specific.
+    #
+    # The field is still called `unfulfilled` so the display column
+    # mapping ("unfulfilled" → "Backorders") and downstream reads keep
+    # working — only the value's derivation changed.
+    df["unfulfilled"] = (df["Allocated"] - df["OnHand"]).clip(lower=0)
 
     # v2.67.307 — compute supplier + tier together. SupplierTier feeds
     # the Ordering-page assignment-audit expander so staff can see
@@ -7249,7 +7224,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.318** · deployed 2026-05-28")
+    "🔹 **v2.67.319** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -11204,23 +11179,20 @@ elif page == "Ordering":
         unfulfilled = float(row.get("unfulfilled") or 0)
         # Effective position = what we'll actually have for future demand.
         #
-        # Available already nets Allocated (CIN7's calc:
-        # Available = OnHand - Allocated). Allocated covers the portion
-        # of open AUTHORISED demand that's reserved against current
-        # stock.
+        # v2.67.319 — Available ALREADY nets Allocated (CIN7's calc:
+        # Available = OnHand − Allocated). When we're over-committed it
+        # goes negative, and that negative value IS the backorder — the
+        # same number CIN7 shows and the same number now in `unfulfilled`
+        # (= max(0, Allocated − OnHand) = max(0, −Available)).
         #
-        # `unfulfilled` (as of v2.67.309) is the residual: open
-        # AUTHORISED line qty (BACKORDERED + ORDERED) MINUS Allocated,
-        # clipped at 0. So we're subtracting only the demand that's
-        # NOT yet reflected in Allocated — the true backlog.
-        #
-        # Walk-through for LEDWIRIS4100-120-5m at the time of fix:
-        #   open_authorised_qty ≈ 21, Allocated ≈ 14
-        #   → unfulfilled = max(0, 21 − 14) = 7
-        #   → effective_pos = Available + OnOrder − 7
-        # Prior to v2.67.309 we subtracted the full 21, double-counting
-        # the 14 already in Allocated.
-        effective_pos = available + on_order - unfulfilled
+        # So effective_pos = Available + OnOrder. We must NOT subtract
+        # `unfulfilled` on top — Available has already accounted for it.
+        # The old `available + on_order − unfulfilled` DOUBLE-counted the
+        # backorder (it was the root of "app shows 14, CIN7 shows 7" and
+        # the earlier 29-vs-16 reorder inflation). `unfulfilled` is now
+        # kept purely for DISPLAY (the Backorders column); it is no
+        # longer a term in the reorder math.
+        effective_pos = available + on_order
         shortfall = max(0, target - effective_pos)
 
         # Fractional ordering — for bulk-roll masters where the supplier
@@ -11557,15 +11529,16 @@ elif page == "Ordering":
             + f" = **{target:.1f} units**\n\n"
             f"**Current position**:\n"
             f"- OnHand: {onhand:.0f} physical units\n"
-            f"- Allocated (reserved for open picks): {allocated:.0f}\n"
-            f"- Available (OnHand - Allocated + phantom): {available:.0f}\n"
-            f"- OnOrder (incoming POs): {on_order:.0f}\n"
-            f"- Open authorised demand (BACKORDERED + ORDERED line qty): "
-            f"{float(row.get('open_authorised_qty') or 0):.0f}\n"
-            f"- Unfulfilled (= open authorised − Allocated, clipped ≥ 0): "
-            f"{unfulfilled:.0f}\n"
+            f"- Allocated (reserved for open orders): {allocated:.0f}\n"
+            f"- Available (OnHand − Allocated): {available:.0f}"
+            + ("  ← negative = we're over-committed\n"
+               if available < 0 else "\n")
+            + f"- OnOrder (incoming POs): {on_order:.0f}\n"
+            f"- Backorder (= max(0, Allocated − OnHand), matches CIN7): "
+            f"{unfulfilled:.0f}  ← already reflected in negative "
+            f"Available, NOT subtracted again\n"
             f"- **Effective position**: {available:.0f} + {on_order:.0f} "
-            f"- {unfulfilled:.0f} = **{effective_pos:.0f}**\n\n"
+            f"= **{effective_pos:.0f}**\n\n"
             f"**Suggested reorder**: max(0, {target:.1f} - "
             f"{effective_pos:.0f}) = "
             + (f"**{reorder:.2f}** rolls "
@@ -12882,8 +12855,9 @@ elif page == "Ordering":
             onhand = float(row.get("OnHand") or 0)
             available = float(row.get("Available") or 0)
             on_order = float(row.get("OnOrder") or 0)
-            unfulfilled = float(row.get("unfulfilled") or 0)
-            effective_pos = available + on_order - unfulfilled
+            # v2.67.319 — Available already nets the backorder (negative
+            # when over-committed); do NOT subtract `unfulfilled` again.
+            effective_pos = available + on_order
             new_reorder = int(round(max(0, new_target - effective_pos)))
             moq = cfg_sel.get("moq_units") or 0
             if new_reorder > 0 and moq and new_reorder < moq:
@@ -14778,9 +14752,10 @@ elif page == "Ordering":
             f"upcoming_window_{sel_sup}", 45))
 
         cand = all_supplier_df.copy()
+        # v2.67.319 — Available already nets the backorder; don't
+        # subtract unfulfilled again (was double-counting).
         cand["eff_pos"] = (cand["Available"].fillna(0)
-                            + cand["OnOrder"].fillna(0)
-                            - cand["unfulfilled"].fillna(0))
+                            + cand["OnOrder"].fillna(0))
         cand["surplus"] = (cand["eff_pos"]
                             - cand["target_stock"].fillna(0))
         cand["days_to_reorder"] = cand.apply(
@@ -15481,11 +15456,12 @@ elif page == "Ordering":
     if upc.empty:
         st.info("No upcoming items for this supplier.")
     else:
-        # Effective position = what we'll have for future demand
+        # Effective position = what we'll have for future demand.
+        # v2.67.319 — Available already nets the backorder (negative when
+        # over-committed); don't subtract unfulfilled again.
         upc["eff_pos"] = (
             upc["Available"].fillna(0)
             + upc["OnOrder"].fillna(0)
-            - upc["unfulfilled"].fillna(0)
         )
         upc["surplus_above_target"] = (
             upc["eff_pos"] - upc["target_stock"].fillna(0)
