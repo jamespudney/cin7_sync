@@ -7252,7 +7252,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.321** · deployed 2026-05-28")
+    "🔹 **v2.67.322** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -12417,7 +12417,55 @@ elif page == "Ordering":
     # so pasted SKUs land under the chosen supplier IMMEDIATELY,
     # regardless of CIN7 product-master or PO-history state. Paste,
     # pick, Assign.
-    with st.expander("🏷️ Assign products to a supplier", expanded=False):
+    # v2.67.322 — unassigned-supplier count, shown on the expander
+    # label so James can see the scope at a glance (he asked "how many
+    # other items aren't assigned"). A SKU is "(unassigned)" ONLY when
+    # CIN7's own product.Suppliers array is empty for it AND there's no
+    # PO history / override — i.e. CIN7 itself has no supplier on the
+    # product. Our records already match CIN7's product master; the
+    # parser reads the exact `SupplierName` key CIN7 returns. We split
+    # the count into "with demand" (worth assigning) vs total so the
+    # number isn't inflated by dead/accessory SKUs.
+    _orderable_all = engine_df[~engine_df["is_non_master_tube"].fillna(False)]
+    _unassigned_all = _orderable_all[
+        _orderable_all["Supplier"] == "(unassigned)"]
+    _unassigned_demand = _unassigned_all[
+        _unassigned_all.get(
+            "effective_units_12mo", pd.Series(dtype=float)).fillna(0) > 0]
+    _n_unassigned = len(_unassigned_all)
+    _n_unassigned_demand = len(_unassigned_demand)
+    _assign_hdr = (
+        f"🏷️ Assign products to a supplier — "
+        f"{_n_unassigned_demand} unassigned with demand"
+        + (f" ({_n_unassigned} total)" if _n_unassigned
+           != _n_unassigned_demand else "")
+    )
+    with st.expander(_assign_hdr, expanded=False):
+        st.caption(
+            f"**{_n_unassigned} orderable SKUs are unassigned** "
+            f"({_n_unassigned_demand} of them sold something in the last "
+            f"12 months — those are the ones worth assigning). A SKU is "
+            f"unassigned only when **CIN7's own product record has no "
+            f"supplier** set on it (empty Suppliers) and we've never "
+            f"raised a PO for it. Our resolution reads CIN7's product "
+            f"`Suppliers` field directly, so once you set the supplier in "
+            f"CIN7 it flows through on the next daily product sync (7 AM) "
+            f"— or assign it here for an immediate override."
+        )
+        if _n_unassigned_demand and st.checkbox(
+            f"📋 Show the {_n_unassigned_demand} unassigned SKUs with "
+            f"demand (copy into the box below)",
+            key="show_unassigned_list"):
+            _ua_cols = [c for c in
+                        ["SKU", "Name", "effective_units_12mo",
+                         "customers_12mo", "OnHand"]
+                        if c in _unassigned_demand.columns]
+            st.dataframe(
+                _unassigned_demand[_ua_cols].sort_values(
+                    "effective_units_12mo", ascending=False).rename(
+                    columns={"effective_units_12mo": "12mo units",
+                             "customers_12mo": "customers"}),
+                hide_index=True, use_container_width=True, height=300)
         _actor_assign = st.session_state.get("current_user", "").strip()
         if not _actor_assign:
             st.caption("Enter your name in the sidebar to assign suppliers.")
