@@ -658,6 +658,17 @@ def _extract_sale_lines(detail: Dict[str, Any], header: Dict[str, Any]) -> List[
     for invoice in (detail.get("Invoices") or []):
         if not isinstance(invoice, dict):
             continue
+        # v2.67.330 — skip VOIDED invoices. When an invoice is voided
+        # and re-issued (a correction/revision), CIN7 KEEPS the voided
+        # invoice in the Invoices array alongside the live one. Summing
+        # lines across all of them double-counts demand. James
+        # 2026-05-28: LED-NEON-FLEX-SUPER-SLIM-ST showed 12 + 12 across
+        # two months — one live invoice plus one voided revision of the
+        # same 12-unit line. Only count finalised invoices; if the
+        # Status field is absent we keep the line (no regression).
+        _inv_status = str(invoice.get("Status") or "").strip().upper()
+        if _inv_status in ("VOIDED", "NOT AVAILABLE"):
+            continue
         inv_date = invoice.get("InvoiceDate")
         inv_num = invoice.get("InvoiceNumber")
         for line in (invoice.get("Lines") or []):
