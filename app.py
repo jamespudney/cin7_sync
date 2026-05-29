@@ -5499,6 +5499,15 @@ def _abc_engine(products: pd.DataFrame,
         "units_prior_45d")
     c45 = sl_recent.groupby("SKU")["CustomerID"].nunique().rename(
         "customers_45d")
+    # v2.67.320 — distinct customers over the full 12mo window. A
+    # "project" is concentrated demand from 1-2 buyers; 3+ distinct
+    # buyers over the year is diversified, repeatable demand and must
+    # NOT be flagged Project regardless of how few UNITS that is. `sl`
+    # is already the trailing-12mo line set (filtered at the top of the
+    # engine). Critical for bulk-roll masters where effective_units_12mo
+    # is in fractional rolls and trips the low-volume rule falsely.
+    c12 = sl.groupby("SKU")["CustomerID"].nunique().rename(
+        "customers_12mo")
     # 90-day units — used for dormancy detection. A SKU with strong
     # 12mo history but zero 90d activity is treated as dormant; the
     # engine uses the 90d rate (≈0) instead of the inflated 12mo rate
@@ -5561,12 +5570,14 @@ def _abc_engine(products: pd.DataFrame,
     vel = vel.merge(u45, on="SKU", how="left")
     vel = vel.merge(uprior, on="SKU", how="left")
     vel = vel.merge(c45, on="SKU", how="left")
+    vel = vel.merge(c12, on="SKU", how="left")
     vel = vel.merge(u90, on="SKU", how="left")
     vel = vel.merge(top_df, on="SKU", how="left")
     vel["units_45d"] = vel["units_45d"].fillna(0)
     vel["units_prior_45d"] = vel["units_prior_45d"].fillna(0)
     vel["units_90d"] = vel["units_90d"].fillna(0)
     vel["customers_45d"] = vel["customers_45d"].fillna(0).astype(int)
+    vel["customers_12mo"] = vel["customers_12mo"].fillna(0).astype(int)
     vel["top_cust_pct"] = vel["top_cust_pct"].fillna(0)
     vel["top_cust_units_12mo"] = vel["top_cust_units_12mo"].fillna(0)
     vel["top_cust_name"] = vel["top_cust_name"].fillna("")
@@ -5771,7 +5782,7 @@ def _abc_engine(products: pd.DataFrame,
               # in the recent window. Must be numeric-0 for downstream
               # int() casts in _compute_target_and_reorder.
               "units_45d", "units_prior_45d", "units_90d",
-              "customers_45d",
+              "customers_45d", "customers_12mo",
               "top_cust_pct", "top_2_cust_pct", "non_top_avg_units",
               "top_cust_units_12mo", "momentum"]:
         if c not in df.columns:
@@ -6927,6 +6938,23 @@ def _abc_engine(products: pd.DataFrame,
             abc = str(r.get("ABC") or "C").strip().upper()
             u45 = float(r.get("units_45d") or 0)
             u90 = float(r.get("units_90d") or 0)
+            cust_12mo = int(r.get("customers_12mo") or 0)
+            # v2.67.320 — CUSTOMER-DIVERSITY GUARD (highest priority
+            # after dormancy). A "project" is concentrated demand from
+            # 1-2 buyers. A SKU sold to 3+ DISTINCT customers over the
+            # trailing year has diversified, repeatable demand — it is
+            # NOT a project no matter how few UNITS that is. Without
+            # this guard the low-volume rule below mislabels bulk-roll
+            # masters: LED-WLNW-40K-IP20-100M (a 100M roll) sold ~a few
+            # rolls/yr to 6 customers → effective_units_12mo < 12 (it's
+            # counted in fractional rolls) → wrongly flagged Project.
+            # James 2026-05-28: "6 customers in 6 months, why is this a
+            # project?". 3+ buyers ⇒ keep whatever _trend_flag decided
+            # (Stable/Trend/Decline), never auto-promote to Project.
+            # is_dormant still fires above this (a diversified SKU that
+            # genuinely went quiet is caught by dormancy, not here).
+            if cust_12mo >= 3:
+                return cur
             # v2.67.316 — Low-volume case checked FIRST, before any
             # ABC grace. A SKU with under 12 units sold in 12mo is
             # not a steady mover by any definition — A-class label
@@ -7224,7 +7252,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.319** · deployed 2026-05-28")
+    "🔹 **v2.67.320** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -11392,12 +11420,16 @@ elif page == "Ordering":
             top_name = str(row.get("top_cust_name") or "—")[:40]
             mom = _fnum(row.get("momentum"), default=1.0)
             mom_s = (f"{mom:.2f}×" if mom != float("inf") else "new")
+            _cust12 = int(_fnum(row.get("customers_12mo")))
             demand_lines.append(
                 f"\n**Trend signal**: {_tf}  \n"
                 f"- Last 45d: **{u45v:.0f} units** "
                 f"(prior 45d: {uprv:.0f}, momentum **{mom_s}**)\n"
-                f"- **{n_cust} distinct customer(s)** in last 45d; "
-                f"top customer **{top_name}** took **{top_pct:.0f}%**, "
+                f"- **{n_cust} distinct customer(s)** in last 45d, "
+                f"**{_cust12} over 12mo** "
+                f"(3+ over 12mo ⇒ diversified, never auto-flagged "
+                f"Project)\n"
+                f"- top customer **{top_name}** took **{top_pct:.0f}%**, "
                 f"top 2 combined **{top_2_pct:.0f}%**\n"
                 f"- Non-top customers avg **{non_top_avg:.1f} units** "
                 f"each (key trend-vs-project signal)\n"
