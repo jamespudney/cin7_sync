@@ -5596,12 +5596,21 @@ def _abc_engine(products: pd.DataFrame,
     #     - 4+ distinct customers in 45d
     #     - top customer < 40%  (was 60%)
     #     - non-top customers avg ≥ 2 units each (real spread, not noise)
-    #   🎯 Project triggers if ANY of:
-    #     - ≤ 2 customers
-    #     - top customer ≥ 50%  (was 70%)
-    #     - top 2 customers ≥ 70% combined (new — catches "8 customers
-    #       but 2 took most of it")
+    #   🎯 Project triggers ONLY when demand is concentrated to 1-2
+    #     distinct buyers in the 45d window (a true one-off project).
+    #     With 3+ distinct buyers it's diversified demand → Trend
+    #     (broad acceleration) or Mixed (uneven sizes), never Project.
     #   🔀 Mixed = spike but neither pure trend nor pure project.
+    #
+    # v2.67.325 — customer DIVERSITY is the deciding signal, matching
+    # the customers_12mo>=3 guard in _promote_dormant_flag. The old
+    # rules also flagged Project whenever top_share>=0.50 OR
+    # top_2_share>=0.70 — but those fired regardless of buyer count,
+    # so a 100M bulk roll bought by 5 customers (one doing a big
+    # install → >50% of UNITS, the rest buying fractions) was wrongly
+    # called a Project. James 2026-05-28: LEDIRIS3000-120-100M, 5
+    # customers in 45d. Uneven order SIZES across many buyers is
+    # normal for bulk rolls and is NOT project concentration.
     def _trend_flag(r):
         u45v = float(r["units_45d"])
         uprv = float(r["units_prior_45d"])
@@ -5616,19 +5625,15 @@ def _abc_engine(products: pd.DataFrame,
         if mom > 1.5:
             n_cust = int(r["customers_45d"])
             top_share = float(r["top_cust_pct"])
-            top_2_share = float(r.get("top_2_cust_pct", top_share))
             non_top_avg = float(r.get("non_top_avg_units", 0))
-            # Project-like concentrations (ANY of these)
+            # Concentrated to 1-2 buyers → genuine one-off project.
             if n_cust <= 2:
                 return "🎯 Project"
-            if top_share >= 0.50:
-                return "🎯 Project"
-            if top_2_share >= 0.70:
-                return "🎯 Project"
-            # Real trend (ALL of these)
-            if (n_cust >= 4
-                    and top_share < 0.40
-                    and non_top_avg >= 2.0):
+            # 3+ distinct buyers = diversified demand, never Project.
+            # Broad spread + meaningful non-top volume = real Trend;
+            # otherwise the sizes are uneven → Mixed (uses normal
+            # 12mo velocity, NOT suppressed).
+            if top_share < 0.40 and non_top_avg >= 2.0:
                 return "📈 Trend"
             return "🔀 Mixed"
         return "Stable"
@@ -7252,7 +7257,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.324** · deployed 2026-05-28")
+    "🔹 **v2.67.325** · deployed 2026-05-28")
 
 
 if page == "Overview":
