@@ -3331,9 +3331,24 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
         except Exception:
             continue
 
-    # Dedupe keeping LAST occurrence (which is the more-recent file's data
+    # Dedupe keeping LAST occurrence (the more-recent file's data).
+    #
+    # v2.67.328 — dedupe on InvoiceNumber, NOT InvoiceDate. James
+    # 2026-05-28: LED-NEON-FLEX-SUPER-SLIM-ST showed its single 12-unit
+    # sale in TWO adjacent months ("…0 12 12"). Cause: the same invoice
+    # line gets re-synced with a changed InvoiceDate (CIN7 re-invoicing,
+    # or a date-format / timezone shift between the multi-window files
+    # we union here). With InvoiceDate in the key the two records differ
+    # only by date, so drop_duplicates keeps BOTH → the units land in
+    # two monthly buckets and every demand figure double-counts.
+    # An invoice has exactly ONE date, so two rows sharing
+    # SaleID+SKU+Quantity+InvoiceNumber+OrderNumber but differing only
+    # by InvoiceDate are definitionally the same line — collapsing them
+    # is strictly correct. Genuinely separate invoices (different
+    # InvoiceNumber, e.g. partial/advanced-sale invoicing) keep distinct
+    # keys and survive.
     dedupe_cols = [c for c in
-                    ["SaleID", "SKU", "Quantity", "InvoiceDate",
+                    ["SaleID", "SKU", "Quantity", "InvoiceNumber",
                      "OrderNumber"]
                     if c in base.columns]
     if dedupe_cols:
@@ -7279,7 +7294,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.327** · deployed 2026-05-28")
+    "🔹 **v2.67.328** · deployed 2026-05-28")
 
 
 if page == "Overview":
