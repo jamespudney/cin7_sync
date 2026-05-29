@@ -7294,7 +7294,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.328** · deployed 2026-05-28")
+    "🔹 **v2.67.329** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -11832,9 +11832,9 @@ elif page == "Ordering":
         _m[2].metric("Status", str(_r.get("Status") or "—"))
         _s = st.columns(4)
         _s[0].metric("OnHand", f"{float(_r.get('OnHand') or 0):.0f}")
-        _s[1].metric("Available", f"{float(_r.get('Available') or 0):.0f}")
-        _s[2].metric("OnOrder", f"{float(_r.get('OnOrder') or 0):.0f}")
-        _s[3].metric("Backorder", f"{float(_r.get('unfulfilled') or 0):.0f}")
+        _s[1].metric("Allocated", f"{float(_r.get('Allocated') or 0):.0f}")
+        _s[2].metric("Available", f"{float(_r.get('Available') or 0):.0f}")
+        _s[3].metric("OnOrder", f"{float(_r.get('OnOrder') or 0):.0f}")
         _d = st.columns(4)
         _d[0].metric("12mo units",
                      f"{float(_r.get('effective_units_12mo') or 0):.0f}")
@@ -13238,7 +13238,7 @@ elif page == "Ordering":
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
         "avg_daily", "LengthMM",
         "OnHand", "Allocated", "Available", "OnOrder",
-        "unfulfilled", "DoC_days",
+        "DoC_days",
         "target_stock", "reorder_qty",
         "Order qty", "Line value",
         "freight_mode", "lead_time_days",
