@@ -7257,7 +7257,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.325** · deployed 2026-05-28")
+    "🔹 **v2.67.326** · deployed 2026-05-28")
 
 
 if page == "Overview":
@@ -11773,16 +11773,14 @@ elif page == "Ordering":
         return f"❗ {base}" if once_slow else base
     engine_df["Status"] = engine_df.apply(_status, axis=1)
 
-    # --- Clickable-SKU → product-detail popup (v2.67.324) -------------
-    # James 2026-05-28: SKUs in the ordering tables should be
-    # hyperlinked to a product-detail window. The ordering grids are
-    # editable st.data_editor widgets (which can't emit a per-cell
-    # click), so each row carries a LinkColumn pointing at
-    # `?inspect=<SKU>`. Clicking reruns the app with that query param;
-    # we catch it here, clear it immediately (so the dialog's X / a
-    # refresh don't reopen it), and pop a modal showing the engine
-    # row's key signals + the full reorder trace. Editor edits persist
-    # across the rerun (kept in session_state).
+    # --- SKU detail panel (v2.67.326) ---------------------------------
+    # James 2026-05-28: see a SKU's full detail without leaving the
+    # ordering page. The original v2.67.324 attempt used a LinkColumn
+    # (?inspect=<SKU>) + st.dialog — it bombed (Streamlit data_editor
+    # links open a new tab / the dialog API + control-flow exceptions
+    # were brittle). Replaced with a rock-solid "🔍 Inspect a SKU"
+    # selectbox + inline bordered panel rendered via _render_sku_detail
+    # right above the editor. Pure native widgets, can't bomb.
     def _render_sku_detail(_sku: str) -> None:
         _hit = engine_df[engine_df["SKU"].astype(str) == str(_sku)]
         if _hit.empty:
@@ -11823,32 +11821,6 @@ elif page == "Ordering":
         st.caption(
             "For the complete drill-through (BOM, full sales/PO history) "
             f"open the **Product Detail** page and search `{_sku}`.")
-
-    _inspect_sku = (st.query_params.get("inspect") or "").strip()
-    if _inspect_sku:
-        # Clear immediately: dialog renders THIS run; any later rerun
-        # (incl. clicking the modal's X) won't re-trigger it → clean close.
-        try:
-            del st.query_params["inspect"]
-        except Exception:  # noqa: BLE001
-            pass
-        _dialog_factory = (getattr(st, "dialog", None)
-                           or getattr(st, "experimental_dialog", None))
-        if _dialog_factory is not None:
-            try:
-                @_dialog_factory(f"Product detail — {_inspect_sku}")
-                def _sku_inspect_dialog():
-                    _render_sku_detail(_inspect_sku)
-                    if st.button("Close", key="_close_inspect"):
-                        st.rerun()
-                _sku_inspect_dialog()
-            except Exception:  # noqa: BLE001
-                # Any dialog-API incompatibility → inline fallback.
-                with st.container(border=True):
-                    _render_sku_detail(_inspect_sku)
-        else:
-            with st.container(border=True):
-                _render_sku_detail(_inspect_sku)
 
     # --- Top-of-page stock optimisation headline -----------------------
     st.markdown("### :moneybag: Stock optimisation overview")
@@ -14379,19 +14351,29 @@ elif page == "Ordering":
                     st.success(f"Reactivated {sku_a}. Refreshing…")
                     st.rerun()
 
-    # v2.67.324 — leading clickable-SKU column. Value is a relative URL
-    # (?inspect=<SKU>); the LinkColumn's display_text regex shows the
-    # SKU itself, so it reads as a clickable SKU. Kept separate from the
-    # data "SKU" column so the PO-building downstream still reads raw
-    # SKUs. Clicking opens the product-detail modal (handled at the top
-    # of this page via the `inspect` query param).
-    if "SKU" in editable.columns and "🔍 SKU" not in editable.columns:
-        editable.insert(
-            0, "🔍 SKU",
-            "?inspect=" + editable["SKU"].astype(str))
-        _po_col_cfg["🔍 SKU"] = st.column_config.LinkColumn(
-            "🔍 SKU", display_text=r"inspect=(.+)$", width="small",
-            help="Click to open this product's detail in a popup.")
+    # v2.67.326 — "Inspect a SKU" picker + inline detail panel. Reliable
+    # replacement for the bombed LinkColumn/dialog approach. Lists the
+    # SKUs currently in this supplier's view; picking one renders the
+    # full engine detail in a bordered panel right above the editor,
+    # without leaving the page.
+    # Cover the WHOLE supplier set (main + upcoming + filtered-out
+    # project/zero-reorder rows), not just the visible editor rows, so
+    # any SKU under this supplier is inspectable.
+    _insp_opts = sorted({
+        *(editable["SKU"].astype(str).tolist()
+          if "SKU" in editable.columns else []),
+        *(all_supplier_df["SKU"].astype(str).tolist()
+          if "SKU" in all_supplier_df.columns else []),
+    })
+    _insp_pick = st.selectbox(
+        "🔍 Inspect a SKU (full detail — stock, velocity, trend, reorder "
+        "math — without leaving this page)",
+        ["—"] + _insp_opts,
+        key=f"inspect_pick_{sel_sup}",
+    )
+    if _insp_pick and _insp_pick != "—":
+        with st.container(border=True):
+            _render_sku_detail(_insp_pick)
 
     edited = st.data_editor(
         editable,
@@ -15676,12 +15658,6 @@ elif page == "Ordering":
                          "Add?"]
             show_cols = [c for c in show_cols if c in upc.columns]
             upc_view = upc[show_cols].sort_values("days_to_reorder")
-            # v2.67.324 — leading clickable-SKU column (same as the main
-            # editor): opens the product-detail popup via ?inspect=<SKU>.
-            upc_view = upc_view.copy()
-            upc_view.insert(
-                0, "🔍 SKU",
-                "?inspect=" + upc_view["SKU"].astype(str))
 
             # Use a unique key so editing here doesn't clash with the
             # main PO editor's state.
@@ -15690,10 +15666,6 @@ elif page == "Ordering":
                 width="stretch", hide_index=True, height=350,
                 key=f"upcoming_editor_{sel_sup}_{upcoming_window}",
                 column_config={
-                    "🔍 SKU": st.column_config.LinkColumn(
-                        "🔍 SKU", display_text=r"inspect=(.+)$",
-                        width="small",
-                        help="Click to open this product's detail popup."),
                     "Add?": st.column_config.CheckboxColumn(
                         "✓ Add to PO",
                         help="Tick + click 'Add ticked items' below. "
