@@ -5642,13 +5642,33 @@ def _abc_engine(products: pd.DataFrame,
                                  ).fillna(0),
             }
             synth = pd.DataFrame(synth_cols)
-            # Align columns to sl so the concat doesn't introduce NaN
-            # spaghetti where unnecessary.
+            # Align columns to sl. v2.67.338 — must use None (not
+            # pd.NA): downstream customer-rollup code is full of
+            # `str(_r.get("CustomerID") or "")` patterns and pd.NA
+            # raises "boolean value of NA is ambiguous" on `or`. None
+            # is falsy in Python so the existing pattern returns "".
             for c in sl.columns:
                 if c not in synth.columns:
-                    synth[c] = pd.NA
+                    synth[c] = None
             synth = synth[sl.columns]
             sl = pd.concat([sl, synth], ignore_index=True)
+            # v2.67.338 — second-line defence: even with None in synth,
+            # pandas can re-promote to pd.NA during concat if sl's
+            # original dtype is a nullable extension type ("string",
+            # "Int64", etc.). Explicitly coerce the columns the engine
+            # touches via `or` patterns to plain object / float with
+            # safe defaults so downstream `str(... or "")` /
+            # `float(... or 0)` never sees pd.NA.
+            for _col in ("SKU", "CustomerID", "Customer",
+                         "OrderNumber", "InvoiceNumber", "Status",
+                         "Name", "SaleID"):
+                if _col in sl.columns:
+                    sl[_col] = sl[_col].astype(object).where(
+                        sl[_col].notna(), "")
+            for _col in ("Quantity", "Total", "Price"):
+                if _col in sl.columns:
+                    sl[_col] = pd.to_numeric(
+                        sl[_col], errors="coerce").fillna(0)
             assembly_components = set(
                 a["ComponentSKU"].astype(str).unique())
             # Per-SKU 12mo / 45d assembly consumption sums for the trace
@@ -7488,7 +7508,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.337** · deployed 2026-06-01")
+    "🔹 **v2.67.338** · deployed 2026-06-01")
 
 
 if page == "Overview":
