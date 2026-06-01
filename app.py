@@ -3394,6 +3394,64 @@ sale_lines = _load_longest_sale_lines()
 if sale_lines.empty:
     sale_lines = sale_lines_30d if not sale_lines_30d.empty else sale_lines_3d
 
+
+# v2.67.334 — assembly (FG-XXXX) consumption loader. Same union+dedup
+# pattern as sale_lines. Each row is one component pick-line consumed
+# by an assembly task: (TaskID, AssemblyNumber, Date, CompletionDate,
+# Status, ParentSKU, ComponentSKU, Quantity, ...). This is GROUND TRUTH
+# for components whose demand is mostly being-built-into-kits — the BOM
+# rollup is derived and usually incomplete. James 2026-06-01 example:
+# LED-NEON-FLEX-NICHO-3000K-2 had ~90 FG- consumptions vs ~5 direct
+# sales per month; the engine was seeing ~half of true demand.
+@st.cache_data(ttl=900, show_spinner=False)
+def _load_longest_assemblies_cached(fingerprint: tuple) -> pd.DataFrame:
+    import re as _re
+    files = []
+    for p in OUTPUT_DIR.glob("assemblies_last_*d_*.csv"):
+        m = _re.match(r"assemblies_last_(\d+)d_", p.name)
+        if m:
+            files.append((int(m.group(1)), p.stat().st_mtime, p))
+    if not files:
+        return pd.DataFrame(columns=[
+            "TaskID", "AssemblyNumber", "Date", "CompletionDate",
+            "Status", "ParentProductID", "ParentSKU", "ParentName",
+            "ParentQuantity", "ComponentProductID", "ComponentSKU",
+            "ComponentName", "Quantity", "Unit", "Cost", "BinID", "Bin",
+        ])
+    # Largest window first, then more-recent smaller files unioned
+    files.sort(key=lambda x: (-x[0], -x[1]))
+    base_file = files[0][2]
+    base_mtime = files[0][1]
+    try:
+        base = pd.read_csv(base_file, low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+    for days, mtime, p in files[1:]:
+        if mtime <= base_mtime:
+            continue
+        try:
+            more = pd.read_csv(p, low_memory=False)
+            base = pd.concat([base, more], ignore_index=True)
+        except Exception:
+            continue
+    # Dedupe on (TaskID, ComponentSKU, Quantity, BinID) — covers the case
+    # where the same task appears in two windows AND the rare same-task
+    # multi-bin pick of one SKU. Keep the most recent file's row.
+    dedupe_cols = [c for c in
+                    ["TaskID", "ComponentSKU", "Quantity", "BinID"]
+                    if c in base.columns]
+    if dedupe_cols:
+        base = base.drop_duplicates(subset=dedupe_cols, keep="last")
+    return base.reset_index(drop=True)
+
+
+def _load_longest_assemblies() -> pd.DataFrame:
+    return _load_longest_assemblies_cached(
+        _dir_fingerprint("assemblies_last_*d_*.csv"))
+
+
+assemblies = _load_longest_assemblies()
+
 # sales_full (order-level headers) is loaded LATER, after its
 # loader function is defined further down the file. See the line
 # `sales_full = _load_longest_sales()` after the purchase-lines
@@ -5483,9 +5541,21 @@ def _abc_engine(products: pd.DataFrame,
                 stock: pd.DataFrame,
                 sale_lines: pd.DataFrame,
                 purchase_lines: pd.DataFrame,
-                window_days: int = 365) -> pd.DataFrame:
+                window_days: int = 365,
+                assemblies_df: Optional[pd.DataFrame] = None
+                ) -> pd.DataFrame:
     """Compute per-SKU ABC, velocity, target, reorder for Stock items.
-    Uses hybrid ABC: 60% value + 40% qty percentile rank."""
+    Uses hybrid ABC: 60% value + 40% qty percentile rank.
+
+    v2.67.334 — assemblies_df: optional Finished-Goods component-pick
+    consumption (one row per (TaskID, ComponentSKU)). When supplied,
+    each consumption row is treated as a synthetic "sale" of the
+    component, so the velocity / monthly-bucket math picks up demand
+    for components whose use is mostly internal (built into kits, not
+    sold directly). Components with assembly data are EXCLUDED from
+    the downstream BOM-rollup unit passes to avoid double-counting
+    (the BOM rollup adds kit-sales × ratio, which is the SAME demand
+    the assembly task already records as ground truth)."""
     # 1. Filter to Stock items only (already done by global filter)
     prods = products[["SKU", "Name", "Type", "Category", "Brand",
                       "Status", "AverageCost",
@@ -5516,6 +5586,82 @@ def _abc_engine(products: pd.DataFrame,
                                .isin(excluded_statuses)]
     sl["Quantity"] = _to_num(sl["Quantity"]).fillna(0)
     sl["Total"] = _to_num(sl["Total"]).fillna(0)
+
+    # v2.67.334 — fold assembly (FG-XXXX) component consumption into the
+    # sale-lines stream so the velocity / monthly-bucket / 45d /
+    # customer math picks it up for free. We track which components got
+    # assembly data so the BOM rollup pass below can skip them (the
+    # BOM rollup would double-count what assemblies already record).
+    # We also keep a per-SKU sum (12mo and 45d) so the calc trace and
+    # Inspect panel can show "Assembly consumption: +X" separately
+    # from direct sales.
+    assembly_components: set = set()
+    assembly_units_12mo_map: dict = {}
+    assembly_units_45d_map: dict = {}
+    if assemblies_df is not None and not assemblies_df.empty:
+        a = assemblies_df.copy()
+        # Date: prefer CompletionDate, fall back to Date.
+        _cd = _to_date(a["CompletionDate"]) if "CompletionDate" in a.columns \
+            else pd.Series(pd.NaT, index=a.index)
+        _d = _to_date(a["Date"]) if "Date" in a.columns \
+            else pd.Series(pd.NaT, index=a.index)
+        a["_dt"] = _cd.fillna(_d).dt.tz_localize(None)
+        a = a.dropna(subset=["_dt", "ComponentSKU"])
+        a = a[a["_dt"] >= cutoff]
+        if "Status" in a.columns:
+            a = a[~a["Status"].astype(str).str.upper().isin(
+                ("VOIDED", "CANCELLED", "DRAFT"))]
+        a["Quantity"] = _to_num(a["Quantity"]).fillna(0)
+        a = a[a["Quantity"] > 0]
+        if not a.empty:
+            # Materialise synthetic sale-line rows. They carry SKU /
+            # InvoiceDate / Quantity / Total / Status which is all the
+            # downstream code reads. Customer is left null on purpose —
+            # CIN7's FG endpoint doesn't surface CustomerID, and the
+            # downstream BOM customer-rollup still propagates kit-sales
+            # customers into components, so distinct-customer counts
+            # stay representative. SaleID gets a synthetic "FG:<TaskID>"
+            # so it can never collide with a real SaleID in dedup paths.
+            synth_cols = {
+                "SaleID": ("FG:" + a["TaskID"].astype(str))
+                          if "TaskID" in a.columns else "",
+                "OrderNumber": a.get("AssemblyNumber", ""),
+                "InvoiceNumber": a.get("AssemblyNumber", ""),
+                "InvoiceDate": a["_dt"],
+                "OrderDate": a["_dt"],
+                "Status": "COMPLETED",
+                "SKU": a["ComponentSKU"].astype(str),
+                "Name": a.get("ComponentName", ""),
+                "Quantity": a["Quantity"],
+                # Cost × Quantity is a stand-in for revenue. Engine
+                # mostly reads rev_12mo for value-based ABC ranking;
+                # assembly cost is a reasonable proxy.
+                "Total": (_to_num(a.get("Cost", pd.Series(0, index=a.index)))
+                          .fillna(0) * a["Quantity"]),
+                "Price": _to_num(a.get("Cost", pd.Series(0, index=a.index))
+                                 ).fillna(0),
+            }
+            synth = pd.DataFrame(synth_cols)
+            # Align columns to sl so the concat doesn't introduce NaN
+            # spaghetti where unnecessary.
+            for c in sl.columns:
+                if c not in synth.columns:
+                    synth[c] = pd.NA
+            synth = synth[sl.columns]
+            sl = pd.concat([sl, synth], ignore_index=True)
+            assembly_components = set(
+                a["ComponentSKU"].astype(str).unique())
+            # Per-SKU 12mo / 45d assembly consumption sums for the trace
+            assembly_units_12mo_map = (
+                a.groupby(a["ComponentSKU"].astype(str))["Quantity"]
+                 .sum().to_dict())
+            _a_45 = a[a["_dt"] >= (
+                pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=45))]
+            if not _a_45.empty:
+                assembly_units_45d_map = (
+                    _a_45.groupby(_a_45["ComponentSKU"].astype(str))
+                          ["Quantity"].sum().to_dict())
+
     vel = (sl.groupby("SKU")
              .agg(units_12mo=("Quantity", "sum"),
                   rev_12mo=("Total", "sum"),
@@ -6399,6 +6545,12 @@ def _abc_engine(products: pd.DataFrame,
         lambda s: float(master_rollup_inflow_90d.get(s, 0))).fillna(0)
     df["tube_rollup_notes"] = df["SKU"].apply(
         lambda s: "; ".join(master_rollup_notes.get(s, []))[:500])
+    # v2.67.334 — per-SKU assembly consumption (12mo / 45d) so the calc
+    # trace and inspect panel can break it out from direct sales.
+    df["assembly_units_12mo"] = df["SKU"].astype(str).map(
+        assembly_units_12mo_map).fillna(0)
+    df["assembly_units_45d"] = df["SKU"].astype(str).map(
+        assembly_units_45d_map).fillna(0)
 
     # Bulk-master length + fractional-eligibility flag.
     # is_bulk_master = strip master with ≥50m roll length. These SKUs
@@ -6619,6 +6771,15 @@ def _abc_engine(products: pd.DataFrame,
     # baked in — so the BOM rollup carries that all the way to the
     # bare tube master.
     for master_sku, ch_list in BOM_CHILDREN.items():
+        # v2.67.334 — skip components that have ground-truth assembly
+        # consumption data this window. The synthetic sale-line rows
+        # we appended above already put actual consumption into
+        # monthly_12[master_sku]; adding kit-sales × ratio on top would
+        # double-count the same event (the kit's sale and the assembly
+        # task that consumed the component are TWO VIEWS of the same
+        # transaction).
+        if master_sku in assembly_components:
+            continue
         for ch in ch_list:
             ch_sku = ch.get("AssemblySKU")
             ratio = float(ch.get("Quantity") or 0)
@@ -6674,6 +6835,9 @@ def _abc_engine(products: pd.DataFrame,
 
     # BOM rollup — child × ratio added to master.
     for master_sku, ch_list in BOM_CHILDREN.items():
+        # v2.67.334 — same double-count guard as the monthly pass.
+        if master_sku in assembly_components:
+            continue
         for ch in ch_list:
             ch_sku = ch.get("AssemblySKU")
             ratio = float(ch.get("Quantity") or 0)
@@ -7313,7 +7477,8 @@ def _get_engine_df() -> "pd.DataFrame":
     if products.empty or sale_lines.empty:
         return pd.DataFrame()
     return _abc_engine(
-        products, stock, sale_lines, purchase_lines)
+        products, stock, sale_lines, purchase_lines,
+        assemblies_df=assemblies)
 
 
 # v2.67.291 — version chip at the BOTTOM of the sidebar. Streamlit
@@ -7323,7 +7488,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.333** · deployed 2026-06-01")
+    "🔹 **v2.67.334** · deployed 2026-06-01")
 
 
 if page == "Overview":
@@ -11403,12 +11568,18 @@ elif page == "Ordering":
         excess_units = max(0, onhand - target)
         excess_value = excess_units * row["AverageCost"]
 
-        # Demand breakdown — show migration + tube rollup contributions
-        direct_u = float(row["units_12mo"])
+        # Demand breakdown — show migration + tube rollup + assembly
+        # contributions. units_12mo here ALREADY INCLUDES assembly
+        # consumption (we folded synthetic FG-pick rows into sl before
+        # the velocity groupby in v2.67.334); subtract to recover the
+        # genuine direct-sales count for display.
+        units_12mo_total = float(row["units_12mo"])
+        asm_u = float(row.get("assembly_units_12mo", 0))
+        direct_u = max(0.0, units_12mo_total - asm_u)
         mig_in = float(row.get("migrated_in", 0))
         mig_out = float(row.get("migrated_out", 0))
         rollup_in = float(row.get("tube_rollup_in", 0))
-        eff_u = float(row.get("effective_units_12mo", direct_u))
+        eff_u = float(row.get("effective_units_12mo", units_12mo_total))
 
         demand_lines = [f"**Supplier**: {supplier or 'unassigned'}\n"]
         if row.get("is_non_master_tube"):
@@ -11424,6 +11595,17 @@ elif page == "Ordering":
                 f"{eff_u:.0f} units):\n"
                 f"- Direct sales of this SKU: **{direct_u:.0f}** units\n"
             )
+            if asm_u > 0:
+                # v2.67.334 — assembly (FG-XXXX) consumption: every kit
+                # built that included this SKU as a pick-line. Ground
+                # truth for components mostly used in kits (the BOM
+                # rollup is skipped for these SKUs to avoid double-
+                # counting the same demand twice).
+                demand_lines.append(
+                    f"- Assembly consumption (FG- tasks): "
+                    f"**+{asm_u:.0f}** units "
+                    f"(ground truth — kits built using this part)\n"
+                )
             if mig_in > 0:
                 demand_lines.append(
                     f"- Migrated IN from retiring SKUs: "
@@ -11951,6 +12133,51 @@ elif page == "Ordering":
                                 f"{_disp['OrderNumber'].nunique()}  ·  "
                                 f"Distinct InvoiceNumbers: "
                                 f"{_disp.get('InvoiceNumber', pd.Series(dtype=object)).nunique()}"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        # v2.67.334 — assembly (FG-XXXX) consumption records for this
+        # SKU. Components consumed in kits show up here even when they
+        # never appear in direct sale_lines.
+        try:
+            if not assemblies.empty:
+                _ra = assemblies[
+                    assemblies["ComponentSKU"].astype(str) == str(_sku)]
+                if not _ra.empty:
+                    with st.expander(
+                        f"🏗️ Assembly consumption ({len(_ra)} FG- tasks) "
+                        f"— components consumed when kits were built",
+                        expanded=False,
+                    ):
+                        _ac = [c for c in [
+                            "AssemblyNumber", "Date", "CompletionDate",
+                            "Status", "ParentSKU", "ParentName",
+                            "ParentQuantity", "Quantity", "Cost",
+                        ] if c in _ra.columns]
+                        _adisp = _ra[_ac].copy()
+                        if "CompletionDate" in _adisp.columns:
+                            _adisp = _adisp.sort_values(
+                                "CompletionDate", ascending=False,
+                                na_position="last")
+                        elif "Date" in _adisp.columns:
+                            _adisp = _adisp.sort_values(
+                                "Date", ascending=False,
+                                na_position="last")
+                        st.dataframe(
+                            _adisp, hide_index=True,
+                            use_container_width=True, height=280)
+                        try:
+                            _q_total = float(pd.to_numeric(
+                                _adisp["Quantity"], errors="coerce"
+                            ).fillna(0).sum())
+                            _parents_n = _adisp["ParentSKU"].nunique()
+                            st.caption(
+                                f"**Total consumed: {_q_total:.0f} "
+                                f"units across {len(_adisp)} tasks**  ·  "
+                                f"Distinct parent kits: {_parents_n}"
                             )
                         except Exception:  # noqa: BLE001
                             pass

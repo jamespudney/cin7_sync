@@ -1321,6 +1321,123 @@ def sync_movements(client: Cin7Client, days: int) -> None:
     sync_stocktransfers(client, days)
 
 
+def sync_assemblies(client: "Cin7Client", days: int) -> None:
+    """Pull completed Finished Goods (FG-XXXX) tasks for the last N days
+    and flatten per-component pick-line consumption into a CSV.
+
+    v2.67.334 — James 2026-06-01: components that are mostly consumed
+    via assemblies (kits being built) were dramatically under-forecast
+    because the engine only counted direct sales + BOM rollup. For
+    SKUs like LED-NEON-FLEX-NICHO-3000K-2 we saw ~5 direct sales but
+    ~90 FG- consumptions per month — the BOM rollup picked up only a
+    fraction. This sync captures the ground truth: every component
+    line CIN7 actually decremented during an assembly task.
+
+    Output: assemblies_last_{days}d_<timestamp>.csv with one row per
+    (TaskID, ComponentSKU) pair:
+        TaskID, AssemblyNumber, Date, CompletionDate, Status,
+        ParentProductID, ParentSKU, ParentName, ParentQuantity,
+        ComponentProductID, ComponentSKU, ComponentName, Quantity,
+        Unit, Cost, BinID, Bin
+
+    The finishedGoodsList endpoint has no date/UpdatedSince filter and
+    sorts roughly newest-first; we paginate completed tasks and break
+    once we see a Date older than the cutoff. Then for each kept task
+    we fetch /finishedGoods?TaskID=... once for its PickLines."""
+    log.info("Pulling Finished Goods (assembly tasks) for last %d days...",
+             days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    def _parse_dt(s):
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            return None
+
+    tasks: List[Dict[str, Any]] = []
+    cross_cutoff_streak = 0
+    for row in client.paginate(
+        "finishedGoodsList", result_key="FinishedGoods",
+        params={"Status": "COMPLETED"},
+    ):
+        dt = _parse_dt(row.get("Date"))
+        if dt is not None and dt < cutoff:
+            # CIN7's list sort isn't formally documented; rather than
+            # break on the FIRST older row (in case of jitter), require
+            # a small streak of older rows before stopping.
+            cross_cutoff_streak += 1
+            if cross_cutoff_streak >= 25:
+                break
+            continue
+        cross_cutoff_streak = 0
+        tasks.append(row)
+
+    log.info("  Found %d completed assemblies in window.", len(tasks))
+
+    rows: List[Dict[str, Any]] = []
+    detail_errors = 0
+    for i, task in enumerate(tasks, 1):
+        tid = task.get("TaskID")
+        if not tid:
+            continue
+        try:
+            detail = client.get("finishedGoods", params={"TaskID": tid})
+        except Exception as exc:  # noqa: BLE001
+            detail_errors += 1
+            log.warning("  finishedGoods detail %s failed: %s",
+                        task.get("AssemblyNumber"), exc)
+            if detail_errors > 50:
+                log.error("Too many detail errors; aborting assembly sync.")
+                break
+            continue
+
+        if not isinstance(detail, dict):
+            continue
+        pick_lines = detail.get("PickLines") or []
+        if not isinstance(pick_lines, list):
+            continue
+
+        parent_sku = task.get("ProductCode")
+        parent_name = task.get("ProductName")
+        parent_qty = task.get("Quantity")
+        completion = detail.get("CompletionDate") or task.get("Date")
+        status = detail.get("Status") or task.get("Status")
+        for pl in pick_lines:
+            if not isinstance(pl, dict):
+                continue
+            rows.append({
+                "TaskID": tid,
+                "AssemblyNumber": task.get("AssemblyNumber"),
+                "Date": task.get("Date"),
+                "CompletionDate": completion,
+                "Status": status,
+                "ParentProductID": task.get("ProductID"),
+                "ParentSKU": parent_sku,
+                "ParentName": parent_name,
+                "ParentQuantity": parent_qty,
+                "ComponentProductID": pl.get("ProductID"),
+                "ComponentSKU": pl.get("ProductCode"),
+                "ComponentName": pl.get("Name"),
+                "Quantity": pl.get("Quantity"),
+                "Unit": pl.get("Unit"),
+                "Cost": pl.get("Cost"),
+                "BinID": pl.get("BinID"),
+                "Bin": pl.get("Bin"),
+            })
+
+        if i % 50 == 0:
+            log.info("  Processed %d/%d assemblies...", i, len(tasks))
+
+    log.info("  Emitting %d component-consumption rows from %d tasks.",
+             len(rows), len(tasks))
+    write_outputs(f"assemblies_last_{days}d", rows)
+
+
 # ---------------------------------------------------------------------------
 # BOM structure (parent-child relationships)
 # ---------------------------------------------------------------------------
@@ -1483,6 +1600,11 @@ def sync_quick(client: Cin7Client, days: int) -> None:
     sync_suppliers(client)
     sync_sales(client, days)
     sync_purchases(client, days)
+    # v2.67.334 — pull assembly (FG-XXXX) consumption so the engine
+    # can attribute demand to components that are mostly built into
+    # kits rather than sold directly. Per-task detail fetch is bounded
+    # by the `days` window and skipped if no completed tasks fall in it.
+    sync_assemblies(client, days)
 
 
 def sync_nearsync(client: Cin7Client, days: int = 1) -> None:
@@ -1505,6 +1627,10 @@ def sync_nearsync(client: Cin7Client, days: int = 1) -> None:
     sync_salelines(client, days)
     sync_purchases(client, days)
     sync_purchaselines(client, days)
+    # v2.67.334 — fold assembly consumption into the 15-min cadence
+    # so kits built today affect tomorrow's reorder math. A 1-day
+    # window typically returns a handful of completed tasks.
+    sync_assemblies(client, days)
     # Also trim old timestamped files for these prefixes to keep the output
     # folder manageable. Keep the last 24 per prefix (~6 hours at 15 min).
     _trim_old_files([
@@ -1515,6 +1641,7 @@ def sync_nearsync(client: Cin7Client, days: int = 1) -> None:
         "sale_lines_last_1d",
         "purchases_last_",
         "purchase_lines_last_1d",
+        "assemblies_last_1d",
     ], keep_n=24)
 
 
@@ -1556,6 +1683,7 @@ COMMANDS = {
     "stockadjustments": ("days", sync_stockadjustments),
     "stocktransfers": ("days", sync_stocktransfers),
     "movements": ("days", sync_movements),
+    "assemblies": ("days", sync_assemblies),
     "boms": ("no-days", lambda client: sync_boms(client)),
     "quick": ("days", sync_quick),
     "nearsync": ("days", sync_nearsync),
