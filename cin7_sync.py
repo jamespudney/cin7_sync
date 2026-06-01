@@ -1359,25 +1359,29 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
         except (ValueError, TypeError):
             return None
 
+    # v2.67.336 — paginate FULLY and filter client-side. The earlier
+    # streak-break optimisation assumed CIN7 returns the list newest-
+    # first, but the v2.67.335 backfill log showed "Found 0 in window"
+    # in 0.7s — i.e. page 1 had 25 consecutive OLD rows and we aborted.
+    # Empirically CIN7 sorts finishedGoodsList oldest-first (or by some
+    # field unrelated to Date), so the only safe strategy is to walk
+    # every page and keep rows where Date is in-window OR unparseable.
     tasks: List[Dict[str, Any]] = []
-    cross_cutoff_streak = 0
+    total_scanned = 0
     for row in client.paginate(
         "finishedGoodsList", result_key="FinishedGoods",
         params={"Status": "COMPLETED"},
     ):
+        total_scanned += 1
         dt = _parse_dt(row.get("Date"))
-        if dt is not None and dt < cutoff:
-            # CIN7's list sort isn't formally documented; rather than
-            # break on the FIRST older row (in case of jitter), require
-            # a small streak of older rows before stopping.
-            cross_cutoff_streak += 1
-            if cross_cutoff_streak >= 25:
-                break
-            continue
-        cross_cutoff_streak = 0
-        tasks.append(row)
+        if dt is None or dt >= cutoff:
+            tasks.append(row)
+        if total_scanned % 500 == 0:
+            log.info("  Scanned %d list rows (%d in window so far)...",
+                     total_scanned, len(tasks))
 
-    log.info("  Found %d completed assemblies in window.", len(tasks))
+    log.info("  Scanned %d total rows; %d in window.",
+             total_scanned, len(tasks))
 
     rows: List[Dict[str, Any]] = []
     detail_errors = 0
@@ -1627,10 +1631,13 @@ def sync_nearsync(client: Cin7Client, days: int = 1) -> None:
     sync_salelines(client, days)
     sync_purchases(client, days)
     sync_purchaselines(client, days)
-    # v2.67.334 — fold assembly consumption into the 15-min cadence
-    # so kits built today affect tomorrow's reorder math. A 1-day
-    # window typically returns a handful of completed tasks.
-    sync_assemblies(client, days)
+    # v2.67.336 — assemblies were briefly included in nearsync (v2.67.334)
+    # but the finishedGoodsList endpoint has no date filter, so each
+    # call has to scan ALL completed FG tasks (potentially thousands of
+    # pages × 2.5s rate limit = many minutes). Far too slow for the
+    # 15-min cadence — it would just keep falling behind. Daily quick
+    # sync runs it instead; assembly demand changes slowly enough that
+    # daily refresh is plenty.
     # Also trim old timestamped files for these prefixes to keep the output
     # folder manageable. Keep the last 24 per prefix (~6 hours at 15 min).
     _trim_old_files([
@@ -1641,7 +1648,6 @@ def sync_nearsync(client: Cin7Client, days: int = 1) -> None:
         "sale_lines_last_1d",
         "purchases_last_",
         "purchase_lines_last_1d",
-        "assemblies_last_1d",
     ], keep_n=24)
 
 
