@@ -3353,6 +3353,35 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
                     if c in base.columns]
     if dedupe_cols:
         base = base.drop_duplicates(subset=dedupe_cols, keep="last")
+
+    # v2.67.331 — second-pass dedup for the revision/void case that
+    # the v2.67.330 Status filter can't reliably catch (CIN7 doesn't
+    # always surface "Status": "VOIDED" on the per-invoice element).
+    # If the SAME (SaleID, SKU, Quantity, OrderNumber) line survived
+    # under MULTIPLE InvoiceNumbers, it's almost always a revision
+    # CIN7 kept in the Invoices array — keep only the LATEST by
+    # InvoiceDate. James 2026-05-28→06-01: LED-NEON-FLEX-SUPER-SLIM-ST
+    # showed "0 0 0 0 12 12" through three engine versions because the
+    # two records have distinct invoice numbers and the Status field
+    # didn't help.
+    #
+    # Safe because the first pass above already collapsed the only
+    # legitimate same-invoice multi-line case (two lines of same
+    # SKU+Qty on ONE invoice → same InvoiceNumber → already deduped).
+    # The remaining cross-invoice duplication is overwhelmingly the
+    # revision artifact. Acknowledged trade-off: a real partial
+    # shipment with two EQUAL-quantity halves on different invoices
+    # would collapse to one — that pattern is rare and obvious to a
+    # buyer eyeballing the data.
+    second_key = [c for c in
+                   ["SaleID", "SKU", "Quantity", "OrderNumber"]
+                   if c in base.columns]
+    if second_key and "InvoiceDate" in base.columns:
+        # NaT (no invoice yet) sorts to the start, so order lines lose
+        # to actual invoice rows for the same sale → correct.
+        base = base.sort_values(
+            "InvoiceDate", na_position="first", kind="stable")
+        base = base.drop_duplicates(subset=second_key, keep="last")
     return base.reset_index(drop=True)
 
 
@@ -7294,7 +7323,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.330** · deployed 2026-05-28")
+    "🔹 **v2.67.331** · deployed 2026-06-01")
 
 
 if page == "Overview":
