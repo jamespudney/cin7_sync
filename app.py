@@ -7323,7 +7323,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.331** · deployed 2026-06-01")
+    "🔹 **v2.67.332** · deployed 2026-06-01")
 
 
 if page == "Overview":
@@ -11884,6 +11884,58 @@ elif page == "Ordering":
         if isinstance(_trace, str) and _trace.strip():
             with st.expander("Full reorder math", expanded=False):
                 st.markdown(_trace)
+
+        # v2.67.332 — raw sale_lines records for THIS SKU, post-dedup.
+        # Lets staff (and Claude) see exactly which records the engine
+        # actually counted when a SKU's monthly buckets look wrong —
+        # e.g. James 2026-06-01: LED-NEON-FLEX-SUPER-SLIM-ST shows
+        # April's single 12-unit sale duplicated into May despite three
+        # rounds of dedup. CIN7's movement screen is the source of truth
+        # (one -12 stock movement); if this expander shows two rows of
+        # 12, our dedup key isn't catching whatever field differs
+        # between the two records. Sorted newest-first.
+        try:
+            if not sale_lines.empty:
+                _raw = sale_lines[
+                    sale_lines["SKU"].astype(str) == str(_sku)]
+                if not _raw.empty:
+                    with st.expander(
+                        f"📜 Raw sale-line records ({len(_raw)} rows) "
+                        f"— sum of Quantity is what the engine counts",
+                        expanded=False,
+                    ):
+                        _cols = [c for c in [
+                            "SaleID", "OrderNumber", "Customer",
+                            "InvoiceNumber", "InvoiceDate", "Status",
+                            "Quantity", "Total", "Price",
+                        ] if c in _raw.columns]
+                        _disp = _raw[_cols].copy()
+                        if "InvoiceDate" in _disp.columns:
+                            _disp = _disp.sort_values(
+                                "InvoiceDate", ascending=False,
+                                na_position="last")
+                        st.dataframe(
+                            _disp, hide_index=True,
+                            use_container_width=True, height=280)
+                        # Total + per-OrderNumber roll-up so duplicates
+                        # are obvious at a glance.
+                        try:
+                            _q_total = float(pd.to_numeric(
+                                _disp["Quantity"], errors="coerce"
+                            ).fillna(0).sum())
+                            st.caption(
+                                f"**Quantity sum across all rows: "
+                                f"{_q_total:.0f}**  ·  Distinct "
+                                f"OrderNumbers: "
+                                f"{_disp['OrderNumber'].nunique()}  ·  "
+                                f"Distinct InvoiceNumbers: "
+                                f"{_disp.get('InvoiceNumber', pd.Series(dtype=object)).nunique()}"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            pass
+
         st.caption(
             "For the complete drill-through (BOM, full sales/PO history) "
             f"open the **Product Detail** page and search `{_sku}`.")
