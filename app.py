@@ -7323,7 +7323,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.332** · deployed 2026-06-01")
+    "🔹 **v2.67.333** · deployed 2026-06-01")
 
 
 if page == "Overview":
@@ -11807,32 +11807,53 @@ elif page == "Ordering":
         eff = float(r.get("effective_units_12mo",
                             r.get("units_12mo", 0)) or 0)
         onhand = float(r.get("OnHand") or 0)
+        allocated = float(r.get("Allocated") or 0)
+        # v2.67.333 — Status now uses AVAILABLE (= OnHand − Allocated),
+        # not OnHand. The old logic compared OnHand to target_stock,
+        # which mislabelled deeply-oversold SKUs as "Overstocked":
+        # LED-NEON-FLEX-SUPER-SLIM-ST-2M, OnHand=7, Allocated=35,
+        # Available=-28, target=0.8 → 7 > 1.2 → "🔵 Overstocked" → the
+        # default status filter hid it → many Neonica products went
+        # missing from the reorder view despite reorder_qty=29. The
+        # engine's reorder math always used Available; only the label
+        # (and so the filter) lagged. Now they agree.
+        #
+        # Tiers, in order:
+        #   ⚪ No demand, no stock        (eff=0, onhand=0)
+        #   💀 Dead stock                 (eff=0, onhand>0)
+        #   🔴 Reorder now if any of:
+        #        – Available ≤ 0          (oversold or no free stock)
+        #        – Available < lead-time demand
+        #        – reorder_qty > 0 AND Available < target
+        #   🟠 Reorder soon                (Available < target)
+        #   🔵 Overstocked                 (Available > target × 1.5)
+        #   🟢 On target                   (everything else)
+        available = onhand - allocated
+        target = float(r.get("target_stock") or 0)
+        avg_daily = float(r.get("avg_daily") or 0)
+        lead_time = float(r.get("lead_time_days") or 0)
+        reorder_qty = float(r.get("reorder_qty") or 0)
         sku_str = str(r.get("SKU") or "")
         once_slow = sku_str in dormancy_warnings_map
         if eff == 0 and onhand == 0:
             base = "⚪ No demand, no stock"
         elif eff == 0 and onhand > 0:
             base = "💀 Dead stock"
-        # v2.67.318 — out of stock but sold this year → Reorder now,
-        # FULL STOP. Previously a 🎯 Project / 💤 Dormant SKU with
-        # OnHand=0 fell through to "🟢 On target" because its
-        # avg_daily / target_stock are suppressed to ~0 (so every
-        # threshold below evaluated false). That mislabelled out-of-
-        # stock project items as healthy AND — since "On target"
-        # isn't in the default status filter — hid them from the
-        # supplier view entirely. James 2026-05-28: Neonica's neon/
-        # profile products (now Project, OnHand 0) vanished from the
-        # Neonica reorder view. An out-of-stock item with 12mo demand
-        # always deserves the buyer's eye, even if the engine suggests
-        # 0 (the buyer decides whether to manually order, e.g. 1 roll).
-        elif onhand <= 0:
+        elif available <= 0:
+            # Oversold or no free stock at all — the engine wants you
+            # to reorder regardless of the steady-state target. Same
+            # spirit as the v2.67.318 OnHand≤0 rule, extended to
+            # negative-Available SKUs that pre-.333 fell through.
             base = "🔴 Reorder now"
-        elif onhand < (r.get("avg_daily") or 0) * (
-                r.get("lead_time_days") or 0):
+        elif available < avg_daily * lead_time:
             base = "🔴 Reorder now"
-        elif onhand < (r.get("target_stock") or 0):
+        elif reorder_qty > 0 and available < target:
+            # Engine still wants to reorder but we have some free
+            # stock — softer urgency.
             base = "🟠 Reorder soon"
-        elif onhand > (r.get("target_stock") or 0) * 1.5:
+        elif available < target:
+            base = "🟠 Reorder soon"
+        elif available > target * 1.5:
             base = "🔵 Overstocked"
         else:
             base = "🟢 On target"
