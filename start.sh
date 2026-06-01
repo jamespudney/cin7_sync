@@ -20,6 +20,32 @@ set -euo pipefail
 mkdir -p "${DATA_DIR:-/data}/output"
 mkdir -p "${DATA_DIR:-/data}/.streamlit"
 
+# v2.67.335 — one-time 365-day backfill of assemblies (FG-XXXX) the
+# first time this boots after the v2.67.334 assembly-consumption
+# pipeline ships. Without this, the engine only sees assemblies from
+# the rolling daily/nearsync windows, so 12-month demand for
+# assembly-heavy components (LED strips, profile parts) stays low
+# until enough time has passed. James 2026-06-01 asked to backfill.
+#
+# Guarded by a marker file on the persistent disk so subsequent
+# deploys / restarts skip it. Run in the background so Streamlit
+# can start serving traffic immediately — the engine will pick up
+# the new CSV on the next refresh (engine cache rebuild) once the
+# backfill completes.
+_BF_MARKER="${DATA_DIR:-/data}/.assemblies_backfilled_v1"
+_BF_LOG="${DATA_DIR:-/data}/output/assemblies_backfill.log"
+if [ ! -f "$_BF_MARKER" ]; then
+    (
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting 365d assembly backfill" >> "$_BF_LOG"
+        if python cin7_sync.py assemblies --days 365 >> "$_BF_LOG" 2>&1; then
+            touch "$_BF_MARKER"
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] backfill done; marker written" >> "$_BF_LOG"
+        else
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] backfill FAILED (will retry next deploy)" >> "$_BF_LOG"
+        fi
+    ) &
+fi
+
 # v2.67.237 — supervise the sync loops. They are infinite while-
 # loops and should never exit on their own, but if one ever does
 # (crash, wedge cleared, OOM kill) it would otherwise stay dead

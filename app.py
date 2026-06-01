@@ -7488,7 +7488,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.334** · deployed 2026-06-01")
+    "🔹 **v2.67.335** · deployed 2026-06-01")
 
 
 if page == "Overview":
