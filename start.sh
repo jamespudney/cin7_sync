@@ -35,7 +35,7 @@ mkdir -p "${DATA_DIR:-/data}/.streamlit"
 # v2.67.336 — marker bumped to _v2: the v2.67.335 run only fetched
 # page 1 because the streak-break aborted on oldest-first sort.
 # v2.67.336 fixes the pagination to walk every page.
-_BF_MARKER="${DATA_DIR:-/data}/.assemblies_backfilled_v2"
+_BF_MARKER="${DATA_DIR:-/data}/.assemblies_backfilled_v3"
 _BF_LOG="${DATA_DIR:-/data}/output/assemblies_backfill.log"
 if [ ! -f "$_BF_MARKER" ]; then
     (

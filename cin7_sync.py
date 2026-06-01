@@ -1383,11 +1383,55 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
     log.info("  Scanned %d total rows; %d in window.",
              total_scanned, len(tasks))
 
+    # v2.67.337 — process NEWEST tasks first. CIN7's list sorts oldest-
+    # first, but recent assemblies are far more demand-relevant — they
+    # drive the 45d / momentum signals immediately. Reversing means
+    # within the first hour the engine has actionable recent data even
+    # if the full 365-day backfill takes many hours.
+    tasks.reverse()
+
+    # v2.67.337 — checkpoint + incremental write so a 14k-task backfill
+    # survives Render container restarts and feeds the engine
+    # progressively. Without this the CSV is written ONLY at the very
+    # end, so any restart loses hours of work and the engine sees
+    # nothing until completion.
+    ckpt_name = f"assemblies_{days}d"
+    state = _load_checkpoint(ckpt_name)
+    processed_ids: set = set(state.get("processed_ids") or [])
     rows: List[Dict[str, Any]] = []
+    if processed_ids:
+        # Try to recover already-flushed rows from the most recent
+        # same-window CSV so we don't start the rows array empty.
+        prior_files = sorted(
+            OUTPUT_DIR.glob(f"assemblies_last_{days}d_*.csv"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if prior_files:
+            latest = prior_files[-1]
+            try:
+                with latest.open(newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for r in reader:
+                        rows.append(r)
+                log.info("  Resuming: %d rows loaded from %s",
+                         len(rows), latest.name)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("  Could not read prior CSV (%s); "
+                            "starting rows fresh.", exc)
+                rows = []
+        log.info("  Resuming from checkpoint: %d tasks already done.",
+                 len(processed_ids))
+
     detail_errors = 0
+    flushed_at = len(processed_ids)
+    FLUSH_EVERY = 100
+
     for i, task in enumerate(tasks, 1):
         tid = task.get("TaskID")
         if not tid:
+            continue
+        tid_s = str(tid)
+        if tid_s in processed_ids:
             continue
         try:
             detail = client.get("finishedGoods", params={"TaskID": tid})
@@ -1434,12 +1478,29 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
                 "Bin": pl.get("Bin"),
             })
 
-        if i % 50 == 0:
-            log.info("  Processed %d/%d assemblies...", i, len(tasks))
+        processed_ids.add(tid_s)
 
-    log.info("  Emitting %d component-consumption rows from %d tasks.",
-             len(rows), len(tasks))
+        if i % 50 == 0:
+            log.info("  Processed %d/%d assemblies (skipped %d "
+                     "already-done)...", i, len(tasks),
+                     i - (len(processed_ids) - flushed_at))
+
+        # v2.67.337 — incremental flush. Engine picks up new data on
+        # next refresh, and a Render restart loses at most FLUSH_EVERY
+        # tasks of progress.
+        if (len(processed_ids) - flushed_at) >= FLUSH_EVERY:
+            log.info("  Flushing: %d tasks processed, %d rows so far...",
+                     len(processed_ids), len(rows))
+            write_outputs(f"assemblies_last_{days}d", rows)
+            _save_checkpoint(ckpt_name, {
+                "processed_ids": sorted(processed_ids),
+            })
+            flushed_at = len(processed_ids)
+
+    log.info("  Final write: %d component-consumption rows from %d tasks.",
+             len(rows), len(processed_ids))
     write_outputs(f"assemblies_last_{days}d", rows)
+    _clear_checkpoint(ckpt_name)
 
 
 # ---------------------------------------------------------------------------
