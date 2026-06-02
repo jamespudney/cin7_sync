@@ -6710,11 +6710,15 @@ def _abc_engine(products: pd.DataFrame,
         # case: the buyer over-bought a few months' supply to
         # secure a better price, sales naturally slowed because
         # there's plenty on hand, but the demand pattern is
-        # unchanged. Flagging that as dormant would push the
-        # buyer to NOT reorder a steady mover — exactly wrong.
-        # The same grace applies in _refine_dormancy_by_class.
+        # unchanged.
+        # v2.67.351 — TIGHTEN the grace: also require eff_90d > 0.
+        # James 2026-06-02: LED-14.007-3 hadn't sold since Aug 2025
+        # but was still labelled "A-class steady mover" because the
+        # 87-unit historic 12mo total kept the grace active. With
+        # zero 90d activity, the SKU is NOT a steady mover anymore
+        # — let dormancy detection fire.
         abc_class = str(row.get("ABC") or "C").strip().upper()
-        if abc_class == "A":
+        if abc_class == "A" and eff_90d > 0:
             return False
         # Tier 1: ~zero 90d activity. The threshold is expressed in
         # PHYSICAL UNITS so master rolls and leaf SKUs are compared
@@ -7134,9 +7138,13 @@ def _abc_engine(products: pd.DataFrame,
         # A-class = high-revenue steady mover; we don't want
         # over-buying for better pricing to reclassify these as
         # slow movers and discourage future reorders.
+        # v2.67.351 — same tightening as in _is_dormant: A-class
+        # grace also requires eff_90d > 0. Without recent activity
+        # an A-class SKU isn't a steady mover; let dormancy fire.
         abc_early = str(row.get("ABC") or "C").strip().upper()
         eff_12mo_early = float(row.get("effective_units_12mo") or 0)
-        if abc_early == "A" and eff_12mo_early > 0:
+        eff_90d_early = float(row.get("effective_units_90d") or 0)
+        if abc_early == "A" and eff_12mo_early > 0 and eff_90d_early > 0:
             return False
         if bool(row.get("is_dormant", False)):
             return True  # already flagged by base rules
@@ -7560,7 +7568,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.350** · deployed 2026-06-02")
+    "🔹 **v2.67.351** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11618,7 +11626,29 @@ elif page == "Ordering":
             (_top12 / _u12) if _u12 > 0 else 0.0)
         clamp_active = False
         clamp_note = ""
-        if _top12_share > 0.50 and _mom < 0.5 and _u12 > 0:
+
+        # v2.67.351 — first check: zero sales in last 90 days.
+        # James 2026-06-02: LED-14.007-3 (last sale August 2025, no
+        # activity in 90+ days) was still asking for 50 units to
+        # reorder. The 12mo top-customer-share clamp couldn't fire
+        # (top customer is empty because there's been no recent
+        # activity to compute a top from) so avg_daily kept treating
+        # the historic 227 units like steady demand. For SKUs with
+        # genuinely ZERO recent activity, the right answer is
+        # avg_daily = 0 — target → 0 → reorder → 0. Buyer manually
+        # triggers any new-project order.
+        _eff_90d_check = float(row.get("effective_units_90d") or 0)
+        if (_eff_90d_check == 0
+                and _eff12_for_clamp > 0
+                and _u12 > 0):
+            avg_daily = 0.0
+            clamp_active = True
+            clamp_note = (
+                " — clamped to zero: no sales in last 90 days, so "
+                "the historic 12mo (dominated by ended project work) "
+                "doesn't justify any reorder. Manually override the "
+                "Order qty if a new project lands.")
+        elif _top12_share > 0.50 and _mom < 0.5 and _u12 > 0:
             # Baseline = everything except this one customer's
             # contribution, expressed against the original 12mo
             # window. Apply the same RATIO to effective_units_12mo so
@@ -15113,6 +15143,118 @@ elif page == "Ordering":
     if _insp_pick and _insp_pick != "—":
         with st.container(border=True):
             _render_sku_detail(_insp_pick)
+
+    # v2.67.351 — click-to-copy SKU chips. James 2026-06-02 asked for
+    # double-click-on-SKU-in-column → clipboard. Streamlit's data_editor
+    # renders cells to canvas inside an iframe, so true in-cell
+    # double-click handlers aren't possible without a custom React
+    # component (real engineering work). Closest practical UX:
+    # render every SKU in the current ordering view as a compact
+    # double-click-to-copy chip above the editor, via an
+    # st.components.v1.html block. Pure native browser clipboard API
+    # with a clipboard.writeText fallback for older browsers.
+    _chip_skus = (editable["SKU"].astype(str).tolist()
+                  if "SKU" in editable.columns else [])
+    if _chip_skus:
+        import html as _html
+        import streamlit.components.v1 as _stc
+        _safe_chips = "".join(
+            f'<span class="sku-chip" data-sku="{_html.escape(s)}" '
+            f'title="Double-click to copy {_html.escape(s)}">'
+            f'{_html.escape(s)}</span>'
+            for s in _chip_skus
+        )
+        _chip_html = f"""
+        <style>
+          .sku-chip-wrap {{
+              display: flex;
+              flex-wrap: wrap;
+              gap: 4px;
+              padding: 8px 4px;
+              max-height: 96px;
+              overflow-y: auto;
+              align-content: flex-start;
+              border: 1px solid #e1e4ea;
+              border-radius: 6px;
+              background: #fafbfc;
+          }}
+          .sku-chip {{
+              font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+              font-size: 11px;
+              padding: 3px 7px;
+              border-radius: 4px;
+              background: #ffffff;
+              color: #262730;
+              border: 1px solid #d8dce4;
+              cursor: pointer;
+              user-select: none;
+              white-space: nowrap;
+              transition: background 0.12s, color 0.12s, border-color 0.12s;
+          }}
+          .sku-chip:hover {{
+              background: #eef2f6;
+              border-color: #b6becb;
+          }}
+          .sku-chip.copied {{
+              background: #d4edda;
+              color: #155724;
+              border-color: #155724;
+          }}
+          .sku-chip-hint {{
+              font-size: 11px;
+              color: #6c7280;
+              padding: 4px 4px 6px 4px;
+              font-family: -apple-system, system-ui, sans-serif;
+          }}
+        </style>
+        <div class="sku-chip-hint">
+          📋 Double-click any SKU below to copy it to the clipboard
+          ({len(_chip_skus)} SKUs in view).
+        </div>
+        <div class="sku-chip-wrap">{_safe_chips}</div>
+        <script>
+          function _copy(text, elem) {{
+              const done = () => {{
+                  const orig = elem.textContent;
+                  elem.classList.add('copied');
+                  elem.textContent = '\\u2713 copied — ' + text;
+                  setTimeout(() => {{
+                      elem.classList.remove('copied');
+                      elem.textContent = orig;
+                  }}, 1200);
+              }};
+              if (navigator.clipboard && window.isSecureContext) {{
+                  navigator.clipboard.writeText(text).then(done).catch(() => {{
+                      // fallback below
+                      const ta = document.createElement('textarea');
+                      ta.value = text;
+                      document.body.appendChild(ta);
+                      ta.select();
+                      try {{ document.execCommand('copy'); done(); }}
+                      catch (e) {{}}
+                      ta.remove();
+                  }});
+              }} else {{
+                  const ta = document.createElement('textarea');
+                  ta.value = text;
+                  document.body.appendChild(ta);
+                  ta.select();
+                  try {{ document.execCommand('copy'); done(); }}
+                  catch (e) {{}}
+                  ta.remove();
+              }}
+          }}
+          document.querySelectorAll('.sku-chip').forEach(el => {{
+              el.addEventListener('dblclick', (ev) => {{
+                  ev.preventDefault();
+                  _copy(el.dataset.sku, el);
+              }});
+          }});
+        </script>
+        """
+        # Height tuned so two rows of chips show without scrollbar
+        # for typical supplier views; scrollbar appears for larger sets.
+        _stc.html(_chip_html, height=170)
 
     edited = st.data_editor(
         editable,
