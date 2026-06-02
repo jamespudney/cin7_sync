@@ -91,26 +91,57 @@ Already accounts for open POs (ORDERED / ORDERING) and backorders.
 #### OnHand / Allocated / Available
 - **OnHand** — physical units in the warehouse.
 - **Allocated** — reserved for existing customer orders.
-- **Available** — OnHand − Allocated.
+- **Available** — OnHand − Allocated. **Negative Available = oversold**
+  (we owe customers more than we have on the shelf). The Status and
+  reorder math both work off Available, not OnHand (v2.67.333).
 
 #### OnOrder
 Units already placed on open POs (status ORDERED or ORDERING). The
 engine subtracts these from what you need to reorder — you won't get
 a suggestion to buy something that's already on its way.
 
-#### Unfulfilled (backorders)
-Customer orders with status BACKORDERED / ORDERED / ORDERING — units
-customers are waiting on. Subtracted from effective position so the
-engine prioritises SKUs that owe customers.
+#### Backorder
+The qty owed to customers we can't ship — equal to `max(0, Allocated −
+OnHand)`. v2.67.329 removed it as a dedicated column because it's
+mathematically just the negative side of Available (Available = −12 is
+already saying "oversold by 12"). The engine still tracks it
+internally; it just doesn't display as its own column to avoid
+duplication with Available.
 
 #### DoC (days of cover)
 **`OnHand / avg_daily`** — how many days the current stock will last
 at the 12-month average sales rate.
 
 #### Effective units (12mo)
-Direct sales + sales rolled up from child variants (MP variants, cuts,
-kit components) + sales migrated from retiring SKUs. Used for the
-reorder math, NOT the raw "units_12mo" figure.
+Direct sales of THIS SKU + **assembly consumption** (the SKU consumed
+as a component in kit-builds, from CIN7's FG-XXXX tasks — see Assembly
+consumption below) + sales rolled up from child variants (MP variants,
+cuts) + sales migrated from retiring SKUs. Used for the reorder math,
+NOT the raw "units_12mo" figure on its own.
+
+#### Assembly consumption (FG-XXXX tasks) — v2.67.334-339
+Many components — LED strips, profile parts, mounting clips — sell
+mostly via kits, not as standalone items. When a kit ships, CIN7 fires
+an **Assembly task** (FG-XXXX) that decrements each component listed
+on the kit's pick list. The engine pulls those tasks
+(/finishedGoods/pick) and folds the per-component consumption into the
+demand math:
+
+- Adds to **units_12mo / units_45d / units_90d / monthly buckets** so
+  the SKU's velocity reflects ALL the ways it left the shelf — not
+  just direct invoices.
+- Suppresses the BOM-rollup-from-kit-sales path for those components
+  (assembly consumption IS the kit-sale-times-ratio, just observed
+  rather than derived — counting both would double).
+- Surfaced in the Inspect-a-SKU panel under "🏗️ Assembly consumption"
+  with every FG-XXXX task that pulled the SKU.
+- Shown as a dedicated line in the calc trace: "Assembly consumption
+  (FG- tasks): +N units (ground truth — kits built using this part)".
+
+A component with active assembly consumption is therefore **not
+slow / not dormant** even if direct invoices are sparse — the engine
+sees the real demand, dormancy / Status / reorder all use the
+augmented figure.
 
 #### FixedCost / AverageCost / PO cost
 - **FixedCost** — the agreed supplier price on the SKU's supplier record
@@ -124,41 +155,82 @@ Set per supplier (e.g. Blebox $250). The PO summary flags when the
 current draft is below MOV so you can consolidate.
 
 #### Freight mode
-Air or Sea. The engine defaults to air when the supplier offers it
-**and** the SKU's length fits in the supplier's air cutoff (e.g.
-Topmet UPS caps at 2200mm). Override per row in the grid; the reorder
-qty recalculates with the new lead time on next refresh.
+Air or Sea. Decision order:
 
-#### Status badges
+1. **Category rule** (v2.67.340-341): SKUs in `Profiles - Channels`,
+   `Accessories - Profiles - Inner profiles`, or `Diffusers` at **~3m
+   length** (2950-3050mm) ship **sea** regardless of supplier
+   air-eligibility. Long awkward items aren't economical on air.
+2. **Supplier default**: otherwise air when the supplier offers it
+   AND the SKU's length fits the supplier's `air_max_length_mm` (e.g.
+   Topmet UPS caps at 2200mm). Sea is the fallback.
+3. **IP lead time** (v2.67.343): when IP has an observed or configured
+   lead time for the SKU, that DURATION wins (it's the real measured
+   PO-to-receipt time). The freight METHOD (air/sea) is still set by
+   rules 1-2 above.
+4. **Per-row override**: the buyer can flip any row's mode via the
+   Freight column dropdown ("air"/"sea"/"air (manual)"/"sea
+   (manual)"). The reorder qty recalculates with the new lead time on
+   next refresh.
+
+The Inspect panel's calc trace shows the reason next to the lead-time
+line, e.g. `Lead time: 35 days (sea (category rule: Profiles -
+Channels at ~3m → sea))`.
+
+#### Status badges (Ordering page)
+Computed in `_status()` using **Available** (not OnHand) so a SKU that's
+oversold (Allocated > OnHand) reads as urgent, not as Overstocked
+(v2.67.333). Ladder:
+
+- 🔴 **Reorder now** — Available ≤ 0 (oversold or no free stock), OR
+  Available < lead-time demand. The engine wants stock immediately.
+- 🟠 **Reorder soon** — engine's `reorder_qty > 0` AND Available <
+  target, OR Available < target without an urgent shortfall.
+- 🔵 **Overstocked** — Available > target × 1.5. **Uses Available, not
+  OnHand** — a SKU with 100 on hand but 90 committed isn't overstocked.
+- 🟢 **On target** — everything else (well-stocked, no reorder needed).
+- 💀 **Dead stock** — eff_units_12mo = 0 AND OnHand > 0. Sitting
+  inventory with no demand.
+- ⚪ **No demand, no stock** — eff_units_12mo = 0 AND OnHand = 0.
+- ❗ prefix — "once-slow" warning on a SKU that's currently recovering
+  (the engine saw it as dormant in the past). Auto-lifts after 90 days
+  of sustained recovery.
+
+Other Status sources:
 - 📦 **Dropship** — order-on-demand, we don't stock it.
-- Active, Deprecated, Discontinued — from CIN7's product status.
+- Active / Deprecated / Discontinued — from CIN7's product status.
 
 #### Trend signal (📈 / 🎯 / 🔀 / 📉)
 A secondary check the engine runs to detect when the last-45-day sales
 pattern has diverged from the prior 45 days (days 45-90 ago). Uses
 four signals combined to avoid false-positives:
 
-- **📈 Trend** — ALL of these must be true: momentum >1.5, **4+ distinct
-  customers**, top customer **under 40%**, and non-top customers averaging
-  **at least 2 units each**. Real broad-based demand; engine switches to
-  last-45d velocity to keep up.
-- **🎯 Project** — ANY of these triggers: top customer **≥50%** of 45d
-  volume, top **2 customers combined ≥70%**, or fewer than 3 distinct
-  customers. Looks concentrated / one-off; engine subtracts top
-  customer's 12mo contribution before forecasting to avoid over-ordering.
-- **🔀 Mixed** — spike exists but fails both sets of rules. Watch
-  signal, no velocity override.
+**Customer diversity is the deciding signal** (v2.67.325). The old
+top-share thresholds (top ≥ 50%, top-2 ≥ 70%) misfired on bulk rolls
+where order sizes are naturally uneven — one buyer doing a big install
+takes >50% of UNITS while 4 other customers buy fractions, and that's
+diversified demand, not a project.
+
+Rules now (when momentum > 1.5, i.e. a spike is present):
+
+- **🎯 Project** — **only when ≤ 2 distinct customers** in the 45-day
+  window. Genuine one-off concentration. Engine subtracts the top
+  customer's 12mo contribution before forecasting to avoid over-
+  ordering future stock against a one-time order.
+- **📈 Trend** — **3+ distinct customers** AND top customer < 40% AND
+  non-top customers averaging ≥ 2 units each. Real broad-based
+  acceleration; engine switches to last-45d velocity to keep up.
+- **🔀 Mixed** — **3+ distinct customers** but the spread isn't broad
+  enough for Trend (one or two buyers leading but multiple
+  participants). Engine uses normal 12mo velocity (NOT suppressed) —
+  this is real demand, just uneven order sizes.
 - **📉 Decline** — units down 50%+ vs prior 45 days. Worth review.
-- **Stable** — everything else.
+- **Stable** — momentum ≤ 1.5 or insufficient signal — no spike to
+  decompose.
 
-**Why "top-2 combined" matters**: 8 customers with one buying 50% and
-a second buying 20% is still concentrated (top-2 = 70%). The tighter
-thresholds stop "many customers" from hiding real concentration.
-
-**Why "non-top avg units"**: a SKU with 8 customers where the top buyer
-took half leaves maybe 1-2 units each for the rest — that's not a trend,
-that's noise. The ≥2 units average rule makes sure there's substance
-beyond the big buyer.
+The promotion path (`_promote_dormant_flag`) uses the SAME diversity
+rule: a 12mo customer count ≥ 3 means a SKU is never promoted to
+Project regardless of low volume.
 
 Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
 skip classification entirely — the signal is too noisy at that scale.
