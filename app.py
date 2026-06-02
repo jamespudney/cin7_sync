@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.341** · deployed 2026-06-02")
+    "🔹 **v2.67.342** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11463,6 +11463,10 @@ elif page == "Ordering":
                 <= _length_for_rule
                 <= _FREIGHT_SEA_LEN_MAX_MM
         )
+        # Set by the category-rule branch below; appended to the freight
+        # line in the calc trace so the reason is visible without
+        # corrupting the selectbox-restricted `freight_mode` value.
+        _freight_rule_note = ""
 
         # Default: air whenever supplier offers it AND the SKU is eligible
         # (length within air_max_length_mm). Sea is the fallback.
@@ -11471,7 +11475,13 @@ elif page == "Ordering":
         # when beneficial (shorter LT = less inventory tied up).
         if _category_rule_sea:
             lead_time_days = lt_sea
-            freight_mode_used = "sea (category rule)"
+            # v2.67.342 — keep the column value in the selectbox's
+            # allowed set ("air"/"sea"); the *reason* is surfaced in
+            # the calc trace below via `_freight_rule_note`. Without
+            # this Streamlit blanks the Freight cell entirely.
+            freight_mode_used = "sea"
+            _freight_rule_note = (
+                f" (category rule: {_category} at ~3m → sea)")
         elif sku_air_ok and lt_air:
             lead_time_days = lt_air
             freight_mode_used = "air"
@@ -11873,7 +11883,7 @@ elif page == "Ordering":
 
         trace = "".join(demand_lines) + (
             f"**Lead time**: {lead_time_days} days "
-            f"({freight_mode_used})"
+            f"({freight_mode_used}{_freight_rule_note})"
             + (
                 " — IP's measured average PO-to-receipt time for "
                 "this SKU; overrides the supplier-config default "
