@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.342** · deployed 2026-06-02")
+    "🔹 **v2.67.343** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11494,6 +11494,15 @@ elif page == "Ordering":
         # (avg_lead_time) — that's the real lead time, not a
         # default. Sane clamp to [3, 120] days so a noisy sample
         # (e.g. a single freak shipment) can't break ordering.
+        # v2.67.343 — only override the lead-time DURATION; do NOT
+        # overwrite freight_mode_used. The freight METHOD is still
+        # air or sea per the supplier/category rule above; IP just
+        # tells us the actual transit time. The old code stored
+        # "IP observed actual" / "IP configured" in freight_mode_used,
+        # which isn't in the Freight selectbox's options set and
+        # blanked the cell for every IP-tracked SKU (most of them).
+        # The basis ("observed" / "configured") is still surfaced in
+        # the calc trace below.
         _sku_for_lt = str(row.get("SKU") or "")
         _ip_row = ip_lead_times_by_sku.get(_sku_for_lt) or {}
         _obs_lt = _ip_row.get("observed_lead_time_days")
@@ -11501,11 +11510,9 @@ elif page == "Ordering":
         lead_time_basis_from_ip = None
         if _obs_lt and 3 <= int(_obs_lt) <= 120:
             lead_time_days = int(_obs_lt)
-            freight_mode_used = "IP observed actual"
             lead_time_basis_from_ip = "observed"
         elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
             lead_time_days = int(_conf_lt_ip)
-            freight_mode_used = "IP configured"
             lead_time_basis_from_ip = "configured"
 
         # Safety factor by class
