@@ -5587,100 +5587,99 @@ def _abc_engine(products: pd.DataFrame,
     sl["Quantity"] = _to_num(sl["Quantity"]).fillna(0)
     sl["Total"] = _to_num(sl["Total"]).fillna(0)
 
-    # v2.67.334 — fold assembly (FG-XXXX) component consumption into the
-    # sale-lines stream so the velocity / monthly-bucket / 45d /
-    # customer math picks it up for free. We track which components got
-    # assembly data so the BOM rollup pass below can skip them (the
-    # BOM rollup would double-count what assemblies already record).
-    # We also keep a per-SKU sum (12mo and 45d) so the calc trace and
-    # Inspect panel can show "Assembly consumption: +X" separately
-    # from direct sales.
+    # v2.67.339 — assembly (FG-XXXX) augmentation via DIRECT manipulation
+    # of vel / u45_dict / u90_dict / monthly_12 / monthly_24. The
+    # earlier v2.67.334 approach (append synthetic rows to sl and let
+    # the downstream groupby pick them up) DIDN'T REACH units_12mo in
+    # practice — James 2026-06-02 saw Inspect-panel reporting 658 units
+    # of assembly consumption for LED-NEON-FLEX-NICHO-3000K-2 but the
+    # engine's 12mo number unchanged. Direct manipulation is more
+    # surgical, easier to verify, and survives dtype quirks in the
+    # concat path.
+    #
+    # We still build the `assembly_components` set so the BOM-rollup
+    # passes downstream skip these components (no double-counting kit
+    # sales × ratio + the assembly consumption that records the same
+    # event). And we keep per-SKU 12mo / 45d sums for the calc trace
+    # and Inspect panel.
     assembly_components: set = set()
     assembly_units_12mo_map: dict = {}
     assembly_units_45d_map: dict = {}
+    assembly_units_prior_45d_map: dict = {}
+    assembly_units_90d_map: dict = {}
+    assembly_rev_12mo_map: dict = {}
+    assembly_monthly_12_map: dict = {}  # {sku: [12-month bucket list]}
+    assembly_monthly_24_map: dict = {}  # {sku: [24-month bucket list]}
     if assemblies_df is not None and not assemblies_df.empty:
         a = assemblies_df.copy()
-        # Date: prefer CompletionDate, fall back to Date.
+        # Date: prefer CompletionDate, fall back to Date. _to_date is
+        # tz-aware UTC; convert to naive (matches sl["InvoiceDate"]).
         _cd = _to_date(a["CompletionDate"]) if "CompletionDate" in a.columns \
             else pd.Series(pd.NaT, index=a.index)
         _d = _to_date(a["Date"]) if "Date" in a.columns \
             else pd.Series(pd.NaT, index=a.index)
         a["_dt"] = _cd.fillna(_d).dt.tz_localize(None)
         a = a.dropna(subset=["_dt", "ComponentSKU"])
-        a = a[a["_dt"] >= cutoff]
         if "Status" in a.columns:
             a = a[~a["Status"].astype(str).str.upper().isin(
                 ("VOIDED", "CANCELLED", "DRAFT"))]
         a["Quantity"] = _to_num(a["Quantity"]).fillna(0)
         a = a[a["Quantity"] > 0]
+        a = a[a["_dt"] >= cutoff]  # 12mo window
         if not a.empty:
-            # Materialise synthetic sale-line rows. They carry SKU /
-            # InvoiceDate / Quantity / Total / Status which is all the
-            # downstream code reads. Customer is left null on purpose —
-            # CIN7's FG endpoint doesn't surface CustomerID, and the
-            # downstream BOM customer-rollup still propagates kit-sales
-            # customers into components, so distinct-customer counts
-            # stay representative. SaleID gets a synthetic "FG:<TaskID>"
-            # so it can never collide with a real SaleID in dedup paths.
-            synth_cols = {
-                "SaleID": ("FG:" + a["TaskID"].astype(str))
-                          if "TaskID" in a.columns else "",
-                "OrderNumber": a.get("AssemblyNumber", ""),
-                "InvoiceNumber": a.get("AssemblyNumber", ""),
-                "InvoiceDate": a["_dt"],
-                "OrderDate": a["_dt"],
-                "Status": "COMPLETED",
-                "SKU": a["ComponentSKU"].astype(str),
-                "Name": a.get("ComponentName", ""),
-                "Quantity": a["Quantity"],
-                # Cost × Quantity is a stand-in for revenue. Engine
-                # mostly reads rev_12mo for value-based ABC ranking;
-                # assembly cost is a reasonable proxy.
-                "Total": (_to_num(a.get("Cost", pd.Series(0, index=a.index)))
-                          .fillna(0) * a["Quantity"]),
-                "Price": _to_num(a.get("Cost", pd.Series(0, index=a.index))
-                                 ).fillna(0),
-            }
-            synth = pd.DataFrame(synth_cols)
-            # Align columns to sl. v2.67.338 — must use None (not
-            # pd.NA): downstream customer-rollup code is full of
-            # `str(_r.get("CustomerID") or "")` patterns and pd.NA
-            # raises "boolean value of NA is ambiguous" on `or`. None
-            # is falsy in Python so the existing pattern returns "".
-            for c in sl.columns:
-                if c not in synth.columns:
-                    synth[c] = None
-            synth = synth[sl.columns]
-            sl = pd.concat([sl, synth], ignore_index=True)
-            # v2.67.338 — second-line defence: even with None in synth,
-            # pandas can re-promote to pd.NA during concat if sl's
-            # original dtype is a nullable extension type ("string",
-            # "Int64", etc.). Explicitly coerce the columns the engine
-            # touches via `or` patterns to plain object / float with
-            # safe defaults so downstream `str(... or "")` /
-            # `float(... or 0)` never sees pd.NA.
-            for _col in ("SKU", "CustomerID", "Customer",
-                         "OrderNumber", "InvoiceNumber", "Status",
-                         "Name", "SaleID"):
-                if _col in sl.columns:
-                    sl[_col] = sl[_col].astype(object).where(
-                        sl[_col].notna(), "")
-            for _col in ("Quantity", "Total", "Price"):
-                if _col in sl.columns:
-                    sl[_col] = pd.to_numeric(
-                        sl[_col], errors="coerce").fillna(0)
-            assembly_components = set(
-                a["ComponentSKU"].astype(str).unique())
-            # Per-SKU 12mo / 45d assembly consumption sums for the trace
+            a["_sku"] = a["ComponentSKU"].astype(str)
+            a["_value"] = (_to_num(a.get("Cost", pd.Series(0, index=a.index)))
+                            .fillna(0) * a["Quantity"])
+            today_naive = pd.Timestamp(datetime.now().date())
+            d45 = today_naive - pd.Timedelta(days=45)
+            d90 = today_naive - pd.Timedelta(days=90)
+            # 12mo per SKU
             assembly_units_12mo_map = (
-                a.groupby(a["ComponentSKU"].astype(str))["Quantity"]
-                 .sum().to_dict())
-            _a_45 = a[a["_dt"] >= (
-                pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=45))]
-            if not _a_45.empty:
+                a.groupby("_sku")["Quantity"].sum().to_dict())
+            assembly_rev_12mo_map = (
+                a.groupby("_sku")["_value"].sum().to_dict())
+            # 45d / prior 45d / 90d windows
+            _a45 = a[a["_dt"] >= d45]
+            if not _a45.empty:
                 assembly_units_45d_map = (
-                    _a_45.groupby(_a_45["ComponentSKU"].astype(str))
-                          ["Quantity"].sum().to_dict())
+                    _a45.groupby("_sku")["Quantity"].sum().to_dict())
+            _ap45 = a[(a["_dt"] < d45) & (a["_dt"] >= d90)]
+            if not _ap45.empty:
+                assembly_units_prior_45d_map = (
+                    _ap45.groupby("_sku")["Quantity"].sum().to_dict())
+            _a90 = a[a["_dt"] >= d90]
+            if not _a90.empty:
+                assembly_units_90d_map = (
+                    _a90.groupby("_sku")["Quantity"].sum().to_dict())
+            # Monthly buckets (added to monthly_12 / monthly_24 below)
+            _months_ago = (today_naive - a["_dt"]).dt.days / 30.437
+            a["_b12"] = (11 - _months_ago.astype(int)).clip(lower=0, upper=11)
+            a["_b24"] = (23 - _months_ago.astype(int)).clip(lower=0, upper=23)
+            _am12 = a[_months_ago < 12]
+            for _sku_g, _grp in _am12.groupby("_sku"):
+                _buckets = [0.0] * 12
+                for _bidx, _qsum in (_grp.groupby("_b12")["Quantity"]
+                                       .sum().items()):
+                    _buckets[int(_bidx)] = float(_qsum)
+                assembly_monthly_12_map[_sku_g] = _buckets
+            _am24 = a[_months_ago < 24]
+            for _sku_g, _grp in _am24.groupby("_sku"):
+                _buckets = [0.0] * 24
+                for _bidx, _qsum in (_grp.groupby("_b24")["Quantity"]
+                                       .sum().items()):
+                    _buckets[int(_bidx)] = float(_qsum)
+                assembly_monthly_24_map[_sku_g] = _buckets
+            assembly_components = set(a["_sku"].unique())
+            try:
+                import logging as _lg
+                _lg.getLogger("app").info(
+                    "Assembly augmentation: %d components, %.0f units "
+                    "in 12mo window (across %d rows).",
+                    len(assembly_components),
+                    sum(assembly_units_12mo_map.values()),
+                    len(a))
+            except Exception:  # noqa: BLE001
+                pass
 
     vel = (sl.groupby("SKU")
              .agg(units_12mo=("Quantity", "sum"),
@@ -5688,6 +5687,30 @@ def _abc_engine(products: pd.DataFrame,
                   last_sold=("InvoiceDate", "max"),
                   first_sold=("InvoiceDate", "min"))
              .reset_index())
+    # v2.67.339 — add assembly consumption to units_12mo / rev_12mo.
+    # If a component's only consumption is via assembly (no direct
+    # sales), it won't be in `vel` at all — add those rows here too.
+    if assembly_units_12mo_map:
+        _vel_skus = set(vel["SKU"].astype(str))
+        _new_rows = []
+        for _asm_sku, _asm_units in assembly_units_12mo_map.items():
+            if _asm_sku in _vel_skus:
+                continue
+            _new_rows.append({
+                "SKU": _asm_sku,
+                "units_12mo": 0.0,
+                "rev_12mo": 0.0,
+                "last_sold": pd.NaT,
+                "first_sold": pd.NaT,
+            })
+        if _new_rows:
+            vel = pd.concat([vel, pd.DataFrame(_new_rows)],
+                            ignore_index=True)
+        _sku_str = vel["SKU"].astype(str)
+        vel["units_12mo"] = vel["units_12mo"].fillna(0) + _sku_str.map(
+            assembly_units_12mo_map).fillna(0)
+        vel["rev_12mo"] = vel["rev_12mo"].fillna(0) + _sku_str.map(
+            assembly_rev_12mo_map).fillna(0)
 
     # --- Trend vs. project detection (45-day window) --------------
     # For each SKU, compute:
@@ -5719,6 +5742,18 @@ def _abc_engine(products: pd.DataFrame,
         "units_prior_45d")
     c45 = sl_recent.groupby("SKU")["CustomerID"].nunique().rename(
         "customers_45d")
+    # v2.67.339 — add assembly consumption to 45d / prior-45d. Use
+    # .add(..., fill_value=0) so SKUs that exist in one but not the
+    # other show up in the result with the right total.
+    if assembly_units_45d_map:
+        u45 = u45.add(
+            pd.Series(assembly_units_45d_map, name="units_45d"),
+            fill_value=0)
+    if assembly_units_prior_45d_map:
+        uprior = uprior.add(
+            pd.Series(assembly_units_prior_45d_map,
+                       name="units_prior_45d"),
+            fill_value=0)
     # v2.67.320 — distinct customers over the full 12mo window. A
     # "project" is concentrated demand from 1-2 buyers; 3+ distinct
     # buyers over the year is diversified, repeatable demand and must
@@ -5733,6 +5768,10 @@ def _abc_engine(products: pd.DataFrame,
     # engine uses the 90d rate (≈0) instead of the inflated 12mo rate
     # to avoid suggesting reorders against demand that's stopped.
     u90 = sl_90d.groupby("SKU")["Quantity"].sum().rename("units_90d")
+    if assembly_units_90d_map:
+        u90 = u90.add(
+            pd.Series(assembly_units_90d_map, name="units_90d"),
+            fill_value=0)
 
     # Top customer(s) per SKU in 45d:
     #   top_cust_pct       — share going to the single biggest buyer
@@ -6742,6 +6781,19 @@ def _abc_engine(products: pd.DataFrame,
         if 0 <= months_ago < 24:
             b24 = 23 - int(months_ago)
             monthly_24[sku_r][b24] += q
+    # v2.67.339 — fold assembly consumption per-SKU per-bucket into the
+    # monthly arrays we just built from direct sales. Pre-aggregated
+    # above into assembly_monthly_{12,24}_map keyed by ComponentSKU.
+    for _sku, _buckets in assembly_monthly_12_map.items():
+        _dest = monthly_12[_sku]
+        for _i, _v in enumerate(_buckets):
+            if _v:
+                _dest[_i] += _v
+    for _sku, _buckets in assembly_monthly_24_map.items():
+        _dest = monthly_24[_sku]
+        for _i, _v in enumerate(_buckets):
+            if _v:
+                _dest[_i] += _v
 
     # --- Migration rollup of monthly buckets ---------------------------
     # For every migration record (retiring → successor), add the
@@ -7508,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.338** · deployed 2026-06-01")
+    "🔹 **v2.67.339** · deployed 2026-06-02")
 
 
 if page == "Overview":
