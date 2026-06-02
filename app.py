@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.343** · deployed 2026-06-02")
+    "🔹 **v2.67.344** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -14551,9 +14551,15 @@ elif page == "Ordering":
                 "Excess u", disabled=True, format="%.0f"),
             "excess_value": st.column_config.NumberColumn(
                 "Excess $", disabled=True, format="$%.0f"),
-            "SKU": st.column_config.TextColumn(disabled=True),
-            "Name": st.column_config.TextColumn(disabled=True,
-                                                  width="large"),
+            # v2.67.344 — pin SKU + Name to the left so they stay
+            # visible when the buyer scrolls horizontally. `pinned=True`
+            # is Streamlit 1.41+; requirements.txt pins streamlit>=1.35
+            # but Render pulls the latest at deploy time so the kwarg
+            # is available.
+            "SKU": st.column_config.TextColumn(
+                disabled=True, pinned=True),
+            "Name": st.column_config.TextColumn(
+                disabled=True, width="large", pinned=True),
             "ABC": st.column_config.TextColumn(disabled=True,
                                                   width="small"),
             "Status": st.column_config.TextColumn(disabled=True,
@@ -16164,9 +16170,12 @@ elif page == "Ordering":
                              "Order qty — you can fine-tune it there.",
                         width="small",
                     ),
-                    "SKU": st.column_config.TextColumn(disabled=True),
+                    # v2.67.344 — pin SKU + Name in Upcoming Reorders
+                    # too, matching the main editor.
+                    "SKU": st.column_config.TextColumn(
+                        disabled=True, pinned=True),
                     "Name": st.column_config.TextColumn(
-                        disabled=True, width="large"),
+                        disabled=True, width="large", pinned=True),
                     "ABC": st.column_config.TextColumn(
                         disabled=True, width="small"),
                     "trend_flag": st.column_config.TextColumn(
