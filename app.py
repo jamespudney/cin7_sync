@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.340** · deployed 2026-06-02")
+    "🔹 **v2.67.341** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11426,7 +11426,11 @@ elif page == "Ordering":
         "Accessories - Profiles - Inner profiles",
         "Diffusers",
     )
-    _FREIGHT_SEA_MIN_LENGTH_MM = 3000.0  # 3m
+    # v2.67.341 — James 2026-06-02: "3m only", not "≥3m". Use a small
+    # tolerance band so a SKU whose length parses as 2998 or 3010 still
+    # matches the rule (parser rounding from "3m (118")" style names).
+    _FREIGHT_SEA_LEN_MIN_MM = 2950.0
+    _FREIGHT_SEA_LEN_MAX_MM = 3050.0
 
     def _compute_target_and_reorder(row: pd.Series) -> dict:
         """Return dict with target_stock, reorder_qty, lead_time_used,
@@ -11447,13 +11451,17 @@ elif page == "Ordering":
             sku_air_ok = False
 
         # v2.67.340 — category-level sea rule (channels / inner profiles /
-        # diffusers at ≥3m). Overrides the air default when matched.
+        # diffusers at 3m). v2.67.341: window narrowed from "≥3m" to
+        # "3m only" (2950-3050mm tolerance band) per James. Overrides
+        # the air default when matched.
         _category = str(row.get("Category") or "").strip()
         _length_for_rule = (
             float(length_mm) if length_mm not in (None, "") else 0.0)
         _category_rule_sea = (
             _category in _FREIGHT_SEA_CATEGORIES
-            and _length_for_rule >= _FREIGHT_SEA_MIN_LENGTH_MM
+            and _FREIGHT_SEA_LEN_MIN_MM
+                <= _length_for_rule
+                <= _FREIGHT_SEA_LEN_MAX_MM
         )
 
         # Default: air whenever supplier offers it AND the SKU is eligible
