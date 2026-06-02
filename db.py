@@ -4344,6 +4344,9 @@ def set_supplier_config(
     actor: str,
     note: str = "",
 ) -> None:
+    # v2.67.349 — canonicalise the supplier_name on every save so the
+    # DB never accumulates near-duplicates that lookups miss.
+    supplier_name = _normalise_supplier_name(supplier_name)
     with connect() as c:
         c.execute(
             """
@@ -4401,11 +4404,27 @@ def set_supplier_config(
         )
 
 
+def _normalise_supplier_name(name) -> str:
+    """v2.67.349 — canonicalise supplier names so save/lookup paths
+    can't be defeated by invisible whitespace mismatches (NBSP,
+    trailing space, double space, leading space). str.split() with no
+    args splits on ANY Unicode whitespace including NBSP, then
+    " ".join() collapses runs of whitespace to single regular spaces.
+    Symmetric: applied at save (set_supplier_config) AND lookup
+    (all_supplier_configs returns normalised keys)."""
+    return " ".join(str(name or "").split()).strip()
+
+
 def all_supplier_configs() -> dict:
-    """Return {supplier_name: row_as_dict}."""
+    """Return {supplier_name: row_as_dict} with normalised keys so
+    callers can lookup with either the canonical or a not-quite-canonical
+    string and still match."""
     with connect() as c:
         rows = c.execute("SELECT * FROM supplier_config").fetchall()
-    return {r["supplier_name"]: dict(r) for r in rows}
+    return {
+        _normalise_supplier_name(r["supplier_name"]): dict(r)
+        for r in rows
+    }
 
 
 # ---------------------------------------------------------------------------

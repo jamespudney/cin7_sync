@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.348** · deployed 2026-06-02")
+    "🔹 **v2.67.349** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11481,7 +11481,15 @@ elif page == "Ordering":
         """Return dict with target_stock, reorder_qty, lead_time_used,
         freight_mode_used, calc_trace (markdown-ready)."""
         supplier = row.get("Supplier") or ""
-        cfg = supp_configs.get(supplier, {})
+        # v2.67.349 — normalise the engine-side supplier string before
+        # lookup to match db.all_supplier_configs's now-normalised
+        # keys. Without this, an SKU whose resolved supplier name has
+        # invisible whitespace (NBSP, trailing space) silently misses
+        # the supp_configs lookup and falls back to schema defaults —
+        # the bug James saw where Luz Negra safety_pct config "didn't
+        # save".
+        supplier_norm = " ".join(str(supplier).split()).strip()
+        cfg = supp_configs.get(supplier_norm, supp_configs.get(supplier, {}))
         lt_sea = cfg.get("lead_time_sea_days") or 35
         lt_air = cfg.get("lead_time_air_days")
         air_eligible_default = bool(cfg.get("air_eligible_default") or 0)
@@ -11591,6 +11599,45 @@ elif page == "Ordering":
                 f"cadence in Supplier settings to tighten it")
 
         avg_daily = row["avg_daily"]
+
+        # v2.67.349 — 12-month concentrated-demand clamp. When one
+        # customer accounted for >50% of the SKU's 12mo volume AND
+        # recent demand has dried up (momentum < 0.5), the annualised
+        # avg_daily is dominated by a one-off past spike that won't
+        # recur. The 45-day Project rule only catches CURRENT spikes
+        # (momentum > 1.5); this catches PAST one-offs that the
+        # engine would otherwise budget against. James 2026-06-02:
+        # LED-EC-19.101 (B-class, OnHand 28) showed Reorder 70 because
+        # 12mo=698 — almost all from one historical big sale, with
+        # recent demand near zero.
+        _top12 = float(row.get("top_cust_units_12mo") or 0)
+        _eff12_for_clamp = float(row.get("effective_units_12mo") or 0)
+        _u12 = float(row.get("units_12mo") or 0)
+        _mom = float(row.get("momentum") or 1.0)
+        _top12_share = (
+            (_top12 / _u12) if _u12 > 0 else 0.0)
+        clamp_active = False
+        clamp_note = ""
+        if _top12_share > 0.50 and _mom < 0.5 and _u12 > 0:
+            # Baseline = everything except this one customer's
+            # contribution, expressed against the original 12mo
+            # window. Apply the same RATIO to effective_units_12mo so
+            # rollup contributions scale down proportionally — the
+            # alternative (raw subtraction) would over-penalise SKUs
+            # whose effective_units_12mo includes assembly/tube rollup
+            # that ISN'T attributable to the top customer.
+            _baseline_share = max(0.0, 1.0 - _top12_share)
+            _baseline_eff = _eff12_for_clamp * _baseline_share
+            avg_daily = _baseline_eff / max(window_days, 1)
+            clamp_active = True
+            _top_name = str(row.get("top_cust_name") or "—")[:40]
+            clamp_note = (
+                f" — clamped: top customer **{_top_name}** took "
+                f"**{_top12_share:.0%}** of 12mo and momentum is "
+                f"**{_mom:.2f}×**, so the rest of the year (baseline "
+                f"{_baseline_eff:.0f} units/yr) drives the reorder, "
+                f"not the past one-off")
+
         lt_demand = avg_daily * lead_time_days
         safety = lt_demand * (safety_pct / 100.0)
         review_demand = avg_daily * review_days
@@ -11930,7 +11977,8 @@ elif page == "Ordering":
             )
             demand_lines.append(
                 f"- Avg daily: {eff_u:.0f} / 365 = "
-                f"**{avg_daily:.2f}** units/day\n"
+                f"**{avg_daily:.2f}** units/day"
+                + (f"{clamp_note}\n" if clamp_active else "\n")
             )
 
         trace = "".join(demand_lines) + (
@@ -12226,6 +12274,11 @@ elif page == "Ordering":
             return
         _r = _hit.iloc[0]
         st.markdown(f"#### {_sku}")
+        # v2.67.349 — render the SKU as a code block too so Streamlit's
+        # built-in hover-copy clipboard icon appears. One-click copy
+        # for pasting into CIN7, Slack, search, etc. No JS injection
+        # needed — pure native widget.
+        st.code(_sku, language=None)
         st.caption(str(_r.get("Name") or ""))
         _m = st.columns(3)
         _m[0].metric("ABC", str(_r.get("ABC") or "—"))
@@ -12683,6 +12736,53 @@ elif page == "Ordering":
                 f"⚙️ Editing config for **{cfg_supplier}** — "
                 "all fields below reflect THIS supplier's saved values."
             )
+            # v2.67.349 — diagnostic for "save persisted but engine
+            # doesn't see it" scenarios (invisible-char mismatch).
+            with st.expander(
+                "🔬 Diagnose supplier-name match", expanded=False,
+            ):
+                _cs_repr = repr(cfg_supplier)
+                _cs_norm = " ".join(str(cfg_supplier).split()).strip()
+                st.markdown(
+                    f"- Picker selection raw `repr()`: `{_cs_repr}`\n"
+                    f"- Canonicalised: `{_cs_norm!r}`"
+                )
+                # Engine-resolved supplier strings for SKUs assigned
+                # to this supplier (any variant).
+                if "engine_df" in dir() and not engine_df.empty:
+                    _eng_sups = (
+                        engine_df["Supplier"].dropna().astype(str)
+                        .unique().tolist())
+                    _matches = [
+                        s for s in _eng_sups
+                        if (" ".join(s.split()).strip()
+                            == _cs_norm)
+                    ]
+                    _close = [
+                        s for s in _eng_sups
+                        if s.strip().lower() == _cs_norm.lower()
+                        and s not in _matches
+                    ]
+                    st.markdown(
+                        f"- Engine-side variants matching this "
+                        f"canonical name: **{len(_matches)}**\n"
+                        + "\n".join(
+                            f"  - `{r!r}`" for r in _matches[:5])
+                    )
+                    if _close:
+                        st.warning(
+                            "Other engine strings that almost match "
+                            "(case- or whitespace-different) — these "
+                            "would have been MISSED before v2.67.349 "
+                            "normalisation:\n"
+                            + "\n".join(f"  - `{r!r}`" for r in _close[:5])
+                        )
+                st.caption(
+                    "If you see `repr()` values that look identical "
+                    "in the UI but differ (e.g. one has `\\xa0` for "
+                    "non-breaking space), that's the invisible-char "
+                    "mismatch the v2.67.349 normalisation handles."
+                )
             # v2.67.347 — surface the last save message across the
             # rerun so the buyer SEES proof of what was written. Then
             # clear it so it doesn't linger forever.
