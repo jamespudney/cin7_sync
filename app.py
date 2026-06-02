@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.339** · deployed 2026-06-02")
+    "🔹 **v2.67.340** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11414,6 +11414,20 @@ elif page == "Ordering":
             })
         return len(closed), matched
 
+    # v2.67.340 — category × length default freight rule. James
+    # 2026-06-02: products in these categories at ≥3m ship sea by
+    # default regardless of supplier air-eligibility (long awkward
+    # items aren't economical on air). All other products keep the
+    # existing supplier-based default (air if eligible, sea otherwise).
+    # IP's observed actual lead time still wins below (that's the real
+    # measurement, not a default).
+    _FREIGHT_SEA_CATEGORIES = (
+        "Profiles - Channels",
+        "Accessories - Profiles - Inner profiles",
+        "Diffusers",
+    )
+    _FREIGHT_SEA_MIN_LENGTH_MM = 3000.0  # 3m
+
     def _compute_target_and_reorder(row: pd.Series) -> dict:
         """Return dict with target_stock, reorder_qty, lead_time_used,
         freight_mode_used, calc_trace (markdown-ready)."""
@@ -11432,12 +11446,25 @@ elif page == "Ordering":
                 and length_mm is not None and length_mm > air_max_len):
             sku_air_ok = False
 
+        # v2.67.340 — category-level sea rule (channels / inner profiles /
+        # diffusers at ≥3m). Overrides the air default when matched.
+        _category = str(row.get("Category") or "").strip()
+        _length_for_rule = (
+            float(length_mm) if length_mm not in (None, "") else 0.0)
+        _category_rule_sea = (
+            _category in _FREIGHT_SEA_CATEGORIES
+            and _length_for_rule >= _FREIGHT_SEA_MIN_LENGTH_MM
+        )
+
         # Default: air whenever supplier offers it AND the SKU is eligible
         # (length within air_max_length_mm). Sea is the fallback.
         # `preferred_freight` on the supplier config is treated as a hint
         # only — if "sea" is preferred, air is still used for small items
         # when beneficial (shorter LT = less inventory tied up).
-        if sku_air_ok and lt_air:
+        if _category_rule_sea:
+            lead_time_days = lt_sea
+            freight_mode_used = "sea (category rule)"
+        elif sku_air_ok and lt_air:
             lead_time_days = lt_air
             freight_mode_used = "air"
         else:
