@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.347** · deployed 2026-06-02")
+    "🔹 **v2.67.348** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -12690,6 +12690,13 @@ elif page == "Ordering":
             if _last_msg:
                 st.success(_last_msg)
 
+            # v2.67.348 — defensive read from session_state at save
+            # time. Belt-and-braces in case Streamlit's commit-on-blur
+            # on number_input races with a fast click on Save (the
+            # click event can fire BEFORE the blur commit, so sf_A
+            # holds stale state). Reading st.session_state[key] at the
+            # moment of submit forces the latest available value.
+
             cc1, cc2, cc3 = st.columns(3)
             lt_sea = cc1.number_input(
                 "Lead time SEA (days)",
@@ -12950,26 +12957,63 @@ elif page == "Ordering":
 
             if st.button("Save supplier config", key="sc_save",
                            type="primary"):
+                # v2.67.348 — pull the most recent committed widget
+                # values from session_state instead of relying on the
+                # in-scope Python variables. This is the same data,
+                # but reading via the canonical key path means if
+                # there's ANY race between number_input commit and
+                # button click, we get the post-commit value.
+                _ss = st.session_state
+                _sfA_save = float(_ss.get(f"sc_sfA_{_sk}", sf_A))
+                _sfB_save = float(_ss.get(f"sc_sfB_{_sk}", sf_B))
+                _sfC_save = float(_ss.get(f"sc_sfC_{_sk}", sf_C))
+                _rvA_save = int(_ss.get(f"sc_rvA_{_sk}", rv_A))
+                _rvB_save = int(_ss.get(f"sc_rvB_{_sk}", rv_B))
+                _rvC_save = int(_ss.get(f"sc_rvC_{_sk}", rv_C))
+                _ltsea_save = int(_ss.get(f"sc_sea_{_sk}", lt_sea))
+                _ltair_save = int(_ss.get(f"sc_air_{_sk}", lt_air))
+                _airmax_save = int(_ss.get(f"sc_airmax_{_sk}", air_max))
+                _moq_save = float(_ss.get(f"sc_moq_{_sk}", moq))
+                _mov_save = float(_ss.get(f"sc_mov_{_sk}", mov))
+                _movccy_save = (_ss.get(f"sc_movccy_{_sk}", mov_ccy)
+                                or "USD")
+                _pref_save = (_ss.get(f"sc_pref_{_sk}", pref_freight)
+                              or "sea")
+                _airdef_save = _ss.get(f"sc_air_def_{_sk}", air_def)
+                _cadence_save = int(_ss.get(
+                    f"sc_cadence_{_sk}", order_cadence))
+                _ds_save = bool(_ss.get(
+                    f"sc_dropship_default_{_sk}", ds_default))
+                # Show what we're ABOUT to write — buyer can spot a
+                # widget-state lag before the DB even gets touched.
+                st.caption(
+                    f"💾 Writing to **{cfg_supplier}**: "
+                    f"safety A/B/C = {_sfA_save:.0f}/{_sfB_save:.0f}/"
+                    f"{_sfC_save:.0f}%  ·  sea LT {_ltsea_save}d  ·  "
+                    f"cadence {_cadence_save}d"
+                )
                 db.set_supplier_config(
                     cfg_supplier,
-                    lead_time_sea_days=int(lt_sea),
-                    lead_time_air_days=(int(lt_air) if lt_air > 0 else None),
-                    air_eligible_default=1 if air_def == "Yes" else 0,
-                    air_max_length_mm=(int(air_max) if air_max > 0 else None),
-                    moq_units=float(moq) if moq > 0 else None,
-                    mov_amount=float(mov) if mov > 0 else None,
-                    mov_currency=mov_ccy or None,
-                    preferred_freight=pref_freight,
-                    safety_pct_A=float(sf_A),
-                    safety_pct_B=float(sf_B),
-                    safety_pct_C=float(sf_C),
-                    review_days_A=int(rv_A),
-                    review_days_B=int(rv_B),
-                    review_days_C=int(rv_C),
-                    order_cadence_days=(int(order_cadence)
-                                         if order_cadence > 0
-                                         else None),
-                    dropship_default=1 if ds_default else 0,
+                    lead_time_sea_days=_ltsea_save,
+                    lead_time_air_days=(_ltair_save
+                                         if _ltair_save > 0 else None),
+                    air_eligible_default=(1 if _airdef_save == "Yes"
+                                           else 0),
+                    air_max_length_mm=(_airmax_save
+                                        if _airmax_save > 0 else None),
+                    moq_units=_moq_save if _moq_save > 0 else None,
+                    mov_amount=_mov_save if _mov_save > 0 else None,
+                    mov_currency=_movccy_save or None,
+                    preferred_freight=_pref_save,
+                    safety_pct_A=_sfA_save,
+                    safety_pct_B=_sfB_save,
+                    safety_pct_C=_sfC_save,
+                    review_days_A=_rvA_save,
+                    review_days_B=_rvB_save,
+                    review_days_C=_rvC_save,
+                    order_cadence_days=(_cadence_save
+                                         if _cadence_save > 0 else None),
+                    dropship_default=1 if _ds_save else 0,
                     actor=actor_o,
                 )
                 # v2.67.289 — NO _safe_cache_clear() here.
@@ -13004,12 +13048,12 @@ elif page == "Ordering":
                 # rebuilds.
                 _confirm = (
                     f"✅ Saved **{cfg_supplier}**: "
-                    f"sea LT {int(lt_sea)}d · air LT "
-                    f"{int(lt_air) if lt_air > 0 else '—'}d · "
-                    f"safety A/B/C {float(sf_A):.0f}/{float(sf_B):.0f}/"
-                    f"{float(sf_C):.0f}% · review A/B/C "
-                    f"{int(rv_A)}/{int(rv_B)}/{int(rv_C)}d · cadence "
-                    f"{int(order_cadence) if order_cadence > 0 else '—'}d"
+                    f"sea LT {_ltsea_save}d · air LT "
+                    f"{_ltair_save if _ltair_save > 0 else '—'}d · "
+                    f"safety A/B/C {_sfA_save:.0f}/{_sfB_save:.0f}/"
+                    f"{_sfC_save:.0f}% · review A/B/C "
+                    f"{_rvA_save}/{_rvB_save}/{_rvC_save}d · cadence "
+                    f"{_cadence_save if _cadence_save > 0 else '—'}d"
                 )
                 st.session_state["_sc_last_save_msg"] = _confirm
                 st.success(_confirm)
