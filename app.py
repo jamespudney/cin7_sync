@@ -7605,7 +7605,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.352** · deployed 2026-06-02")
+    "🔹 **v2.67.353** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11674,8 +11674,38 @@ elif page == "Ordering":
         # genuinely ZERO recent activity, the right answer is
         # avg_daily = 0 — target → 0 → reorder → 0. Buyer manually
         # triggers any new-project order.
+        #
+        # v2.67.353 — TIGHTEN the trigger. Original check used
+        # `effective_units_90d == 0`, but effective_units_90d
+        # includes `tube_rollup_in_90d` (sister-variant rollup).
+        # LED-18.074-6 (James 2026-06-02): own 90d activity was 0
+        # (no direct sales, no assemblies in 90d) but sister rollup
+        # from LED-18.074-2/-2390 kept eff_90d > 0, so the clamp
+        # skipped and the engine asked for 22 units against ended
+        # project demand. The engine already correctly flags this
+        # case as `project_reason == "stale-12mo"` (line 7379 checks
+        # u90 = units_90d = direct + own assembly only). Trust THAT
+        # signal — it's the canonical "no own activity in 90d" flag.
+        # Fall back to the old eff_90d_check for SKUs not flagged
+        # stale-12mo but where eff_90d is also zero (no rollup).
+        _proj_reason = str(row.get("project_reason") or "")
+        _own_units_90d = float(row.get("units_90d") or 0)
         _eff_90d_check = float(row.get("effective_units_90d") or 0)
-        if (_eff_90d_check == 0
+        if (_proj_reason == "stale-12mo"
+                and _eff12_for_clamp > 0
+                and _u12 > 0):
+            avg_daily = 0.0
+            clamp_active = True
+            clamp_note = (
+                " — clamped to zero: no OWN activity (zero direct "
+                "sales AND zero assembly consumption) in the last "
+                "90 days, so the historic 12mo (dominated by ended "
+                "project work) doesn't justify any reorder. Sister "
+                "tube rollup in 90d is ignored for this check — it "
+                "represents demand on sibling SKUs, not on this "
+                "one. Manually override the Order qty if a new "
+                "project lands.")
+        elif (_eff_90d_check == 0
                 and _eff12_for_clamp > 0
                 and _u12 > 0):
             avg_daily = 0.0
@@ -12057,6 +12087,23 @@ elif page == "Ordering":
                 f"- Avg daily: {eff_u:.0f} / 365 = "
                 f"**{avg_daily:.2f}** units/day"
                 + (f"{clamp_note}\n" if clamp_active else "\n")
+            )
+            # v2.67.353 — recency diagnostic. Splits the 90d activity
+            # into "own" (direct + own assembly — what counts toward
+            # the stale-12mo check at engine line 7379) vs "tube
+            # rollup IN" (sister-variant rollup) vs "effective"
+            # (sum). The stale-90d clamp uses OWN. Surfacing this
+            # one-glance saves a CSV export next time a buyer asks
+            # "why isn't this clamped to zero".
+            _own90 = float(row.get("units_90d") or 0)
+            _eff90 = float(row.get("effective_units_90d") or 0)
+            _roll90 = float(row.get("tube_rollup_in_90d") or 0)
+            demand_lines.append(
+                f"- 90-day activity (recency diagnostic): "
+                f"**own = {_own90:.1f}** (direct + own assembly — "
+                f"used by stale-90d clamp), "
+                f"sister tube rollup IN = {_roll90:.1f}, "
+                f"effective = {_eff90:.1f}\n"
             )
 
         trace = "".join(demand_lines) + (
