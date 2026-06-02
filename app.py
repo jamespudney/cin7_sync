@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.346** · deployed 2026-06-02")
+    "🔹 **v2.67.347** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -12664,24 +12664,50 @@ elif page == "Ordering":
             cfg_supplier = cfg_label_to_sup[cfg_label_pick]
             existing = supp_configs.get(cfg_supplier, {})
 
+            # v2.67.347 — widget keys are supplier-specific so switching
+            # suppliers in the picker properly re-renders the fields
+            # with that supplier's persisted values. James 2026-06-02:
+            # safety changes appeared to "not save" — likely because
+            # Streamlit's session_state on static keys (sc_sfA etc.)
+            # kept showing a previously-edited supplier's value, so a
+            # save wrote that value back unchanged.
+            _sk = (
+                "".join(ch if ch.isalnum() else "_"
+                        for ch in (cfg_supplier or "_"))
+                .strip("_")[:60]
+            )
+
+            # Loud current-supplier banner so the buyer can never miss
+            # which supplier they're editing.
+            st.info(
+                f"⚙️ Editing config for **{cfg_supplier}** — "
+                "all fields below reflect THIS supplier's saved values."
+            )
+            # v2.67.347 — surface the last save message across the
+            # rerun so the buyer SEES proof of what was written. Then
+            # clear it so it doesn't linger forever.
+            _last_msg = st.session_state.pop("_sc_last_save_msg", None)
+            if _last_msg:
+                st.success(_last_msg)
+
             cc1, cc2, cc3 = st.columns(3)
             lt_sea = cc1.number_input(
                 "Lead time SEA (days)",
                 min_value=1, max_value=200,
                 value=int(existing.get("lead_time_sea_days") or 35),
-                key="sc_sea",
+                key=f"sc_sea_{_sk}",
             )
             lt_air = cc2.number_input(
                 "Lead time AIR (days; 0 = not offered)",
                 min_value=0, max_value=60,
                 value=int(existing.get("lead_time_air_days") or 0),
-                key="sc_air",
+                key=f"sc_air_{_sk}",
             )
             air_def = cc3.selectbox(
                 "Air eligible by default?",
                 ["No", "Yes"],
                 index=int(bool(existing.get("air_eligible_default"))),
-                key="sc_air_def",
+                key=f"sc_air_def_{_sk}",
             )
 
             cd1, cd2, cd3 = st.columns(3)
@@ -12691,32 +12717,32 @@ elif page == "Ordering":
                 value=int(existing.get("air_max_length_mm") or 0),
                 help="For UPS etc., items longer than this are sea-only. "
                      "E.g. Topmet UPS caps at ~2200mm.",
-                key="sc_airmax",
+                key=f"sc_airmax_{_sk}",
             )
             moq = cd2.number_input(
                 "MOQ units",
                 min_value=0.0, max_value=10000.0,
                 value=float(existing.get("moq_units") or 0),
-                key="sc_moq",
+                key=f"sc_moq_{_sk}",
             )
             pref_freight = cd3.selectbox(
                 "Preferred freight",
                 ["sea", "air", "mixed"],
                 index=(["sea","air","mixed"].index(
                     existing.get("preferred_freight") or "sea")),
-                key="sc_pref",
+                key=f"sc_pref_{_sk}",
             )
 
             ce1, ce2, ce3 = st.columns(3)
             mov = ce1.number_input(
                 "MOV amount", min_value=0.0, max_value=100000.0,
                 value=float(existing.get("mov_amount") or 0),
-                key="sc_mov",
+                key=f"sc_mov_{_sk}",
             )
             mov_ccy = ce2.text_input(
                 "MOV currency",
                 value=existing.get("mov_currency") or "USD",
-                key="sc_movccy",
+                key=f"sc_movccy_{_sk}",
             )
 
             st.markdown("**ABC safety factors & review days** "
@@ -12725,27 +12751,27 @@ elif page == "Ordering":
             sf_A = sf_cols[0].number_input("Safety A (%)",
                                             min_value=0.0, max_value=100.0,
                                             value=float(existing.get("safety_pct_A") or 30.0),
-                                            key="sc_sfA")
+                                            key=f"sc_sfA_{_sk}")
             sf_B = sf_cols[1].number_input("Safety B (%)",
                                             min_value=0.0, max_value=100.0,
                                             value=float(existing.get("safety_pct_B") or 20.0),
-                                            key="sc_sfB")
+                                            key=f"sc_sfB_{_sk}")
             sf_C = sf_cols[2].number_input("Safety C (%)",
                                             min_value=0.0, max_value=100.0,
                                             value=float(existing.get("safety_pct_C") or 15.0),
-                                            key="sc_sfC")
+                                            key=f"sc_sfC_{_sk}")
             rv_A = sf_cols[3].number_input("Review A (d)",
                                             min_value=1, max_value=180,
                                             value=int(existing.get("review_days_A") or 14),
-                                            key="sc_rvA")
+                                            key=f"sc_rvA_{_sk}")
             rv_B = sf_cols[4].number_input("Review B (d)",
                                             min_value=1, max_value=180,
                                             value=int(existing.get("review_days_B") or 30),
-                                            key="sc_rvB")
+                                            key=f"sc_rvB_{_sk}")
             rv_C = sf_cols[5].number_input("Review C (d)",
                                             min_value=1, max_value=180,
                                             value=int(existing.get("review_days_C") or 45),
-                                            key="sc_rvC")
+                                            key=f"sc_rvC_{_sk}")
 
             # v2.67.283 — order cadence. The real interval between
             # reorders with this supplier. Drives the reorder
@@ -12759,7 +12785,7 @@ elif page == "Ordering":
                 "Order cadence (days)",
                 min_value=0, max_value=180,
                 value=int(existing.get("order_cadence_days") or 0),
-                key="sc_cadence",
+                key=f"sc_cadence_{_sk}",
                 help="The real gap between reorders — e.g. 7 if you "
                      "order this supplier weekly. The engine then "
                      "stocks only enough to bridge to the next "
@@ -12908,7 +12934,7 @@ elif page == "Ordering":
             ds_default = ds_col[0].toggle(
                 "All items from this supplier are dropship",
                 value=bool(existing.get("dropship_default") or 0),
-                key="sc_dropship_default",
+                key=f"sc_dropship_default_{_sk}",
                 help="Use for suppliers where we never stock anything "
                      "(e.g. Gyford). Every SKU whose primary supplier is "
                      "this one will be treated as dropship — engine zeros "
@@ -12970,7 +12996,23 @@ elif page == "Ordering":
                 except Exception:  # noqa: BLE001
                     pass
                 st.session_state["_engine_last_built_at"] = datetime.now()
-                st.success(f"Saved config for {cfg_supplier}")
+                # v2.67.347 — verbose confirmation so the buyer can SEE
+                # which supplier got which values. Previously a tight
+                # "Saved config for {supplier}" hid whether the
+                # numbers actually changed. Persist the message across
+                # the rerun so it's still visible after the page
+                # rebuilds.
+                _confirm = (
+                    f"✅ Saved **{cfg_supplier}**: "
+                    f"sea LT {int(lt_sea)}d · air LT "
+                    f"{int(lt_air) if lt_air > 0 else '—'}d · "
+                    f"safety A/B/C {float(sf_A):.0f}/{float(sf_B):.0f}/"
+                    f"{float(sf_C):.0f}% · review A/B/C "
+                    f"{int(rv_A)}/{int(rv_B)}/{int(rv_C)}d · cadence "
+                    f"{int(order_cadence) if order_cadence > 0 else '—'}d"
+                )
+                st.session_state["_sc_last_save_msg"] = _confirm
+                st.success(_confirm)
                 st.rerun()
 
             # Current config table
