@@ -4922,7 +4922,16 @@ def render_demand_breakdown(
                           for c in children if c.get("AssemblySKU")}
         bom_parent_set = {str(p.get("ComponentSKU"))
                            for p in parents if p.get("ComponentSKU")}
-        excluded_set = bom_child_set | bom_parent_set | {str(sku)}
+        # v2.67.352 — James 2026-06-02: include BOM-linked length
+        # variants in the family-variants list (previously excluded
+        # to "avoid duplication with the BOM section"). The buyer
+        # wants ONE view of every length variant when looking at
+        # e.g. LED-01.018-3 — including LED-01.018-2 (the 2m parent
+        # roll, which was being filtered out as a BOM parent). They
+        # get a 📦 prefix in the Variant name so the buyer knows
+        # they're formally BOM-linked too.
+        excluded_set = {str(sku)}
+        _bom_linked_set = bom_child_set | bom_parent_set
         sibs_mask = (
             products_df["SKU"].astype(str).str.startswith(family_prefix + "-")
             & ~products_df["SKU"].astype(str).isin(excluded_set)
@@ -5050,9 +5059,16 @@ def render_demand_breakdown(
                     onhand_num > 0 and
                     ("Lagging" in trend or "Slowing" in trend
                      or "Stale" in trend))
+                # v2.67.352 — prefix BOM-linked siblings with 📦 so the
+                # buyer can see at a glance which ones are formally
+                # related in CIN7 (master roll / cut variant) vs
+                # heuristically prefix-matched.
+                _vname_raw = str(sib.get("Name") or "")[:40]
+                _vname = (f"📦 {_vname_raw}" if sib_sku in _bom_linked_set
+                          else _vname_raw)
                 sib_rows.append({
                     "Sibling SKU": sib_sku,
-                    "Variant name": str(sib.get("Name") or "")[:40],
+                    "Variant name": _vname,
                     "OnHand": onhand_str,
                     "12mo units": int(s_12mo),
                     "90d units": int(s_90d),
@@ -6440,9 +6456,23 @@ def _abc_engine(products: pd.DataFrame,
         targets = _find_all_masters_for_assembly(sku)
         if not targets:
             continue
+        # v2.67.352 — subtract assembly contribution from own_units
+        # before rolling up to masters. The strip rollup attributes
+        # sister-variant demand to the family master (e.g. 1m cuts'
+        # demand rolls up to the 100m roll). Assembly consumption is
+        # ALREADY attributed to the sister variant's own SKU as
+        # ground truth from FG- pick lines — rolling it up to a
+        # master would double-count kit consumption against the
+        # master. James 2026-06-02: LED-01.018-3 showed effective
+        # 588 vs IP's 49; some of the gap is sister-assembly being
+        # double-attributed via this rollup.
         own_units = float(vel.loc[vel["SKU"] == sku, "units_12mo"].sum())
         own_units_90d = float(
             vel.loc[vel["SKU"] == sku, "units_90d"].sum())
+        own_units = max(0.0, own_units - float(
+            assembly_units_12mo_map.get(sku, 0)))
+        own_units_90d = max(0.0, own_units_90d - float(
+            assembly_units_90d_map.get(sku, 0)))
         # Migration-aware adjustment to own_units before rolling up:
         #   migration_in : this SKU is a SUCCESSOR — receives demand
         #                  from retired predecessors. Critical for
@@ -6559,6 +6589,13 @@ def _abc_engine(products: pd.DataFrame,
                                        "units_12mo"].sum())
             own_units_90d = float(vel.loc[vel["SKU"] == sku_m,
                                            "units_90d"].sum())
+            # v2.67.352 — same direct-only adjustment as the main
+            # rollup loop above (don't attribute sister-variant
+            # assembly demand to the bulk master).
+            own_units = max(0.0, own_units - float(
+                assembly_units_12mo_map.get(sku_m, 0)))
+            own_units_90d = max(0.0, own_units_90d - float(
+                assembly_units_90d_map.get(sku_m, 0)))
             if (own_units == 0 and own_units_90d == 0) or length_m == 0:
                 strip_non_master_skus.add(sku_m)
                 continue
@@ -7568,7 +7605,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.351** · deployed 2026-06-02")
+    "🔹 **v2.67.352** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -12004,8 +12041,15 @@ elif page == "Ordering":
                         "because the spike is concentrated to one "
                         "buyer — unlikely to repeat.\n"
                     )
+            # v2.67.352 — include the +asm_u term in the formula so the
+            # LHS actually sums to the displayed eff_u. Pre-v2.67.352
+            # the line read "0 - 0 + 0 + 356 = 588" which dropped the
+            # +232 assembly term, making the math look broken even
+            # though the engine computed eff_u correctly.
             demand_lines.append(
-                f"- **Effective total**: {direct_u:.0f} - {mig_out:.0f} "
+                f"- **Effective total**: {direct_u:.0f}"
+                + (f" + {asm_u:.0f}" if asm_u > 0 else "")
+                + f" - {mig_out:.0f} "
                 f"+ {mig_in:.0f} + {rollup_in:.0f} = "
                 f"**{eff_u:.0f}** units/year\n"
             )
