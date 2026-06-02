@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.345** · deployed 2026-06-02")
+    "🔹 **v2.67.346** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11229,6 +11229,51 @@ elif page == "Ordering":
         "transparent calculations, and draft-PO staging."
     )
 
+    # v2.67.346 — explicit recompute button. The engine is cached
+    # (@st.cache_resource) so it doesn't auto-rebuild between user
+    # interactions; supplier config saves DO invalidate the reorder
+    # apply via _reorder_apply_sig, but other settings (Holidays,
+    # SKU-supplier assignments, freight rules) sometimes leave the
+    # buyer wondering whether the numbers on screen reflect the
+    # latest config. This button rebuilds the engine from scratch
+    # so there's never any doubt. Cheap-ish on Render Pro (4GB) —
+    # the rebuild is the same one that runs on first page load.
+    _rc1, _rc2, _rc3 = st.columns([6, 2, 2])
+    with _rc2:
+        _eng_at = st.session_state.get("_engine_last_built_at")
+        if _eng_at:
+            _age_min = (datetime.now() - _eng_at).total_seconds() / 60.0
+            if _age_min < 1:
+                _age_str = "just now"
+            elif _age_min < 60:
+                _age_str = f"{_age_min:.0f} min ago"
+            else:
+                _age_str = f"{_age_min/60:.1f} h ago"
+            st.caption(f"Engine built **{_age_str}**")
+        else:
+            st.caption("Engine built **just now**")
+    with _rc3:
+        if st.button(
+            "🔄 Recompute now",
+            key="ord_recompute_now",
+            help="Force a fresh engine rebuild so any recent config "
+                 "changes (supplier settings, freight rules, holiday "
+                 "closures, SKU-supplier assignments) take effect "
+                 "immediately. Takes a few seconds.",
+            width="stretch",
+        ):
+            try:
+                _get_engine_df.clear()
+            except Exception:  # noqa: BLE001
+                pass
+            st.session_state.pop("_reorder_apply_sig", None)
+            st.session_state["_engine_last_built_at"] = datetime.now()
+            st.rerun()
+    # First page render of this session — stamp the build time so the
+    # caption above has something to display next time.
+    if "_engine_last_built_at" not in st.session_state:
+        st.session_state["_engine_last_built_at"] = datetime.now()
+
     # ------------------------------------------------------------------
     # Glossary — click-to-reveal definitions for every buyer-facing term.
     # Keep terminology single-sourced here so edits propagate via search.
@@ -12904,19 +12949,27 @@ elif page == "Ordering":
                 # v2.67.289 — NO _safe_cache_clear() here.
                 # db.all_supplier_configs() is an uncached direct
                 # DB read, so the engine picks up the new cadence
-                # on the next render automatically. A global cache
+                # on the next render automatically. A GLOBAL cache
                 # clear evicts the ABC engine + every other frame,
                 # which causes a rebuild on top of still-resident
                 # caches and crashes Render's 2GB memory ceiling.
                 # v2.67.318 — explicitly drop the reorder cache-skip
                 # signature so the NEXT render is GUARANTEED to re-run
-                # _compute_target_and_reorder with the new config. The
-                # signature already includes supp_configs (so it would
-                # recompute anyway), but James 2026-05-28 reported
-                # config saves seeming not to recompute — this removes
-                # any doubt. It only forces ONE reorder apply (~10k
-                # rows), NOT a cache eviction, so no memory spike.
+                # _compute_target_and_reorder with the new config.
+                # v2.67.346 — also clear the engine's cache_resource
+                # so any derived columns that depend on supplier cfg
+                # (avg_daily/target/Status ladder) rebuild from scratch.
+                # James 2026-06-02: config saves were still leaving
+                # the table looking stale. A TARGETED clear of just
+                # _get_engine_df (not the global cache_data store) is
+                # safe — only one engine in memory at a time, no
+                # multi-frame pile-up that triggers the 2GB ceiling.
                 st.session_state.pop("_reorder_apply_sig", None)
+                try:
+                    _get_engine_df.clear()
+                except Exception:  # noqa: BLE001
+                    pass
+                st.session_state["_engine_last_built_at"] = datetime.now()
                 st.success(f"Saved config for {cfg_supplier}")
                 st.rerun()
 
