@@ -7560,7 +7560,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.349** · deployed 2026-06-02")
+    "🔹 **v2.67.350** · deployed 2026-06-02")
 
 
 if page == "Overview":
@@ -11628,7 +11628,11 @@ elif page == "Ordering":
             # that ISN'T attributable to the top customer.
             _baseline_share = max(0.0, 1.0 - _top12_share)
             _baseline_eff = _eff12_for_clamp * _baseline_share
-            avg_daily = _baseline_eff / max(window_days, 1)
+            # 12mo annualisation — divide by 365 (this function runs
+            # on the Ordering page where `window_days` from
+            # _abc_engine isn't in scope; the engine always uses 365
+            # for the 12mo bucket anyway).
+            avg_daily = _baseline_eff / 365.0
             clamp_active = True
             _top_name = str(row.get("top_cust_name") or "—")[:40]
             clamp_note = (
