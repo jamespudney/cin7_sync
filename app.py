@@ -7254,6 +7254,29 @@ def _abc_engine(products: pd.DataFrame,
             top_u = _safe(r.get("top_cust_units_12mo"))
             corrected = max(0.0, eff - top_u)
             return corrected / max(window_days, 1)
+        # v2.67.354 — Decline velocity override. Pre-v2.67.354 this
+        # path did NOTHING — a 📉 Decline SKU kept its 12mo
+        # annualised rate, over-ordering against demand that may
+        # have genuinely fallen off. Now: ONLY fire the override
+        # when BOTH the 45d momentum AND the 90d annualised rate
+        # confirm sustained decline. This avoids overreacting to
+        # lumpy assembly timing — LED-13.019 (James 2026-06-03)
+        # shows 45d momentum 0.41× but 90d annualised rate (666/yr)
+        # is HIGHER than 12mo (601), so the recent 45d drop is
+        # batch timing, not real decline. With the AND-gate, that
+        # SKU correctly keeps its 12mo rate.
+        if flag == "📉 Decline":
+            eff_90d = _safe(r.get("effective_units_90d"))
+            eff_12mo = _safe(r.get("effective_units_12mo"))
+            mom = _safe(r.get("momentum"), default=1.0)
+            if eff_12mo > 0 and eff_90d > 0:
+                rate_90d_yr = eff_90d * (365.0 / 90.0)
+                if rate_90d_yr < eff_12mo * 0.7 and mom < 0.5:
+                    # Sustained decline confirmed across BOTH windows.
+                    # Use the 90d rate (lower than 12mo) instead of
+                    # 12mo, so target/reorder reflect the new reality
+                    # without waiting for the 12mo window to catch up.
+                    return eff_90d / 90.0
         return base
 
     df["avg_daily_base"] = df["avg_daily"]
@@ -7605,7 +7628,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.353** · deployed 2026-06-02")
+    "🔹 **v2.67.354** · deployed 2026-06-03")
 
 
 if page == "Overview":
@@ -11991,13 +12014,25 @@ elif page == "Ordering":
             mom = _fnum(row.get("momentum"), default=1.0)
             mom_s = (f"{mom:.2f}×" if mom != float("inf") else "new")
             _cust12 = int(_fnum(row.get("customers_12mo")))
+            # v2.67.354 — customer count line: clarify that
+            # customers_45d is rolled up across the strip family
+            # (line 7084 overwrites the raw groupby with rolled-up
+            # counts) while customers_12mo is direct-only (line 5780
+            # groupby on sl directly). On strip masters with zero
+            # direct sales (e.g. LED-13.019 — all demand is sister
+            # rollup + assembly), the trace previously read
+            # "3 in 45d, 0 in 12mo" — apparently impossible because
+            # the metrics measure different things. Make both
+            # measurements explicit.
             demand_lines.append(
                 f"\n**Trend signal**: {_tf}  \n"
                 f"- Last 45d: **{u45v:.0f} units** "
                 f"(prior 45d: {uprv:.0f}, momentum **{mom_s}**)\n"
-                f"- **{n_cust} distinct customer(s)** in last 45d, "
-                f"**{_cust12} over 12mo** "
-                f"(3+ over 12mo ⇒ diversified, never auto-flagged "
+                f"- **{n_cust} customer(s) in last 45d** "
+                f"(rolled up across strip family), "
+                f"**{_cust12} direct customer(s) over 12mo** "
+                f"(this SKU only — sister-variant buyers not counted "
+                f"here; 3+ direct ⇒ diversified, never auto-flagged "
                 f"Project)\n"
                 f"- top customer **{top_name}** took **{top_pct:.0f}%**, "
                 f"top 2 combined **{top_2_pct:.0f}%**\n"
@@ -12011,6 +12046,46 @@ elif page == "Ordering":
                     "accelerating broadly. Engine will build stock "
                     "faster to catch up.\n"
                 )
+            elif _tf == "📉 Decline":
+                # v2.67.354 — Decline override transparency. Either
+                # the override fired (sustained decline) or it didn't
+                # (lumpy 45d timing). Either way the buyer sees the
+                # comparison so they understand the engine's choice.
+                _eff90_d = float(row.get("effective_units_90d") or 0)
+                _eff12_d = float(row.get("effective_units_12mo") or 0)
+                _mom_d = float(row.get("momentum") or 1.0)
+                _rate90yr = (
+                    _eff90_d * (365.0 / 90.0) if _eff90_d > 0 else 0)
+                _share_pct = (
+                    (_rate90yr / _eff12_d * 100.0)
+                    if _eff12_d > 0 else 0.0)
+                if (_eff12_d > 0 and _eff90_d > 0
+                        and _rate90yr < _eff12_d * 0.7
+                        and _mom_d < 0.5):
+                    demand_lines.append(
+                        f"- **Velocity override**: 90d annualised "
+                        f"rate (**{_rate90yr:.0f} units/yr**) is "
+                        f"**{_share_pct:.0f}%** of 12mo "
+                        f"({_eff12_d:.0f}) AND 45d momentum is "
+                        f"**{_mom_d:.2f}×** — sustained decline "
+                        f"confirmed across both windows. Using "
+                        f"90d rate (**{_eff90_d/90:.2f}/day**) "
+                        f"instead of 12mo, to avoid over-ordering "
+                        f"against demand that's stepped down.\n"
+                    )
+                else:
+                    demand_lines.append(
+                        f"- **No velocity override**: 45d momentum "
+                        f"(**{_mom_d:.2f}×**) flags decline, but 90d "
+                        f"annualised rate (**{_rate90yr:.0f} "
+                        f"units/yr**) is **{_share_pct:.0f}%** of "
+                        f"12mo ({_eff12_d:.0f}) — likely lumpy "
+                        f"timing (assembly batches, single big "
+                        f"customer order in prior 45d window), not "
+                        f"sustained decline. Engine keeps the 12mo "
+                        f"annualised rate; the Decline label is a "
+                        f"watch-flag, not an action signal.\n"
+                    )
             elif _tf == "🎯 Project":
                 _topu = float(row.get("top_cust_units_12mo") or 0)
                 _topname = str(row.get("top_cust_name") or "—")[:40]
