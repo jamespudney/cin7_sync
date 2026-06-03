@@ -7680,7 +7680,7 @@ _auto_invalidate_engine_if_stale()
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.356** · deployed 2026-06-03")
+    "🔹 **v2.67.357** · deployed 2026-06-03")
 
 
 if page == "Overview":
@@ -13042,122 +13042,162 @@ elif page == "Ordering":
             if _last_msg:
                 st.success(_last_msg)
 
-            # v2.67.348 — defensive read from session_state at save
-            # time. Belt-and-braces in case Streamlit's commit-on-blur
-            # on number_input races with a fast click on Save (the
-            # click event can fire BEFORE the blur commit, so sf_A
-            # holds stale state). Reading st.session_state[key] at the
-            # moment of submit forces the latest available value.
+            # v2.67.357 — wrap supplier config in st.form() to fix
+            # the commit-on-blur race that silently reverted typed
+            # safety/review changes to defaults. Pre-357 the
+            # number_input widgets relied on commit-on-blur: clicking
+            # Save without first tabbing out of a field sent the click
+            # event WITHOUT the pending widget value, so the server-
+            # side handler read the OLD (default) value from
+            # session_state and wrote that back to DB. James 2026-06-
+            # 03 confirmed via the post-save banner: "Saved Topmet
+            # Light (EUR) ... safety A/B/C 30/20/15%" even after
+            # typing different values. st.form is the native
+            # Streamlit primitive for batched save-button forms —
+            # submit commits all widget values atomically.
+            with st.form(f"sc_main_{_sk}", clear_on_submit=False):
+                cc1, cc2, cc3 = st.columns(3)
+                lt_sea = cc1.number_input(
+                    "Lead time SEA (days)",
+                    min_value=1, max_value=200,
+                    value=int(existing.get("lead_time_sea_days") or 35),
+                    key=f"sc_sea_{_sk}",
+                )
+                lt_air = cc2.number_input(
+                    "Lead time AIR (days; 0 = not offered)",
+                    min_value=0, max_value=60,
+                    value=int(existing.get("lead_time_air_days") or 0),
+                    key=f"sc_air_{_sk}",
+                )
+                air_def = cc3.selectbox(
+                    "Air eligible by default?",
+                    ["No", "Yes"],
+                    index=int(bool(existing.get("air_eligible_default"))),
+                    key=f"sc_air_def_{_sk}",
+                )
 
-            cc1, cc2, cc3 = st.columns(3)
-            lt_sea = cc1.number_input(
-                "Lead time SEA (days)",
-                min_value=1, max_value=200,
-                value=int(existing.get("lead_time_sea_days") or 35),
-                key=f"sc_sea_{_sk}",
-            )
-            lt_air = cc2.number_input(
-                "Lead time AIR (days; 0 = not offered)",
-                min_value=0, max_value=60,
-                value=int(existing.get("lead_time_air_days") or 0),
-                key=f"sc_air_{_sk}",
-            )
-            air_def = cc3.selectbox(
-                "Air eligible by default?",
-                ["No", "Yes"],
-                index=int(bool(existing.get("air_eligible_default"))),
-                key=f"sc_air_def_{_sk}",
-            )
+                cd1, cd2, cd3 = st.columns(3)
+                air_max = cd1.number_input(
+                    "Air MAX length (mm; 0 = any)",
+                    min_value=0, max_value=5000,
+                    value=int(existing.get("air_max_length_mm") or 0),
+                    help="For UPS etc., items longer than this are sea-only. "
+                         "E.g. Topmet UPS caps at ~2200mm.",
+                    key=f"sc_airmax_{_sk}",
+                )
+                moq = cd2.number_input(
+                    "MOQ units",
+                    min_value=0.0, max_value=10000.0,
+                    value=float(existing.get("moq_units") or 0),
+                    key=f"sc_moq_{_sk}",
+                )
+                pref_freight = cd3.selectbox(
+                    "Preferred freight",
+                    ["sea", "air", "mixed"],
+                    index=(["sea","air","mixed"].index(
+                        existing.get("preferred_freight") or "sea")),
+                    key=f"sc_pref_{_sk}",
+                )
 
-            cd1, cd2, cd3 = st.columns(3)
-            air_max = cd1.number_input(
-                "Air MAX length (mm; 0 = any)",
-                min_value=0, max_value=5000,
-                value=int(existing.get("air_max_length_mm") or 0),
-                help="For UPS etc., items longer than this are sea-only. "
-                     "E.g. Topmet UPS caps at ~2200mm.",
-                key=f"sc_airmax_{_sk}",
-            )
-            moq = cd2.number_input(
-                "MOQ units",
-                min_value=0.0, max_value=10000.0,
-                value=float(existing.get("moq_units") or 0),
-                key=f"sc_moq_{_sk}",
-            )
-            pref_freight = cd3.selectbox(
-                "Preferred freight",
-                ["sea", "air", "mixed"],
-                index=(["sea","air","mixed"].index(
-                    existing.get("preferred_freight") or "sea")),
-                key=f"sc_pref_{_sk}",
-            )
+                ce1, ce2, ce3 = st.columns(3)
+                mov = ce1.number_input(
+                    "MOV amount", min_value=0.0, max_value=100000.0,
+                    value=float(existing.get("mov_amount") or 0),
+                    key=f"sc_mov_{_sk}",
+                )
+                mov_ccy = ce2.text_input(
+                    "MOV currency",
+                    value=existing.get("mov_currency") or "USD",
+                    key=f"sc_movccy_{_sk}",
+                )
 
-            ce1, ce2, ce3 = st.columns(3)
-            mov = ce1.number_input(
-                "MOV amount", min_value=0.0, max_value=100000.0,
-                value=float(existing.get("mov_amount") or 0),
-                key=f"sc_mov_{_sk}",
-            )
-            mov_ccy = ce2.text_input(
-                "MOV currency",
-                value=existing.get("mov_currency") or "USD",
-                key=f"sc_movccy_{_sk}",
-            )
+                st.markdown("**ABC safety factors & review days** "
+                             "(override the defaults for this supplier)")
+                sf_cols = st.columns(6)
+                sf_A = sf_cols[0].number_input("Safety A (%)",
+                                                min_value=0.0, max_value=100.0,
+                                                value=float(existing.get("safety_pct_A") or 30.0),
+                                                key=f"sc_sfA_{_sk}")
+                sf_B = sf_cols[1].number_input("Safety B (%)",
+                                                min_value=0.0, max_value=100.0,
+                                                value=float(existing.get("safety_pct_B") or 20.0),
+                                                key=f"sc_sfB_{_sk}")
+                sf_C = sf_cols[2].number_input("Safety C (%)",
+                                                min_value=0.0, max_value=100.0,
+                                                value=float(existing.get("safety_pct_C") or 15.0),
+                                                key=f"sc_sfC_{_sk}")
+                rv_A = sf_cols[3].number_input("Review A (d)",
+                                                min_value=1, max_value=180,
+                                                value=int(existing.get("review_days_A") or 14),
+                                                key=f"sc_rvA_{_sk}")
+                rv_B = sf_cols[4].number_input("Review B (d)",
+                                                min_value=1, max_value=180,
+                                                value=int(existing.get("review_days_B") or 30),
+                                                key=f"sc_rvB_{_sk}")
+                rv_C = sf_cols[5].number_input("Review C (d)",
+                                                min_value=1, max_value=180,
+                                                value=int(existing.get("review_days_C") or 45),
+                                                key=f"sc_rvC_{_sk}")
 
-            st.markdown("**ABC safety factors & review days** "
-                         "(override the defaults for this supplier)")
-            sf_cols = st.columns(6)
-            sf_A = sf_cols[0].number_input("Safety A (%)",
-                                            min_value=0.0, max_value=100.0,
-                                            value=float(existing.get("safety_pct_A") or 30.0),
-                                            key=f"sc_sfA_{_sk}")
-            sf_B = sf_cols[1].number_input("Safety B (%)",
-                                            min_value=0.0, max_value=100.0,
-                                            value=float(existing.get("safety_pct_B") or 20.0),
-                                            key=f"sc_sfB_{_sk}")
-            sf_C = sf_cols[2].number_input("Safety C (%)",
-                                            min_value=0.0, max_value=100.0,
-                                            value=float(existing.get("safety_pct_C") or 15.0),
-                                            key=f"sc_sfC_{_sk}")
-            rv_A = sf_cols[3].number_input("Review A (d)",
-                                            min_value=1, max_value=180,
-                                            value=int(existing.get("review_days_A") or 14),
-                                            key=f"sc_rvA_{_sk}")
-            rv_B = sf_cols[4].number_input("Review B (d)",
-                                            min_value=1, max_value=180,
-                                            value=int(existing.get("review_days_B") or 30),
-                                            key=f"sc_rvB_{_sk}")
-            rv_C = sf_cols[5].number_input("Review C (d)",
-                                            min_value=1, max_value=180,
-                                            value=int(existing.get("review_days_C") or 45),
-                                            key=f"sc_rvC_{_sk}")
+                # v2.67.283 — order cadence. The real interval between
+                # reorders with this supplier. Drives the reorder
+                # engine's review period — the leanest, highest-impact
+                # cashflow lever (carry stock only until the NEXT order,
+                # not a generic 30-45 days).
+                st.markdown("**Order cadence** — how often you actually "
+                             "place orders with this supplier")
+                oc_cols = st.columns([2, 4])
+                order_cadence = oc_cols[0].number_input(
+                    "Order cadence (days)",
+                    min_value=0, max_value=180,
+                    value=int(existing.get("order_cadence_days") or 0),
+                    key=f"sc_cadence_{_sk}",
+                    help="The real gap between reorders — e.g. 7 if you "
+                         "order this supplier weekly. The engine then "
+                         "stocks only enough to bridge to the next "
+                         "order, not a generic 30-45 days. 0 = not set "
+                         "(falls back to the ABC-class review days).",
+                )
+                oc_cols[1].caption(
+                    ":information_source: Set this for your regular "
+                    "suppliers — Neonica, Topmet, Luz Negra, LEDsOn are "
+                    "ordered weekly, so set them to **7**. This is the "
+                    "biggest single lever for freeing cash tied up in "
+                    "stock; the per-SKU reorder explanation shows the "
+                    "effect.")
 
-            # v2.67.283 — order cadence. The real interval between
-            # reorders with this supplier. Drives the reorder
-            # engine's review period — the leanest, highest-impact
-            # cashflow lever (carry stock only until the NEXT order,
-            # not a generic 30-45 days).
-            st.markdown("**Order cadence** — how often you actually "
-                         "place orders with this supplier")
-            oc_cols = st.columns([2, 4])
-            order_cadence = oc_cols[0].number_input(
-                "Order cadence (days)",
-                min_value=0, max_value=180,
-                value=int(existing.get("order_cadence_days") or 0),
-                key=f"sc_cadence_{_sk}",
-                help="The real gap between reorders — e.g. 7 if you "
-                     "order this supplier weekly. The engine then "
-                     "stocks only enough to bridge to the next "
-                     "order, not a generic 30-45 days. 0 = not set "
-                     "(falls back to the ABC-class review days).",
-            )
-            oc_cols[1].caption(
-                ":information_source: Set this for your regular "
-                "suppliers — Neonica, Topmet, Luz Negra, LEDsOn are "
-                "ordered weekly, so set them to **7**. This is the "
-                "biggest single lever for freeing cash tied up in "
-                "stock; the per-SKU reorder explanation shows the "
-                "effect.")
+                # 100%-dropship supplier toggle (v2.67.357: moved INTO
+                # the main form so it commits atomically with all the
+                # other config fields on Save). Pre-357 it lived below
+                # holiday closures.
+                st.markdown("**Dropship default**")
+                ds_col = st.columns([2, 4])
+                ds_default = ds_col[0].toggle(
+                    "All items from this supplier are dropship",
+                    value=bool(existing.get("dropship_default") or 0),
+                    key=f"sc_dropship_default_{_sk}",
+                    help="Use for suppliers where we never stock anything "
+                         "(e.g. Gyford). Every SKU whose primary supplier is "
+                         "this one will be treated as dropship — engine zeros "
+                         "target stock and reorder qty. You can still flag "
+                         "individual SKUs as dropship via the Ordering table "
+                         "for suppliers that are a mix.",
+                )
+                ds_col[1].caption(
+                    ":information_source: This only affects the local app's "
+                    "reorder logic. It doesn't write anything back to CIN7 — "
+                    "that integration is a separate phase."
+                )
+
+                # v2.67.357 — form_submit_button. Replaces the previous
+                # plain st.button; commits every widget above atomically.
+                # Named `sc_submitted` (not just `submitted`) because
+                # the holiday Add sub-form below reuses the variable
+                # name `submitted` for its own form_submit_button —
+                # without the rename the handler below would fire on
+                # any holiday-Add click.
+                sc_submitted = st.form_submit_button(
+                    "Save supplier config", type="primary")
 
             # ------------------------------------------------------
             # v2.67.284 — supplier holiday closures
@@ -13283,38 +13323,11 @@ elif page == "Ordering":
                             f"{new_end} ({_wk_preview})")
                         st.rerun()
 
-            # 100%-dropship supplier toggle — covers Gyford-type suppliers
-            # where every SKU is order-on-demand (we never stock any of it).
-            # When on, EVERY product whose primary supplier is this supplier
-            # is automatically treated as Dropship by the engine (target
-            # and reorder qty go to 0).
-            st.markdown("**Dropship default**")
-            ds_col = st.columns([2, 4])
-            ds_default = ds_col[0].toggle(
-                "All items from this supplier are dropship",
-                value=bool(existing.get("dropship_default") or 0),
-                key=f"sc_dropship_default_{_sk}",
-                help="Use for suppliers where we never stock anything "
-                     "(e.g. Gyford). Every SKU whose primary supplier is "
-                     "this one will be treated as dropship — engine zeros "
-                     "target stock and reorder qty. You can still flag "
-                     "individual SKUs as dropship via the Ordering table "
-                     "for suppliers that are a mix.",
-            )
-            ds_col[1].caption(
-                ":information_source: This only affects the local app's "
-                "reorder logic. It doesn't write anything back to CIN7 — "
-                "that integration is a separate phase."
-            )
-
-            if st.button("Save supplier config", key="sc_save",
-                           type="primary"):
-                # v2.67.348 — pull the most recent committed widget
-                # values from session_state instead of relying on the
-                # in-scope Python variables. This is the same data,
-                # but reading via the canonical key path means if
-                # there's ANY race between number_input commit and
-                # button click, we get the post-commit value.
+            # v2.67.357 — old standalone Dropship section + Save
+            # button removed; both moved INSIDE the main st.form
+            # above so they commit atomically. Handler below now
+            # runs `if sc_submitted:` against the form_submit_button.
+            if sc_submitted:
                 _ss = st.session_state
                 _sfA_save = float(_ss.get(f"sc_sfA_{_sk}", sf_A))
                 _sfB_save = float(_ss.get(f"sc_sfB_{_sk}", sf_B))
