@@ -7687,7 +7687,7 @@ _auto_invalidate_engine_if_stale()
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.358** · deployed 2026-06-03")
+    "🔹 **v2.67.359** · deployed 2026-06-03")
 
 
 if page == "Overview":
@@ -11414,6 +11414,93 @@ elif page == "Ordering":
         # renders on the Slow Movers page expander and is
         # injected into the AI Assistant system prompt.
         st.markdown(GLOSSARY_MARKDOWN)
+
+    # ------------------------------------------------------------------
+    # v2.67.359 — inline AI chat for the Ordering page. Reuses the
+    # SAME code path as the Slack bot and the standalone AI Assistant
+    # page via slack_listener._compose_response. One brain, multiple
+    # surfaces — when we tune the system prompt or add a tool, all
+    # three surfaces benefit together. Strategy: see the
+    # strategy_viktor_specialise memory note (James 2026-06-03:
+    # build our own AI intelligence; Viktor retired as Q&A endpoint).
+    # channel_intent="po_review" routes to the reorder-focused system
+    # prompt copy (PO drafts, backorders, stock decisions).
+    # ------------------------------------------------------------------
+    with st.expander(
+        "🤖 Ask the AI about ordering",
+        expanded=False,
+    ):
+        st.caption(
+            "Ask anything about reorders, suppliers, SKUs, lead "
+            "times, the engine, or our processes. The AI has the "
+            "same tools and Notion knowledge-base access as the "
+            "standalone AI Assistant page — answers should match. "
+            "Examples: *why is LED-13.019 suggesting 80?* · "
+            "*what's our process for Topmet weekly orders?* · "
+            "*which Luz Negra SKUs are most over target?*")
+        _ord_ai_key = "_ord_ai_history"
+        if _ord_ai_key not in st.session_state:
+            st.session_state[_ord_ai_key] = []
+        # Render existing conversation (oldest first).
+        for _entry in st.session_state[_ord_ai_key]:
+            with st.chat_message(_entry["role"]):
+                st.markdown(_entry["content"])
+        # New question.
+        _ord_ai_question = st.chat_input(
+            "Ask about ordering…",
+            key="ord_ai_chat_input")
+        if _ord_ai_question:
+            st.session_state[_ord_ai_key].append({
+                "role": "user", "content": _ord_ai_question})
+            with st.chat_message("user"):
+                st.markdown(_ord_ai_question)
+            # Compose via the shared LLM pipeline. po_review intent
+            # gives reorder-focused system prompt copy.
+            try:
+                import slack_listener as _sl
+                _user_name = (
+                    (current_user_profile or {}).get("name")
+                    or (current_user_profile or {}).get(
+                        "real_name")
+                    or "buyer")
+                _msg = {
+                    "text": _ord_ai_question,
+                    "channel_name": "ordering-dashboard",
+                    "user_name": _user_name,
+                    "user_id": (
+                        (current_user_profile or {}).get(
+                            "user_id") or "ordering-page"),
+                    "channel_id": "ordering-dashboard",
+                    "ts": str(datetime.now().timestamp()),
+                    "thread_ts": None,
+                }
+                with st.spinner("Thinking…"):
+                    _text, _tools = _sl._compose_response(
+                        _msg,
+                        classification="ordering_question",
+                        channel_intent="po_review",
+                    )
+            except Exception as _ai_exc:  # noqa: BLE001
+                _text = f"_(AI error: {_ai_exc})_"
+                _tools = []
+            if not _text or not _text.strip():
+                _text = (
+                    "_(no response — the AI declined to answer. "
+                    "Try rephrasing the question or be more "
+                    "specific about which SKU/supplier you mean.)_")
+            st.session_state[_ord_ai_key].append({
+                "role": "assistant", "content": _text})
+            with st.chat_message("assistant"):
+                st.markdown(_text)
+            if _tools:
+                st.caption(
+                    "🔧 tools used: " + ", ".join(_tools[:6]))
+        if st.session_state[_ord_ai_key] and st.button(
+                "🗑 Clear conversation",
+                key="ord_ai_clear",
+                help="Reset the chat history for this session."):
+            st.session_state[_ord_ai_key] = []
+            st.rerun()
 
     if products.empty or sale_lines.empty:
         st.warning("Need products + 12-month sales to run ABC.")
