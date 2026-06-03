@@ -7621,6 +7621,58 @@ def _get_engine_df() -> "pd.DataFrame":
         assemblies_df=assemblies)
 
 
+# v2.67.356 — engine cache auto-invalidate on fresh source files.
+#
+# _get_engine_df is @st.cache_resource so the engine_df is shared
+# across sessions in the SAME Streamlit process. Pre-v2.67.356,
+# nothing ever cleared that cache between syncs — Render's
+# sync_loop wrote fresh CSVs every 15 min, _abc_engine's disk
+# cache picked them up, but _get_engine_df's process-level cache
+# kept returning the OLD result until someone clicked Recompute
+# or the Render process restarted. James 2026-06-03: "the auto-run
+# seems to have broken" — i.e. the engine was stale on the page
+# even though sync had run.
+#
+# Fix: fingerprint the source CSV files on every script rerun.
+# When it differs from the fingerprint stored when _get_engine_df
+# was last populated, clear the cache so the next read rebuilds
+# against the fresh data. Streamlit reruns the WHOLE script on
+# every user interaction, so this check is essentially free
+# (just file stat()s) and runs constantly. The holder dict is
+# itself @st.cache_resource so the fingerprint persists across
+# user sessions in the same process.
+@st.cache_resource(show_spinner=False)
+def _engine_fp_holder() -> dict:
+    """Process-level dict tracking the source-file fingerprint
+    that produced the currently-cached engine_df."""
+    return {"fp": None}
+
+
+def _auto_invalidate_engine_if_stale() -> None:
+    holder = _engine_fp_holder()
+    current_fp = (
+        _dir_fingerprint("products_*.csv"),
+        _dir_fingerprint("stock_on_hand_*.csv"),
+        _dir_fingerprint("sale_lines_last_*d_*.csv"),
+        _dir_fingerprint("purchase_lines_last_*d_*.csv"),
+        _dir_fingerprint("assemblies_last_*d_*.csv"),
+    )
+    prev_fp = holder.get("fp")
+    if prev_fp != current_fp:
+        if prev_fp is not None:
+            # Skip the first observed fingerprint (cache is empty
+            # anyway). From the second one onwards, ANY change in
+            # any source-file mtime triggers a recompute.
+            try:
+                _get_engine_df.clear()
+            except Exception:
+                pass
+        holder["fp"] = current_fp
+
+
+_auto_invalidate_engine_if_stale()
+
+
 # v2.67.291 — version chip at the BOTTOM of the sidebar. Streamlit
 # appends sidebar elements in call order, and the main `with st.
 # sidebar:` block above has already finished, so this lands after
@@ -7628,7 +7680,7 @@ def _get_engine_df() -> "pd.DataFrame":
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.355** · deployed 2026-06-03")
+    "🔹 **v2.67.356** · deployed 2026-06-03")
 
 
 if page == "Overview":
