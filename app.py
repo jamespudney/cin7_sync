@@ -7281,6 +7281,13 @@ def _abc_engine(products: pd.DataFrame,
 
     df["avg_daily_base"] = df["avg_daily"]
     df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)
+    # v2.67.358 — buyer-friendly monthly view. Daily is the right
+    # input for the reorder math (LT × avg_daily) but buyers think
+    # and reason in months ("about 60 a month"). Surface both — the
+    # Ordering table and Upcoming Reorders display avg/month while
+    # the math trace keeps both. 30.4 = average days per calendar
+    # month (365.25 / 12).
+    df["avg_month"] = df["avg_daily"] * 30.4
 
     # Promote is_dormant into trend_flag display so the buyer sees
     # 💤 Dormant in the PO editor's Trend column. We override Stable
@@ -7680,7 +7687,7 @@ _auto_invalidate_engine_if_stale()
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.357** · deployed 2026-06-03")
+    "🔹 **v2.67.358** · deployed 2026-06-03")
 
 
 if page == "Overview":
@@ -12210,9 +12217,16 @@ elif page == "Ordering":
                 f"+ {mig_in:.0f} + {rollup_in:.0f} = "
                 f"**{eff_u:.0f}** units/year\n"
             )
+            # v2.67.358 — show avg/month alongside avg/day. James
+            # 2026-06-03: buyers think in months, not days. avg/month
+            # is more intuitive for replenishment cadence ("about 60
+            # a month" is easier to reason about than "2.0/day").
+            # Computed as avg_daily × 30.4 (avg days per month).
+            _avg_month = avg_daily * 30.4
             demand_lines.append(
                 f"- Avg daily: {eff_u:.0f} / 365 = "
-                f"**{avg_daily:.2f}** units/day"
+                f"**{avg_daily:.2f}** units/day "
+                f"(≈ **{_avg_month:.0f}/month**)"
                 + (f"{clamp_note}\n" if clamp_active else "\n")
             )
             # v2.67.353 — recency diagnostic. Splits the 90d activity
@@ -14245,6 +14259,7 @@ elif page == "Ordering":
         "last_6mo_series": "Last 6 months (trend numbers)",
         "units_12mo": "12mo units sold",
         "avg_daily": "Avg daily units",
+        "avg_month": "Avg/month",
         "LengthMM": "Length (mm)",
         "OnHand": "On hand",
         "Allocated": "Allocated",
@@ -14280,7 +14295,7 @@ elif page == "Ordering":
     PRESETS = {
         "Buyer essentials (default)": [
             "Include?", "SKU", "Name", "ABC", "Status",
-            "trend_flag", "last_6mo_series",
+            "trend_flag", "last_6mo_series", "avg_month",
             "OnHand", "Available", "OnOrder", "unfulfilled",
             "target_stock", "reorder_qty", "freight_mode",
             "POCost", "Order qty", "Line value",
@@ -15007,6 +15022,14 @@ elif page == "Ordering":
                 "12mo units", disabled=True, format="%.0f"),
             "avg_daily": st.column_config.NumberColumn(
                 "Daily", disabled=True, format="%.2f"),
+            "avg_month": st.column_config.NumberColumn(
+                "Avg/month",
+                help="Avg monthly units = avg_daily × 30.4 (days/mo). "
+                     "Buyer-friendly view of velocity for cadence "
+                     "reasoning (\"~60 a month\" is easier to "
+                     "compare against MOQ + lead-time than "
+                     "\"2.0/day\"). Same number, different scale.",
+                disabled=True, format="%.0f"),
             "LengthMM": st.column_config.NumberColumn(
                 "Len mm", disabled=True),
             "OnHand": st.column_config.NumberColumn(disabled=True),
@@ -16762,8 +16785,14 @@ elif page == "Ordering":
             upc["Line $"] = (upc["Suggest"] * upc["POCost"]).round(2)
             upc["Add?"] = False
 
+            # v2.67.358 — avg_month for buyer-friendly cadence view.
+            # Computed inline (the engine_df one is on the master
+            # engine frame, this upc frame may be a per-supplier
+            # slice/copy so we derive locally).
+            if "avg_daily" in upc.columns and "avg_month" not in upc.columns:
+                upc["avg_month"] = upc["avg_daily"] * 30.4
             show_cols = ["SKU", "Name", "ABC", "trend_flag",
-                         "last_6mo_series",
+                         "last_6mo_series", "avg_month",
                          "OnHand", "OnOrder", "eff_pos",
                          "target_stock", "days_to_reorder",
                          "avg_daily", "Suggest", "POCost", "Line $",
@@ -16817,6 +16846,10 @@ elif page == "Ordering":
                              "target at current 12mo sales rate."),
                     "avg_daily": st.column_config.NumberColumn(
                         "Daily", disabled=True, format="%.2f"),
+                    "avg_month": st.column_config.NumberColumn(
+                        "Avg/month", disabled=True, format="%.0f",
+                        help="avg_daily × 30.4. Buyer-friendly "
+                             "view for cadence reasoning."),
                     "Suggest": st.column_config.NumberColumn(
                         "Suggest qty", disabled=True, format="%.0f",
                         help="avg_daily × window — enough to fill the "
