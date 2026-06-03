@@ -4141,7 +4141,85 @@ def get_purchase_live(engine_df: pd.DataFrame,
                     engine_df["SKU"].astype(str).str.upper())[
                     "OnHand"].apply(
                     lambda v: float(v or 0)).to_dict())
+
+    # v2.67.355 — Storage dim check (James 2026-06-03). Warehouse
+    # needs `Storage L x W x H In` populated on every product so
+    # bin assignment works when a shipment lands. Fetch each line's
+    # product detail and surface the dim value (or flag it missing).
+    # Defensive parser — CIN7 returns custom attributes in either:
+    #   (a) AdditionalAttributes: [{Name: "...", Value: "..."}, ...]
+    #   (b) Positional flat dict: AdditionalAttribute1..10 keys
+    #       with the name-to-position map coming from AttributeSet
+    # We probe both. If neither yields a value, treat as missing.
+    _DIM_FIELD = "Storage L x W x H In"
+
+    def _extract_storage_dim(product_detail: dict) -> str:
+        """Return the dim value (trimmed) or empty string if absent.
+        Tries the array form first, then the positional form."""
+        if not isinstance(product_detail, dict):
+            return ""
+        attrs = product_detail.get("AdditionalAttributes")
+        # Form (a): list of {Name, Value}
+        if isinstance(attrs, list):
+            for a in attrs:
+                if not isinstance(a, dict):
+                    continue
+                name = str(a.get("Name") or "").strip()
+                if name.lower() == _DIM_FIELD.lower():
+                    return str(a.get("Value") or "").strip()
+        # Form (b): positional flat dict (sometimes nested under
+        # AdditionalAttributes, sometimes top-level on the product).
+        # Names live in AttributeSet config; without that mapping we
+        # scan all 10 slots and check if any non-empty value LOOKS
+        # like a dim (matches "<n> x <n> x <n>" pattern). This is
+        # a fallback for accounts where the attribute name isn't
+        # echoed in the response.
+        import re as _re
+        _dim_pat = _re.compile(
+            r"^\s*\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?",
+            _re.IGNORECASE)
+        positional = (
+            attrs if isinstance(attrs, dict)
+            else product_detail)
+        for i in range(1, 11):
+            v = positional.get(f"AdditionalAttribute{i}")
+            if v and isinstance(v, str) and _dim_pat.match(v):
+                return v.strip()
+        return ""
+
+    def _fetch_product_dim(sku_val: str) -> dict:
+        """Fetch the product detail for a single SKU and pull the
+        Storage L x W x H In value. Returns {dim, missing, error}.
+        Swallows per-SKU failures so one bad lookup doesn't sink the
+        whole PO commentary — buyer can still see the rest of the
+        analysis."""
+        if not sku_val:
+            return {"dim": "", "missing": True, "error": "no SKU"}
+        try:
+            resp = client.get(
+                "product",
+                params={"SKU": sku_val, "IncludeAttributes": "true"})
+        except Exception as exc:
+            return {
+                "dim": "", "missing": True,
+                "error": f"product lookup failed: {exc}"[:200]}
+        # CIN7 returns either a single product dict OR a list wrapped
+        # in {Products: [...]}. Handle both.
+        if isinstance(resp, dict):
+            prods = resp.get("Products")
+            if isinstance(prods, list) and prods:
+                p = prods[0]
+            else:
+                p = resp
+        else:
+            return {
+                "dim": "", "missing": True,
+                "error": "unexpected response shape"}
+        dim = _extract_storage_dim(p)
+        return {"dim": dim, "missing": not bool(dim)}
+
     line_rows = []
+    missing_dim_skus: list = []
     for line in lines:
         sku = str(line.get("SKU") or "").strip()
         qty = line.get("Quantity")
@@ -4150,6 +4228,9 @@ def get_purchase_live(engine_df: pd.DataFrame,
         except (TypeError, ValueError):
             qty_n = None
         oh = on_hand_map.get(sku.upper())
+        dim_info = _fetch_product_dim(sku)
+        if dim_info.get("missing") and sku:
+            missing_dim_skus.append(sku)
         line_rows.append({
             "sku": sku,
             "name": line.get("Name") or "",
@@ -4162,6 +4243,8 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "uom": line.get("UOM"),
             "supplier_sku": line.get("SupplierSKU"),
             "comment": line.get("Comment") or "",
+            "storage_dim": dim_info.get("dim", ""),
+            "storage_dim_missing": dim_info.get("missing", True),
         })
 
     # Header-level metadata. v2.67.197 — surface draft status
@@ -4188,6 +4271,8 @@ def get_purchase_live(engine_df: pd.DataFrame,
         "note": purchase.get("Note"),
         "terms": purchase.get("Terms"),
         "lines": line_rows,
+        "storage_dims_missing_skus": missing_dim_skus,
+        "storage_dims_missing_count": len(missing_dim_skus),
         "guidance": (
             "Data fetched LIVE from CIN7 (bypasses the 30-day "
             "local sync window). For each line, compose engine "
@@ -4200,7 +4285,22 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "'📝 *DRAFT* — pending approval. Commentary "
             "follows so you can decide whether to approve.' "
             "Draft commentary is the high-value path — "
-            "decisions get made off it."),
+            "decisions get made off it.\n\n"
+            "v2.67.355 — STORAGE DIM CHECK (warehouse pre-binning). "
+            "Each line carries `storage_dim` (the value from CIN7's "
+            "`Storage L x W x H In` custom field, e.g. \"12 x 4 x "
+            "2\") and `storage_dim_missing` (true if the field is "
+            "empty). For every line where `storage_dim_missing` is "
+            "true, append `📐 dims missing — capture before "
+            "binning` to that line's commentary. Also include an "
+            "end-of-message summary if `storage_dims_missing_count "
+            "> 0`: a section titled '📐 *Storage dims needed "
+            "before binning:*' listing all SKUs from "
+            "`storage_dims_missing_skus`. Use Slack mention "
+            "`<!subteam^WAREHOUSE>` or `@warehouse` (whichever "
+            "you've used before in this channel) so the warehouse "
+            "team gets pinged. If `storage_dims_missing_count == "
+            "0`, say nothing about dims — clean output."),
     }
 
 
