@@ -7687,7 +7687,7 @@ _auto_invalidate_engine_if_stale()
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.359** · deployed 2026-06-03")
+    "🔹 **v2.67.360** · deployed 2026-06-03")
 
 
 if page == "Overview":
@@ -14294,7 +14294,7 @@ elif page == "Ordering":
         "trend_flag",
         "trend_12m", "last_6mo_series", "units_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
-        "avg_daily", "LengthMM",
+        "avg_daily", "avg_month", "LengthMM",
         "OnHand", "Allocated", "Available", "OnOrder",
         "DoC_days",
         "target_stock", "reorder_qty",
@@ -14331,6 +14331,21 @@ elif page == "Ordering":
     for _req in REQUIRED_COLS:
         if _req not in editor_cols and _req in default_editor_cols:
             editor_cols.append(_req)
+
+    # v2.67.360 — auto-append newly-introduced columns to saved
+    # layouts so buyers don't have to Reset layout just to see a
+    # column added in a recent release. The user can still reorder
+    # / hide via the layout editor afterwards. Add new column names
+    # to this set as they ship.
+    _NEWLY_INTRODUCED_COLS = {"avg_month"}
+    for _new in _NEWLY_INTRODUCED_COLS:
+        if _new not in editor_cols and _new in default_editor_cols:
+            # Insert just after avg_daily if it's there, else append.
+            if "avg_daily" in editor_cols:
+                _idx = editor_cols.index("avg_daily") + 1
+                editor_cols.insert(_idx, _new)
+            else:
+                editor_cols.append(_new)
 
     # --- Column layout editor ------------------------------------------
     # Human-friendly labels for the config table (so buyer doesn't see
