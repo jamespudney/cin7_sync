@@ -4154,7 +4154,10 @@ def get_purchase_live(engine_df: pd.DataFrame,
     _DIM_FIELD = "Storage L x W x H In"
 
     def _extract_storage_dim(product_detail: dict) -> str:
-        """Return the dim value (trimmed) or empty string if absent.
+        """Return the raw Storage L x W x H In value (trimmed), or empty
+        string if the field is absent entirely.  We return whatever CIN7
+        has — including partials like '___ x 2.756" x 1.969"' — so the
+        team can see the current state and fill in what's missing over time.
         Tries the array form first, then the positional form."""
         if not isinstance(product_detail, dict):
             return ""
@@ -4171,21 +4174,45 @@ def get_purchase_live(engine_df: pd.DataFrame,
         # AdditionalAttributes, sometimes top-level on the product).
         # Names live in AttributeSet config; without that mapping we
         # scan all 10 slots and check if any non-empty value LOOKS
-        # like a dim (matches "<n> x <n> x <n>" pattern). This is
-        # a fallback for accounts where the attribute name isn't
-        # echoed in the response.
+        # like a dim string (contains at least one 'x' separator with a
+        # number on one side). We accept partials — ___ x 2.5 x 1.9 is
+        # still useful — so we just need at least one numeric segment.
         import re as _re
-        _dim_pat = _re.compile(
-            r"^\s*\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?\s*x\s*\d+(?:\.\d+)?",
+        _dim_loose = _re.compile(
+            r"(?:\d+(?:\.\d+)?|_+)\s*x\s*(?:\d+(?:\.\d+)?|_+)",
             _re.IGNORECASE)
         positional = (
             attrs if isinstance(attrs, dict)
             else product_detail)
         for i in range(1, 11):
             v = positional.get(f"AdditionalAttribute{i}")
-            if v and isinstance(v, str) and _dim_pat.match(v):
+            if v and isinstance(v, str) and _dim_loose.search(v):
                 return v.strip()
         return ""
+
+    import re as _re_dim
+    _incomplete_pat = _re_dim.compile(r"_{2,}|^x\s|^\s*x", _re_dim.IGNORECASE)
+
+    def _dim_is_incomplete(dim: str) -> bool:
+        """True if the dim value exists but has placeholders (___) or
+        missing segments — e.g. '___ x 2.756" x 1.969"'."""
+        if not dim:
+            return False
+        # Has ___ placeholder anywhere
+        if "___" in dim or "__" in dim:
+            return True
+        # Doesn't contain two 'x' separators (not all 3 dimensions present)
+        parts = [p.strip() for p in _re_dim.split(r"\s*x\s*", dim, flags=_re_dim.IGNORECASE)]
+        if len(parts) < 3:
+            return True
+        # Any segment is empty or non-numeric
+        for part in parts[:3]:
+            clean = part.replace('"', '').replace("'", "").strip()
+            try:
+                float(clean)
+            except ValueError:
+                return True
+        return False
 
     def _fetch_product_dim(sku_val: str) -> dict:
         """Fetch the product detail for a single SKU and pull the
@@ -4216,10 +4243,16 @@ def get_purchase_live(engine_df: pd.DataFrame,
                 "dim": "", "missing": True,
                 "error": "unexpected response shape"}
         dim = _extract_storage_dim(p)
-        return {"dim": dim, "missing": not bool(dim)}
+        incomplete = _dim_is_incomplete(dim) if dim else False
+        return {
+            "dim": dim,
+            "missing": not bool(dim),
+            "incomplete": incomplete,
+        }
 
     line_rows = []
     missing_dim_skus: list = []
+    incomplete_dim_skus: list = []
     for line in lines:
         sku = str(line.get("SKU") or "").strip()
         qty = line.get("Quantity")
@@ -4231,6 +4264,8 @@ def get_purchase_live(engine_df: pd.DataFrame,
         dim_info = _fetch_product_dim(sku)
         if dim_info.get("missing") and sku:
             missing_dim_skus.append(sku)
+        elif dim_info.get("incomplete") and sku:
+            incomplete_dim_skus.append(sku)
         line_rows.append({
             "sku": sku,
             "name": line.get("Name") or "",
@@ -4245,6 +4280,7 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "comment": line.get("Comment") or "",
             "storage_dim": dim_info.get("dim", ""),
             "storage_dim_missing": dim_info.get("missing", True),
+            "storage_dim_incomplete": dim_info.get("incomplete", False),
         })
 
     # Header-level metadata. v2.67.197 — surface draft status
@@ -4273,6 +4309,8 @@ def get_purchase_live(engine_df: pd.DataFrame,
         "lines": line_rows,
         "storage_dims_missing_skus": missing_dim_skus,
         "storage_dims_missing_count": len(missing_dim_skus),
+        "storage_dims_incomplete_skus": incomplete_dim_skus,
+        "storage_dims_incomplete_count": len(incomplete_dim_skus),
         "guidance": (
             "Data fetched LIVE from CIN7 (bypasses the 30-day "
             "local sync window). For each line, compose engine "
@@ -4286,21 +4324,28 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "follows so you can decide whether to approve.' "
             "Draft commentary is the high-value path — "
             "decisions get made off it.\n\n"
-            "v2.67.355 — STORAGE DIM CHECK (warehouse pre-binning). "
-            "Each line carries `storage_dim` (the value from CIN7's "
-            "`Storage L x W x H In` custom field, e.g. \"12 x 4 x "
-            "2\") and `storage_dim_missing` (true if the field is "
-            "empty). For every line where `storage_dim_missing` is "
-            "true, append `📐 dims missing — capture before "
-            "binning` to that line's commentary. Also include an "
-            "end-of-message summary if `storage_dims_missing_count "
-            "> 0`: a section titled '📐 *Storage dims needed "
-            "before binning:*' listing all SKUs from "
-            "`storage_dims_missing_skus`. Use Slack mention "
-            "`<!subteam^WAREHOUSE>` or `@warehouse` (whichever "
-            "you've used before in this channel) so the warehouse "
-            "team gets pinged. If `storage_dims_missing_count == "
-            "0`, say nothing about dims — clean output."),
+            "v2.67.361 — STORAGE DIMS (always surface, flag gaps). "
+            "Each line carries `storage_dim` (raw value of CIN7's "
+            "`Storage L x W x H In` field — always show it even if "
+            "partial, e.g. '___ x 2.756\" x 1.969\"'), "
+            "`storage_dim_missing` (true = field is blank), and "
+            "`storage_dim_incomplete` (true = field has a value but "
+            "contains placeholders or fewer than 3 dimensions). "
+            "For EVERY line: append the dim value to that line's "
+            "commentary as `📐 <value>` if present, or "
+            "`📐 dims not set` if missing. "
+            "After all per-line output, if any SKUs have missing "
+            "OR incomplete dims, include a summary section:\\n"
+            "```\\n"
+            "📐 *Storage dims incomplete/missing — update in CIN7:*\\n"
+            "<SKU1> (___ x 2.756 x 1.969 — length missing), "
+            "<SKU2> (not set)\\n"
+            "@warehouse please capture before shipment lands.\\n"
+            "```\\n"
+            "The team updates dims over time so always show what's "
+            "there. Only omit the summary section if ALL lines have "
+            "complete dims (storage_dims_missing_count == 0 AND "
+            "storage_dims_incomplete_count == 0)."),
     }
 
 
