@@ -16068,11 +16068,13 @@ elif page == "Ordering":
             st.session_state[f"_show_push_confirm_{sel_sup}"] = True
             st.rerun()
     with _qp_col3:
-        _po_val_quick = sum(
-            float(r.get("Line value") or 0) for r in po_lines)
+        _po_val_quick = float(
+            (po_lines["Order qty"] * po_lines["POCost"].fillna(0)).sum()
+            if not po_lines.empty else 0)
+        _po_units_quick = int(po_lines["Order qty"].sum()) if not po_lines.empty else 0
         st.caption(
             f"**{len(po_lines)} lines · "
-            f"{sum(int(r.get('Order qty') or 0) for r in po_lines)} units · "
+            f"{_po_units_quick} units · "
             f"~${_po_val_quick:,.0f}**")
     st.divider()
 
