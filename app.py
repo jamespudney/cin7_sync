@@ -12297,12 +12297,24 @@ elif page == "Ordering":
             # the line read "0 - 0 + 0 + 356 = 588" which dropped the
             # +232 assembly term, making the math look broken even
             # though the engine computed eff_u correctly.
+            # v2.67.362 — for 🎯 Project SKUs, also show the top-customer
+            # subtraction in the formula so the RHS matches the daily
+            # velocity displayed below. Pre-fix: "27 - 0 + 0 + 0 = 27"
+            # but avg_daily showed 0.03 (= 11/365 not 27/365), making the
+            # math look inconsistent. Now shows "27 - 16 + 0 + 0 = 11".
+            _proj_top_u = (
+                _topu if _tf == "🎯 Project" and "_topu" in dir()
+                else 0.0)
+            _proj_top_u = _proj_top_u if not pd.isna(_proj_top_u) else 0.0
+            _display_eff = max(0.0, eff_u - _proj_top_u)
             demand_lines.append(
                 f"- **Effective total**: {direct_u:.0f}"
                 + (f" + {asm_u:.0f}" if asm_u > 0 else "")
                 + f" - {mig_out:.0f} "
-                f"+ {mig_in:.0f} + {rollup_in:.0f} = "
-                f"**{eff_u:.0f}** units/year\n"
+                f"+ {mig_in:.0f} + {rollup_in:.0f}"
+                + (f" - {_proj_top_u:.0f} *(top-buyer removed)*"
+                   if _proj_top_u > 0 else "")
+                + f" = **{_display_eff:.0f}** units/year\n"
             )
             # v2.67.358 — show avg/month alongside avg/day. James
             # 2026-06-03: buyers think in months, not days. avg/month
