@@ -16051,9 +16051,10 @@ elif page == "Ordering":
     _qp_col1.caption(
         "📋 **PO actions** — save your edits above, then push to CIN7.")
     with _qp_col2:
+        _qp_actor = st.session_state.get("current_user", "").strip()
         _qpush_disabled = (
             len(po_lines) == 0
-            or not actor_ord
+            or not _qp_actor
             or _active_draft_id is None
             or not _draft_can_edit
         )
