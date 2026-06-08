@@ -15502,15 +15502,28 @@ elif page == "Ordering":
         *(all_supplier_df["SKU"].astype(str).tolist()
           if "SKU" in all_supplier_df.columns else []),
     })
-    _insp_pick = st.selectbox(
-        "🔍 Inspect a SKU (full detail — stock, velocity, trend, reorder "
-        "math — without leaving this page)",
-        ["—"] + _insp_opts,
-        key=f"inspect_pick_{sel_sup}",
-    )
-    if _insp_pick and _insp_pick != "—":
-        with st.container(border=True):
-            _render_sku_detail(_insp_pick)
+    # v2.67.363 — wrap inspect panel in an expander so it's collapsed by
+    # default and can be fully hidden after use. Clear button resets the
+    # selectbox back to "—" without a page reload.
+    _insp_active = (st.session_state.get(f"inspect_pick_{sel_sup}", "—") not in ("—", "", None))
+    with st.expander("🔍 Inspect a SKU", expanded=_insp_active):
+        _ic1, _ic2 = st.columns([5, 1])
+        _insp_pick = _ic1.selectbox(
+            "Full detail — stock, velocity, trend, reorder math — "
+            "without leaving this page",
+            ["—"] + _insp_opts,
+            key=f"inspect_pick_{sel_sup}",
+            label_visibility="collapsed",
+        )
+        if _insp_pick and _insp_pick != "—":
+            if _ic2.button("✕ Clear", key=f"inspect_clear_{sel_sup}",
+                           use_container_width=True):
+                st.session_state[f"inspect_pick_{sel_sup}"] = "—"
+                st.rerun()
+            with st.container(border=True):
+                _render_sku_detail(_insp_pick)
+        else:
+            _ic2.empty()
 
     # v2.67.351 — click-to-copy SKU chips. James 2026-06-02 asked for
     # double-click-on-SKU-in-column → clipboard. Streamlit's data_editor
@@ -16028,6 +16041,39 @@ elif page == "Ordering":
                           key=f"clr_all_freight_{sel_sup}"):
                 st.session_state["freight_overrides"][sel_sup] = {}
                 st.rerun()
+
+    # v2.67.363 — secondary action bar: mirrors the push button below so
+    # the buyer can save qtys, then immediately push without scrolling
+    # past "Add extra line" and the full PO summary. Uses a distinct
+    # session-state key (_quick_push_) to trigger the same confirm flow.
+    st.divider()
+    _qp_col1, _qp_col2, _qp_col3 = st.columns([2, 2, 2])
+    _qp_col1.caption(
+        "📋 **PO actions** — save your edits above, then push to CIN7.")
+    with _qp_col2:
+        _qpush_disabled = (
+            len(po_lines) == 0
+            or not actor_ord
+            or _active_draft_id is None
+            or not _draft_can_edit
+        )
+        if st.button(
+                "🚀 Create draft PO in CIN7",
+                key=f"quick_push_to_cin7_{sel_sup}",
+                type="primary",
+                disabled=_qpush_disabled,
+                use_container_width=True,
+                help="Shortcut — same as the push button below the PO summary."):
+            st.session_state[f"_show_push_confirm_{sel_sup}"] = True
+            st.rerun()
+    with _qp_col3:
+        _po_val_quick = sum(
+            float(r.get("Line value") or 0) for r in po_lines)
+        st.caption(
+            f"**{len(po_lines)} lines · "
+            f"{sum(int(r.get('Order qty') or 0) for r in po_lines)} units · "
+            f"~${_po_val_quick:,.0f}**")
+    st.divider()
 
     # --- Add extra lines manually --------------------------------------
     st.markdown("#### :heavy_plus_sign: Add extra line to this PO")
@@ -16826,7 +16872,13 @@ elif page == "Ordering":
     # reorder list today but will be within the next N days. Lets the
     # buyer consolidate future orders into this PO rather than placing
     # a second one soon.
-    st.markdown("### :calendar: Upcoming reorders — consolidate into this PO")
+    # v2.67.363 — collapse the upcoming reorders header into a visual
+    # separator so it's clearly a secondary section. The content stays
+    # fully visible but the section is visually de-emphasised vs Draft PO.
+    st.markdown("---")
+    _up_hdr1, _up_hdr2 = st.columns([4, 1])
+    _up_hdr1.markdown("### 📅 Upcoming reorders — consolidate into this PO")
+    _up_hdr2.caption("ℹ️ Only needed when consolidating shipments or hitting MOV.")
     st.caption(
         "Items from this supplier that the engine doesn't need yet but "
         "will need within the window below. Tick to add to the main PO "
