@@ -3668,10 +3668,28 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 invoice_date = hdr.get("InvoiceDate")
                 order_status = hdr.get("OrderStatus")
 
+        # v2.67.366 — enrich each line with real engine signals so the
+        # AI doesn't hallucinate demand/classification from OnHand alone.
+        _eng_map_po: dict = {}
+        if engine_df is not None and not engine_df.empty:
+            for _, _er in engine_df.iterrows():
+                _esk = str(_er.get("SKU") or "").strip().upper()
+                if _esk:
+                    _eng_map_po[_esk] = _er
+
+        def _epо(sku: str, col: str, default=None):
+            import math
+            row = _eng_map_po.get(str(sku or "").strip().upper())
+            if row is None:
+                return default
+            v = row.get(col)
+            return default if v is None or (isinstance(v, float) and math.isnan(v)) else v
+
         line_rows = []
         for _, lr in gdf.iterrows():
+            _lsku = str(lr.get("SKU") or "").strip()
             line_rows.append(_serialise_row({
-                "sku": lr.get("SKU"),
+                "sku": _lsku,
                 "name": lr.get("Name"),
                 "quantity": lr.get("Quantity"),
                 "price": lr.get("Price"),
@@ -3679,6 +3697,20 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 "discount": lr.get("Discount"),
                 "total": lr.get("Total"),
                 "uom": lr.get("UOM"),
+                # Engine signals — real data, not AI inference
+                "on_hand_now": _epо(_lsku, "OnHand"),
+                "abc_class": _epо(_lsku, "ABC", ""),
+                "trend_flag": _epо(_lsku, "trend_flag", ""),
+                "is_dormant": bool(_epо(_lsku, "is_dormant", False)),
+                "units_12mo": _epо(_lsku, "units_12mo", 0),
+                "effective_units_12mo": _epо(_lsku, "effective_units_12mo", 0),
+                "units_45d": _epо(_lsku, "units_45d", 0),
+                "available": _epо(_lsku, "Available"),
+                "on_order": _epо(_lsku, "OnOrder"),
+                "allocated": _epо(_lsku, "Allocated"),
+                "excess_units": _epо(_lsku, "excess_units", 0),
+                "suggested_reorder": _epо(_lsku, "suggested_reorder"),
+                "reorder_status": _epо(_lsku, "reorder_status", ""),
             }))
 
         po_record = {
