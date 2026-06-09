@@ -4250,6 +4250,23 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "incomplete": incomplete,
         }
 
+    # v2.67.366 — build a SKU→engine-row lookup so every PO line gets
+    # the real ABC / trend / demand / available / on_order data from the
+    # engine instead of leaving the AI to hallucinate it from OnHand alone.
+    eng_map: dict = {}
+    if engine_df is not None and not engine_df.empty:
+        for _, _erow in engine_df.iterrows():
+            _esku = str(_erow.get("SKU") or "").strip().upper()
+            if _esku:
+                eng_map[_esku] = _erow
+
+    def _eng(sku: str, col: str, default=None):
+        row = eng_map.get(sku.upper())
+        if row is None:
+            return default
+        v = row.get(col)
+        return default if v is None or (isinstance(v, float) and __import__("math").isnan(v)) else v
+
     line_rows = []
     missing_dim_skus: list = []
     incomplete_dim_skus: list = []
@@ -4281,6 +4298,19 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "storage_dim": dim_info.get("dim", ""),
             "storage_dim_missing": dim_info.get("missing", True),
             "storage_dim_incomplete": dim_info.get("incomplete", False),
+            # Engine signals — real data, not AI inference
+            "abc_class": _eng(sku, "ABC", ""),
+            "trend_flag": _eng(sku, "trend_flag", ""),
+            "is_dormant": bool(_eng(sku, "is_dormant", False)),
+            "units_12mo": _eng(sku, "units_12mo", 0),
+            "effective_units_12mo": _eng(sku, "effective_units_12mo", 0),
+            "units_45d": _eng(sku, "units_45d", 0),
+            "available": _eng(sku, "Available", None),
+            "on_order": _eng(sku, "OnOrder", None),
+            "allocated": _eng(sku, "Allocated", None),
+            "excess_units": _eng(sku, "excess_units", 0),
+            "suggested_reorder": _eng(sku, "suggested_reorder", None),
+            "reorder_status": _eng(sku, "reorder_status", ""),
         })
 
     # Header-level metadata. v2.67.197 — surface draft status
@@ -4324,6 +4354,19 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "follows so you can decide whether to approve.' "
             "Draft commentary is the high-value path — "
             "decisions get made off it.\n\n"
+            "v2.67.366 — ENGINE SIGNALS NOW ON EVERY LINE. "
+            "Each line now carries real engine data: `abc_class`, "
+            "`trend_flag`, `is_dormant`, `units_12mo`, "
+            "`effective_units_12mo`, `units_45d`, `available`, "
+            "`on_order`, `allocated`, `excess_units`, "
+            "`suggested_reorder`, `reorder_status`. "
+            "ALWAYS use these fields for your commentary — NEVER "
+            "infer or guess demand/classification from OnHand alone. "
+            "If `units_12mo` is 0 but `effective_units_12mo` > 0, "
+            "report the effective figure. "
+            "If engine data is missing for a SKU (fields are null/0), "
+            "say 'not in engine — verify manually' rather than "
+            "calling it dead or dormant. "
             "v2.67.361 — STORAGE DIMS (always surface, flag gaps). "
             "Each line carries `storage_dim` (raw value of CIN7's "
             "`Storage L x W x H In` field — always show it even if "
