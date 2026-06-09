@@ -20724,6 +20724,12 @@ elif page == "AI Assistant":
         ai_tools.set_shopify_orders(shopify_orders)
     except Exception:
         pass
+    try:
+        # v2.67.367 — IP notes so PO commentary can surface buyer
+        # notes (e.g. "must have product — keep stock") per SKU.
+        ai_tools.set_ip_notes(IP_NOTES)
+    except Exception:
+        pass
 
     # Lay out the page. Left column: chat input + transcript. Right:
     # a "what can I ask" cheatsheet so users know where to start.

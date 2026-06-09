@@ -2295,6 +2295,17 @@ def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
     _SALES_FULL_HOLDER["df"] = headers_df
 
 
+# v2.67.367 — IP notes holder (SKU -> [{text, warehouse_id, tags}])
+_IP_NOTES_HOLDER: dict = {}
+
+def set_ip_notes(ip_notes: dict) -> None:
+    """Pass in the IP_NOTES dict loaded from ip_notes_*.csv so PO
+    commentary tools can surface per-SKU notes (e.g. 'must have product
+    to mount profile — keep stock') alongside engine signals."""
+    global _IP_NOTES_HOLDER
+    _IP_NOTES_HOLDER = ip_notes or {}
+
+
 def set_purchase_lines(purchase_lines_df: pd.DataFrame) -> None:
     """Called by the Streamlit AI Assistant page on load. Stashes the
     purchase-lines DataFrame (longest available window post-v2.67.51)
@@ -3697,6 +3708,10 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 "discount": lr.get("Discount"),
                 "total": lr.get("Total"),
                 "uom": lr.get("UOM"),
+                # IP notes — buyer/planner notes from Inventory Planner
+                "ip_notes": "; ".join(
+                    n["text"] for n in _IP_NOTES_HOLDER.get(_lsku, [])
+                    if n.get("text")),
                 # Engine signals — real data, not AI inference
                 "on_hand_now": _epо(_lsku, "OnHand"),
                 "abc_class": _epо(_lsku, "ABC", ""),
@@ -4330,6 +4345,10 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "storage_dim": dim_info.get("dim", ""),
             "storage_dim_missing": dim_info.get("missing", True),
             "storage_dim_incomplete": dim_info.get("incomplete", False),
+            # IP notes — buyer/planner notes from Inventory Planner
+            "ip_notes": "; ".join(
+                n["text"] for n in _IP_NOTES_HOLDER.get(sku, [])
+                if n.get("text")),
             # Engine signals — real data, not AI inference
             "abc_class": _eng(sku, "ABC", ""),
             "trend_flag": _eng(sku, "trend_flag", ""),
@@ -4386,19 +4405,27 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "follows so you can decide whether to approve.' "
             "Draft commentary is the high-value path — "
             "decisions get made off it.\n\n"
-            "v2.67.366 — ENGINE SIGNALS NOW ON EVERY LINE. "
-            "Each line now carries real engine data: `abc_class`, "
+            "v2.67.367 — ENGINE SIGNALS + IP NOTES ON EVERY LINE. "
+            "Each line carries real engine data: `abc_class`, "
             "`trend_flag`, `is_dormant`, `units_12mo`, "
             "`effective_units_12mo`, `units_45d`, `available`, "
             "`on_order`, `allocated`, `excess_units`, "
             "`suggested_reorder`, `reorder_status`. "
-            "ALWAYS use these fields for your commentary — NEVER "
-            "infer or guess demand/classification from OnHand alone. "
+            "ALWAYS use these fields — NEVER infer demand or "
+            "classification from OnHand alone. "
             "If `units_12mo` is 0 but `effective_units_12mo` > 0, "
             "report the effective figure. "
-            "If engine data is missing for a SKU (fields are null/0), "
+            "If engine data is missing for a SKU (fields null/0), "
             "say 'not in engine — verify manually' rather than "
             "calling it dead or dormant. "
+            "Each line also carries `ip_notes` — free-text notes "
+            "written by the buyer/planner in Inventory Planner "
+            "(e.g. 'must have product to mount profile — keep stock'). "
+            "CRITICAL: if `ip_notes` is non-empty, ALWAYS surface it "
+            "in the commentary for that line. If a note says to keep "
+            "stock or flags a product as essential, DO NOT recommend "
+            "cancelling or reducing that line — flag it as buyer-noted "
+            "instead. "
             "v2.67.361 — STORAGE DIMS (always surface, flag gaps). "
             "Each line carries `storage_dim` (raw value of CIN7's "
             "`Storage L x W x H In` field — always show it even if "
