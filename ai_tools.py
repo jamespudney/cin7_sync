@@ -3712,6 +3712,10 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 "ip_notes": "; ".join(
                     n["text"] for n in _IP_NOTES_HOLDER.get(_lsku, [])
                     if n.get("text")),
+                # Storage dim from engine (v2.67.369 — from synced products CSV)
+                "storage_dim": str(_epо(_lsku, "storage_dim", "") or "").strip(),
+                "storage_dim_missing": not bool(
+                    str(_epо(_lsku, "storage_dim", "") or "").strip()),
                 # Engine signals — real data, not AI inference
                 "on_hand_now": _epо(_lsku, "OnHand"),
                 "abc_class": _epо(_lsku, "ABC", ""),
@@ -4325,10 +4329,27 @@ def get_purchase_live(engine_df: pd.DataFrame,
         except (TypeError, ValueError):
             qty_n = None
         oh = on_hand_map.get(sku.upper())
-        dim_info = _fetch_product_dim(sku)
-        if dim_info.get("missing") and sku:
+        # v2.67.369 — use storage_dim from engine (synced from products CSV)
+        # instead of making a live CIN7 API call per SKU.
+        _sdim = str(_eng(sku, "storage_dim", "") or "").strip()
+        _sdim_missing = not bool(_sdim)
+        # Incomplete: has ___ placeholder or fewer than 3 numeric segments
+        import re as _redim
+        _sdim_incomplete = False
+        if _sdim and not _sdim_missing:
+            _parts = [p.strip() for p in _redim.split(r"\s*[xX]\s*", _sdim)]
+            if len(_parts) < 3 or "___" in _sdim or "__" in _sdim:
+                _sdim_incomplete = True
+            else:
+                for _p in _parts[:3]:
+                    try:
+                        float(_p.replace('"','').replace("'","").strip())
+                    except ValueError:
+                        _sdim_incomplete = True
+                        break
+        if _sdim_missing and sku:
             missing_dim_skus.append(sku)
-        elif dim_info.get("incomplete") and sku:
+        elif _sdim_incomplete and sku:
             incomplete_dim_skus.append(sku)
         line_rows.append({
             "sku": sku,
@@ -4342,9 +4363,9 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "uom": line.get("UOM"),
             "supplier_sku": line.get("SupplierSKU"),
             "comment": line.get("Comment") or "",
-            "storage_dim": dim_info.get("dim", ""),
-            "storage_dim_missing": dim_info.get("missing", True),
-            "storage_dim_incomplete": dim_info.get("incomplete", False),
+            "storage_dim": _sdim,
+            "storage_dim_missing": _sdim_missing,
+            "storage_dim_incomplete": _sdim_incomplete,
             # IP notes — buyer/planner notes from Inventory Planner
             "ip_notes": "; ".join(
                 n["text"] for n in _IP_NOTES_HOLDER.get(sku, [])

@@ -506,17 +506,47 @@ def sync_test(client: Cin7Client) -> None:
 
 
 def sync_products(client: Cin7Client) -> None:
-    """Pull the product master, including Suppliers + ReorderLevels.
-    Without these Include* flags, CIN7 returns empty arrays for both,
-    which breaks supplier auto-detection downstream."""
-    log.info("Pulling product master (with Suppliers + ReorderLevels)...")
+    """Pull the product master, including Suppliers + ReorderLevels +
+    AdditionalAttributes. v2.67.369 — IncludeAttributes added so the
+    Storage L x W x H In dim field is present in the products CSV for
+    use by the AI commentary tools without live per-SKU API calls."""
+    log.info("Pulling product master (with Suppliers + ReorderLevels + Attributes)...")
     rows = list(client.paginate(
         "product", result_key="Products",
         params={
             "IncludeSuppliers": "true",
             "IncludeReorderLevels": "true",
+            "IncludeAttributes": "true",
         },
     ))
+    # v2.67.369 — extract Storage L x W x H In from AdditionalAttributes
+    # into a top-level storage_dim column so it ends up as a plain CSV
+    # column that the engine and ai_tools can join without live API calls.
+    # CIN7 returns attributes in two shapes:
+    #   (a) list of {Name, Value} dicts   — newer accounts
+    #   (b) flat dict AdditionalAttribute1..10 — older / some endpoints
+    # We try (a) first (name-matched), then (b) (scan for dim pattern).
+    import re as _re_dim
+    _dim_name = "Storage L x W x H In"
+    _dim_loose = _re_dim.compile(
+        r"(?:\d+(?:\.\d+)?|_+)\s*[xX]\s*(?:\d+(?:\.\d+)?|_+)")
+    for row in rows:
+        dim_val = ""
+        attrs = row.get("AdditionalAttributes")
+        if isinstance(attrs, list):
+            for a in attrs:
+                if (isinstance(a, dict)
+                        and str(a.get("Name") or "").strip().lower()
+                        == _dim_name.lower()):
+                    dim_val = str(a.get("Value") or "").strip()
+                    break
+        if not dim_val and isinstance(attrs, dict):
+            for i in range(1, 11):
+                v = attrs.get(f"AdditionalAttribute{i}")
+                if v and isinstance(v, str) and _dim_loose.search(v):
+                    dim_val = v.strip()
+                    break
+        row["storage_dim"] = dim_val
     write_outputs("products", rows)
 
 

@@ -20642,6 +20642,12 @@ elif page == "AI Assistant":
                     _stock_view, on="SKU", how="left")
             if "AdditionalAttribute1" in engine_df.columns:
                 engine_df["Family"] = engine_df["AdditionalAttribute1"]
+            # v2.67.369 — promote storage_dim from products CSV into
+            # engine_df so AI tools can use it without live API calls.
+            if "storage_dim" not in engine_df.columns:
+                engine_df["storage_dim"] = ""
+            else:
+                engine_df["storage_dim"] = engine_df["storage_dim"].fillna("")
     elif not products.empty:
         # No sale_lines — can't run full engine. Lightweight only.
         engine_df = products.copy()
@@ -20657,6 +20663,11 @@ elif page == "AI Assistant":
                 _stock_view, on="SKU", how="left")
         if "AdditionalAttribute1" in engine_df.columns:
             engine_df["Family"] = engine_df["AdditionalAttribute1"]
+        # v2.67.369 — promote storage_dim (lightweight path)
+        if "storage_dim" not in engine_df.columns:
+            engine_df["storage_dim"] = ""
+        else:
+            engine_df["storage_dim"] = engine_df["storage_dim"].fillna("")
     else:
         engine_df = pd.DataFrame(columns=["SKU", "Name", "OnHand"])
 
