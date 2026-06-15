@@ -1980,6 +1980,29 @@ def process_once(max_messages: int = 25) -> int:
                 f":bar_chart: *PO commentary* "
                 f"— source: <{permalink}|message in #"
                 f"{ch_name or msg['channel_id']}>\n\n")
+            # v2.67.370 - suppress noisy "PO not found" posts
+            # for draft POs that haven't been saved in CIN7 yet.
+            # If the AI response indicates the PO couldn't be
+            # retrieved, silently drop it rather than posting a
+            # confusing error to the commentary channel.
+            _not_found_signals = (
+                "not found",
+                "no match",
+                "unable to retrieve",
+                "doesn't exist",
+                "does not exist",
+                "returned no match",
+                "returned empty",
+            )
+            _text_lower = text.lower()
+            if (any(sig in _text_lower for sig in _not_found_signals)
+                    and "matched" not in _text_lower
+                    and len(text.strip()) < 1500):
+                log.info(
+                    "po_commentary_crosspost: suppressed not-found "
+                    "response for %s/%s (PO likely unsaved draft)",
+                    ch_name, msg["ts"])
+                continue
             body = header + text
             try:
                 posted_ts = _post_response(
