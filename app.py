@@ -32,6 +32,29 @@ import sys
 
 import db
 
+from app_config import (
+    APP_DEPLOYED,
+    APP_VERSION,
+    PAGE_CAPTIONS,
+    PAGE_GROUPS,
+    PAGE_OPTIONS,
+)
+from app_pages.data_health import render_data_health
+from app_pages.my_profile import render_my_profile
+from app_pages.ordering_layout import ORDERING_PO_EDITOR_VIEW
+from app_pages.overview_actions import render_attention_queue
+from app_pages.product_master import render_product_master
+from app_pages.purchase_analysis import render_purchase_analysis
+from app_pages.sales_recent import render_sales_recent
+from app_pages.stock_explorer import render_stock_explorer
+from data_catalog import file_mtime as catalog_file_mtime
+from data_catalog import latest_file as catalog_latest_file
+from engine.sku_rules import _is_strip_sku
+from engine.sku_rules import _parse_length
+from engine.sku_rules import _parse_strip_base
+from engine.sku_rules import _parse_tube_sku
+from engine.sku_rules import parse_sourcing_rule
+
 # Optional drag-and-drop UI for the PO-editor column organizer. Falls back
 # gracefully to the data_editor flow if the package isn't installed.
 # Install: pip install streamlit-sortables
@@ -612,8 +635,7 @@ _require_password()
 # arrives.
 def _latest_file(prefix: str) -> Optional[Path]:
     """Return the most recent CSV file in output/ with the given prefix."""
-    files = sorted(OUTPUT_DIR.glob(f"{prefix}_*.csv"))
-    return files[-1] if files else None
+    return catalog_latest_file(prefix, OUTPUT_DIR)
 
 
 @st.cache_data(persist="disk", show_spinner="Loading data…")
@@ -637,8 +659,7 @@ def load(prefix: str) -> pd.DataFrame:
 
 
 def file_mtime(prefix: str) -> Optional[datetime]:
-    p = _latest_file(prefix)
-    return datetime.fromtimestamp(p.stat().st_mtime) if p else None
+    return catalog_file_mtime(prefix, OUTPUT_DIR)
 
 
 def _fmt_number(n) -> str:
@@ -3027,60 +3048,8 @@ with st.sidebar:
         except Exception:
             pass
 
-    _page_options = [
-            "Overview",
-            "AI Assistant",
-            "AI Feedback",
-            "Demand Signals",
-            "Slow Movers",  # v2.67.38 — dedicated stock-reduction page
-            "Ad-Umpire",  # v2.67.104 — paid-marketing dashboard
-            "My Profile",
-            "Monthly Metrics",
-            "Ordering",
-            "FixedCost Audit",
-            "Product Detail",
-            "Kits & Fixtures",
-            "LED Tubes",
-            "Migrations",
-            "Supplier Pricing",
-            "Stock Explorer",
-            "Product Master",
-            "Purchase Analysis",
-            "Sales Recent",
-            "Data Health",
-            "Cashflow",  # v2.67.211 — QBO-backed cash position
-            "User Permissions",  # v2.67.185 — admin-only
-    ]
-    # v2.67.41 — one-line per-page descriptions, rendered as
-    # captions under each radio option. Order MUST match
-    # `_page_options` exactly. Hover-style tooltip is achieved
-    # by rendering as visible captions (Streamlit's radio
-    # doesn't expose a per-option help= so this is the cleanest
-    # way to surface the same info).
-    _page_captions = [
-        "High-level KPIs: stock value, sales, slow movers, today vs YoY.",
-        "Natural-language Q&A grounded in live CIN7 + Shopify data.",
-        "Review past AI answers and team-logged corrections.",
-        "Track customer interest before it shows up in sales.",
-        "Stock-reduction workspace: dormant SKUs, value tied up, dismiss/flag.",
-        "Paid-ads dashboard: Google Ads + GA4 attribution + ROAS.",
-        "Edit your profile; admins manage all users.",
-        "Month-over-month KPI report — commission reference.",
-        "ABC-driven reorder workbench with PO drafts.",
-        "Review fixed-cost overrides applied to PO calculations.",
-        "Single-SKU drill-down: stock, sales, BOM, pricing, history.",
-        "Pre-built kits, components, build candidates.",
-        "Tube families, MP variants, migration forecast.",
-        "Retiring → successor SKU mappings + impact.",
-        "Per-SKU supplier costs, freight modes, lead times.",
-        "Searchable stock view with FIFO values + flags.",
-        "Browse / search products with categories + statuses.",
-        "PO-side analytics: spend by supplier, lead-time variance.",
-        "Recent sales feed + filters.",
-        "Sync freshness, CSV row counts, data integrity flags.",
-        "Cash position + forecast, backed by QuickBooks Online.",
-        "Admin: assign which pages each user can access.",
-    ]
+    _page_options = list(PAGE_OPTIONS)
+    _page_captions = list(PAGE_CAPTIONS)
     # v2.67.185 — filter _page_options by per-user permissions.
     # Unconfigured users (no rows in user_page_permissions) see
     # everything (backwards compat).
@@ -3143,9 +3112,16 @@ with st.sidebar:
     # screen.
     with st.expander("ⓘ What does each section do?",
                        expanded=False):
-        for _opt, _cap in zip(_visible_pages, _visible_captions):
-            st.markdown(f"**{_opt}** — <small>{_cap}</small>",
-                          unsafe_allow_html=True)
+        _caption_by_page = dict(zip(_visible_pages, _visible_captions))
+        for _group, _pages in PAGE_GROUPS.items():
+            _group_pages = [p for p in _pages if p in _visible_pages]
+            if not _group_pages:
+                continue
+            st.markdown(f"**{_group}**")
+            for _opt in _group_pages:
+                _cap = _caption_by_page.get(_opt, "")
+                st.markdown(f"- **{_opt}** — <small>{_cap}</small>",
+                              unsafe_allow_html=True)
 
     st.divider()
     st.subheader("Global filters")
@@ -5220,285 +5196,7 @@ def family_sku_for(sku: str) -> str:
     return BOM_FAMILY.get(sku, sku)
 
 
-# ---------------------------------------------------------------------------
-# Sourcing rule parser (AdditionalAttribute1)
-# ---------------------------------------------------------------------------
-# Example values seen in W4S data:
-#   "Rule: SR100 | Logic: Purchased full length. No BOM | Auto-Assembly: N/A | Note: ..."
-#   "Rule: SR100 | Logic: Assemble from 1 x 3m | Auto-Assembly: ON | Note: Offcut..."
-#   "Rule: SR140 | Logic: Assemble from 0.5 x 2m profile + 3.28ft plate | Auto-Assembly: ON"
-
-import re as _re_sr
-
-
-def parse_sourcing_rule(attr1: Optional[str]) -> dict:
-    """Parse the AdditionalAttribute1 sourcing-rule string into structured
-    fields. Returns a dict with keys — all optional.
-      RuleCode   — e.g. 'SR100'
-      Logic      — raw logic text (as stored)
-      IsMaster   — True if rule says 'Purchased full length'
-      SourceFraction — e.g. 0.5, 1.0, 0.25
-      SourceLengthMM — normalized to mm (e.g. 3000 for '3m', 609 for '609mm')
-      HasPlate   — True if rule mentions 'plate' (i.e. SR140-style MP combo)
-      AutoAssembly — 'ON' / 'OFF' / 'N/A' / None
-      Note       — operational note text
-    """
-    out = {
-        "RuleCode": None, "Logic": None, "IsMaster": False,
-        "SourceFraction": None, "SourceLengthMM": None,
-        "HasPlate": False, "AutoAssembly": None, "Note": None,
-    }
-    if not attr1 or not isinstance(attr1, str):
-        return out
-    s = attr1.strip()
-    if not s:
-        return out
-    for segment in s.split("|"):
-        seg = segment.strip()
-        if not seg:
-            continue
-        lower = seg.lower()
-        if lower.startswith("rule:"):
-            out["RuleCode"] = seg.split(":", 1)[1].strip()
-        elif lower.startswith("logic:"):
-            logic = seg.split(":", 1)[1].strip()
-            out["Logic"] = logic
-            low = logic.lower()
-            if "purchas" in low:
-                out["IsMaster"] = True
-            else:
-                # "Assemble from 0.5 x 2m [rest]" or "0.25 x 609mm ..."
-                m = _re_sr.search(
-                    r"([\d.]+)\s*x\s*([\d.]+)\s*(mm|m|ft)?",
-                    logic, flags=_re_sr.IGNORECASE,
-                )
-                if m:
-                    try:
-                        frac = float(m.group(1))
-                    except ValueError:
-                        frac = None
-                    try:
-                        lval = float(m.group(2))
-                    except ValueError:
-                        lval = None
-                    unit = (m.group(3) or "").lower()
-                    out["SourceFraction"] = frac
-                    if lval is not None:
-                        if unit == "m":
-                            out["SourceLengthMM"] = int(round(lval * 1000))
-                        elif unit == "ft":
-                            out["SourceLengthMM"] = int(round(lval * 304.8))
-                        else:
-                            # default: mm OR bare number; follow same
-                            # heuristic as length parser (small = metres)
-                            out["SourceLengthMM"] = (
-                                int(round(lval * 1000))
-                                if lval < 20 else int(round(lval))
-                            )
-            if "plate" in low:
-                out["HasPlate"] = True
-        elif lower.startswith("auto-assembly:"):
-            out["AutoAssembly"] = seg.split(":", 1)[1].strip()
-        elif lower.startswith("note:"):
-            out["Note"] = seg.split(":", 1)[1].strip()
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Tube SKU parser (global scope — used by LED Tubes AND Ordering pages)
-# ---------------------------------------------------------------------------
-
-def _parse_length(s) -> Optional[int]:
-    """Return length in mm. '1' -> 1000, '0609' -> 609, '2390' -> 2390."""
-    if s is None:
-        return None
-    try:
-        n = float(str(s).strip())
-    except (ValueError, TypeError):
-        return None
-    if n <= 0:
-        return None
-    return int(round(n * 1000)) if n < 20 else int(round(n))
-
-
-TUBE_FAMILY_NAME_KEYWORDS = [
-    ("OSLO MINI",   "OSLOMINI"),
-    ("OSLO DOBLE",  "OSLODOBLE"),
-    ("OSLO DOUBLE", "OSLODOBLE"),
-    ("OSLOMINI",    "OSLOMINI"),
-    ("OSLODOBLE",   "OSLODOBLE"),
-]
-
-NON_TUBE_NAME_PATTERNS = (
-    "END CAP", "ENDCAP",
-    "HEATSINK", "HEAT PLATE",
-    "MOUNTING PLATE FOR", "MOUNT PLATE FOR",
-    "BASE FOR", "JOINER",
-    "ADAPTOR", "ADAPTER",
-    "CLIP FOR", "SWIVEL",
-    "SLIDE ", "BRACKET",
-)
-
-
-def _parse_tube_sku(sku: str, name: str = "") -> Optional[dict]:
-    """Identify a tube from (SKU, Name). Module-level so every page can use
-    it. Two strategies: A) SKU-based, B) Name-based fallback."""
-    if not sku or not isinstance(sku, str):
-        return None
-    s = sku.upper()
-    n = (name or "").upper()
-    if any(tok in n for tok in NON_TUBE_NAME_PATTERNS):
-        return None
-    # Strategy A: standard LED-{FAMILY}-{COLOR}-[MP]-{LENGTH}
-    if s.startswith("LED-"):
-        parts = s.split("-")
-        if len(parts) >= 4:
-            family_a = parts[1]
-            length_mm = _parse_length(parts[-1])
-            skipped_tokens = {"EC", "TJ", "CLIP", "SLIDE", "SWIVEL",
-                              "3D", "VEND", "ACCESSORY", "ACC",
-                              "ANODIZED", "HEATSINK"}
-            has_skipped = any(t in skipped_tokens for t in parts[2:-1])
-            middle = parts[2:-1]
-            if length_mm is not None and not has_skipped and middle:
-                color = middle[0]
-                has_mp = "MP" in middle
-                if color in ("W", "B", "R", "C", "A", "G", "S", "BULK"):
-                    return {"SKU": sku, "Family": family_a,
-                            "Color": color, "HasMP": has_mp,
-                            "LengthMM": length_mm}
-    # Strategy B: family detected from Name
-    family_b = None
-    for kw, fam in TUBE_FAMILY_NAME_KEYWORDS:
-        if kw in n:
-            family_b = fam
-            break
-    if not family_b:
-        return None
-    length_mm = None
-    for part in reversed(s.split("-")):
-        lp = _parse_length(part)
-        if lp is not None and 50 <= lp <= 5000:
-            length_mm = lp
-            break
-    if length_mm is None:
-        m_len = _re_sr.search(r"(\d+(?:\.\d+)?)\s*(mm|m)\b", n)
-        if m_len:
-            try:
-                v = float(m_len.group(1))
-                u = m_len.group(2).lower()
-                length_mm = int(round(v * 1000)) if u == "m" else int(round(v))
-            except ValueError:
-                pass
-    if length_mm is None:
-        return None
-    color = "W"
-    if "BLACK" in n:
-        color = "B"
-    elif "CLEAR" in n:
-        color = "C"
-    return {"SKU": sku, "Family": family_b, "Color": color,
-            "HasMP": False, "LengthMM": length_mm}
-
-
-# ---------------------------------------------------------------------------
-# LED strip SKU parser (pattern-based — BOMs aren't populated in CIN7 for
-# most strips, so we infer bulk-master relationships from naming).
-# ---------------------------------------------------------------------------
-
-# Family-prefix patterns that indicate an LED strip product.
-STRIP_FAMILY_PREFIXES = (
-    "LEDIRIS",           # White Iris + RGB(W) Iris series
-    "LEDUL",             # UL-listed strips
-    "LED-UL",
-    "LEDHR",             # High CRI
-    "LEDAW",             # Amplified White
-    "LEDRGB",            # Standalone RGB strip SKUs
-    "LED-STRIP",
-)
-
-# Positive name check — must have STRIP or similar in name
-STRIP_NAME_KEYWORDS = ("STRIP", "LED TAPE", "FLEX LED")
-
-
-def _is_strip_sku(sku: str, name: str) -> bool:
-    """Heuristic: is this a LED-strip SKU?"""
-    if not sku:
-        return False
-    s = str(sku).upper()
-    n = (name or "").upper()
-    prefix_match = any(s.startswith(p) for p in STRIP_FAMILY_PREFIXES)
-    name_match = any(k in n for k in STRIP_NAME_KEYWORDS)
-    return prefix_match or name_match
-
-
-def _parse_strip_length_suffix(part: str) -> Optional[float]:
-    """Turn a strip SKU suffix into length in METRES. Returns None if
-    the part isn't a length.
-    Examples:
-      '0305' → 0.305   (305mm, typically a 1ft cut)
-      '5m'   → 5.0
-      '5M'   → 5.0
-      '25M'  → 25.0
-      '100'  → 100.0
-      '100M' → 100.0
-      '40m'  → 40.0
-      '12V'  → None (voltage marker, not length)
-      '180'  → None (LED density, not length — ambiguous; handled upstream)
-    """
-    if not part:
-        return None
-    s = str(part).strip().upper()
-    if not s:
-        return None
-    # Voltage markers
-    if s in ("12V", "24V"):
-        return None
-    # '0305' pattern — leading zero + 3+ digits = millimetre length
-    if s.startswith("0") and s.isdigit() and len(s) >= 3:
-        return int(s) / 1000.0
-    # Trailing 'M' or 'm' — strip and parse
-    core = s.rstrip("Mm")
-    if core.replace(".", "", 1).isdigit():
-        try:
-            n = float(core)
-        except ValueError:
-            return None
-        # 4-digit bare number (like 2390) is mm, not m
-        if len(core) >= 4 and "." not in core and not s.endswith(("m", "M")):
-            return n / 1000.0
-        return n
-    return None
-
-
-def _parse_strip_base(sku: str) -> Optional[tuple]:
-    """Return (base_family, length_m) for strip SKUs, or None if we can't
-    split them. The base family preserves the -12V suffix as part of its
-    identity (12V vs 24V rolls are different products)."""
-    if not sku:
-        return None
-    parts = str(sku).upper().split("-")
-    if len(parts) < 2:
-        return None
-
-    # Strip trailing voltage suffix and attach to base
-    voltage = None
-    if parts[-1] in ("12V", "24V"):
-        voltage = parts[-1]
-        length_part = parts[-2]
-        body = parts[:-2]
-    else:
-        length_part = parts[-1]
-        body = parts[:-1]
-
-    length_m = _parse_strip_length_suffix(length_part)
-    if length_m is None:
-        return None
-
-    base = "-".join(body)
-    if voltage:
-        base = f"{base}-{voltage}"
-    return (base, length_m)
+# SKU parsing and sourcing-rule helpers now live in engine/sku_rules.py.
 
 
 # ---------------------------------------------------------------------------
@@ -7687,11 +7385,20 @@ _auto_invalidate_engine_if_stale()
 # prime UX space at the top. Update the string with each release.
 st.sidebar.caption(
     "ㅤ\n\n"
-    "🔹 **v2.67.360** · deployed 2026-06-03")
+    f"🔹 **{APP_VERSION}** · deployed {APP_DEPLOYED}")
 
 
 if page == "Overview":
     st.header(":bar_chart: Overview")
+    render_attention_queue(
+        freshness=_freshness_from_output_dir(),
+        purchase_lines=purchase_lines,
+        db_module=db,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
+        to_num=_to_num,
+    )
+    st.divider()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Products", _fmt_number(len(products)))
@@ -10936,130 +10643,16 @@ elif page == "Migrations":
 
 
 elif page == "Stock Explorer":
-    st.header(":package: Stock Explorer")
-
-    if stock.empty:
-        st.warning("No stock data. Run `python cin7_sync.py stock`.")
-    else:
-        # Join BOM flag from product master so we can tell cuts/assemblies apart
-        df = stock.copy()
-        df["OnHand"] = _to_num(df["OnHand"]).fillna(0)
-        df["Available"] = _to_num(df["Available"]).fillna(0)
-        df["OnOrder"] = _to_num(df["OnOrder"]).fillna(0)
-        df["Allocated"] = _to_num(df.get("Allocated", 0)).fillna(0)
-        # Phantom stock = derivable from BOM masters (Available minus physical)
-        df["Phantom"] = (df["Available"] - df["OnHand"]).clip(lower=0)
-
-        if not products.empty:
-            bom_map = products.set_index("SKU")[
-                ["BillOfMaterial", "BOMType", "AutoAssembly",
-                 "AutoDisassembly", "AverageCost"]
-            ].to_dict(orient="index")
-            df["IsBOM"] = df["SKU"].map(
-                lambda s: str(bom_map.get(s, {}).get("BillOfMaterial")) == "True"
-            )
-            df["BOMType"] = df["SKU"].map(
-                lambda s: bom_map.get(s, {}).get("BOMType")
-            )
-            df["AvgCost"] = df["SKU"].map(
-                lambda s: float(bom_map.get(s, {}).get("AverageCost") or 0)
-            )
-            # OnHandValue uses CIN7's FIFO StockOnHand (authoritative),
-            # falling back to OnHand × AvgCost only when CIN7 returns 0.
-            if "StockOnHand" in df.columns:
-                _fifo = _to_num(df["StockOnHand"]).fillna(0)
-                _oxa = df["OnHand"] * df["AvgCost"]
-                df["OnHandValue"] = _fifo.where(_fifo > 0, _oxa)
-            else:
-                df["OnHandValue"] = df["OnHand"] * df["AvgCost"]
-        else:
-            df["IsBOM"] = False
-            df["BOMType"] = None
-            df["AvgCost"] = 0.0
-            df["OnHandValue"] = 0.0
-
-        # Parent / family columns (populated when BOM sync has run)
-        df["Parent"] = df["SKU"].map(parent_sku_for)
-        df["Family"] = df["SKU"].map(family_sku_for)
-
-        c1, c2, c3, c4 = st.columns(4)
-        locs = sorted(stock["Location"].dropna().unique().tolist())
-        sel_loc = c1.multiselect("Location", locs, default=[])
-        q = c2.text_input("Search SKU or name", "")
-        only = c3.selectbox(
-            "Stock filter",
-            ["All", "Zero physical (OnHand=0)", "Below 5 physical",
-             "Positive physical only"],
-        )
-        bom_only = c4.selectbox(
-            "BOM filter",
-            ["All", "BOM products only", "Non-BOM only",
-             "Phantom stock > 0 (derivable from masters)"],
-        )
-
-        if sel_loc:
-            df = df[df["Location"].isin(sel_loc)]
-        if q:
-            mask = (
-                df["SKU"].astype(str).str.contains(q, case=False, na=False) |
-                df["Name"].astype(str).str.contains(q, case=False, na=False)
-            )
-            df = df[mask]
-        if only == "Zero physical (OnHand=0)":
-            df = df[df["OnHand"] <= 0]
-        elif only == "Below 5 physical":
-            df = df[(df["OnHand"] > 0) & (df["OnHand"] < 5)]
-        elif only == "Positive physical only":
-            df = df[df["OnHand"] > 0]
-
-        if bom_only == "BOM products only":
-            df = df[df["IsBOM"]]
-        elif bom_only == "Non-BOM only":
-            df = df[~df["IsBOM"]]
-        elif bom_only == "Phantom stock > 0 (derivable from masters)":
-            df = df[df["Phantom"] > 0]
-
-        # Summary strip
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("SKU-locations shown", _fmt_number(len(df)))
-        c2.metric("Physical units (OnHand)", _fmt_number(df["OnHand"].sum()))
-        c3.metric("Phantom units (derivable)",
-                  _fmt_number(df["Phantom"].sum()))
-        c4.metric("Physical cash tied up",
-                  _fmt_money(df["OnHandValue"].sum()))
-
-        with st.expander("What's 'Phantom Stock'?"):
-            st.markdown(
-                "**`Available − OnHand`** for BOM products. These are units "
-                "CIN7 *could* make by auto-assembly or auto-disassembly from "
-                "master-length stock. They don't exist yet — no cash is tied "
-                "up in them — but they're fulfillable if a customer orders.\n\n"
-                "- **`OnHand`** = physical stock with actual cash invested.\n"
-                "- **`Available`** = OnHand + Phantom = what we can actually "
-                "ship to a customer.\n"
-                "- Use **OnHand × AvgCost** for cash / working capital analysis.\n"
-                "- Use **Available** for service-level / reorder decisions."
-            )
-
-        show_cols = [
-            "SKU", "Name", "Parent", "Location", "OnHand", "Phantom", "Available",
-            "Allocated", "OnOrder", "IsBOM", "BOMType",
-            "AvgCost", "OnHandValue", "Bin", "NextDeliveryDate",
-        ]
-        show_cols = [c for c in show_cols if c in df.columns]
-        limit = rows_selector(key="stock_rows")
-        sorted_df = df[show_cols].sort_values("OnHandValue", ascending=False)
-        st.caption(f"Showing {min(limit, len(sorted_df)):,} of {len(sorted_df):,} matching rows")
-        st.dataframe(
-            sorted_df.head(limit),
-            width="stretch",
-            height=520,
-            column_config={
-                "AvgCost": st.column_config.NumberColumn(format="$%.2f"),
-                "OnHandValue": st.column_config.NumberColumn(format="$%.0f"),
-                "IsBOM": st.column_config.CheckboxColumn("BOM?"),
-            },
-        )
+    render_stock_explorer(
+        stock=stock,
+        products=products,
+        to_num=_to_num,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
+        rows_selector=rows_selector,
+        parent_sku_for=parent_sku_for,
+        family_sku_for=family_sku_for,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -11067,53 +10660,11 @@ elif page == "Stock Explorer":
 # ---------------------------------------------------------------------------
 
 elif page == "Product Master":
-    st.header(":label: Product Master")
-
-    if products.empty:
-        st.warning("No products data. Run `python cin7_sync.py products`.")
-    else:
-        c1, c2, c3, c4 = st.columns(4)
-        cats = sorted(products["Category"].dropna().unique().tolist())
-        brands = sorted(products["Brand"].dropna().unique().tolist())
-        types = sorted(products["Type"].dropna().unique().tolist())
-        statuses = sorted(products["Status"].dropna().unique().tolist())
-
-        sel_cat = c1.multiselect("Category", cats, default=[])
-        sel_brand = c2.multiselect("Brand", brands, default=[])
-        sel_type = c3.multiselect("Type", types, default=[])
-        sel_status = c4.multiselect("Status", statuses, default=["Active"]
-                                    if "Active" in statuses else [])
-
-        q = st.text_input("Search SKU or name", "")
-
-        df = products.copy()
-        if sel_cat:
-            df = df[df["Category"].isin(sel_cat)]
-        if sel_brand:
-            df = df[df["Brand"].isin(sel_brand)]
-        if sel_type:
-            df = df[df["Type"].isin(sel_type)]
-        if sel_status:
-            df = df[df["Status"].isin(sel_status)]
-        if q:
-            mask = (
-                df["SKU"].astype(str).str.contains(q, case=False, na=False) |
-                df["Name"].astype(str).str.contains(q, case=False, na=False)
-            )
-            df = df[mask]
-
-        # Add Parent column from BOM index
-        df["Parent"] = df["SKU"].map(parent_sku_for)
-
-        show_cols = ["SKU", "Name", "Parent", "Category", "Brand", "Type",
-                     "Status", "AverageCost", "MinimumBeforeReorder",
-                     "ReorderQuantity", "CreatedDate", "LastModifiedOn"]
-        show_cols = [c for c in show_cols if c in df.columns]
-        limit = rows_selector(key="product_rows")
-        st.caption(f"Showing {min(limit, len(df)):,} of {len(df):,} "
-                   f"matching (out of {len(products):,} total)")
-        st.dataframe(df[show_cols].head(limit),
-                     width="stretch", height=560)
+    render_product_master(
+        products=products,
+        rows_selector=rows_selector,
+        parent_sku_for=parent_sku_for,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -11121,97 +10672,14 @@ elif page == "Product Master":
 # ---------------------------------------------------------------------------
 
 elif page == "Purchase Analysis":
-    st.header(":truck: Purchase Analysis")
-
-    if purchase_lines.empty:
-        st.warning("No purchase line data. Run `python cin7_sync.py "
-                   "purchaselines --days 90`.")
-    else:
-        # v2.67.206 — same correctness fixes as Recent Sales
-        # (v2.67.205). `purchase_lines` is the longest window
-        # available (up to 5 years), NOT 90 days as the header
-        # implied. Filters: user-selected window + exclude
-        # VOIDED/CANCELLED so the figures represent real spend.
-        df = purchase_lines.copy()
-        df["Total"] = _to_num(df["Total"]).fillna(0)
-        df["Quantity"] = _to_num(df["Quantity"]).fillna(0)
-        df["OrderDate"] = _to_date(df["OrderDate"]).dt.tz_localize(None)
-
-        col_w, _ = st.columns([1, 3])
-        with col_w:
-            _window_days = st.selectbox(
-                "Window", [90, 30, 7, 365, 1825],
-                index=0, key="pa_window_days",
-                format_func=lambda d: f"Last {d} days"
-                    if d <= 365 else "Last 5 years (all)")
-
-        # Filter to window.
-        _cutoff = (pd.Timestamp(datetime.now().date())
-                      - pd.Timedelta(days=int(_window_days)))
-        df = df[df["OrderDate"] >= _cutoff]
-
-        # Exclude voided / cancelled / draft.
-        n_before_status = len(df)
-        if "Status" in df.columns:
-            bad_statuses = ("VOIDED", "CANCELLED", "CANCELED",
-                              "DRAFT")
-            df = df[~df["Status"].astype(str).str.upper().isin(
-                bad_statuses)]
-        n_dropped_status = n_before_status - len(df)
-
-        st.caption(
-            f"Showing purchase lines for the last "
-            f"{_window_days} days · excludes voided/"
-            f"cancelled/draft ({n_dropped_status:,} dropped). "
-            "Window selector above changes the period.")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Line items", _fmt_number(len(df)))
-        c2.metric("Distinct POs", _fmt_number(df["PurchaseID"].nunique()))
-        c3.metric("Distinct SKUs", _fmt_number(df["SKU"].nunique()))
-        c4.metric("Total value", _fmt_money(df["Total"].sum()))
-
-        tab_sup, tab_sku, tab_po = st.tabs(
-            ["By supplier", "Top SKUs", "Recent POs"])
-
-        with tab_sup:
-            by_sup = (
-                df.groupby("Supplier", dropna=False)
-                  .agg(POs=("PurchaseID", "nunique"),
-                       Lines=("SKU", "count"),
-                       SKUs=("SKU", "nunique"),
-                       Value=("Total", "sum"))
-                  .sort_values("Value", ascending=False)
-            )
-            limit = rows_selector(key="pa_sup_rows")
-            st.caption(f"Showing {min(limit, len(by_sup)):,} of {len(by_sup):,} suppliers")
-            st.dataframe(by_sup.head(limit), width="stretch")
-
-        with tab_sku:
-            by_sku = (
-                df.groupby(["SKU", "Name"], dropna=False)
-                  .agg(Qty=("Quantity", "sum"),
-                       Value=("Total", "sum"),
-                       POs=("PurchaseID", "nunique"))
-                  .sort_values("Value", ascending=False)
-            )
-            limit = rows_selector(key="pa_sku_rows")
-            st.caption(f"Showing {min(limit, len(by_sku)):,} of {len(by_sku):,} SKUs")
-            st.dataframe(by_sku.head(limit), width="stretch")
-
-        with tab_po:
-            po_summary = (
-                df.groupby(["PurchaseID", "OrderNumber", "OrderDate",
-                            "Supplier", "Status"], dropna=False)
-                  .agg(Lines=("SKU", "count"),
-                       Value=("Total", "sum"))
-                  .reset_index()
-                  .sort_values("OrderDate", ascending=False)
-            )
-            limit = rows_selector(key="pa_po_rows")
-            st.caption(f"Showing {min(limit, len(po_summary)):,} of {len(po_summary):,} POs")
-            st.dataframe(po_summary.head(limit),
-                         width="stretch", height=560)
+    render_purchase_analysis(
+        purchase_lines=purchase_lines,
+        to_num=_to_num,
+        to_date=_to_date,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
+        rows_selector=rows_selector,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -11219,129 +10687,14 @@ elif page == "Purchase Analysis":
 # ---------------------------------------------------------------------------
 
 elif page == "Sales Recent":
-    st.header(":moneybag: Recent Sales")
-
-    if sale_lines.empty:
-        st.warning("No sale line data. Run `python cin7_sync.py "
-                   "salelines --days 30`.")
-    else:
-        # v2.67.205 — three correctness fixes so the figures here
-        # correlate with Monthly Metrics and the rest of the app:
-        #   1. The `sale_lines` variable is the LONGEST window
-        #      available (up to 5 years), not 30 days. The
-        #      previous caption ("Showing for the last 30 days")
-        #      lied — the metrics were summing the whole window.
-        #      Now we actually filter to the user-selected window.
-        #   2. Exclude VOIDED / CREDITED / CANCELLED rows. Matches
-        #      Monthly Metrics (Status filter on line 14524) so
-        #      sales-team commissions and Recent Sales agree.
-        #   3. Exclude shipping/freight line items. Real revenue
-        #      is product revenue; shipping charges are separately
-        #      reported on Monthly Metrics → Margins.
-        df = sale_lines.copy()
-        df["Total"] = _to_num(df["Total"]).fillna(0)
-        df["Quantity"] = _to_num(df["Quantity"]).fillna(0)
-        df["InvoiceDate"] = _to_date(df["InvoiceDate"]).dt.tz_localize(None)
-
-        # Window selector — user picks how many days back.
-        col_w, col_status = st.columns([1, 3])
-        with col_w:
-            _window_days = st.selectbox(
-                "Window", [30, 7, 90, 365, 1825],
-                index=0, key="sr_window_days",
-                format_func=lambda d: f"Last {d} days"
-                    if d <= 365 else "Last 5 years (all)")
-
-        # Filter to window.
-        _cutoff = (pd.Timestamp(datetime.now().date())
-                      - pd.Timedelta(days=int(_window_days)))
-        df = df[df["InvoiceDate"] >= _cutoff]
-
-        # Filter out booked-but-not-kept sales.
-        n_before_status = len(df)
-        if "Status" in df.columns:
-            bad_statuses = ("VOIDED", "CREDITED", "CANCELLED",
-                              "CANCELED")
-            df = df[~df["Status"].astype(str).str.upper().isin(
-                bad_statuses)]
-        n_dropped_status = n_before_status - len(df)
-
-        # Exclude shipping-charge line items (matches the way
-        # Monthly Metrics splits sl_prod vs sl_ship).
-        _ship_sku_pats = (
-            "SHIPPING", "FREIGHT", "DELIVERY", "POSTAGE",
-            "COURIER", "HANDLING")
-        sku_str = df["SKU"].fillna("").astype(str).str.upper()
-        name_str = df["Name"].fillna("").astype(str).str.upper()
-        is_ship = pd.Series(False, index=df.index)
-        for pat in _ship_sku_pats:
-            is_ship = is_ship | sku_str.str.startswith(pat)
-            is_ship = is_ship | name_str.str.contains(
-                pat, regex=False, na=False)
-        n_ship = int(is_ship.sum())
-        df = df[~is_ship]
-
-        st.caption(
-            f"Showing **product** sale lines for the last "
-            f"{_window_days} days · "
-            f"excludes voided/credited/cancelled "
-            f"({n_dropped_status:,} dropped) · "
-            f"excludes shipping/freight line items "
-            f"({n_ship:,} dropped). "
-            "These filters match the Monthly Metrics sales "
-            "row so the figures correlate.")
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Line items", _fmt_number(len(df)))
-        c2.metric("Distinct sales", _fmt_number(df["SaleID"].nunique()))
-        c3.metric("Distinct SKUs", _fmt_number(df["SKU"].nunique()))
-        c4.metric("Product revenue", _fmt_money(df["Total"].sum()))
-
-        # Optional filter by SaleType if present
-        if "SaleType" in df.columns:
-            types = sorted(df["SaleType"].dropna().unique().tolist())
-            sel_types = st.multiselect("Sale type", types, default=types)
-            if sel_types:
-                df = df[df["SaleType"].isin(sel_types)]
-
-        tab_sku, tab_cust, tab_lines = st.tabs(
-            ["Top SKUs", "Top customers", "Recent lines"])
-
-        with tab_sku:
-            by_sku = (
-                df.groupby(["SKU", "Name"], dropna=False)
-                  .agg(Qty=("Quantity", "sum"),
-                       Revenue=("Total", "sum"),
-                       Orders=("SaleID", "nunique"))
-                  .sort_values("Revenue", ascending=False)
-            )
-            limit = rows_selector(key="sr_sku_rows")
-            st.caption(f"Showing {min(limit, len(by_sku)):,} of {len(by_sku):,} SKUs")
-            st.dataframe(by_sku.head(limit), width="stretch")
-
-        with tab_cust:
-            by_cust = (
-                df.groupby(["CustomerID", "Customer"], dropna=False)
-                  .agg(Orders=("SaleID", "nunique"),
-                       Lines=("SKU", "count"),
-                       Revenue=("Total", "sum"))
-                  .sort_values("Revenue", ascending=False)
-            )
-            limit = rows_selector(key="sr_cust_rows")
-            st.caption(f"Showing {min(limit, len(by_cust)):,} of {len(by_cust):,} customers")
-            st.dataframe(by_cust.head(limit), width="stretch")
-
-        with tab_lines:
-            recent = (df.sort_values("InvoiceDate", ascending=False)
-                      [["InvoiceDate", "OrderNumber", "Customer",
-                        "SKU", "Name", "Quantity", "Price", "Total", "Status"]])
-            limit = rows_selector(key="sr_lines_rows")
-            st.caption(f"Showing {min(limit, len(recent)):,} of {len(recent):,} lines")
-            st.dataframe(
-                recent.head(limit),
-                width="stretch",
-                height=560,
-            )
+    render_sales_recent(
+        sale_lines=sale_lines,
+        to_num=_to_num,
+        to_date=_to_date,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
+        rows_selector=rows_selector,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -14325,7 +13678,7 @@ elif page == "Ordering":
 
     # Load saved layout for the current user (falls back to 'default').
     _layout_user = st.session_state.get("current_user", "").strip() or "default"
-    _layout_view = "ordering_po_editor"
+    _layout_view = ORDERING_PO_EDITOR_VIEW
     saved_layout = db.get_column_layout(_layout_user, _layout_view)
     if saved_layout:
         # Keep only columns that still exist in the engine output, preserving
@@ -22862,190 +22215,11 @@ elif page == "Slow Movers":
 # ---------------------------------------------------------------------------
 
 elif page == "My Profile":
-    st.header("👤 My Profile")
-    st.caption(
-        "Your profile is loaded automatically when you sign in. "
-        "Edit your role, default landing page, or email below. "
-        "Admins can manage other users via the panel at the bottom.")
-
-    _me = current_user_profile or {}
-    _is_admin = (_me.get("role") == "admin")
-    # v2.67.207 — super-admin check for THIS user.
-    _me_is_super = db.is_super_admin(
-        _me.get("display_name") or "", _me.get("role") or "")
-
-    if not _me:
-        st.warning(
-            "No profile loaded. Sign out and sign back in via the "
-            "sidebar.")
-    else:
-        with st.form("_my_profile_form", clear_on_submit=False):
-            st.markdown(f"**Display name:** `{_me.get('display_name')}` "
-                         f"(set at sign-in; cannot be edited here — "
-                         f"sign out and back in with a different name "
-                         f"to switch identity)")
-            # v2.67.207 — role is NOT self-editable. Letting any
-            # user pick their own role from a dropdown (including
-            # super_admin) is a privilege-escalation hole. Only
-            # super-admins can change roles, and they do it on
-            # the User Permissions page. Here the role is shown
-            # read-only; _new_role passes the EXISTING role
-            # through unchanged on save.
-            _new_role = _me.get("role") or db.DEFAULT_NEW_USER_ROLE
-            st.markdown(
-                f"**Role:** `{_new_role}` "
-                + ("— you're a super-admin; change roles on the "
-                    "User Permissions page."
-                    if _me_is_super
-                    else "— role changes are made by a "
-                          "super-admin on the User Permissions "
-                          "page."))
-            _new_email = st.text_input(
-                "Email (optional)",
-                value=_me.get("email") or "",
-                placeholder="you@w4susa.com")
-            _new_default_page = st.selectbox(
-                "Default landing page",
-                options=["(none)"] + _page_options,
-                index=(_page_options.index(_me.get("default_page")) + 1
-                       if _me.get("default_page") in _page_options
-                       else 0),
-                help="When you sign in, jump straight to this page "
-                     "instead of Overview.")
-            _save_profile = st.form_submit_button(
-                "💾 Save profile",
-                type="primary", width="stretch")
-
-        if _save_profile:
-            try:
-                _final_default = (None
-                                   if _new_default_page == "(none)"
-                                   else _new_default_page)
-                db.upsert_user(
-                    display_name=_me.get("display_name"),
-                    role=_new_role,
-                    email=_new_email.strip() or None,
-                    active=True,
-                    default_page=_final_default,
-                    actor=_me.get("display_name"))
-                # Refresh the session profile so the change reflects
-                # immediately without a re-sign-in.
-                _refreshed = db.get_user_by_name(
-                    _me.get("display_name"))
-                if _refreshed is not None:
-                    st.session_state["current_user_profile"] = {
-                        "user_id": int(_refreshed["user_id"]),
-                        "display_name": _refreshed["display_name"],
-                        "role": _refreshed["role"],
-                        "email": _refreshed["email"],
-                        "default_page": _refreshed["default_page"],
-                        "active": bool(_refreshed["active"]),
-                    }
-                st.success(":white_check_mark: Profile saved.")
-                st.rerun()
-            except Exception as _e:
-                st.error(f"Save failed: {_e}")
-
-    # ---- Connect Slack for Viktor bridge (v2.67.126) ----
-    # Slack apps universally filter messages with bot_id set, so
-    # our bot can't @-mention Viktor on the user's behalf. The
-    # workaround: the user authorises the dashboard to post to
-    # Slack AS THEM, then dashboard-initiated marketing questions
-    # get forwarded to Viktor as a real-human message that Viktor
-    # will respond to. Viktor's reply is then pulled back into
-    # the dashboard with our engine-signal overlay.
-    if _me.get("user_id"):
-        st.divider()
-        st.subheader("📡 Connect Slack (for Viktor)")
-        st.caption(
-            "Authorise the dashboard to ask Viktor on your behalf "
-            "when you ask marketing questions here. One-time "
-            "OAuth — no passwords stored, just a scoped Slack "
-            "token (encrypted at rest). Disconnect any time below.")
-        try:
-            import slack_oauth as _slack_oauth_ui
-            _connected = _slack_oauth_ui.is_user_connected(
-                _me["user_id"])
-        except Exception as _exc:  # noqa: BLE001
-            _connected = False
-            st.warning(
-                f"Slack OAuth module not configured: {_exc}")
-        if _connected:
-            try:
-                _slack_uid = _slack_oauth_ui.get_user_slack_id(
-                    _me["user_id"])
-            except Exception:
-                _slack_uid = None
-            st.success(
-                f":white_check_mark: Connected"
-                f"{f' as `<@{_slack_uid}>`' if _slack_uid else ''}. "
-                f"Marketing questions in the AI Assistant will be "
-                f"forwarded to Viktor on your behalf.")
-            if st.button(
-                    ":electric_plug: Disconnect Slack",
-                    key="_disconnect_slack",
-                    help="Revoke the dashboard's permission to post "
-                          "as you. You can reconnect any time."):
-                try:
-                    _slack_oauth_ui.disconnect_user(_me["user_id"])
-                    st.success("Disconnected.")
-                    st.rerun()
-                except Exception as _exc:  # noqa: BLE001
-                    st.error(f"Disconnect failed: {_exc}")
-        else:
-            # Show the connect button. Generate a fresh state token
-            # each render so refreshes don't reuse the same nonce.
-            try:
-                import secrets as _secrets
-                _state = _secrets.token_urlsafe(24)
-                st.session_state["_slack_oauth_state"] = _state
-                _auth_url = _slack_oauth_ui.build_authorize_url(_state)
-                st.markdown(
-                    f"[🔗 **Connect Slack** "
-                    f"(opens Slack to authorise)]({_auth_url})")
-                st.caption(
-                    "Required Slack-app config (one-time, see "
-                    "slack_oauth.py docstring): User Token Scopes "
-                    "must include `chat:write`, and the Redirect "
-                    "URL must match this dashboard's URL.")
-            except Exception as _exc:  # noqa: BLE001
-                st.error(
-                    f"Connect button unavailable: {_exc}. The "
-                    f"admin needs to set SLACK_OAUTH_CLIENT_ID, "
-                    f"SLACK_OAUTH_CLIENT_SECRET, "
-                    f"SLACK_OAUTH_REDIRECT_URI, and "
-                    f"SLACK_USER_TOKEN_ENCRYPTION_KEY env vars.")
-
-    # ---- Admin: manage other users ----
-    if _is_admin:
-        st.divider()
-        st.subheader(":shield: Admin — all users")
-        try:
-            _all_users = db.list_users(active_only=False)
-        except Exception as _e:
-            _all_users = []
-            st.error(f"Could not load users: {_e}")
-        if _all_users:
-            st.dataframe(
-                pd.DataFrame([
-                    {
-                        "user_id": u["user_id"],
-                        "display_name": u["display_name"],
-                        "role": u["role"],
-                        "email": u["email"] or "",
-                        "active": bool(u["active"]),
-                        "default_page": u["default_page"] or "",
-                        "created_at": str(u["created_at"]),
-                        "updated_at": str(u["updated_at"]),
-                    } for u in _all_users
-                ]),
-                width="stretch", height=300)
-            st.caption(
-                "To edit another user, ask them to sign in and "
-                "update their own profile, OR add a per-user "
-                "edit form here in a follow-up version. "
-                "Deactivating users is also future work.")
-
+    render_my_profile(
+        current_user_profile=current_user_profile,
+        page_options=_page_options,
+        db_module=db,
+    )
 
 # ---------------------------------------------------------------------------
 # Page: AI Feedback — review thumbs-down chats and turn corrections into
@@ -24042,64 +23216,21 @@ list of fields that changed and your `current_user` as actor.
 # ---------------------------------------------------------------------------
 
 elif page == "Data Health":
-    st.header(":stethoscope: Data Health")
-
-    datasets = [
-        ("Products",           "products",                len(products)),
-        ("Stock on hand",      "stock_on_hand",           len(stock)),
-        ("Customers",          "customers",               None),
-        ("Suppliers",          "suppliers",               len(suppliers)),
-        ("Sales headers (30d)", "sales_last_30d",         len(sales_headers)),
-        ("Purchase headers (30d)", "purchases_last_30d",  len(purchase_headers)),
-        ("Sale lines (30d)",   "sale_lines_last_30d",     len(sale_lines_30d)),
-        ("Sale lines (3d)",    "sale_lines_last_3d",      len(sale_lines_3d)),
-        ("Purchase lines (90d)", "purchase_lines_last_90d", len(purchase_lines)),
-        ("Stock adjustments (30d)", "stock_adjustments_last_30d",
-         len(stock_adjustments)),
-        ("Stock transfers (30d)", "stock_transfers_last_30d",
-         len(stock_transfers)),
-    ]
-
-    rows = []
-    for label, prefix, rowcount in datasets:
-        # mt = mtime of the latest CSV with this prefix, or None if none.
-        # Was previously a NameError — the variable was never defined.
-        mt = file_mtime(prefix)
-        rows.append({
-            "Dataset": label,
-            "File prefix": prefix,
-            "Rows": rowcount if rowcount is not None else "—",
-            "Last sync": mt.strftime("%Y-%m-%d %H:%M") if mt else "never",
-            "Age (hours)":
-                f"{(datetime.now() - mt).total_seconds() / 3600:.1f}"
-                if mt else "—",
-        })
-    st.dataframe(pd.DataFrame(rows), width="stretch", height=460)
-
-    st.subheader("Expected sync commands")
-    st.code(
-        "# Daily quick refresh (masters + headers)\n"
-        "python cin7_sync.py quick --days 7\n\n"
-        "# Weekly line-level refresh\n"
-        "python cin7_sync.py salelines --days 7\n"
-        "python cin7_sync.py purchaselines --days 30\n"
-        "python cin7_sync.py movements --days 30\n\n"
-        "# Full 12-month bootstrap (once, overnight)\n"
-        "python cin7_sync.py salelines --days 365\n",
-        language="powershell",
-    )
-
-    st.subheader("What's coming in later phases")
-    st.markdown(
-        "- **DuckDB warehouse** — replace CSV loads with proper analytical DB.\n"
-        "- **ABC Explorer** — hybrid value+qty classification per your policy.\n"
-        "- **Reorder Queue** — SKUs hitting ROP, grouped by supplier with MOV check.\n"
-        "- **Slow Movers** — class-aware slow-moving flags with team review.\n"
-        "- **Maturing Items** — 0–120 day SKUs with early demand signals.\n"
-        "- **Policy Tuner** — team-editable thresholds with audit log.\n"
-        "- **Team Actions** — flags, notes, approvals shared across users (SQLite).\n"
-        "- **Auth + hosted URL** — public link with login for remote team members.\n"
-    )
+    render_data_health({
+        "products": len(products),
+        "stock_on_hand": len(stock),
+        "suppliers": len(suppliers),
+        "sales_last_30d": len(sales_headers),
+        "purchases_last_30d": len(purchase_headers),
+        "sale_lines_last_30d": len(sale_lines_30d),
+        "sale_lines_last_3d": len(sale_lines_3d),
+        "purchase_lines_last_90d": len(purchase_lines),
+        "stock_adjustments_last_30d": len(stock_adjustments),
+        "stock_transfers_last_30d": len(stock_transfers),
+        "shipments_last_30d": len(shipments),
+        "shopify_orders_last_30d": len(shopify_orders),
+        "engine_output": "—",
+    })
 
 
 # ---------------------------------------------------------------------------
