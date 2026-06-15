@@ -229,4 +229,13 @@ def compute_engine_signals(products: pd.DataFrame,
         int(df["is_dormant"].sum()),
         int((df["excess_units"] > 0).sum()))
 
+    # v2.67.371 - ensure storage_dim is always present so ai_tools
+    # never sees a KeyError. The column is written by sync_products
+    # (v2.67.369); if the products CSV pre-dates that change the
+    # column is simply absent from the DataFrame.
+    if "storage_dim" not in df.columns:
+        df["storage_dim"] = ""
+    else:
+        df["storage_dim"] = df["storage_dim"].fillna("")
+
     return df

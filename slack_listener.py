@@ -1370,6 +1370,11 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
                 stock[stock_cols], on="SKU", how="left")
             if "AdditionalAttribute1" in engine_df.columns:
                 engine_df["Family"] = engine_df["AdditionalAttribute1"]
+            # v2.67.371 - ensure storage_dim present in fallback path
+            if "storage_dim" not in engine_df.columns:
+                engine_df["storage_dim"] = ""
+            else:
+                engine_df["storage_dim"] = engine_df["storage_dim"].fillna("")
 
         # Wire up purchase-line / shipment / shopify holders for the
         # AI tools that need them.
