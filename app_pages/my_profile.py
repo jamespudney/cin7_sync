@@ -2,8 +2,23 @@
 
 from __future__ import annotations
 
+import os
+
 import pandas as pd
 import streamlit as st
+
+
+SLACK_OAUTH_ENV_VARS = (
+    "SLACK_OAUTH_CLIENT_ID",
+    "SLACK_OAUTH_CLIENT_SECRET",
+    "SLACK_OAUTH_REDIRECT_URI",
+    "SLACK_USER_TOKEN_ENCRYPTION_KEY",
+)
+
+
+def missing_slack_oauth_env_vars() -> list[str]:
+    return [name for name in SLACK_OAUTH_ENV_VARS
+            if not os.environ.get(name, "").strip()]
 
 
 def render_my_profile(*, current_user_profile, page_options, db_module) -> None:
@@ -82,61 +97,72 @@ def render_my_profile(*, current_user_profile, page_options, db_module) -> None:
                 st.error(f"Save failed: {exc}")
 
     if me.get("user_id"):
-        st.divider()
-        st.subheader("📡 Connect Slack (for Viktor)")
-        st.caption(
-            "Authorise the dashboard to ask Viktor on your behalf "
-            "when you ask marketing questions here. One-time "
-            "OAuth — no passwords stored, just a scoped Slack "
-            "token (encrypted at rest). Disconnect any time below.")
-        try:
-            import slack_oauth as slack_oauth_ui
-            connected = slack_oauth_ui.is_user_connected(me["user_id"])
-        except Exception as exc:  # noqa: BLE001
-            connected = False
-            st.warning(f"Slack OAuth module not configured: {exc}")
-        if connected:
-            try:
-                slack_uid = slack_oauth_ui.get_user_slack_id(me["user_id"])
-            except Exception:  # noqa: BLE001
-                slack_uid = None
-            st.success(
-                f":white_check_mark: Connected"
-                f"{f' as `<@{slack_uid}>`' if slack_uid else ''}. "
-                f"Marketing questions in the AI Assistant will be "
-                f"forwarded to Viktor on your behalf.")
-            if st.button(
-                    ":electric_plug: Disconnect Slack",
-                    key="_disconnect_slack",
-                    help="Revoke the dashboard's permission to post "
-                         "as you. You can reconnect any time."):
-                try:
-                    slack_oauth_ui.disconnect_user(me["user_id"])
-                    st.success("Disconnected.")
-                    st.rerun()
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Disconnect failed: {exc}")
+        missing_oauth_env = missing_slack_oauth_env_vars()
+        if missing_oauth_env:
+            if is_admin or me_is_super:
+                st.divider()
+                with st.expander(
+                        "Slack OAuth for Viktor is not configured",
+                        expanded=False):
+                    st.info(
+                        "This optional setup lets the dashboard post "
+                        "marketing questions to Slack as the signed-in "
+                        "user. The normal Slack bot still works without it.")
+                    st.caption(
+                        "Set these Render environment variables to enable "
+                        "the Connect Slack button:")
+                    st.code("\n".join(missing_oauth_env), language="text")
         else:
+            st.divider()
+            st.subheader("📡 Connect Slack (for Viktor)")
+            st.caption(
+                "Authorise the dashboard to ask Viktor on your behalf "
+                "when you ask marketing questions here. One-time "
+                "OAuth — no passwords stored, just a scoped Slack "
+                "token (encrypted at rest). Disconnect any time below.")
             try:
-                import secrets as secrets_module
-                state = secrets_module.token_urlsafe(24)
-                st.session_state["_slack_oauth_state"] = state
-                auth_url = slack_oauth_ui.build_authorize_url(state)
-                st.markdown(
-                    f"[🔗 **Connect Slack** "
-                    f"(opens Slack to authorise)]({auth_url})")
-                st.caption(
-                    "Required Slack-app config (one-time, see "
-                    "slack_oauth.py docstring): User Token Scopes "
-                    "must include `chat:write`, and the Redirect "
-                    "URL must match this dashboard's URL.")
+                import slack_oauth as slack_oauth_ui
+                connected = slack_oauth_ui.is_user_connected(me["user_id"])
             except Exception as exc:  # noqa: BLE001
-                st.error(
-                    f"Connect button unavailable: {exc}. The "
-                    f"admin needs to set SLACK_OAUTH_CLIENT_ID, "
-                    f"SLACK_OAUTH_CLIENT_SECRET, "
-                    f"SLACK_OAUTH_REDIRECT_URI, and "
-                    f"SLACK_USER_TOKEN_ENCRYPTION_KEY env vars.")
+                connected = False
+                st.warning(f"Slack OAuth module not configured: {exc}")
+            if connected:
+                try:
+                    slack_uid = slack_oauth_ui.get_user_slack_id(me["user_id"])
+                except Exception:  # noqa: BLE001
+                    slack_uid = None
+                st.success(
+                    f":white_check_mark: Connected"
+                    f"{f' as `<@{slack_uid}>`' if slack_uid else ''}. "
+                    f"Marketing questions in the AI Assistant will be "
+                    f"forwarded to Viktor on your behalf.")
+                if st.button(
+                        ":electric_plug: Disconnect Slack",
+                        key="_disconnect_slack",
+                        help="Revoke the dashboard's permission to post "
+                             "as you. You can reconnect any time."):
+                    try:
+                        slack_oauth_ui.disconnect_user(me["user_id"])
+                        st.success("Disconnected.")
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Disconnect failed: {exc}")
+            else:
+                try:
+                    import secrets as secrets_module
+                    state = secrets_module.token_urlsafe(24)
+                    st.session_state["_slack_oauth_state"] = state
+                    auth_url = slack_oauth_ui.build_authorize_url(state)
+                    st.markdown(
+                        f"[🔗 **Connect Slack** "
+                        f"(opens Slack to authorise)]({auth_url})")
+                    st.caption(
+                        "Required Slack-app config (one-time, see "
+                        "slack_oauth.py docstring): User Token Scopes "
+                        "must include `chat:write`, and the Redirect "
+                        "URL must match this dashboard's URL.")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Connect button unavailable: {exc}.")
 
     if is_admin:
         st.divider()
@@ -166,4 +192,3 @@ def render_my_profile(*, current_user_profile, page_options, db_module) -> None:
                 "update their own profile, OR add a per-user "
                 "edit form here in a follow-up version. "
                 "Deactivating users is also future work.")
-
