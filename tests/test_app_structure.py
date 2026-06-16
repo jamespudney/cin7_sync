@@ -338,6 +338,27 @@ class IncomingStockTests(unittest.TestCase):
             {"PO-7071", "PO-7210"})
         self.assertIn("OnOrder", result["formatting_guidance"])
 
+    def test_stock_position_uses_stock_locator_as_bin_alias(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "OnHand": 133.75,
+            "Allocated": 29,
+            "Available": 104.75,
+            "OnOrder": 160,
+            "StockLocator": "D29B",
+            "ABC": "A",
+            "trend_flag": "Trend",
+            "is_dormant": False,
+        }])
+
+        ai_tools.set_purchase_lines(pd.DataFrame())
+        result = ai_tools.get_stock_position(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertEqual(result["stock"]["bin"], "D29B")
+
 
 class SkuRuleTests(unittest.TestCase):
     def test_sourcing_rule_parses_purchase_and_assembly_logic(self) -> None:
