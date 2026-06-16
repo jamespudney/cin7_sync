@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import ai_tools
+import worker_engine
 from app_config import (
     PAGE_CAPTIONS,
     PAGE_DESCRIPTIONS,
@@ -358,6 +359,43 @@ class IncomingStockTests(unittest.TestCase):
             engine_df, pd.DataFrame(), {"sku": sku})
 
         self.assertEqual(result["stock"]["bin"], "D29B")
+
+    def test_stock_position_skips_blank_bin_for_stock_locator(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "OnHand": 133.75,
+            "Available": 104.75,
+            "OnOrder": 160,
+            "Bin": "",
+            "StockLocator": "D29B",
+        }])
+
+        ai_tools.set_purchase_lines(pd.DataFrame())
+        result = ai_tools.get_stock_position(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertEqual(result["stock"]["bin"], "D29B")
+
+    def test_worker_engine_normalises_stock_locator_to_bin(self) -> None:
+        sku = "LED-89030021-2"
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "AverageCost": 1.0,
+        }])
+        stock = pd.DataFrame([{
+            "SKU": sku,
+            "OnHand": 133.75,
+            "Bin": "",
+            "StockLocator": "D29B",
+        }])
+
+        result = worker_engine.compute_engine_signals(
+            products, stock, pd.DataFrame())
+
+        self.assertEqual(result.iloc[0]["Bin"], "D29B")
 
 
 class SkuRuleTests(unittest.TestCase):
