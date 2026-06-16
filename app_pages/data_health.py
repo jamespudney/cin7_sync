@@ -45,13 +45,21 @@ def render_data_health(row_counts: dict[str, object]) -> None:
 
     st.subheader("Expected sync commands")
     st.code(
-        "# Daily quick refresh (masters + headers)\n"
-        "python cin7_sync.py quick --days 7\n\n"
-        "# Weekly line-level refresh\n"
-        "python cin7_sync.py salelines --days 7\n"
+        "# Near-real-time refresh\n"
+        "python cin7_sync.py nearsync --days 1\n"
+        "python warm_engine.py\n\n"
+        "# Daily refresh\n"
+        "python cin7_sync.py quick --days 3\n"
+        "python cin7_sync.py sales --days 30\n"
+        "python cin7_sync.py purchases --days 30\n"
+        "python cin7_sync.py salelines --days 30\n"
         "python cin7_sync.py purchaselines --days 30\n"
-        "python cin7_sync.py movements --days 30\n\n"
-        "# Full 12-month bootstrap (once, overnight)\n"
+        "python cin7_sync.py stockadjustments --days 30\n"
+        "python cin7_sync.py stocktransfers --days 30\n"
+        "python ip_pull_alternates.py\n"
+        "python shopify_sync.py\n"
+        "python warm_engine.py\n\n"
+        "# Full 12-month bootstrap (manual, overnight)\n"
         "python cin7_sync.py salelines --days 365\n",
         language="powershell",
     )

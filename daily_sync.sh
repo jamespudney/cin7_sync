@@ -51,6 +51,13 @@ echo "[$(stamp)] cin7_sync sales --days 30" >> "$LOG"
 python cin7_sync.py sales --days 30 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync sales --days 30 FAILED (continuing)" >> "$LOG"
 
+# Purchase headers feed open-PO visibility and auto-finalization. `quick`
+# only pulls the 3-day window, but the dashboard expects the 30-day
+# snapshot too.
+echo "[$(stamp)] cin7_sync purchases --days 30" >> "$LOG"
+python cin7_sync.py purchases --days 30 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync purchases --days 30 FAILED (continuing)" >> "$LOG"
+
 # Sale lines feed the ABC engine, customer rollups, velocity. The
 # `quick` sync above pulls sale headers but NOT line items. Without
 # this incremental pull, line-level data goes stale by ~1 day per day.
@@ -72,6 +79,17 @@ python cin7_sync.py salelines --days 30 >> "$LOG" 2>&1 || \
 echo "[$(stamp)] cin7_sync purchaselines --days 30" >> "$LOG"
 python cin7_sync.py purchaselines --days 30 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync purchaselines FAILED (continuing)" >> "$LOG"
+
+# Product Detail and AI stock-audit answers use the 30-day movement
+# window. Nearsync keeps 1-day movement files hot; this keeps the wider
+# movement context fresh once per day.
+echo "[$(stamp)] cin7_sync stockadjustments --days 30" >> "$LOG"
+python cin7_sync.py stockadjustments --days 30 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync stockadjustments FAILED (continuing)" >> "$LOG"
+
+echo "[$(stamp)] cin7_sync stocktransfers --days 30" >> "$LOG"
+python cin7_sync.py stocktransfers --days 30 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync stocktransfers FAILED (continuing)" >> "$LOG"
 
 echo "[$(stamp)] sync_sku_renames" >> "$LOG"
 python sync_sku_renames.py --apply >> "$LOG" 2>&1 || \
@@ -104,6 +122,17 @@ if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
       echo "[$(stamp)] shopify_orders_recent FAILED (continuing)" >> "$LOG"
 else
     echo "[$(stamp)] shopify_sync skipped (env vars not set)" >> "$LOG"
+fi
+
+# Inventory Planner buyer notes and alternates are curated team knowledge
+# used by PO commentary and migration/compatibility workflows.
+if [ -n "${IP_API_KEY:-}" ] && [ -n "${IP_ACCOUNT:-}" ]; then
+    echo "[$(stamp)] ip_pull_alternates" >> "$LOG"
+    python ip_pull_alternates.py >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] ip_pull_alternates FAILED (continuing)" >> "$LOG"
+else
+    echo "[$(stamp)] ip_pull_alternates skipped (IP env vars unset)" \
+      >> "$LOG"
 fi
 
 # v2.67.54 — ShipStation sync. Recent catch-up keeps the rolling

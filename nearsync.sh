@@ -18,6 +18,12 @@ python cin7_sync.py nearsync --days 1 >> "$LOG" 2>&1
 RC=$?
 if [ "$RC" -eq 0 ]; then
   echo "[$(stamp)] nearsync done (ok)" >> "$LOG"
+  if [ "${WARM_ENGINE_AFTER_NEARSYNC:-1}" = "1" ]; then
+    echo "[$(stamp)] warm_engine after nearsync" >> "$LOG"
+    python warm_engine.py >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] warm_engine after nearsync FAILED (continuing)" \
+        >> "$LOG"
+  fi
 else
   echo "[$(stamp)] nearsync exited rc=$RC" >> "$LOG"
 fi

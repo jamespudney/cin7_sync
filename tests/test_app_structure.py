@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from app_config import (
     PAGE_CAPTIONS,
@@ -11,6 +12,10 @@ from app_config import (
     PAGE_GROUP_BY_NAME,
     PAGE_GROUPS,
     PAGE_OPTIONS,
+)
+from app_pages.my_profile import (
+    SLACK_OAUTH_ENV_VARS,
+    missing_slack_oauth_env_vars,
 )
 from app_pages.ordering_layout import ORDERING_PO_EDITOR_VIEW
 from data_catalog import DatasetSpec, catalog_rows, latest_file
@@ -26,6 +31,17 @@ from engine.sku_rules import (
 class PageConfigTests(unittest.TestCase):
     def test_ordering_column_preferences_keep_stable_view_key(self) -> None:
         self.assertEqual(ORDERING_PO_EDITOR_VIEW, "ordering_po_editor")
+
+    def test_missing_slack_oauth_env_vars_reports_optional_setup(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                missing_slack_oauth_env_vars(),
+                list(SLACK_OAUTH_ENV_VARS),
+            )
+
+        configured = {name: "set" for name in SLACK_OAUTH_ENV_VARS}
+        with patch.dict("os.environ", configured, clear=True):
+            self.assertEqual(missing_slack_oauth_env_vars(), [])
 
     def test_page_metadata_is_consistent(self) -> None:
         self.assertEqual(len(PAGE_OPTIONS), len(PAGE_CAPTIONS))
