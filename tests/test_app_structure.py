@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
+
+import ai_tools
 from app_config import (
     PAGE_CAPTIONS,
     PAGE_DESCRIPTIONS,
@@ -102,6 +105,163 @@ class DataCatalogTests(unittest.TestCase):
                 output_dir=root,
             )
             self.assertEqual(missing[0]["Status"], "missing")
+
+
+class IncomingStockTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        ai_tools.set_purchase_lines(pd.DataFrame())
+
+    def test_incoming_stock_excludes_fully_received_po_balance(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "OnOrder": 160,
+            "OnHand": 133.75,
+        }])
+        purchase_lines = pd.DataFrame([
+            {
+                "PurchaseID": "6816",
+                "OrderNumber": "PO-6816",
+                "RequiredBy": "2026-05-03",
+                "Status": "INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 120,
+                "Price": 6.5,
+                "Total": 780,
+            },
+            {
+                "PurchaseID": "6816",
+                "OrderNumber": "PO-6816",
+                "RequiredBy": "2026-05-03",
+                "Status": "INVOICED-Received",
+                "ReceivedDate": "2026-05-06",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 120,
+            },
+            {
+                "PurchaseID": "7071",
+                "OrderNumber": "PO-7071",
+                "RequiredBy": "2026-06-18",
+                "Status": "INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 80,
+            },
+            {
+                "PurchaseID": "7210",
+                "OrderNumber": "PO-7210",
+                "RequiredBy": "2026-07-16",
+                "Status": "PARTIALLY INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 80,
+            },
+        ])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        result = ai_tools.get_incoming_stock(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        po_numbers = {line["po_number"] for line in result["lines"]}
+        self.assertNotIn("PO-6816", po_numbers)
+        self.assertEqual(po_numbers, {"PO-7071", "PO-7210"})
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["open_po_quantity_total"], 160)
+        self.assertEqual(result["cin7_stock_on_order"], 160)
+        self.assertIsNone(result["reconciliation_note"])
+
+    def test_incoming_stock_keeps_remaining_partial_receipt_balance(self) -> None:
+        sku = "LED-PARTIAL"
+        engine_df = pd.DataFrame([{"SKU": sku, "OnOrder": 60}])
+        purchase_lines = pd.DataFrame([
+            {
+                "PurchaseID": "8000",
+                "OrderNumber": "PO-8000",
+                "RequiredBy": "2026-06-20",
+                "Status": "PARTIALLY RECEIVED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Partial test",
+                "Quantity": 100,
+                "Total": 1000,
+            },
+            {
+                "PurchaseID": "8000",
+                "OrderNumber": "PO-8000",
+                "Status": "PARTIALLY RECEIVED-Received",
+                "ReceivedDate": "2026-06-12",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Partial test",
+                "Quantity": 40,
+            },
+        ])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        result = ai_tools.get_incoming_stock(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertEqual(result["matched"], 1)
+        line = result["lines"][0]
+        self.assertEqual(line["quantity_on_order"], 60)
+        self.assertEqual(line["original_order_quantity"], 100)
+        self.assertEqual(line["quantity_received_against_order"], 40)
+        self.assertEqual(line["line_total_value"], 600)
+        self.assertEqual(result["open_po_quantity_total"], 60)
+
+    def test_incoming_stock_suppresses_oldest_excess_line_by_on_order(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{"SKU": sku, "OnOrder": 160}])
+        purchase_lines = pd.DataFrame([
+            {
+                "PurchaseID": "6816",
+                "OrderNumber": "PO-6816",
+                "RequiredBy": "2026-05-03",
+                "Status": "INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 120,
+            },
+            {
+                "PurchaseID": "7071",
+                "OrderNumber": "PO-7071",
+                "RequiredBy": "2026-06-18",
+                "Status": "INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 80,
+            },
+            {
+                "PurchaseID": "7210",
+                "OrderNumber": "PO-7210",
+                "RequiredBy": "2026-07-16",
+                "Status": "PARTIALLY INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 80,
+            },
+        ])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        result = ai_tools.get_incoming_stock(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        po_numbers = {line["po_number"] for line in result["lines"]}
+        self.assertEqual(po_numbers, {"PO-7071", "PO-7210"})
+        self.assertEqual(result["open_po_quantity_total"], 160)
+        self.assertEqual(
+            result["stock_on_order_suppressed_lines"][0]["po_number"],
+            "PO-6816")
+        self.assertIn("suppressed", result["reconciliation_note"])
 
 
 class SkuRuleTests(unittest.TestCase):
