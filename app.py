@@ -55,6 +55,10 @@ from engine.sku_rules import _parse_length
 from engine.sku_rules import _parse_strip_base
 from engine.sku_rules import _parse_tube_sku
 from engine.sku_rules import parse_sourcing_rule
+from storage_dimensions import (
+    ensure_storage_dim_column,
+    storage_dim_source_columns,
+)
 
 # Optional drag-and-drop UI for the PO-editor column organizer. Falls back
 # gracefully to the data_editor flow if the package isn't installed.
@@ -3350,6 +3354,7 @@ def _normalise_engine_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     """Restore CSV-loaded engine snapshot columns to app-friendly types."""
     if df.empty:
         return df
+    ensure_storage_dim_column(df)
     for col in ("trend_12m", "trend_24m"):
         if col in df.columns:
             df[col] = df[col].apply(_parse_engine_list_cell)
@@ -5528,11 +5533,16 @@ def _abc_engine(products: pd.DataFrame,
     (the BOM rollup adds kit-sales × ratio, which is the SAME demand
     the assembly task already records as ground truth)."""
     # 1. Filter to Stock items only (already done by global filter)
-    prods = products[["SKU", "Name", "Type", "Category", "Brand",
-                      "Status", "AverageCost",
-                      "MinimumBeforeReorder", "ReorderQuantity",
-                      "AdditionalAttribute1", "BillOfMaterial",
-                      "BOMType"]].copy()
+    product_cols = ["SKU", "Name", "Type", "Category", "Brand",
+                    "Status", "AverageCost",
+                    "MinimumBeforeReorder", "ReorderQuantity",
+                    "AdditionalAttribute1", "BillOfMaterial",
+                    "BOMType"]
+    for col in storage_dim_source_columns(products.columns):
+        if col not in product_cols:
+            product_cols.append(col)
+    prods = products[product_cols].copy()
+    ensure_storage_dim_column(prods)
     prods = prods[prods["Type"] == "Stock"]
     # Dedupe on SKU so downstream .map() operations don't hit
     # pandas Arrow-backend InvalidIndexError on duplicate indices.
@@ -7583,9 +7593,9 @@ def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
     snapshot = _load_engine_output_snapshot()
     if not snapshot.empty:
         return snapshot
-    return _abc_engine(
+    return _normalise_engine_snapshot(_abc_engine(
         products, stock, sale_lines, purchase_lines,
-        assemblies_df=assemblies)
+        assemblies_df=assemblies))
 
 
 def _get_engine_df() -> "pd.DataFrame":
@@ -20297,12 +20307,7 @@ elif page == "AI Assistant":
                     _stock_view, on="SKU", how="left")
             if "AdditionalAttribute1" in engine_df.columns:
                 engine_df["Family"] = engine_df["AdditionalAttribute1"]
-            # v2.67.369 — promote storage_dim from products CSV into
-            # engine_df so AI tools can use it without live API calls.
-            if "storage_dim" not in engine_df.columns:
-                engine_df["storage_dim"] = ""
-            else:
-                engine_df["storage_dim"] = engine_df["storage_dim"].fillna("")
+            ensure_storage_dim_column(engine_df)
     elif not products.empty:
         # No sale_lines — can't run full engine. Lightweight only.
         engine_df = products.copy()
@@ -20327,11 +20332,7 @@ elif page == "AI Assistant":
                 _stock_view, on="SKU", how="left")
         if "AdditionalAttribute1" in engine_df.columns:
             engine_df["Family"] = engine_df["AdditionalAttribute1"]
-        # v2.67.369 — promote storage_dim (lightweight path)
-        if "storage_dim" not in engine_df.columns:
-            engine_df["storage_dim"] = ""
-        else:
-            engine_df["storage_dim"] = engine_df["storage_dim"].fillna("")
+        ensure_storage_dim_column(engine_df)
     else:
         engine_df = pd.DataFrame(columns=["SKU", "Name", "OnHand"])
 

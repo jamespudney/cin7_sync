@@ -62,6 +62,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import db  # noqa: E402
 import slack_sync  # noqa: E402
+from storage_dimensions import ensure_storage_dim_column  # noqa: E402
 
 LOG_FORMAT = "%(asctime)s  %(levelname)-8s %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -1355,6 +1356,7 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
             import worker_engine
             engine_df = worker_engine.compute_engine_signals(
                 products, stock, sale_lines)
+            ensure_storage_dim_column(engine_df)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "worker_engine.compute_engine_signals failed: "
@@ -1370,11 +1372,7 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
                 stock[stock_cols], on="SKU", how="left")
             if "AdditionalAttribute1" in engine_df.columns:
                 engine_df["Family"] = engine_df["AdditionalAttribute1"]
-            # v2.67.371 - ensure storage_dim present in fallback path
-            if "storage_dim" not in engine_df.columns:
-                engine_df["storage_dim"] = ""
-            else:
-                engine_df["storage_dim"] = engine_df["storage_dim"].fillna("")
+            ensure_storage_dim_column(engine_df)
 
         # Wire up purchase-line / shipment / shopify holders for the
         # AI tools that need them.

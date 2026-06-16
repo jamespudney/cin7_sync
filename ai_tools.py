@@ -34,6 +34,7 @@ from typing import Any, Optional
 import pandas as pd
 
 import db
+from storage_dimensions import extract_storage_dim
 
 
 # ---------------------------------------------------------------------------
@@ -2026,7 +2027,7 @@ def get_stock_position(engine_df: pd.DataFrame,
     else:
         stock_state = "stock position unknown"
 
-    storage_dim = _text("storage_dim")
+    storage_dim = _text("storage_dim") or extract_storage_dim(detail)
     bin_location = None
     for c in ("StockLocator", "Stock Locator", "Stock locator",
               "stock_locator", "StockLocator_x", "StockLocator_y",
@@ -4104,9 +4105,19 @@ def get_purchase_order(engine_df: pd.DataFrame,
             v = row.get(col)
             return default if v is None or (isinstance(v, float) and math.isnan(v)) else v
 
+        def _storage_dim_for_po_line(sku: str) -> str:
+            dim = str(_epо(sku, "storage_dim", "") or "").strip()
+            if dim:
+                return dim
+            row = _eng_map_po.get(str(sku or "").strip().upper())
+            if row is None:
+                return ""
+            return extract_storage_dim(row.to_dict())
+
         line_rows = []
         for _, lr in gdf.iterrows():
             _lsku = str(lr.get("SKU") or "").strip()
+            _storage_dim = _storage_dim_for_po_line(_lsku)
             line_rows.append(_serialise_row({
                 "sku": _lsku,
                 "name": lr.get("Name"),
@@ -4121,9 +4132,8 @@ def get_purchase_order(engine_df: pd.DataFrame,
                     n["text"] for n in _IP_NOTES_HOLDER.get(_lsku, [])
                     if n.get("text")),
                 # Storage dim from engine (v2.67.369 — from synced products CSV)
-                "storage_dim": str(_epо(_lsku, "storage_dim", "") or "").strip(),
-                "storage_dim_missing": not bool(
-                    str(_epо(_lsku, "storage_dim", "") or "").strip()),
+                "storage_dim": _storage_dim,
+                "storage_dim_missing": not bool(_storage_dim),
                 # Engine signals — real data, not AI inference
                 "on_hand_now": _epо(_lsku, "OnHand"),
                 "abc_class": _epо(_lsku, "ABC", ""),
@@ -4740,6 +4750,10 @@ def get_purchase_live(engine_df: pd.DataFrame,
         # v2.67.369 — use storage_dim from engine (synced from products CSV)
         # instead of making a live CIN7 API call per SKU.
         _sdim = str(_eng(sku, "storage_dim", "") or "").strip()
+        if not _sdim and sku:
+            _erow = eng_map.get(sku.upper())
+            if _erow is not None:
+                _sdim = extract_storage_dim(_erow.to_dict())
         _sdim_missing = not bool(_sdim)
         # Incomplete: has ___ placeholder or fewer than 3 numeric segments
         import re as _redim

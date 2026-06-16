@@ -69,6 +69,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # OUTPUT_DIR follows DATA_DIR env var (set to /data on Render).
 # Defaults to project folder locally. See data_paths.py.
 from data_paths import OUTPUT_DIR  # noqa: E402
+from storage_dimensions import extract_storage_dim  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -519,34 +520,11 @@ def sync_products(client: Cin7Client) -> None:
             "IncludeAttributes": "true",
         },
     ))
-    # v2.67.369 — extract Storage L x W x H In from AdditionalAttributes
-    # into a top-level storage_dim column so it ends up as a plain CSV
-    # column that the engine and ai_tools can join without live API calls.
-    # CIN7 returns attributes in two shapes:
-    #   (a) list of {Name, Value} dicts   — newer accounts
-    #   (b) flat dict AdditionalAttribute1..10 — older / some endpoints
-    # We try (a) first (name-matched), then (b) (scan for dim pattern).
-    import re as _re_dim
-    _dim_name = "Storage L x W x H In"
-    _dim_loose = _re_dim.compile(
-        r"(?:\d+(?:\.\d+)?|_+)\s*[xX]\s*(?:\d+(?:\.\d+)?|_+)")
+    # Extract CIN7's Storage L x W x H In additional attribute into a
+    # top-level storage_dim column so the engine and AI tools can join
+    # it without live per-SKU API calls.
     for row in rows:
-        dim_val = ""
-        attrs = row.get("AdditionalAttributes")
-        if isinstance(attrs, list):
-            for a in attrs:
-                if (isinstance(a, dict)
-                        and str(a.get("Name") or "").strip().lower()
-                        == _dim_name.lower()):
-                    dim_val = str(a.get("Value") or "").strip()
-                    break
-        if not dim_val and isinstance(attrs, dict):
-            for i in range(1, 11):
-                v = attrs.get(f"AdditionalAttribute{i}")
-                if v and isinstance(v, str) and _dim_loose.search(v):
-                    dim_val = v.strip()
-                    break
-        row["storage_dim"] = dim_val
+        row["storage_dim"] = extract_storage_dim(row)
     write_outputs("products", rows)
 
 
