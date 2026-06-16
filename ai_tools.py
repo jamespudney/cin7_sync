@@ -34,7 +34,7 @@ from typing import Any, Optional
 import pandas as pd
 
 import db
-from storage_dimensions import extract_storage_dim
+from storage_dimensions import ensure_storage_dim_column, extract_storage_dim
 
 
 # ---------------------------------------------------------------------------
@@ -2027,7 +2027,11 @@ def get_stock_position(engine_df: pd.DataFrame,
     else:
         stock_state = "stock position unknown"
 
-    storage_dim = _text("storage_dim") or extract_storage_dim(detail)
+    storage_dim = (
+        _text("storage_dim")
+        or extract_storage_dim(detail)
+        or _storage_dim_from_product_master(sku)
+    )
     bin_location = None
     for c in ("StockLocator", "Stock Locator", "Stock locator",
               "stock_locator", "StockLocator_x", "StockLocator_y",
@@ -2463,6 +2467,8 @@ def get_sales_totals(engine_df: pd.DataFrame,
 # populates this once per session via set_sales_full_headers() so
 # every tool call sees the same headers without repeatedly loading.
 _SALES_FULL_HOLDER: dict = {"df": None}
+_PRODUCTS_HOLDER: dict = {"df": None}
+_PRODUCTS_DIM_CACHE: dict = {"path": None, "mtime": None, "df": None}
 _PURCHASE_LINES_HOLDER: dict = {"df": None}
 # v2.67.51 — additional holders for the new transaction-lookup tools.
 # Purchase headers carry InvoiceAmount, RequiredBy, Status, etc. that
@@ -2484,6 +2490,64 @@ def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
     the merged sales-headers DataFrame so get_sales_totals can read
     it without recomputing per-tool-call."""
     _SALES_FULL_HOLDER["df"] = headers_df
+
+
+def set_products(products_df: pd.DataFrame) -> None:
+    """Store the product master so tools can recover product-only fields."""
+    _PRODUCTS_HOLDER["df"] = products_df
+
+
+def _storage_dim_from_products_df(sku: str, products_df: Any) -> str:
+    if (
+        products_df is None
+        or getattr(products_df, "empty", True)
+        or "SKU" not in products_df.columns
+    ):
+        return ""
+    df = products_df
+    try:
+        ensure_storage_dim_column(df)
+    except Exception:  # noqa: BLE001
+        df = products_df.copy()
+        ensure_storage_dim_column(df)
+    match = df[
+        df["SKU"].astype(str).str.strip().str.upper()
+        == str(sku or "").strip().upper()
+    ]
+    if match.empty:
+        return ""
+    row = match.iloc[0]
+    dim = str(row.get("storage_dim") or "").strip()
+    return dim or extract_storage_dim(row.to_dict())
+
+
+def _storage_dim_from_product_master(sku: str) -> str:
+    dim = _storage_dim_from_products_df(sku, _PRODUCTS_HOLDER.get("df"))
+    if dim:
+        return dim
+
+    try:
+        from data_catalog import latest_file
+
+        path = latest_file("products")
+        if path is None:
+            return ""
+        mtime = path.stat().st_mtime
+        if (
+            _PRODUCTS_DIM_CACHE.get("path") != str(path)
+            or _PRODUCTS_DIM_CACHE.get("mtime") != mtime
+        ):
+            df = pd.read_csv(path, low_memory=False)
+            ensure_storage_dim_column(df)
+            _PRODUCTS_DIM_CACHE.update({
+                "path": str(path),
+                "mtime": mtime,
+                "df": df,
+            })
+        return _storage_dim_from_products_df(
+            sku, _PRODUCTS_DIM_CACHE.get("df"))
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 # v2.67.367 — IP notes holder (SKU -> [{text, warehouse_id, tags}])
@@ -4110,9 +4174,11 @@ def get_purchase_order(engine_df: pd.DataFrame,
             if dim:
                 return dim
             row = _eng_map_po.get(str(sku or "").strip().upper())
-            if row is None:
-                return ""
-            return extract_storage_dim(row.to_dict())
+            if row is not None:
+                dim = extract_storage_dim(row.to_dict())
+                if dim:
+                    return dim
+            return _storage_dim_from_product_master(sku)
 
         line_rows = []
         for _, lr in gdf.iterrows():
@@ -4754,6 +4820,8 @@ def get_purchase_live(engine_df: pd.DataFrame,
             _erow = eng_map.get(sku.upper())
             if _erow is not None:
                 _sdim = extract_storage_dim(_erow.to_dict())
+        if not _sdim and sku:
+            _sdim = _storage_dim_from_product_master(sku)
         _sdim_missing = not bool(_sdim)
         # Incomplete: has ___ placeholder or fewer than 3 numeric segments
         import re as _redim

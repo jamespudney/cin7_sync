@@ -19152,6 +19152,10 @@ elif page == "AI Assistant":
     # Hand the merged sales headers to the tool module so the
     # get_sales_totals tool can read order-level revenue (which
     # includes shipping + tax — matches CIN7's dashboard).
+    try:
+        ai_tools.set_products(products)
+    except Exception:
+        pass
     ai_tools.set_sales_full_headers(sales_full)
     # v2.64: hand the purchase_lines DataFrame to ai_tools so the new
     # get_incoming_stock tool can scan open POs without re-reading

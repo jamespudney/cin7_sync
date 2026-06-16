@@ -12,8 +12,10 @@ STORAGE_DIM_FIELD = "Storage L x W x H In"
 
 _TARGET_LABEL = "storage l x w x h in"
 _TARGET_COMPACT = re.sub(r"[^a-z0-9]+", "", _TARGET_LABEL)
+_DIM_UNIT = r"(?:\"|'|in(?:ches?)?)?"
 _DIM_VALUE_RE = re.compile(
-    r"(?:\d+(?:\.\d+)?|_+)\s*[xX]\s*(?:\d+(?:\.\d+)?|_+)"
+    rf"(?:\d+(?:\.\d+)?|_+)\s*{_DIM_UNIT}\s*[xX×]\s*"
+    rf"(?:\d+(?:\.\d+)?|_+)"
 )
 _EMPTY_VALUES = {"", "<na>", "na", "nan", "none", "null", "nat"}
 
