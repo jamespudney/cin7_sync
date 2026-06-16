@@ -3124,6 +3124,175 @@ def _find_parent_sku(child_sku: str,
     return None
 
 
+def _purchase_lines_with_remaining_quantities(
+        purchase_lines: pd.DataFrame) -> pd.DataFrame:
+    """Subtract CIN7 stock-received rows from their original PO rows."""
+    if purchase_lines is None or purchase_lines.empty:
+        return purchase_lines
+    if "Quantity" not in purchase_lines.columns:
+        return purchase_lines.copy()
+
+    po_key_col = next(
+        (c for c in ("PurchaseID", "OrderNumber")
+         if c in purchase_lines.columns),
+        None)
+    item_key_col = next(
+        (c for c in ("SKU", "ProductID") if c in purchase_lines.columns),
+        None)
+    if not po_key_col or not item_key_col:
+        return purchase_lines.copy()
+
+    work = purchase_lines.copy()
+    qty = pd.to_numeric(work["Quantity"], errors="coerce").fillna(0)
+
+    received_mask = pd.Series(False, index=work.index)
+    if "Status" in work.columns:
+        status_u = work["Status"].fillna("").astype(str).str.upper()
+        received_mask = received_mask | status_u.eq("RECEIVED")
+        received_mask = received_mask | status_u.str.endswith("-RECEIVED")
+        received_mask = received_mask | status_u.str.contains(
+            "FULLY RECEIVED", na=False)
+    if "ReceivedDate" in work.columns:
+        received_dates = pd.to_datetime(
+            work["ReceivedDate"], errors="coerce")
+        received_mask = received_mask | received_dates.notna()
+
+    received_mask = received_mask & (qty > 0)
+    if not received_mask.any():
+        return work
+
+    work["_po_reconcile_key"] = (
+        work[po_key_col].fillna("").astype(str).str.strip().str.upper())
+    work["_item_reconcile_key"] = (
+        work[item_key_col].fillna("").astype(str).str.strip().str.upper())
+    work["_quantity_original"] = qty
+
+    received_qty = (
+        work.loc[received_mask]
+            .groupby(["_po_reconcile_key",
+                      "_item_reconcile_key"])["_quantity_original"]
+            .sum()
+    )
+
+    out = work.loc[~received_mask].copy()
+    if out.empty:
+        return out.drop(
+            columns=["_po_reconcile_key", "_item_reconcile_key",
+                     "_quantity_original"],
+            errors="ignore")
+
+    out["OriginalQuantity"] = out["_quantity_original"]
+    out["ReceivedAgainstOrder"] = 0.0
+
+    for key, idx in out.groupby(
+            ["_po_reconcile_key", "_item_reconcile_key"]).groups.items():
+        remaining_receipt_qty = float(received_qty.get(key, 0) or 0)
+        if remaining_receipt_qty <= 0:
+            continue
+        for row_idx in idx:
+            original_qty = float(out.at[row_idx, "_quantity_original"] or 0)
+            applied_qty = min(original_qty, remaining_receipt_qty)
+            out.at[row_idx, "ReceivedAgainstOrder"] = applied_qty
+            remaining_receipt_qty -= applied_qty
+            if remaining_receipt_qty <= 0:
+                break
+
+    remaining_qty = (
+        out["_quantity_original"] - out["ReceivedAgainstOrder"]).clip(
+            lower=0)
+    out["Quantity"] = remaining_qty
+    out["QuantityRemaining"] = remaining_qty
+
+    return out.drop(
+        columns=["_po_reconcile_key", "_item_reconcile_key",
+                 "_quantity_original"],
+        errors="ignore")
+
+
+def _engine_on_order_for_sku(
+        engine_df: pd.DataFrame, sku: str) -> Optional[float]:
+    """Return stock-record OnOrder for one SKU, if present."""
+    if engine_df is None or engine_df.empty or not sku:
+        return None
+    if "SKU" not in engine_df.columns or "OnOrder" not in engine_df.columns:
+        return None
+    row = engine_df[
+        engine_df["SKU"].astype(str).str.upper() == sku.upper()]
+    if row.empty:
+        return None
+    value = pd.to_numeric(row.iloc[0].get("OnOrder"), errors="coerce")
+    if pd.isna(value):
+        return None
+    return float(value)
+
+
+def _cap_open_lines_to_stock_on_order(
+        df: pd.DataFrame,
+        stock_on_order: Optional[float],
+        date_col: Optional[str]) -> tuple[pd.DataFrame, list[dict]]:
+    """Use CIN7 stock OnOrder to suppress stale excess PO lines."""
+    if df is None or df.empty or stock_on_order is None:
+        return df, []
+    if "Quantity" not in df.columns:
+        return df.copy(), []
+
+    work = df.copy()
+    qty = pd.to_numeric(work["Quantity"], errors="coerce").fillna(0)
+    excess_qty = float(qty.sum()) - float(stock_on_order)
+    if excess_qty <= 0.5:
+        return work, []
+
+    work["_qty_current"] = qty
+    if date_col and date_col in work.columns:
+        work["_expected_sort"] = pd.to_datetime(
+            work[date_col], errors="coerce")
+    else:
+        work["_expected_sort"] = pd.NaT
+    if "OrderDate" in work.columns:
+        work["_order_sort"] = pd.to_datetime(
+            work["OrderDate"], errors="coerce")
+    else:
+        work["_order_sort"] = pd.NaT
+
+    ordered = work.sort_values(
+        by=["_expected_sort", "_order_sort"],
+        na_position="last")
+    suppressed: list[dict] = []
+    for idx, row in ordered.iterrows():
+        if excess_qty <= 0.5:
+            break
+        line_qty = float(row.get("_qty_current") or 0)
+        if line_qty <= 0:
+            continue
+        applied_qty = min(line_qty, excess_qty)
+        remaining_line_qty = max(line_qty - applied_qty, 0)
+        work.at[idx, "Quantity"] = remaining_line_qty
+        work.at[idx, "QuantityRemaining"] = remaining_line_qty
+        work.at[idx, "SuppressedByStockOnOrderQty"] = applied_qty
+        suppressed.append({
+            "po_number": row.get("OrderNumber"),
+            "sku": row.get("SKU"),
+            "name": row.get("Name"),
+            "status": row.get("Status"),
+            "expected_date": (
+                str(row.get(date_col))
+                if date_col and pd.notna(row.get(date_col))
+                else None),
+            "suppressed_quantity": round(applied_qty, 2),
+            "reason": (
+                "CIN7 stock OnOrder is lower than open PO-line "
+                "detail, so this oldest excess line is likely "
+                "already received or stale in the local line CSV."),
+        })
+        excess_qty -= applied_qty
+
+    work = work[pd.to_numeric(
+        work["Quantity"], errors="coerce").fillna(0) > 0]
+    return work.drop(
+        columns=["_qty_current", "_expected_sort", "_order_sort"],
+        errors="ignore"), suppressed
+
+
 def get_incoming_stock(engine_df: pd.DataFrame,
                         sale_lines_df: pd.DataFrame,
                         args: dict) -> dict:
@@ -3157,7 +3326,7 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                       "Assistant page boot."),
         }
 
-    df = purchase_lines.copy()
+    df = _purchase_lines_with_remaining_quantities(purchase_lines)
 
     # Pick a date column from whichever of the candidates is present.
     date_col_candidates = (
@@ -3171,18 +3340,24 @@ def get_incoming_stock(engine_df: pd.DataFrame,
     # cancelled / fully-received tail. Status containing 'Received'
     # (e.g. 'ORDERED-Received') is the synthetic stock-received row
     # written by _extract_purchase_lines — exclude that too.
-    closed_keywords = ("RECEIVED", "CLOSED", "COMPLETED",
-                        "CANCELLED", "VOIDED", "DRAFT")
+    closed_keywords = ("CLOSED", "COMPLETED", "CANCELLED",
+                        "VOIDED", "DRAFT")
     if "Status" in df.columns:
         status_u = df["Status"].fillna("").astype(str).str.upper()
-        keep_mask = ~status_u.apply(
-            lambda s: any(k in s for k in closed_keywords))
+        keep_mask = ~status_u.apply(lambda s: (
+            any(k in s for k in closed_keywords)
+            or s == "RECEIVED"
+            or s.endswith("-RECEIVED")
+            or "FULLY RECEIVED" in s))
         df = df[keep_mask]
 
-    # Suppress zero-qty lines.
+    # Suppress zero-qty lines. Received quantities may have reduced
+    # an old PO line to 0 above; those have already arrived.
     if "Quantity" in df.columns:
         df = df[pd.to_numeric(
             df["Quantity"], errors="coerce").fillna(0) > 0]
+
+    open_purchase_df = df.copy()
 
     # Match by SKU or family.
     if sku and "SKU" in df.columns:
@@ -3195,6 +3370,12 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         name_match = (df["Name"].astype(str).str.upper().str.contains(
             family, na=False) if "Name" in df.columns else False)
         df = df[sku_match | name_match]
+
+    stock_on_order = _engine_on_order_for_sku(engine_df, sku) if sku else None
+    stock_on_order_suppressed_lines: list[dict] = []
+    if sku and stock_on_order is not None and not df.empty:
+        df, stock_on_order_suppressed_lines = (
+            _cap_open_lines_to_stock_on_order(df, stock_on_order, date_col))
 
     if df.empty:
         # v2.67.127 — Per-foot child SKU fallback. If the user
@@ -3211,18 +3392,7 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                 # Hand-rolled retry rather than recursion to avoid
                 # surprise behaviour if parent itself also has no
                 # POs.
-                _pdf = purchase_lines.copy()
-                if "Status" in _pdf.columns:
-                    _status_u = (_pdf["Status"].fillna("")
-                                  .astype(str).str.upper())
-                    _keep = ~_status_u.apply(
-                        lambda s: any(
-                            k in s for k in closed_keywords))
-                    _pdf = _pdf[_keep]
-                if "Quantity" in _pdf.columns:
-                    _pdf = _pdf[pd.to_numeric(
-                        _pdf["Quantity"],
-                        errors="coerce").fillna(0) > 0]
+                _pdf = open_purchase_df.copy()
                 if "SKU" in _pdf.columns:
                     _pdf = _pdf[
                         _pdf["SKU"].astype(str).str.upper()
@@ -3240,6 +3410,10 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                             "quantity_on_order": _r.get("Quantity"),
                             "quantity_remaining":
                                 _r.get("QuantityRemaining"),
+                            "original_order_quantity":
+                                _r.get("OriginalQuantity"),
+                            "quantity_received_against_order":
+                                _r.get("ReceivedAgainstOrder"),
                             "expected_date": (_r.get(date_col)
                                                 if date_col
                                                 else None),
@@ -3284,29 +3458,22 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         gap_hint = None
         try:
             if engine_df is not None and not engine_df.empty and sku:
-                _eng = engine_df
-                if "SKU" in _eng.columns:
-                    _row = _eng[
-                        _eng["SKU"].astype(str).str.upper()
-                        == sku.upper()]
-                    if not _row.empty and "OnOrder" in _row.columns:
-                        _on_order = pd.to_numeric(
-                            _row.iloc[0].get("OnOrder"),
-                            errors="coerce")
-                        if pd.notna(_on_order) and _on_order > 0:
-                            gap_hint = (
-                                f"DATA GAP: CIN7 stock record shows "
-                                f"{int(_on_order)} units on order for "
-                                f"{sku}, but no matching open PO line "
-                                f"is in our local sync window. The PO "
-                                f"may have been raised before the "
-                                f"current purchase-lines window "
-                                f"(daily sync = 30d). Tell the user "
-                                f"to either look up the PO directly "
-                                f"in CIN7 OR ask an admin to widen "
-                                f"the sync window. Do not say 'no PO "
-                                f"exists' — say 'the local sync "
-                                f"doesn't cover the PO'.")
+                _on_order = _engine_on_order_for_sku(engine_df, sku)
+                if _on_order is not None:
+                    if _on_order > 0:
+                        gap_hint = (
+                            f"DATA GAP: CIN7 stock record shows "
+                            f"{int(_on_order)} units on order for "
+                            f"{sku}, but no matching open PO line "
+                            f"is in our local sync window. The PO "
+                            f"may have been raised before the "
+                            f"current purchase-lines window "
+                            f"(daily sync = 30d). Tell the user "
+                            f"to either look up the PO directly "
+                            f"in CIN7 OR ask an admin to widen "
+                            f"the sync window. Do not say 'no PO "
+                            f"exists' — say 'the local sync "
+                            f"doesn't cover the PO'.")
         except Exception:
             pass
         return {
@@ -3340,10 +3507,20 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         # subtotal). Prefer Total when present and >0 (it's the
         # canonical line value).
         qty_n = pd.to_numeric(r.get("Quantity"), errors="coerce")
+        original_qty_n = pd.to_numeric(
+            r.get("OriginalQuantity"), errors="coerce")
+        received_against_n = pd.to_numeric(
+            r.get("ReceivedAgainstOrder"), errors="coerce")
         price_n = pd.to_numeric(r.get("Price"), errors="coerce")
         total_n = pd.to_numeric(r.get("Total"), errors="coerce")
         if pd.notna(total_n) and total_n > 0:
-            line_total = float(total_n)
+            if (pd.notna(original_qty_n) and original_qty_n > 0
+                    and pd.notna(received_against_n)
+                    and received_against_n > 0
+                    and pd.notna(qty_n)):
+                line_total = float(total_n * (qty_n / original_qty_n))
+            else:
+                line_total = float(total_n)
         elif pd.notna(qty_n) and pd.notna(price_n):
             line_total = float(qty_n * price_n)
         else:
@@ -3357,6 +3534,14 @@ def get_incoming_stock(engine_df: pd.DataFrame,
             "quantity_remaining": (
                 r.get("QuantityRemaining")
                 if "QuantityRemaining" in df.columns
+                else None),
+            "original_order_quantity": (
+                r.get("OriginalQuantity")
+                if "OriginalQuantity" in df.columns
+                else None),
+            "quantity_received_against_order": (
+                r.get("ReceivedAgainstOrder")
+                if "ReceivedAgainstOrder" in df.columns
                 else None),
             # v2.67.181 — per-line dollar value so the AI can
             # report "$3,702" rather than just unit counts.
@@ -3433,6 +3618,32 @@ def get_incoming_stock(engine_df: pd.DataFrame,
                 else None),
         }
         out_rows.append(_serialise_row(rec))
+
+    open_po_quantity_total = None
+    reconciliation_note = None
+    if out_rows:
+        qty_values = [
+            pd.to_numeric(r.get("quantity_on_order"), errors="coerce")
+            for r in out_rows
+        ]
+        qty_values = [float(v) for v in qty_values if pd.notna(v)]
+        open_po_quantity_total = round(sum(qty_values), 2)
+
+    if (stock_on_order is not None and open_po_quantity_total is not None
+            and abs(open_po_quantity_total - stock_on_order) > 0.5):
+        reconciliation_note = (
+            f"CIN7 stock OnOrder shows {stock_on_order:g} units for "
+            f"{sku}, but the visible open PO lines total "
+            f"{open_po_quantity_total:g}. Treat the stock OnOrder "
+            f"figure as canonical for the buying position and tell "
+            f"the user the PO-line detail needs checking in CIN7 "
+            f"before acting.")
+    elif stock_on_order_suppressed_lines:
+        reconciliation_note = (
+            f"CIN7 stock OnOrder shows {stock_on_order:g} units for "
+            f"{sku}. The local PO-line detail was higher, so the "
+            f"oldest excess line(s) were suppressed as likely "
+            f"already received or stale.")
 
     # v2.67.181 — supplier history. For each unique supplier in
     # the open POs, find the most recent FULLY-RECEIVED PO and
@@ -3516,13 +3727,20 @@ def get_incoming_stock(engine_df: pd.DataFrame,
         "(5) Be terse with internal notes (Memo/Note/Comments) — "
         "show only the freight mode and any progress detail; "
         "skip 'Draft', 'test', 'Generated by' style internal "
-        "metadata.")
+        "metadata. (6) If `reconciliation_note` is present, include "
+        "that warning plainly and do not present the PO lines as a "
+        "fully reconciled incoming-stock picture.")
 
     return {
         "matched": len(out_rows),
         "subject": sku or family,
         "date_field_used": date_col,
         "lines": out_rows,
+        "cin7_stock_on_order": stock_on_order,
+        "open_po_quantity_total": open_po_quantity_total,
+        "reconciliation_note": reconciliation_note,
+        "stock_on_order_suppressed_lines":
+            stock_on_order_suppressed_lines or None,
         "supplier_history": supplier_history or None,
         "formatting_guidance": formatting_guidance,
         "note": (
