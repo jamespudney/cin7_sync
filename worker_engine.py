@@ -51,6 +51,8 @@ from typing import Optional
 
 import pandas as pd
 
+from storage_dimensions import ensure_storage_dim_column
+
 log = logging.getLogger("worker_engine")
 
 _STOCK_LOCATOR_COLUMNS = (
@@ -111,6 +113,7 @@ def compute_engine_signals(products: pd.DataFrame,
 
     # 1. Base merge: products + stock_on_hand on SKU.
     df = products.copy()
+    ensure_storage_dim_column(df)
     df["SKU"] = df["SKU"].astype(str)
 
     if stock is not None and not stock.empty:
@@ -272,13 +275,8 @@ def compute_engine_signals(products: pd.DataFrame,
         int(df["is_dormant"].sum()),
         int((df["excess_units"] > 0).sum()))
 
-    # v2.67.371 - ensure storage_dim is always present so ai_tools
-    # never sees a KeyError. The column is written by sync_products
-    # (v2.67.369); if the products CSV pre-dates that change the
-    # column is simply absent from the DataFrame.
-    if "storage_dim" not in df.columns:
-        df["storage_dim"] = ""
-    else:
-        df["storage_dim"] = df["storage_dim"].fillna("")
+    # Keep storage_dim present even when older products snapshots only
+    # have CIN7's raw "Storage L x W x H In" additional attribute column.
+    ensure_storage_dim_column(df)
 
     return df

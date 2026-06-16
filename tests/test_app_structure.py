@@ -30,6 +30,7 @@ from engine.sku_rules import (
     _parse_tube_sku,
     parse_sourcing_rule,
 )
+from storage_dimensions import extract_storage_dim
 
 
 class PageConfigTests(unittest.TestCase):
@@ -360,6 +361,23 @@ class IncomingStockTests(unittest.TestCase):
 
         self.assertEqual(result["stock"]["bin"], "D29B")
 
+    def test_stock_position_uses_raw_storage_dimension_field(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "OnHand": 133.75,
+            "OnOrder": 160,
+            " storage l x w x h in ": "78 x 0.47 x 0.31",
+        }])
+
+        ai_tools.set_purchase_lines(pd.DataFrame())
+        result = ai_tools.get_stock_position(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertEqual(
+            result["stock"]["storage_dim"], "78 x 0.47 x 0.31")
+
     def test_stock_position_skips_blank_bin_for_stock_locator(self) -> None:
         sku = "LED-89030021-2"
         engine_df = pd.DataFrame([{
@@ -432,6 +450,32 @@ class IncomingStockTests(unittest.TestCase):
             products, stock, pd.DataFrame())
 
         self.assertEqual(result.iloc[0].get("Bin", ""), "")
+
+    def test_storage_dimension_extracts_named_cin7_field(self) -> None:
+        row = {
+            "SKU": "LED-NEON-FLEX-SUPER-SLIM-ST",
+            " storage l x w x h in ": "10 x 0.5 x 0.5",
+        }
+
+        self.assertEqual(extract_storage_dim(row), "10 x 0.5 x 0.5")
+
+    def test_worker_engine_promotes_raw_storage_dimension_field(self) -> None:
+        sku = "LED-NEON-FLEX-SUPER-SLIM-ST"
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Super Slim ST",
+            "AverageCost": 1.0,
+            " storage l x w x h in ": "10 x 0.5 x 0.5",
+        }])
+        stock = pd.DataFrame([{
+            "SKU": sku,
+            "OnHand": 20,
+        }])
+
+        result = worker_engine.compute_engine_signals(
+            products, stock, pd.DataFrame())
+
+        self.assertEqual(result.iloc[0]["storage_dim"], "10 x 0.5 x 0.5")
 
 
 class SkuRuleTests(unittest.TestCase):
