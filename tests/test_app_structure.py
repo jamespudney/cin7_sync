@@ -401,6 +401,60 @@ class IncomingStockTests(unittest.TestCase):
         self.assertEqual(
             result["stock"]["storage_dim"], '78" x 0.906" x 0.354"')
 
+    def test_product_dimensions_returns_cin7_storage_dimension(self) -> None:
+        sku = "LED-89030021-2"
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim LED Channel ~ Model Slim8 (Black, 2m)",
+            "AdditionalAttribute6": '78" x 0.906" x 0.354"',
+        }])
+        ai_tools.set_products(products)
+
+        with patch("ai_tools.db.search_product_dimensions", return_value=[]):
+            result = ai_tools.get_product_dimensions(
+                pd.DataFrame(), pd.DataFrame(), {"query": "Slim8 Black 2m"})
+
+        self.assertEqual(
+            result["cin7_storage_dimension"]["storage_dim"],
+            '78" x 0.906" x 0.354"')
+        self.assertFalse(
+            result["cin7_storage_dimension"]["storage_dim_missing"])
+
+    def test_product_dimensions_rows_include_cin7_storage_dimension(self) -> None:
+        sku = "LED-89030021-2"
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim LED Channel ~ Model Slim8 (Black, 2m)",
+            "AdditionalAttribute6": '78" x 0.906" x 0.354"',
+        }])
+        ai_tools.set_products(products)
+        dimension_rows = [{
+            "title": "Slim8 Black 2m",
+            "shopify_handle": "slim8-black-2m",
+            "family": "Slim8",
+            "outer_width_mm": 12.2,
+            "outer_height_mm": 7,
+            "channel_width_mm": None,
+            "channel_depth_mm": None,
+            "max_strip_width_mm": None,
+            "wing_count": None,
+            "wing_width_mm": None,
+            "mounting_type": "surface",
+            "profile_shape": "channel",
+            "extra_notes": "",
+        }]
+
+        with patch(
+            "ai_tools.db.search_product_dimensions",
+            return_value=dimension_rows,
+        ):
+            result = ai_tools.get_product_dimensions(
+                pd.DataFrame(), pd.DataFrame(), {"query": "Slim8 Black 2m"})
+
+        self.assertEqual(
+            result["results"][0]["cin7_storage_dimension_in"],
+            '78" x 0.906" x 0.354"')
+
     def test_stock_position_skips_blank_bin_for_stock_locator(self) -> None:
         sku = "LED-89030021-2"
         engine_df = pd.DataFrame([{

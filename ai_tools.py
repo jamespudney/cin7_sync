@@ -1761,7 +1761,10 @@ TOOL_SCHEMAS: list[dict] = [
             "product name, model, Shopify handle, or SKU family. "
             "All values are in millimetres. If nothing matches, "
             "tell the user dimensions haven't been catalogued for "
-            "that product — do NOT guess or estimate dimensions."
+            "that product — do NOT guess or estimate dimensions. "
+            "Also returns CIN7's warehouse storage dimension "
+            "(`Storage L x W x H In`) when it can resolve the product; "
+            "use that field for storage/packaging dimension questions."
         ),
         "input_schema": {
             "type": "object",
@@ -2521,17 +2524,13 @@ def _storage_dim_from_products_df(sku: str, products_df: Any) -> str:
     return dim or extract_storage_dim(row.to_dict())
 
 
-def _storage_dim_from_product_master(sku: str) -> str:
-    dim = _storage_dim_from_products_df(sku, _PRODUCTS_HOLDER.get("df"))
-    if dim:
-        return dim
-
+def _latest_products_df_for_dims() -> Any:
     try:
         from data_catalog import latest_file
 
         path = latest_file("products")
         if path is None:
-            return ""
+            return None
         mtime = path.stat().st_mtime
         if (
             _PRODUCTS_DIM_CACHE.get("path") != str(path)
@@ -2544,10 +2543,112 @@ def _storage_dim_from_product_master(sku: str) -> str:
                 "mtime": mtime,
                 "df": df,
             })
-        return _storage_dim_from_products_df(
-            sku, _PRODUCTS_DIM_CACHE.get("df"))
+        return _PRODUCTS_DIM_CACHE.get("df")
     except Exception:  # noqa: BLE001
-        return ""
+        return None
+
+
+def _storage_dim_from_product_master(sku: str) -> str:
+    dim = _storage_dim_from_products_df(sku, _PRODUCTS_HOLDER.get("df"))
+    if dim:
+        return dim
+    return _storage_dim_from_products_df(sku, _latest_products_df_for_dims())
+
+
+def _storage_dim_match_from_df(query: str, products_df: Any) -> dict:
+    if (
+        products_df is None
+        or getattr(products_df, "empty", True)
+        or "SKU" not in products_df.columns
+    ):
+        return {}
+    df = products_df
+    try:
+        ensure_storage_dim_column(df)
+    except Exception:  # noqa: BLE001
+        df = products_df.copy()
+        ensure_storage_dim_column(df)
+
+    q = str(query or "").strip()
+    if not q:
+        return {}
+    q_upper = q.upper()
+    q_lower = q.lower()
+    tokens = [t for t in q_lower.replace("-", " ").split() if t]
+    sku_series = df["SKU"].astype(str).str.strip()
+
+    def _row_result(row) -> dict:
+        sku = str(row.get("SKU") or "").strip()
+        name = str(row.get("Name") or "").strip()
+        dim = str(row.get("storage_dim") or "").strip()
+        if not dim:
+            dim = extract_storage_dim(row.to_dict())
+        return {
+            "matched": bool(sku),
+            "sku": sku,
+            "name": name,
+            "storage_dim": dim or None,
+            "storage_dim_missing": not bool(dim),
+            "source": "CIN7 Storage L x W x H In",
+        }
+
+    exact = df[sku_series.str.upper() == q_upper]
+    if not exact.empty:
+        return _row_result(exact.iloc[0])
+
+    if "Name" not in df.columns:
+        return {}
+
+    name_series = df["Name"].astype(str).str.lower()
+    sku_lower = sku_series.str.lower()
+    contains = df[
+        sku_lower.str.contains(q_lower, regex=False, na=False)
+        | name_series.str.contains(q_lower, regex=False, na=False)
+    ]
+    if contains.empty and tokens:
+        hay = (sku_lower + " " + name_series).fillna("")
+        mask = hay.apply(lambda text: all(t in text for t in tokens))
+        contains = df[mask]
+    if contains.empty:
+        return {}
+    if "storage_dim" in contains.columns:
+        dim_text = contains["storage_dim"].astype(str).str.strip()
+        with_dim = contains[
+            ~dim_text.str.lower().isin({"", "nan", "none", "null"})
+        ]
+    else:
+        with_dim = contains.iloc[0:0]
+    return _row_result(
+        (with_dim if not with_dim.empty else contains).iloc[0])
+
+
+def _storage_dim_match_for_query(query: str,
+                                 engine_df: Any = None) -> dict:
+    remembered = {}
+    for df in (
+        engine_df,
+        _PRODUCTS_HOLDER.get("df"),
+        _latest_products_df_for_dims(),
+    ):
+        result = _storage_dim_match_from_df(query, df)
+        if result and not result.get("storage_dim_missing"):
+            return result
+        if result and not remembered:
+            remembered = result
+            fallback = _storage_dim_from_product_master(
+                result.get("sku", ""))
+            if fallback:
+                remembered["storage_dim"] = fallback
+                remembered["storage_dim_missing"] = False
+                return remembered
+    if remembered:
+        return remembered
+    return {
+        "matched": False,
+        "storage_dim": None,
+        "storage_dim_missing": True,
+        "source": "CIN7 Storage L x W x H In",
+    }
 
 
 # v2.67.367 — IP notes holder (SKU -> [{text, warehouse_id, tags}])
@@ -7055,6 +7156,7 @@ def get_product_dimensions(engine_df: pd.DataFrame,
     query = (args.get("query") or "").strip()
     if not query:
         return {"error": "query is required"}
+    cin7_storage_dim = _storage_dim_match_for_query(query, engine_df)
     try:
         rows = db.search_product_dimensions(query, limit=10)
     except Exception as exc:  # noqa: BLE001
@@ -7063,11 +7165,13 @@ def get_product_dimensions(engine_df: pd.DataFrame,
         return {
             "matched": 0,
             "query": query,
+            "cin7_storage_dimension": cin7_storage_dim,
             "note": ("No product matched. Dimensions are "
                      "catalogued only for LED channels/profiles "
                      "whose Shopify spec diagram was extracted — "
-                     "do NOT guess or estimate dimensions; tell "
-                     "the user it hasn't been catalogued."),
+                     "do NOT guess or estimate cross-section specs. "
+                     "If cin7_storage_dimension has a value, report "
+                     "that as the CIN7 warehouse storage dimension."),
         }
     out = []
     for r in rows:
@@ -7085,16 +7189,23 @@ def get_product_dimensions(engine_df: pd.DataFrame,
             "mounting_type": r.get("mounting_type"),
             "profile_shape": r.get("profile_shape"),
             "notes": r.get("extra_notes"),
+            "cin7_storage_dimension_in": (
+                cin7_storage_dim.get("storage_dim")),
+            "cin7_storage_dimension_sku": cin7_storage_dim.get("sku"),
+            "cin7_storage_dimension_source": cin7_storage_dim.get("source"),
         })
     return {
         "matched": len(out),
         "query": query,
+        "cin7_storage_dimension": cin7_storage_dim,
         "results": out,
         "note": ("All values in millimetres. Outer = total "
                  "external profile size; channel = the LED-strip "
                  "recess. Source: the Notion 'Product Dimensions' "
                  "page. If a value is null it wasn't on the spec "
-                 "diagram — say so rather than guessing."),
+                 "diagram — say so rather than guessing. CIN7 storage "
+                 "dimension is separate warehouse/packaging data from "
+                 "the product master, in inches."),
     }
 
 
