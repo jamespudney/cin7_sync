@@ -104,6 +104,7 @@ def warm() -> dict[str, Any]:
     summary dict for the caller's log output."""
     import datetime as _dt
     import pandas as pd  # noqa: F401
+    from data_paths import OUTPUT_DIR
 
     # Import _abc_engine lazily so any Streamlit import noise during
     # app.py module-load is contained. We wrap in a try-except to
@@ -153,6 +154,10 @@ def warm() -> dict[str, Any]:
     # calling is what matters.
     result_df = _abc_engine(
         products, stock, sale_lines, purchase_lines)
+    out_path = OUTPUT_DIR / "engine_output.csv"
+    tmp_path = OUTPUT_DIR / "engine_output.tmp.csv"
+    result_df.to_csv(tmp_path, index=False)
+    tmp_path.replace(out_path)
 
     return {
         "rows": int(len(result_df)) if hasattr(result_df, "__len__") else None,

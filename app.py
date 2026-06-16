@@ -23222,13 +23222,13 @@ elif page == "Data Health":
         "suppliers": len(suppliers),
         "sales_last_30d": len(sales_headers),
         "purchases_last_30d": len(purchase_headers),
-        "sale_lines_last_30d": len(sale_lines_30d),
-        "sale_lines_last_3d": len(sale_lines_3d),
-        "purchase_lines_last_90d": len(purchase_lines),
+        "sale_lines_last": len(sale_lines),
+        "purchase_lines_last": len(purchase_lines),
+        "assemblies_last": len(assemblies),
         "stock_adjustments_last_30d": len(stock_adjustments),
         "stock_transfers_last_30d": len(stock_transfers),
         "shipments_last_30d": len(shipments),
-        "shopify_orders_last_30d": len(shopify_orders),
+        "shopify_orders": len(shopify_orders),
         "engine_output": "—",
     })
 

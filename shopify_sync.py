@@ -76,6 +76,7 @@ PAGES_DIR = OUTPUT_DIR / "pages"
 BLOG_ARTICLES_DIR = OUTPUT_DIR / "blog-articles"
 POLICIES_DIR = OUTPUT_DIR / "policies"
 MENUS_DIR = OUTPUT_DIR / "menus"
+CONTENT_SYNC_MARKER = OUTPUT_DIR / "last_content_sync.txt"
 
 
 def _setup_log() -> logging.Logger:
@@ -844,6 +845,16 @@ def main() -> int:
               "%d policies, %d menus",
               n_products, n_collections, n_pages, n_articles,
               n_policies, n_menus)
+    if not args.dry_run:
+        CONTENT_SYNC_MARKER.write_text(
+            f"{_dt.utcnow().isoformat()}Z\n"
+            f"products={n_products}\n"
+            f"collections={n_collections}\n"
+            f"pages={n_pages}\n"
+            f"articles={n_articles}\n"
+            f"policies={n_policies}\n"
+            f"menus={n_menus}\n",
+            encoding="utf-8")
     log.info("Output: %s", OUTPUT_DIR)
     return 0
 

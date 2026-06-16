@@ -81,6 +81,7 @@ if not log.handlers:
 
 SHOPIFY_DIR = DATA_DIR / "shopify"
 SHOPIFY_PRODUCTS_DIR = SHOPIFY_DIR / "products"
+SHOPIFY_CONTENT_SYNC_MARKER = SHOPIFY_DIR / "last_content_sync.txt"
 # v2.67.14 — collections directory contains curated groupings (e.g.
 # "White LED Strip", "Outdoor Strips") written by shopify_sync.py.
 # find_products scores each collection against the query and uses
@@ -537,16 +538,26 @@ def shopify_freshness_status() -> dict:
     mtimes = [p.stat().st_mtime for p in paths]
     oldest_age_hours = (now - min(mtimes)) / 3600.0
     newest_age_hours = (now - max(mtimes)) / 3600.0
-    state = "fresh" if oldest_age_hours <= STALE_THRESHOLD_HOURS else "stale"
+    marker_age_hours = None
+    if SHOPIFY_CONTENT_SYNC_MARKER.exists():
+        marker_age_hours = (
+            now - SHOPIFY_CONTENT_SYNC_MARKER.stat().st_mtime) / 3600.0
+    freshness_age = (marker_age_hours
+                     if marker_age_hours is not None
+                     else newest_age_hours)
+    state = "fresh" if freshness_age <= STALE_THRESHOLD_HOURS else "stale"
     return {
         "state": state,
         "n_products": len(paths),
         "oldest_age_hours": round(oldest_age_hours, 1),
         "newest_age_hours": round(newest_age_hours, 1),
+        "last_sync_age_hours": (
+            round(marker_age_hours, 1)
+            if marker_age_hours is not None else None),
         "message": (
-            f"{len(paths)} Shopify products indexed; oldest file "
-            f"{oldest_age_hours:.1f}h old, newest "
-            f"{newest_age_hours:.1f}h old."
+            f"{len(paths)} Shopify products indexed; "
+            f"last content sync "
+            f"{freshness_age:.1f}h ago."
         ),
     }
 
