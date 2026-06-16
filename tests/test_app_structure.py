@@ -109,6 +109,23 @@ class DataCatalogTests(unittest.TestCase):
             self.assertEqual(missing[0]["Status"], "missing")
 
 
+class WorkerLoopTests(unittest.TestCase):
+    def test_slack_worker_refreshes_product_master_for_storage_dims(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "slack_loop.sh"
+        ).read_text(encoding="utf-8")
+
+        daily_refresh = script.index("launching daily 30d refresh chain")
+        products_refresh = script.index("python cin7_sync.py products",
+                                        daily_refresh)
+        sales_refresh = script.index("python cin7_sync.py salelines --days 30",
+                                    daily_refresh)
+
+        self.assertLess(products_refresh, sales_refresh)
+        self.assertIn("NearSync", script)
+        self.assertIn("Storage L x W x H In", script)
+
+
 class IncomingStockTests(unittest.TestCase):
     def tearDown(self) -> None:
         ai_tools.set_purchase_lines(pd.DataFrame())
