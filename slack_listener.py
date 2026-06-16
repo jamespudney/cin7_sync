@@ -1379,6 +1379,7 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         try:
             import ai_tools
             import gc
+            ai_tools.set_products(products)
             pl_files = sorted(_glob.glob(str(OUTPUT_DIR / "purchase_lines_last_*d_*.csv")))
             if pl_files:
                 ai_tools.set_purchase_lines(pd.read_csv(pl_files[-1], low_memory=False))

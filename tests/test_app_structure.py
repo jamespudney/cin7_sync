@@ -368,7 +368,7 @@ class IncomingStockTests(unittest.TestCase):
             "Name": "Slim8 Black 2m",
             "OnHand": 133.75,
             "OnOrder": 160,
-            " storage l x w x h in ": "78 x 0.47 x 0.31",
+            " storage l x w x h in ": '78" x 0.906" x 0.354"',
         }])
 
         ai_tools.set_purchase_lines(pd.DataFrame())
@@ -376,7 +376,30 @@ class IncomingStockTests(unittest.TestCase):
             engine_df, pd.DataFrame(), {"sku": sku})
 
         self.assertEqual(
-            result["stock"]["storage_dim"], "78 x 0.47 x 0.31")
+            result["stock"]["storage_dim"], '78" x 0.906" x 0.354"')
+
+    def test_stock_position_falls_back_to_product_master_storage_dim(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "OnHand": 133.75,
+            "OnOrder": 160,
+            "storage_dim": "",
+        }])
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "AdditionalAttribute6": '78" x 0.906" x 0.354"',
+        }])
+
+        ai_tools.set_products(products)
+        ai_tools.set_purchase_lines(pd.DataFrame())
+        result = ai_tools.get_stock_position(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertEqual(
+            result["stock"]["storage_dim"], '78" x 0.906" x 0.354"')
 
     def test_stock_position_skips_blank_bin_for_stock_locator(self) -> None:
         sku = "LED-89030021-2"
@@ -454,10 +477,18 @@ class IncomingStockTests(unittest.TestCase):
     def test_storage_dimension_extracts_named_cin7_field(self) -> None:
         row = {
             "SKU": "LED-NEON-FLEX-SUPER-SLIM-ST",
-            " storage l x w x h in ": "10 x 0.5 x 0.5",
+            " storage l x w x h in ": '78" x 0.906" x 0.354"',
         }
 
-        self.assertEqual(extract_storage_dim(row), "10 x 0.5 x 0.5")
+        self.assertEqual(extract_storage_dim(row), '78" x 0.906" x 0.354"')
+
+    def test_storage_dimension_extracts_inches_from_positional_attribute(self) -> None:
+        row = {
+            "SKU": "LED-89030021-2",
+            "AdditionalAttribute6": '78" x 0.906" x 0.354"',
+        }
+
+        self.assertEqual(extract_storage_dim(row), '78" x 0.906" x 0.354"')
 
     def test_worker_engine_promotes_raw_storage_dimension_field(self) -> None:
         sku = "LED-NEON-FLEX-SUPER-SLIM-ST"
