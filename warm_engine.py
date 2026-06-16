@@ -35,7 +35,9 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 from pathlib import Path
+from datetime import datetime
 
 # Set STREAMLIT_HOME to match what the live app uses, so we write
 # to the same cache directory.
@@ -50,6 +52,33 @@ def _emit(msg: str) -> None:
     elsewhere by the calling shell."""
     sys.stderr.write(f"[warm_engine] {msg}\n")
     sys.stderr.flush()
+
+
+def _finish_background_refresh(exit_code: int) -> None:
+    """Update optional background-refresh status files for the web UI."""
+    lock_path = os.environ.get("ENGINE_REFRESH_LOCK_PATH", "").strip()
+    status_path = os.environ.get("ENGINE_REFRESH_STATUS_PATH", "").strip()
+    reason = os.environ.get("ENGINE_REFRESH_REASON", "").strip()
+
+    if status_path:
+        try:
+            payload = {
+                "state": "complete" if exit_code == 0 else "failed",
+                "exit_code": exit_code,
+                "reason": reason,
+                "updated_at": datetime.utcnow().isoformat() + "Z",
+            }
+            p = Path(status_path)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(p)
+        except Exception:
+            pass
+    if lock_path:
+        try:
+            Path(lock_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def main() -> int:
@@ -157,4 +186,6 @@ def _fallback_inline_warm(t_start: float) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit_code = main()
+    _finish_background_refresh(_exit_code)
+    sys.exit(_exit_code)

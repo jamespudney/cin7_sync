@@ -17,6 +17,7 @@ Over the internet with auth (once you're ready):
 
 from __future__ import annotations
 
+import ast
 import glob
 import json
 import os
@@ -3251,6 +3252,202 @@ def _dir_fingerprint(pattern: str) -> tuple:
         except OSError:
             continue
     return tuple(out)
+
+
+def _engine_source_fingerprint() -> tuple:
+    """Fingerprint every source file that feeds the ABC engine."""
+    return (
+        _dir_fingerprint("products_*.csv"),
+        _dir_fingerprint("stock_on_hand_*.csv"),
+        _dir_fingerprint("sale_lines_last_*d_*.csv"),
+        _dir_fingerprint("purchase_lines_last_*d_*.csv"),
+        _dir_fingerprint("assemblies_last_*d_*.csv"),
+    )
+
+
+def _fingerprint_latest_mtime(fp: tuple) -> float:
+    """Return the newest mtime embedded in a nested fingerprint."""
+    newest = 0.0
+    for group in fp:
+        for _, mtime in group:
+            try:
+                newest = max(newest, float(mtime or 0))
+            except (TypeError, ValueError):
+                continue
+    return newest
+
+
+_ENGINE_OUTPUT_PATH = OUTPUT_DIR / "engine_output.csv"
+_ENGINE_REFRESH_LOCK = OUTPUT_DIR / "engine_refresh.lock"
+_ENGINE_REFRESH_STATUS = OUTPUT_DIR / "engine_refresh_status.json"
+_ENGINE_REFRESH_LOG = OUTPUT_DIR / "engine_refresh.log"
+
+
+def _engine_output_mtime() -> Optional[float]:
+    try:
+        if _ENGINE_OUTPUT_PATH.exists():
+            return _ENGINE_OUTPUT_PATH.stat().st_mtime
+    except OSError:
+        return None
+    return None
+
+
+def _parse_engine_list_cell(value):
+    if isinstance(value, list):
+        return value
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text.startswith("["):
+        return []
+    try:
+        parsed = ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out = []
+    for item in parsed:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    return out
+
+
+def _parse_engine_bool_cell(value) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n", ""}:
+        return False
+    return bool(value)
+
+
+def _normalise_engine_snapshot(df: pd.DataFrame) -> pd.DataFrame:
+    """Restore CSV-loaded engine snapshot columns to app-friendly types."""
+    if df.empty:
+        return df
+    for col in ("trend_12m", "trend_24m"):
+        if col in df.columns:
+            df[col] = df[col].apply(_parse_engine_list_cell)
+    for col in ("is_dormant", "is_non_master_tube"):
+        if col in df.columns:
+            df[col] = df[col].apply(_parse_engine_bool_cell)
+    return df
+
+
+def _load_engine_output_snapshot() -> pd.DataFrame:
+    """Fast last-good ABC engine result written by warm_engine.py."""
+    try:
+        if not _ENGINE_OUTPUT_PATH.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(_ENGINE_OUTPUT_PATH, low_memory=False)
+        return _normalise_engine_snapshot(df)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+
+def _stock_bin_view(stock_df: pd.DataFrame) -> pd.DataFrame:
+    """Return SKU -> Bin using any CIN7 stock-locator column name."""
+    if stock_df is None or stock_df.empty or "SKU" not in stock_df.columns:
+        return pd.DataFrame(columns=["SKU", "Bin"])
+    bin_col = next(
+        (c for c in ("Bin", "BinLocation", "StockLocator",
+                     "Stock Locator", "Location")
+         if c in stock_df.columns),
+        None)
+    if not bin_col:
+        return pd.DataFrame(columns=["SKU", "Bin"])
+    view = stock_df[["SKU", bin_col]].copy()
+    view["SKU"] = view["SKU"].astype(str)
+    view["Bin"] = view[bin_col].fillna("").astype(str).str.strip()
+    view = view[view["Bin"] != ""]
+    return view[["SKU", "Bin"]].drop_duplicates(subset=["SKU"])
+
+
+def _engine_refresh_running(max_age_minutes: int = 45) -> bool:
+    try:
+        if not _ENGINE_REFRESH_LOCK.exists():
+            return False
+        age_min = (
+            datetime.now().timestamp()
+            - _ENGINE_REFRESH_LOCK.stat().st_mtime
+        ) / 60.0
+        return age_min <= max_age_minutes
+    except OSError:
+        return False
+
+
+def _write_engine_refresh_status(payload: dict) -> None:
+    try:
+        payload = dict(payload)
+        payload["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        tmp = _ENGINE_REFRESH_STATUS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+        tmp.replace(_ENGINE_REFRESH_STATUS)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _start_background_engine_refresh(reason: str,
+                                     source_fp: Optional[tuple] = None
+                                     ) -> bool:
+    """Start warm_engine.py without blocking the current Streamlit user."""
+    if os.environ.get("WARM_ENGINE_RUNNING") == "1":
+        return False
+    if _engine_refresh_running():
+        return False
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        _ENGINE_REFRESH_LOCK.write_text(
+            json.dumps({
+                "started_at": datetime.utcnow().isoformat() + "Z",
+                "reason": reason,
+                "source_latest_mtime": (
+                    _fingerprint_latest_mtime(source_fp)
+                    if source_fp is not None else None),
+            }, default=str),
+            encoding="utf-8",
+        )
+        _write_engine_refresh_status({
+            "state": "running",
+            "reason": reason,
+        })
+        env = os.environ.copy()
+        env.setdefault("DATA_DIR", str(OUTPUT_DIR.parent))
+        env.setdefault("STREAMLIT_HOME", str(OUTPUT_DIR.parent / ".streamlit"))
+        env["WARM_ENGINE_RUNNING"] = "1"
+        env["ENGINE_REFRESH_LOCK_PATH"] = str(_ENGINE_REFRESH_LOCK)
+        env["ENGINE_REFRESH_STATUS_PATH"] = str(_ENGINE_REFRESH_STATUS)
+        env["ENGINE_REFRESH_REASON"] = reason
+        log_fh = _ENGINE_REFRESH_LOG.open("a", encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, "warm_engine.py"],
+            cwd=str(APP_DIR),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            close_fds=True,
+            env=env,
+        )
+        log_fh.close()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        try:
+            _ENGINE_REFRESH_LOCK.unlink(missing_ok=True)
+        except Exception:
+            pass
+        _write_engine_refresh_status({
+            "state": "failed_to_start",
+            "reason": reason,
+            "error": repr(exc),
+        })
+        return False
 
 
 # Empty-frame factories used by loaders when no CSVs exist on disk yet.
@@ -7313,17 +7510,36 @@ def _abc_engine(products: pd.DataFrame,
 # semantically identical to a fresh compute. The wrapper makes the
 # pattern explicit: read here, mutate downstream, expect to see
 # mutations on subsequent reads in the same process.
-@st.cache_resource(show_spinner="Loading ABC engine…")
-def _get_engine_df() -> "pd.DataFrame":
+@st.cache_resource(show_spinner=False)
+def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
     """Process-cached accessor for the full ABC engine output.
-    Computes once via the disk-cached _abc_engine and returns the
-    same instance to every page in every session. Cleared by the
-    Refresh button below (st.cache_resource.clear())."""
+
+    Prefer the last-good engine_output.csv snapshot written by
+    warm_engine.py. That keeps users moving while a fresh ABC run is
+    happening in the background. Only fall back to foreground compute
+    when no snapshot exists yet (fresh install / first boot)."""
     if products.empty or sale_lines.empty:
         return pd.DataFrame()
+    snapshot = _load_engine_output_snapshot()
+    if not snapshot.empty:
+        return snapshot
     return _abc_engine(
         products, stock, sale_lines, purchase_lines,
         assemblies_df=assemblies)
+
+
+def _get_engine_df() -> "pd.DataFrame":
+    return _get_engine_df_cached(_engine_output_mtime())
+
+
+def _clear_engine_df_cache() -> None:
+    try:
+        _get_engine_df_cached.clear()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_get_engine_df.clear = _clear_engine_df_cache  # type: ignore[attr-defined]
 
 
 # v2.67.356 — engine cache auto-invalidate on fresh source files.
@@ -7339,13 +7555,12 @@ def _get_engine_df() -> "pd.DataFrame":
 # even though sync had run.
 #
 # Fix: fingerprint the source CSV files on every script rerun.
-# When it differs from the fingerprint stored when _get_engine_df
-# was last populated, clear the cache so the next read rebuilds
-# against the fresh data. Streamlit reruns the WHOLE script on
-# every user interaction, so this check is essentially free
-# (just file stat()s) and runs constantly. The holder dict is
-# itself @st.cache_resource so the fingerprint persists across
-# user sessions in the same process.
+# When it differs from the last observed fingerprint, ask warm_engine.py
+# to rebuild engine_output.csv in the background. Streamlit reruns the
+# WHOLE script on every user interaction, so this check is essentially
+# free (just file stat()s) and runs constantly. The holder dict is itself
+# @st.cache_resource so the fingerprint persists across user sessions in
+# the same process.
 @st.cache_resource(show_spinner=False)
 def _engine_fp_holder() -> dict:
     """Process-level dict tracking the source-file fingerprint
@@ -7355,23 +7570,31 @@ def _engine_fp_holder() -> dict:
 
 def _auto_invalidate_engine_if_stale() -> None:
     holder = _engine_fp_holder()
-    current_fp = (
-        _dir_fingerprint("products_*.csv"),
-        _dir_fingerprint("stock_on_hand_*.csv"),
-        _dir_fingerprint("sale_lines_last_*d_*.csv"),
-        _dir_fingerprint("purchase_lines_last_*d_*.csv"),
-        _dir_fingerprint("assemblies_last_*d_*.csv"),
-    )
+    current_fp = _engine_source_fingerprint()
     prev_fp = holder.get("fp")
     if prev_fp != current_fp:
         if prev_fp is not None:
-            # Skip the first observed fingerprint (cache is empty
-            # anyway). From the second one onwards, ANY change in
-            # any source-file mtime triggers a recompute.
-            try:
-                _get_engine_df.clear()
-            except Exception:
-                pass
+            # Do not clear the user-facing engine cache here. Clearing
+            # made the next unlucky user pay for the full ABC rebuild.
+            # Instead, start warm_engine.py in the background. Pages keep
+            # using the last-good engine_output.csv snapshot until the
+            # new one lands, at which point _get_engine_df() sees a new
+            # snapshot mtime and swaps in the fresh data on the next
+            # normal rerun.
+            _start_background_engine_refresh(
+                "source CSV fingerprint changed", current_fp)
+        else:
+            snapshot_mtime = _engine_output_mtime()
+            source_mtime = _fingerprint_latest_mtime(current_fp)
+            if snapshot_mtime is None:
+                # Fresh install / empty cache: ask the warmer to create the
+                # first snapshot. If a page needs the engine before it
+                # finishes, _get_engine_df_cached will still compute once.
+                _start_background_engine_refresh(
+                    "initial engine snapshot missing", current_fp)
+            elif source_mtime > float(snapshot_mtime or 0) + 1.0:
+                _start_background_engine_refresh(
+                    "engine snapshot older than source CSVs", current_fp)
         holder["fp"] = current_fp
 
 
@@ -10709,19 +10932,18 @@ elif page == "Ordering":
         "transparent calculations, and draft-PO staging."
     )
 
-    # v2.67.346 — explicit recompute button. The engine is cached
-    # (@st.cache_resource) so it doesn't auto-rebuild between user
-    # interactions; supplier config saves DO invalidate the reorder
-    # apply via _reorder_apply_sig, but other settings (Holidays,
-    # SKU-supplier assignments, freight rules) sometimes leave the
-    # buyer wondering whether the numbers on screen reflect the
-    # latest config. This button rebuilds the engine from scratch
-    # so there's never any doubt. Cheap-ish on Render Pro (4GB) —
-    # the rebuild is the same one that runs on first page load.
+    # v2.67.346 — explicit recompute button. The engine snapshot is
+    # shared across sessions, and supplier/config changes can leave
+    # buyers wondering whether the numbers on screen reflect the latest
+    # inputs. This starts a background rebuild and keeps the current
+    # last-good snapshot live until the fresh output lands.
     _rc1, _rc2, _rc3 = st.columns([6, 2, 2])
     with _rc2:
-        _eng_at = st.session_state.get("_engine_last_built_at")
-        if _eng_at:
+        _eng_mtime = _engine_output_mtime()
+        if _engine_refresh_running():
+            st.caption("ABC refresh **running in background**")
+        elif _eng_mtime:
+            _eng_at = datetime.fromtimestamp(_eng_mtime)
             _age_min = (datetime.now() - _eng_at).total_seconds() / 60.0
             if _age_min < 1:
                 _age_str = "just now"
@@ -10729,9 +10951,9 @@ elif page == "Ordering":
                 _age_str = f"{_age_min:.0f} min ago"
             else:
                 _age_str = f"{_age_min/60:.1f} h ago"
-            st.caption(f"Engine built **{_age_str}**")
+            st.caption(f"Engine snapshot updated **{_age_str}**")
         else:
-            st.caption("Engine built **just now**")
+            st.caption("Engine snapshot **not created yet**")
     with _rc3:
         if st.button(
             "🔄 Recompute now",
@@ -10739,20 +10961,24 @@ elif page == "Ordering":
             help="Force a fresh engine rebuild so any recent config "
                  "changes (supplier settings, freight rules, holiday "
                  "closures, SKU-supplier assignments) take effect "
-                 "immediately. Takes a few seconds.",
+                 "without blocking the page.",
             width="stretch",
         ):
-            try:
-                _get_engine_df.clear()
-            except Exception:  # noqa: BLE001
-                pass
+            _started = _start_background_engine_refresh(
+                "manual ABC refresh requested",
+                _engine_source_fingerprint())
+            _get_engine_df.clear()
             st.session_state.pop("_reorder_apply_sig", None)
-            st.session_state["_engine_last_built_at"] = datetime.now()
-            st.rerun()
-    # First page render of this session — stamp the build time so the
-    # caption above has something to display next time.
-    if "_engine_last_built_at" not in st.session_state:
-        st.session_state["_engine_last_built_at"] = datetime.now()
+            if _started:
+                st.success(
+                    "ABC refresh started in the background. You can "
+                    "keep working; the dashboard will pick up the new "
+                    "engine output when it finishes.")
+            else:
+                st.info(
+                    "ABC refresh is already running, or could not be "
+                    "started. The dashboard will keep using the last "
+                    "good engine output.")
 
     # ------------------------------------------------------------------
     # Glossary — click-to-reveal definitions for every buyer-facing term.
@@ -19963,12 +20189,8 @@ elif page == "AI Assistant":
             # the AI needs it. Take the first non-empty Bin per
             # SKU (a SKU can be in multiple bins — first one is a
             # reasonable default for a single-line answer).
-            if not stock.empty and "Bin" in stock.columns:
-                _bin_view = stock[["SKU", "Bin"]].copy()
-                _bin_view["SKU"] = _bin_view["SKU"].astype(str)
-                _bin_view["Bin"] = _bin_view["Bin"].fillna("").astype(str)
-                _bin_view = _bin_view[_bin_view["Bin"].str.strip() != ""]
-                _bin_view = _bin_view.drop_duplicates(subset=["SKU"])
+            _bin_view = _stock_bin_view(stock)
+            if not _bin_view.empty:
                 engine_df = engine_df.copy()  # don't mutate cache
                 if "Bin" in engine_df.columns:
                     engine_df = engine_df.drop(columns=["Bin"])
@@ -19987,10 +20209,15 @@ elif page == "AI Assistant":
             if not stock.empty and "SKU" in stock.columns:
                 _stock_view = stock[["SKU"]].copy()
                 _stock_view["SKU"] = _stock_view["SKU"].astype(str)
-                for _col in ("OnHand", "Available"):
+                for _col in ("OnHand", "Available", "Allocated",
+                             "OnOrder"):
                     if _col in stock.columns:
                         _stock_view[_col] = pd.to_numeric(
                             stock[_col], errors="coerce")
+                _bin_view = _stock_bin_view(stock)
+                if not _bin_view.empty:
+                    _stock_view = _stock_view.merge(
+                        _bin_view, on="SKU", how="left")
                 engine_df = engine_df.merge(
                     _stock_view, on="SKU", how="left")
             if "AdditionalAttribute1" in engine_df.columns:
@@ -20008,10 +20235,14 @@ elif page == "AI Assistant":
         if not stock.empty and "SKU" in stock.columns:
             _stock_view = stock[["SKU"]].copy()
             _stock_view["SKU"] = _stock_view["SKU"].astype(str)
-            for _col in ("OnHand", "Available"):
+            for _col in ("OnHand", "Available", "Allocated", "OnOrder"):
                 if _col in stock.columns:
                     _stock_view[_col] = pd.to_numeric(
                         stock[_col], errors="coerce")
+            _bin_view = _stock_bin_view(stock)
+            if not _bin_view.empty:
+                _stock_view = _stock_view.merge(
+                    _bin_view, on="SKU", how="left")
             engine_df = engine_df.merge(
                 _stock_view, on="SKU", how="left")
         if "AdditionalAttribute1" in engine_df.columns:
