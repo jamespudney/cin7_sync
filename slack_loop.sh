@@ -259,6 +259,13 @@ while true; do
             last_dim_refresh_epoch=$(date -u +%s)
             (
                 if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
+                    # v2.67.370 — refresh products here because NearSync
+                    # deliberately skips master data. This keeps Slack's
+                    # local products_*.csv aligned with dashboard fixes for
+                    # CIN7 fields such as Storage L x W x H In.
+                    echo "[$(stamp)] [bg] cin7 products" >> "$LOG"
+                    python cin7_sync.py products \
+                        >> "$LOG" 2>&1 || true
                     echo "[$(stamp)] [bg] cin7 salelines 30d" >> "$LOG"
                     python cin7_sync.py salelines --days 30 \
                         >> "$LOG" 2>&1 || true
