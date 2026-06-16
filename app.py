@@ -37,6 +37,8 @@ from app_config import (
     APP_DEPLOYED,
     APP_VERSION,
     PAGE_CAPTIONS,
+    PAGE_DESCRIPTIONS,
+    PAGE_GROUP_BY_NAME,
     PAGE_GROUPS,
     PAGE_OPTIONS,
 )
@@ -994,1222 +996,102 @@ products = load("products")
 customers = load("customers")
 
 
+def _sidebar_age_label(dt: datetime) -> str:
+    age_min = (datetime.now() - dt).total_seconds() / 60.0
+    if age_min < 1:
+        return "just now"
+    if age_min < 60:
+        return f"{age_min:.0f}m ago"
+    if age_min < 1440:
+        return f"{age_min / 60:.1f}h ago"
+    return f"{age_min / 1440:.1f}d ago"
+
+
+def _sidebar_abc_status() -> str:
+    try:
+        eng_path = OUTPUT_DIR / "engine_output.csv"
+        lock_path = OUTPUT_DIR / "engine_refresh.lock"
+        eng_mtime = eng_path.stat().st_mtime if eng_path.exists() else None
+        refresh_running = False
+        if lock_path.exists():
+            lock_age_min = (
+                datetime.now().timestamp() - lock_path.stat().st_mtime
+            ) / 60.0
+            refresh_running = lock_age_min <= 45
+        if refresh_running:
+            if eng_mtime:
+                eng_at = datetime.fromtimestamp(eng_mtime)
+                return (
+                    "🟡 ABC refresh running · using "
+                    f"{eng_at.strftime('%Y-%m-%d %H:%M')}"
+                )
+            return "🟡 ABC refresh running · first snapshot pending"
+        if eng_mtime:
+            eng_at = datetime.fromtimestamp(eng_mtime)
+            age_min = (datetime.now() - eng_at).total_seconds() / 60.0
+            icon = "🟢" if age_min < 1440 else "🟡"
+            return f"{icon} ABC updated {_sidebar_age_label(eng_at)}"
+        return "🟡 ABC snapshot not yet created"
+    except Exception:  # noqa: BLE001
+        return "ABC status unavailable"
+
+
+def _sidebar_sync_status() -> str:
+    _, age_min, filename = _freshness_from_output_dir()
+    if age_min is None:
+        return "🟡 CIN7 sync status unavailable"
+    icon = "🟢" if age_min <= 30 else "🟡" if age_min <= 180 else "🔴"
+    if age_min < 60:
+        age = f"{age_min:.0f}m ago"
+    elif age_min < 1440:
+        age = f"{age_min / 60:.1f}h ago"
+    else:
+        age = f"{age_min / 1440:.1f}d ago"
+    suffix = f" · {filename}" if filename else ""
+    return f"{icon} CIN7 sync {age}{suffix}"
+
+
+def _clear_app_caches_for_sidebar() -> None:
+    _safe_cache_clear()
+    try:
+        st.cache_resource.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    st.session_state.pop("_engine_df_cached", None)
+
+
+def _visible_pages_for_profile(profile: dict) -> list[str]:
+    page_options = list(PAGE_OPTIONS)
+    user_role = (profile or {}).get("role") or "sales"
+    user_id = (profile or {}).get("user_id") or 0
+    user_name = (
+        (profile or {}).get("display_name")
+        or st.session_state.get("current_user", "")
+    )
+    is_super_admin = db.is_super_admin(user_name, user_role)
+    if is_super_admin:
+        return page_options
+    if (user_role or "").strip().lower() == "admin":
+        return [p for p in page_options if p != "User Permissions"]
+    try:
+        return [
+            p for p in page_options
+            if (
+                p != "User Permissions"
+                and db.can_user_access_page(user_id, p, user_role)
+            )
+        ]
+    except Exception:
+        return [p for p in page_options if p != "User Permissions"]
+
+
 with st.sidebar:
     st.title(":bar_chart: Cin7 Analytics")
     st.caption("Wired4Signs USA, LLC — ops dashboard")
-    # v2.67.291 — version banner moved to the BOTTOM of the sidebar
-    # (see APP_VERSION line further down). The old multi-line
-    # changelog at the top consumed prime UX space and tended to go
-    # stale; the current deploy is now shown as a small caption
-    # below the navigation, and the per-version detail still lives
-    # in the "Recent versions" expander further down.
-    # v2.67.36 — ABC snapshot indicator. This used to inspect
-    # Streamlit's generic cache directory, which became misleading
-    # after background refresh moved the source of truth to
-    # engine_output.csv. Keep this tied to the real engine snapshot.
-    try:
-        _eng_path = OUTPUT_DIR / "engine_output.csv"
-        _lock_path = OUTPUT_DIR / "engine_refresh.lock"
-        _eng_mtime = (
-            _eng_path.stat().st_mtime if _eng_path.exists() else None)
-        _refresh_running = False
-        if _lock_path.exists():
-            _lock_age_min = (
-                datetime.now().timestamp()
-                - _lock_path.stat().st_mtime
-            ) / 60.0
-            _refresh_running = _lock_age_min <= 45
-
-        def _fmt_sidebar_engine_age(_dt: datetime) -> str:
-            _age_min = (datetime.now() - _dt).total_seconds() / 60.0
-            if _age_min < 1:
-                return "just now"
-            if _age_min < 60:
-                return f"{_age_min:.0f}m ago"
-            if _age_min < 1440:
-                return f"{_age_min / 60:.1f}h ago"
-            return f"{_age_min / 1440:.1f}d ago"
-
-        if _refresh_running:
-            if _eng_mtime:
-                _eng_at = datetime.fromtimestamp(_eng_mtime)
-                st.caption(
-                    "🟡 ABC refresh running · using snapshot from "
-                    f"{_eng_at.strftime('%Y-%m-%d %H:%M')}")
-            else:
-                st.caption("🟡 ABC refresh running · first snapshot pending")
-        elif _eng_mtime:
-            _eng_at = datetime.fromtimestamp(_eng_mtime)
-            _age_min = (datetime.now() - _eng_at).total_seconds() / 60.0
-            _icon = "🟢" if _age_min < 1440 else "🟡"
-            st.caption(
-                f"{_icon} ABC updated {_fmt_sidebar_engine_age(_eng_at)}")
-        else:
-            st.caption("🟡 ABC snapshot not yet created")
-    except Exception:  # noqa: BLE001
-        # Don't break the sidebar over a status caption.
-        pass
-    with st.expander("Recent versions", expanded=False):
-        st.caption(
-            "**v2.67.66** — Auto-improvement loop. The bot now "
-            "reads its own audit trail: emoji reactions on its "
-            "posts (👍/👎/🛑/✅), human thread replies in any "
-            "thread the bot has posted in, and comments in "
-            "#ai-audit threads. A daily summarizer "
-            "(`bot_self_improvement.py`) digests the last 7 "
-            "days of feedback into a 'lessons learned' markdown "
-            "that's auto-prepended to the system prompt at "
-            "compose time. Closes the loop overnight — staff "
-            "react/comment, bot adjusts tomorrow.\n\n"
-            "Architecture:\n"
-            "1. `slack_sync._capture_feedback_from_message` "
-            "extracts feedback signals during the normal poll "
-            "cycle. New `slack_audit_feedback` table holds "
-            "every event (idempotent via UNIQUE index).\n"
-            "2. `slack_loop.sh` invokes "
-            "`bot_self_improvement.py daily --days 7` once per "
-            "24h. Self-healing: a worker reboot mid-day "
-            "re-fires the summarizer.\n"
-            "3. New `bot_lessons_learned` table (one row per "
-            "day) stores the markdown summary. Markdown also "
-            "written to `/data/output/bot_lessons_learned.md` "
-            "for human review.\n"
-            "4. `slack_listener._get_lessons_learned_block` "
-            "fetches the latest summary at compose time and "
-            "prepends it as 'TEAM FEEDBACK CONTEXT' to every "
-            "system prompt. 10-min in-process cache.\n\n"
-            "Polarity classifier (curated emoji lists): 👍/✅/"
-            "💯/🎉/🚀/🙏 → +1. 👎/🛑/❌/⛔/😠 → −1. Others + "
-            "thread-reply text are neutral context.\n\n"
-            "Cost: ~$0.30/day for the summarizer Anthropic "
-            "call. Negligible.\n\n"
-            "Setup: no env-var changes. Worker picks up new "
-            "tables via db.py auto-migration on connect. First "
-            "summary generates ~24h after deploy, OR run "
-            "manually with `python bot_self_improvement.py "
-            "daily` for an immediate first cut."
-        )
-        st.caption(
-            "**v2.67.59** — #returns channel intent. User pointed "
-            "out we'd discussed earlier wanting the bot to watch "
-            "#returns and warn the buyer when a returned SKU is "
-            "on an open PO (so he doesn't double-order). I'd "
-            "missed adding it in v2.67.57. Fixed by:\n\n"
-            "1. New `returns` value in the channel-intent map "
-            "(triggers on channel name containing 'return').\n"
-            "2. Classification rule: in #returns, ANY SKU mention "
-            "is enough to fire — staff don't ask 'questions' here, "
-            "they post returns; the bot's job is the proactive "
-            "cross-link, not Q&A.\n"
-            "3. Returns-mode system prompt: workflow is "
-            "(a) get_incoming_stock for the SKU, (b) "
-            "get_sku_details for engine signals, (c) post a "
-            "short warning thread reply with @-mention to the "
-            "buyer if open PO exists. Format spec'd in the "
-            "prompt — one line if no open PO, full warning "
-            "with units / supplier / 12mo demand if there is "
-            "one.\n"
-            "4. Dormant / excess-flagged SKUs get extra-loud "
-            "warnings in the response — those are the "
-            "highest-value catches (don't order more of stock "
-            "that isn't selling, especially when a customer just "
-            "returned some).\n\n"
-            "User's SLACK_AI_CHANNELS env var on the worker now "
-            "includes #returns (C08TU462G9Z) — 7 channels total."
-        )
-        st.caption(
-            "**v2.67.58** — Worker self-sufficiency. v2.67.57 "
-            "shipped the Slack code but assumed the worker could "
-            "share the web service's disk. Render disks are "
-            "exclusive per service — confirmed by attempting to "
-            "set up the worker. Solution: worker has its own "
-            "disk and bootstraps its own data.\n\n"
-            "**Updated `slack_loop.sh`:**\n"
-            "- First-boot detection (no products_*.csv in /data) "
-            "→ runs `cin7_sync quick --days 30` + salelines + "
-            "purchaselines + shipstation_sync recent 30d + "
-            "shopify_sync orders-recent 30d. Takes ~20-40 min "
-            "on first deploy.\n"
-            "- Steady-state main loop now interleaves: every "
-            "60s Slack poll/respond, every 30 min data refresh "
-            "(NearSync 1d window). Cadence configurable via "
-            "WORKER_DATA_SYNC_MINUTES env var.\n"
-            "- All sync calls are gated on the relevant env vars "
-            "being set (CIN7_ACCOUNT_ID for cin7_sync, "
-            "SHIPSTATION_API_KEY for shipstation, etc.) — the "
-            "worker no-ops cleanly for any data source not "
-            "configured rather than crashing.\n\n"
-            "**`slack_listener.py` graceful degrade:**\n"
-            "- When `_get_data_for_listener` returns None "
-            "(bootstrap not yet complete), the composer returns "
-            "a user-friendly '⏳ still loading data, ask again' "
-            "message instead of silently failing. Bot stays "
-            "polite and informative during the first-boot "
-            "warm-up window.\n\n"
-            "Setup steps for the worker (refreshed):\n"
-            "1. Render → New → Background Worker, repo + branch "
-            "= same as web service.\n"
-            "2. Build: `pip install -r requirements.txt`. "
-            "Start: `bash slack_loop.sh`.\n"
-            "3. Region: same as web service (Ohio).\n"
-            "4. Plan: Starter (512 MB).\n"
-            "5. Add a NEW disk (separate from web service's) — "
-            "mount path `/data`, size 1 GB+.\n"
-            "6. Env vars: copy ALL the keys from the web service "
-            "(SLACK_*, ANTHROPIC_API_KEY, CIN7_*, "
-            "SHIPSTATION_API_KEY, SHOPIFY_*).\n"
-            "7. Deploy. First boot bootstraps data (~30 min), "
-            "then the bot is live."
-        )
-        st.caption(
-            "**v2.67.57** — Big batch ship: Slack integration + "
-            "shipping cost-semantics fix + Shipping P&L AI tool.\n\n"
-            "**Slack** — bot now polls 6 channels every 60s "
-            "(#purchase-backorders, #stock-issues-queries, "
-            "#shipping-issues, #fulfilment, "
-            "#shopify-website-improvement, #saleschat) plus "
-            "mirrors every response to #ai-audit. Threaded replies "
-            "only. Question-detection + trigger-detection (SO/"
-            "PO/INV numbers + SKU patterns + customer names + "
-            "@-mentions). PO-review channel gets per-SKU "
-            "commentary using the engine's signals (ABC, "
-            "OnHand, OnOrder, is_dormant, excess_units, "
-            "trend_flag) plus duplicate-PO check. New AI tool "
-            "`get_slack_messages` lets the AI cross-reference "
-            "team chat from any channel. New SQLite tables: "
-            "slack_messages, slack_bot_responses, "
-            "slack_channel_cursors. Two new scripts: "
-            "`slack_sync.py` (poller) and `slack_listener.py` "
-            "(responder). Background-worker entrypoint: "
-            "`slack_loop.sh`.\n\n"
-            "**Shipping cost semantics (v2.67.55c rolled in)** — "
-            "fixed a bug uncovered via SO-55451 / SO-55971: the "
-            "v2 ShipStation `shipping_paid` field was being "
-            "mapped to `ShipmentCost`, but it's actually what "
-            "the CUSTOMER paid (revenue), not what UPS billed "
-            "us (cost). Cost lives on the /labels endpoint. New "
-            "split: `CustomerShippingCharge` (revenue), "
-            "`ShipmentCost` (true cost from label.shipment_cost), "
-            "`ShippingMargin` (charge - cost). "
-            "_merge_label_data populates both. Monthly Metrics' "
-            "Shipping Cost row now sums the true cost; label "
-            "shows '⚠️ stale CSV' if reading legacy data.\n\n"
-            "**get_shipping_margin AI tool** — first revealed "
-            "$149k/year shipping bleed via ad-hoc analysis "
-            "(LEDKIT-NICHO-UT180 alone losing $2.7k/month from "
-            "DIM-weight underquoting). Now an AI-callable tool "
-            "for any future P&L question, filterable by "
-            "SKU/customer/carrier/service/date with optional "
-            "loss-only flag. Returns headline totals + worst-N "
-            "rows.\n\n"
-            "**Memory note** — the OOM that killed last night's "
-            "parallel backfills is real (4 concurrent Python "
-            "processes + Streamlit caches exceeded the web "
-            "service's memory limit). Mitigation: run backfills "
-            "SERIALLY (one at a time). v2.67.58 will refactor "
-            "the sync scripts to write CSVs incrementally so "
-            "memory peaks stay flat."
-        )
-        st.caption(
-            "**v2.67.55** — Shopify order tracing for conversion "
-            "attribution. User asked: 'can you trace shopify "
-            "orders in cin7 and glean more information when "
-            "required... example if a user asks how did we get "
-            "this conversion, then ai knows to trace back an "
-            "order to amazon or shopify and give conversion "
-            "details'.\n\n"
-            "Problem: CIN7 stores Shopify sales with "
-            "SourceChannel='Shopify' but DROPS the conversion-"
-            "attribution fields. landing_site, referring_site, "
-            "source_name, customer_locale, note_attributes (UTM "
-            "params), discount_codes, browser_ip — all useful for "
-            "'how did we get this conversion' answers — only live "
-            "on the Shopify order itself.\n\n"
-            "Built into the existing shopify_sync.py:\n"
-            "- New `_flatten_shopify_order` extracts the conversion-"
-            "attribution columns alongside the financial fields.\n"
-            "- `sync_orders_recent(days)` for rolling-window pulls "
-            "(NearSync 1d, Daily 7d).\n"
-            "- `sync_orders_full(days=1825)` for one-time 5y "
-            "backfill.\n"
-            "- Output: `shopify_orders_full.csv` (backfill base) + "
-            "`shopify_orders_last_<N>d_*.csv` (rolling patches), "
-            "merged via `_load_longest_shopify_orders()` (same "
-            "pattern as shipments).\n\n"
-            "AI side:\n"
-            "- New `get_shopify_order(order_name / email / "
-            "customer + date)` tool. Returns total_price, "
-            "financial_status, fulfillment_status, customer "
-            "details, **plus** the headline conversion fields: "
-            "source_name, landing_site, referring_site, "
-            "customer_locale, note_attributes (UTM key=value "
-            "pairs), discount_codes, customer_orders_count, "
-            "customer_total_spent.\n"
-            "- System prompt CONVERSION-ATTRIBUTION routing rule: "
-            "when the user asks attribution-flavoured questions "
-            "AND the sale is Shopify-channel, AI calls the tool. "
-            "Pattern: when get_sale_order returns "
-            "SourceChannel=Shopify, AI proactively follows up "
-            "with get_shopify_order for the joined view "
-            "(rather than 'I have CIN7 data, you check Shopify').\n\n"
-            "Sync schedule:\n"
-            "- NearSync: `shopify_sync.py --orders-recent 1`\n"
-            "- Daily Sync: `shopify_sync.py --orders-recent 7`\n"
-            "- Both gated on existing SHOPIFY_DOMAIN + "
-            "SHOPIFY_ACCESS_TOKEN env vars; no-op when missing.\n\n"
-            "Future enhancement: customer_journey GraphQL endpoint "
-            "for multi-touch attribution (placeholder column "
-            "`CustomerJourneySource` already in the schema). "
-            "Amazon-side conversion data isn't currently in scope "
-            "— Amazon's Selling Partner API has equivalents "
-            "(referring_url, traffic_source) but a separate "
-            "client. Flagged for v2.67.56+ if/when needed."
-        )
-        st.caption(
-            "**v2.67.54** — ShipStation integration. The "
-            "Monthly Metrics 'Shipping Cost' row has been a "
-            "placeholder since launch; staff also wanted AI "
-            "lookup of shipping details by order / tracking / "
-            "customer.\n\n"
-            "Built `shipstation_sync.py` (parallel to "
-            "`cin7_sync.py` and `shopify_sync.py`):\n"
-            "- ShipStation v1 API client with Basic auth + "
-            "rate-limit-aware pagination (honours "
-            "X-Rate-Limit-Remaining/-Reset headers; sleeps for "
-            "the reset rather than burning a fixed delay).\n"
-            "- `recent --days N` mode for rolling window "
-            "(NearSync 1d, Daily 7d).\n"
-            "- `full --days 1825` mode for one-time 5-year "
-            "backfill.\n"
-            "- Output: `shipments_full.csv` (backfill base) + "
-            "`shipments_last_<N>d_*.csv` (rolling-window "
-            "patches). Same merge pattern as "
-            "`purchase_lines_*` — `_load_longest_shipments()` "
-            "picks the widest base and layers newer files on "
-            "top, deduped by ShipmentID.\n\n"
-            "AI side:\n"
-            "- New `get_shipping_details` tool: filters by "
-            "order_number / tracking_number / customer / "
-            "carrier_code / date range. Returns ship_date, "
-            "carrier, service, tracking, cost, ship-to "
-            "address, weight, item_summary, customer/internal "
-            "notes. Voided shipments flagged explicitly.\n"
-            "- `_SHIPMENTS_HOLDER` + `set_shipments()` setter "
-            "wired into AI page boot. Tool gracefully reports "
-            "'not loaded' when env vars missing.\n"
-            "- System prompt SHIPPING-LOOKUP routing rule "
-            "covers 'where's order X', 'tracking on Y', "
-            "'who shipped Z', etc.\n\n"
-            "Monthly Metrics:\n"
-            "- Shipping Cost row now aggregates "
-            "`ShipmentCost` from the merged shipments DF, "
-            "grouped by ShipDate month, voided shipments "
-            "excluded. Label flips between '(ShipStation)' "
-            "(live) and '(ShipStation pending — set "
-            "SHIPSTATION_API_KEY+SECRET)' (not configured).\n\n"
-            "Sync schedule:\n"
-            "- NearSync (15-min): `recent --days 1`.\n"
-            "- Daily (7am): `recent --days 7` catch-up.\n"
-            "- Both gate on env vars; no-op when missing.\n\n"
-            "Setup steps to enable: (1) add "
-            "SHIPSTATION_API_KEY + SHIPSTATION_API_SECRET to "
-            ".env / Render env. (2) Run `python "
-            "shipstation_sync.py full --days 1825` once. "
-            "(3) NearSync + Daily Sync take over."
-        )
-        st.caption(
-            "**v2.67.53** — Slow-stock value reconciliation. "
-            "User reported a $58k discrepancy: the Overview's "
-            "'Slow stock — value on shelf' tile said $290,872 "
-            "while the Slow Movers page said $232,153. Three "
-            "code paths were computing what's labelled the same "
-            "metric three different ways:\n\n"
-            "(1) Overview — summed `stock.StockOnHand` across "
-            "ALL flagged SKUs (no parent filter, no OnHand>0 "
-            "filter; included children whose stock rolls up to "
-            "the bulk-roll parent and zero-stock entries that "
-            "can't be cleared).\n\n"
-            "(2) Slow Movers page — summed "
-            "`engine_df.OnHandValue` filtered to "
-            "parents/standalones with OnHand>0 (the actionable "
-            "definition).\n\n"
-            "(3) Engine snapshot writer — used the right filter "
-            "but the wrong value column (`StockOnHand` instead "
-            "of `OnHandValue`), so MoM delta caption compared "
-            "apples to oranges.\n\n"
-            "Fix: extracted `_compute_slow_stock_holding(engine_df, "
-            "dormancy_warnings)` next to `_headline_stock_value`. "
-            "Returns sku_count + units_held + value_held + "
-            "filter_summary. Definition: parents/standalones, "
-            "OnHand>0, engine OnHandValue cost chain (graceful "
-            "fallback for SKUs missing CIN7 FIFO). All three "
-            "callers now invoke it, so the numbers tie. The "
-            "Slow Movers page falls back to its raw _slow_df "
-            "sum only when the diagnostic 'Show all flagged "
-            "SKUs' toggle is on. Snapshots written before the "
-            "deploy will produce a small one-time discontinuity "
-            "in the MoM caption — accepted because the new "
-            "definition is the canonical one going forward."
-        )
-        st.caption(
-            "**v2.67.52** — Document memo / notes capture. "
-            "After v2.67.51 made PO-7109 visible, the user "
-            "noticed the AI was leaving out the 'Purchase Order "
-            "Memo' field — the main instruction text box on the "
-            "CIN7 PO form, where the buyer types the most "
-            "detailed instructions. Probed the live CIN7 API "
-            "and found the PO endpoint exposes Memo at "
-            "`detail.Order.Memo`, plus three sibling freeform "
-            "fields (`Note` top-level, `Terms` payment terms, "
-            "and the existing `Comments`/`ShippingNotes`).\n\n"
-            "Sale endpoint has the parallel set: Memo, Note, "
-            "ShippingNotes, Terms, CustomerReference (the "
-            "customer's own PO#).\n\n"
-            "Changes:\n"
-            "(1) `_extract_po_freight_signals` now pulls Memo, "
-            "Note, Terms in addition to Comments + ShippingNotes. "
-            "All five carried through into purchase_lines CSV.\n"
-            "(2) New `_extract_sale_text_fields` mirror, wired "
-            "into `_extract_sale_lines` at all four emission "
-            "points (invoice line, invoice charge, fallback "
-            "order line, fallback order charge).\n"
-            "(3) AI tools `get_incoming_stock`, "
-            "`get_purchase_order`, `get_sale_order` all return "
-            "every non-empty field per record.\n"
-            "(4) Tool descriptions and system prompt updated "
-            "with explicit 'surface every non-null one' rule "
-            "so the AI doesn't suppress fields it doesn't "
-            "recognise.\n"
-            "(5) Glossary documents the field map.\n\n"
-            "Re-sync needed to backfill older transactions. "
-            "Next daily sync will pick up the new fields for "
-            "anything in its 30-day window. For deeper history, "
-            "run a manual `cin7_sync.py purchaselines --days "
-            "180 && cin7_sync.py salelines --days 180`."
-        )
-        st.caption(
-            "**v2.67.51** — Transaction lookup tools + PO-7109 "
-            "visibility fix. User reported the AI couldn't find "
-            "PO-7109 / LED-V3060001-2 even though OnOrder=190 "
-            "in stock-on-hand. Root cause: the AI was reading "
-            "`purchase_lines_last_90d_*.csv` directly, which is "
-            "only refreshed by manual full-syncs (the daily "
-            "sync was running `purchaselines --days 7`, so the "
-            "90d file was 14 days stale and PO-7109 — raised "
-            "less than 14 days ago — was invisible). Three "
-            "fixes shipped together:\n\n"
-            "(1) **Sync window bump.** `daily_sync.sh` and "
-            "`daily_sync.bat` now run "
-            "`cin7_sync.py purchaselines --days 30` daily. "
-            "Parallels the v2.67.43 sales-window bump. The "
-            "Windows .bat previously didn't run purchaselines "
-            "at all — added.\n\n"
-            "(2) **Longest-window holder.** `purchase_lines` is "
-            "now bound to `_load_longest_purchase_lines()` "
-            "instead of `load('purchase_lines_last_90d')`. "
-            "Same merge pattern as `sales_full`: pick the "
-            "widest window file as base, layer newer 1d/3d/30d "
-            "files on top. Now even if the 90d window goes "
-            "stale, recent 1d files patch it.\n\n"
-            "(3) **OnOrder data-gap hint.** "
-            "`get_incoming_stock` cross-checks "
-            "`engine_df.OnOrder` when matched=0; if OnOrder>0 "
-            "the response includes a `data_gap` field telling "
-            "the AI to say 'CIN7 record shows X on order but "
-            "the PO line isn't in our local sync window' "
-            "rather than 'no PO exists'.\n\n"
-            "Also added three new AI tools per user request "
-            "('look up any transaction'): "
-            "`get_purchase_order(po_number)` for full PO "
-            "lookup including received/closed; "
-            "`get_sale_order(order_number / invoice_number / "
-            "customer+date)` for sale-side lookup; "
-            "`get_stock_adjustment(stocktake_number / "
-            "date_range)` for adjustment headers (line detail "
-            "isn't synced — tool tells the AI to point users "
-            "at CIN7 directly for the per-SKU breakdown). "
-            "System prompt updated with TRANSACTION-LOOKUP "
-            "routing rules covering each number style "
-            "(PO-XXXX / SO-XXXX / INV-XXXX / ST-XXXX). "
-            "Glossary documents the new tools and the local "
-            "sync windows."
-        )
-        st.caption(
-            "**v2.67.50** — Slow Movers detail-table hotfix. "
-            "v2.67.47's `_category → Category` rename created "
-            "a duplicate Category column — engine_df inherits "
-            "Category from `products`, and the rename added a "
-            "second one. pyarrow refused to serialise the "
-            "DataFrame with duplicate column names, raising "
-            "ValueError in `st.dataframe`. Fixed by overwriting "
-            "the existing Category column in place rather than "
-            "creating a parallel `_category` and renaming it. "
-            "Pie chart groupby and detail-table column list "
-            "both updated to reference the resolved Category "
-            "directly."
-        )
-        st.caption(
-            "**v2.67.49** — Single-source glossary. The 'How "
-            "to read this page' panel was previously inline "
-            "markdown in the Ordering page only. User pointed "
-            "out that improvements like dormancy, A-class "
-            "grace, REMNANT, etc. weren't documented anywhere "
-            "the buyer or AI could reference, leading to "
-            "confusion about what the system was doing. "
-            "v2.67.49 extracts the content into a "
-            "module-level `GLOSSARY_MARKDOWN` constant, adds "
-            "new sections covering every concept shipped "
-            "since v2.67.20 (slow movers / dormancy / once-"
-            "slow warning / A-class grace / overstock / "
-            "REMNANT / fly-wheel flags / parents_only filter "
-            "/ Bin location / freight signals), renders it on "
-            "BOTH the Ordering page and the Slow Movers page, "
-            "AND injects it into the AI Assistant system "
-            "prompt as a knowledge appendix. So when a user "
-            "asks the AI 'what's A-class grace?' or 'why is "
-            "this REMNANT?', the AI quotes the canonical "
-            "definition. Future glossary edits automatically "
-            "propagate to every consumer."
-        )
-        st.caption(
-            "**v2.67.48** — A-class grace in dormancy detection. "
-            "User reported A-class SKUs appearing in Slow Movers "
-            "because the buyer over-buys for better pricing — "
-            "stock-on-hand goes up so 90d activity briefly "
-            "drops below threshold, engine flagged dormancy, "
-            "buyer gets discouraged from reordering a steady "
-            "mover. Wrong outcome.\n\n"
-            "(1) `_is_dormant` and `_refine_dormancy_by_class` "
-            "now both early-return `False` for any SKU with "
-            "ABC=A and positive `effective_units_12mo`. "
-            "Rationale: ABC=A means top cumulative 70% of "
-            "annual revenue — by definition a steady-revenue "
-            "item. If it had ANY 12mo demand we trust the "
-            "long-term pattern over a short-term lull.\n\n"
-            "(2) `db.auto_lift_aclass_dormancy(active_aclass_skus)` "
-            "called from inside the engine recompute lifts "
-            "existing A-class warnings immediately rather than "
-            "waiting the standard 90-day auto-lift window. "
-            "Reason='aclass_grace_v2_67_48' so the lift is "
-            "auditable.\n\n"
-            "(3) Ordering page Notes column now also surfaces "
-            "a 💼 note on A-class items where 90d activity is "
-            "below the dormancy threshold (would have flagged "
-            "if not A-class). Tells the buyer the engine's "
-            "reasoning explicitly: 'A-class steady mover (90d "
-            "activity low — possibly over-bought for pricing). "
-            "Engine grace applied … verify need before "
-            "ordering more.' So the over-buying signal isn't "
-            "lost; it's just not framed as dormancy.\n\n"
-            "Confirm on unflag: when the user clicks Unflag in "
-            "the Slow Movers search, db.dismiss_dormancy_warning "
-            "sets warning_lifted_at on that row. Every dashboard "
-            "(Overview slow-mover panel, Slow Movers page, "
-            "Ordering ❗ prefix + auto-note, weekly digest email) "
-            "reads via `db.get_dormancy_warnings()` which filters "
-            "WHERE warning_lifted_at IS NULL — so dismissed "
-            "SKUs vanish from every figure and calculation that "
-            "consumes the dormancy log."
-        )
-        st.caption(
-            "**v2.67.47** — Slow Movers detail table gets two "
-            "new columns: **Overstock qty** (`excess_units`) "
-            "and **Overstock value** (`excess_value`). Naive "
-            "baseline computed inside `_abc_engine` as "
-            "max(0, OnHand − effective_units_12mo) × per-unit "
-            "cost — i.e. how many units we hold beyond a year's "
-            "demand and what the dollar value of that overhang "
-            "is. The Ordering page later overwrites these with "
-            "a more precise version that factors supplier lead "
-            "times, freight modes, safety stock, and review "
-            "windows — so visiting the Ordering page in your "
-            "session upgrades the same cached engine_df. "
-            "Resolved Category column now also appears in the "
-            "detail table (was previously only the pie's "
-            "group key)."
-        )
-        st.caption(
-            "**v2.67.46** — AI Assistant fixes for "
-            "shipment-timing questions. User reported "
-            "'when do we get more slim8 silver' and 'when "
-            "does the next shipment of slim8 silver 2m "
-            "arrive' both produced 'I couldn't answer that' "
-            "even though the data was available via "
-            "`get_incoming_stock`.\n\n"
-            "(1) **Routing fix.** v2.67.25's STOCK intent "
-            "rule pinned every STOCK-tagged question to "
-            "`search_products_by_text`. Shipment-timing "
-            "questions ('when', 'next shipment', 'ETA', "
-            "'arrive', 'incoming', 'on order') are STOCK in "
-            "spirit but need PO data, not stock listings. "
-            "New SHIPMENT-TIMING rule overrides the STOCK "
-            "intent for those phrasings — call "
-            "`get_incoming_stock` instead, with sku/family "
-            "resolved via `search_products_by_text` first if "
-            "the user gave a friendly name like 'slim8 "
-            "silver' instead of a literal SKU.\n\n"
-            "(2) **'Must produce text' backstop.** The "
-            "tool-use loop falls back to 'I couldn't answer "
-            "that' when the AI generates ZERO text across "
-            "all turns (only tool calls). System prompt now "
-            "mandates that EVERY answer must include text, "
-            "even when all tools returned matched=0 — the AI "
-            "must say what was searched, what was found "
-            "(or not), and suggest a follow-up. Examples in "
-            "the prompt cover both empty get_incoming_stock "
-            "and empty search_products_by_text cases."
-        )
-        st.caption(
-            "**v2.67.45** — Three small fixes addressing user "
-            "feedback on v2.67.41-44.\n\n"
-            "(1) **Sidebar captions removed.** v2.67.41 "
-            "rendered each page's description as a caption "
-            "BELOW the radio option, doubling the sidebar's "
-            "vertical footprint. v2.67.45 collapses these "
-            "behind a single 'ⓘ What does each section do?' "
-            "expander — folded by default, click to read all "
-            "descriptions.\n\n"
-            "(2) **Slow Movers pie chart fixed.** v2.67.41 "
-            "regrouped the pie by Category but the chart was "
-            "rendering blank for users who landed on Slow "
-            "Movers without first visiting Ordering. Root "
-            "cause: `OnHandValue` (the per-SKU dollar value the "
-            "pie sums) was set inside the Ordering page elif, "
-            "not inside `_abc_engine`. Slow Movers + Overview "
-            "slow-mover panel both depend on it. Moved the "
-            "OnHandValue computation into `_abc_engine` so the "
-            "column is part of every cached engine_df.\n\n"
-            "(3) **Engine cache switched to "
-            "@st.cache_resource.** v2.67.41's session_state "
-            "approach was unreliable in practice — users "
-            "reported the engine spinner kicking in on every "
-            "page navigation despite the cache. cache_resource "
-            "is purpose-built for this exact pattern (expensive "
-            "object, share across sessions, only recompute on "
-            "explicit clear). Refresh button now clears both "
-            "cache_data and cache_resource."
-        )
-        st.caption(
-            "**v2.67.44** — Buyer's freight signals on AI "
-            "shipment-status queries. The user's buyer logs "
-            "freight mode in the PO Comments field "
-            "(\"airfreight\" / \"seafreight\") and shipment "
-            "progress in a \"Shipping notes\" attribute on the "
-            "\"Vendor purchase\" attribute set (\"departed "
-            "Shenzhen 2026-04-12, in customs\"). Both got pulled "
-            "off the CIN7 sync into purchase_lines via a new "
-            "`_extract_po_freight_signals` helper that's "
-            "defensive against multiple shape variants. The "
-            "`get_incoming_stock` tool now returns both as "
-            "`comments` + `shipping_notes` per line, and the "
-            "tool description tells the AI to format them as "
-            "`✈/🚢 <comments> · 📍 <shipping_notes>` when "
-            "non-empty. AI answers like 'when is the next "
-            "shipment of LED-X coming?' now report the full "
-            "freight picture instead of just the Required-By "
-            "date."
-        )
-        st.caption(
-            "**v2.67.43** — Sales-invoiced reconciliation. "
-            "User reported the Overview's 'Sales invoiced "
-            "(last 30d)' showed $323K against CIN7's actual "
-            "$520K Revenue for the same window — a 38% "
-            "understatement. Root cause: `sales_last_30d_*.csv` "
-            "was 13 days stale (last written April 23 but the "
-            "user was checking on May 6). The Daily Sync only "
-            "refreshes 3-day windows via `cin7_sync.py quick "
-            "--days 3`; the 30-day file only got refreshed by "
-            "the weekend deep sync. Fix: daily_sync.sh and "
-            "daily_sync.bat now also run `cin7_sync.py sales "
-            "--days 30` and `salelines --days 30` so the "
-            "headline window stays fresh nightly. The tile gets "
-            "a freshness indicator: ✓ green when source CSV is "
-            "<36h old, ⚠ red otherwise so the user immediately "
-            "knows when the number is reliable. Pattern matches "
-            "v2.67.36's engine-cache-age caption."
-        )
-        st.caption(
-            "**v2.67.42** — Month-over-month delta on the "
-            "Slow-stock value-on-shelf tile. New "
-            "`slow_mover_value_snapshots` table holds one row "
-            "per calendar date with skus_count + units_on_hand "
-            "+ value_on_shelf. The engine writes a fresh "
-            "snapshot on every recompute (last-write-wins per "
-            "day). The Overview tile reads the latest snapshot "
-            "from the previous calendar month and renders a "
-            "small caption below the dollar value: green ↓ "
-            "when the value dropped (we cleared slow stock), "
-            "red ↑ when it grew (we accumulated more). Until "
-            "we have a previous-month snapshot the caption "
-            "explains what to expect."
-        )
-        st.caption(
-            "**v2.67.41** — Three small wins shipped together. "
-            "(1) **Engine session cache**: `_abc_engine` is "
-            "@st.cache_data(persist='disk') but Streamlit's "
-            "deep DataFrame hashing was eating ~5-10s on every "
-            "page navigation against ~150K sale-line rows. New "
-            "`_get_engine_df()` helper stores the result in "
-            "`st.session_state` after the first call; "
-            "navigating between Overview / Ordering / Slow "
-            "Movers / AI Assistant is now instant. Cleared by "
-            "the Refresh button. (2) **Sidebar tooltips**: each "
-            "page name in the navigation now has a one-line "
-            "description below it (\"FixedCost Audit — Review "
-            "fixed-cost overrides applied to PO calculations\" "
-            "etc.) so new users know what each section is "
-            "about without clicking. (3) **Slow Movers pie**: "
-            "regrouped by CIN7 Category instead of Family — "
-            "shows high-level distribution (LED Strip vs Power "
-            "Supplies vs Channels) instead of SKU-series-level "
-            "(White Iris vs White Lily). Family detail "
-            "preserved in the detail table where granularity "
-            "matters."
-        )
-        st.caption(
-            "**v2.67.40** — Slow Movers page rework + engine "
-            "fix. Three issues addressed.\n\n"
-            "(1) **Engine fix.** `_refine_dormancy_by_class` was "
-            "flagging non-master tubes (per-foot cuts, BOM "
-            "derivatives) as dormant because their "
-            "`effective_units_90d=0` — but that zero is by "
-            "design. The engine deliberately rolls UP a child's "
-            "demand to its bulk master so the master's optimum/"
-            "excess math reflects real consumption. Flagging the "
-            "child as dormant on the basis of its own zero is "
-            "double-counting at the wrong granularity. The "
-            "function now early-returns False for any SKU with "
-            "`is_non_master_tube=True`. The dormancy log will "
-            "stop accumulating children on the next engine "
-            "recompute.\n\n"
-            "(2) **Page filters.** The Slow Movers page now "
-            "filters to (a) parents/standalones only (mirrors the "
-            "Ordering page's PO-suggestion logic), (b) OnHand>0 "
-            "(zero-stock entries can't be liquidated). A toggle "
-            "`Show all flagged SKUs` reveals the raw log "
-            "including children + zero-stock for diagnostic "
-            "users. Default is the filtered view because that's "
-            "what's actionable.\n\n"
-            "(3) **🔎 SKU search + toggle.** New search box "
-            "matches across SKU + Name (substring, top 25 "
-            "results). Each match shows its current state "
-            "(⚠️ FLAGGED / ✅ active / 🧩 child SKU) plus OnHand "
-            "+ value + ABC + trend. Per-row Flag-as-slow / "
-            "Unflag button writes to sku_dormancy_log. Manual "
-            "flags persist across re-dormancy and propagate to "
-            "the Ordering page's ❗ prefix and the weekly digest "
-            "email."
-        )
-        st.caption(
-            "**v2.67.39** — Slow Movers page hotfix. The pie "
-            "chart's groupby was reading `_slow_df['Family']` "
-            "directly, but the lifted `_abc_engine` doesn't "
-            "produce a `Family` column on engine_df — CIN7 "
-            "carries family info in `AdditionalAttribute1`. "
-            "Page now resolves Family with: literal Family "
-            "column → AdditionalAttribute1 → '(no family)' "
-            "fallback. Detail table also uses the resolved "
-            "Family series so it renders end-to-end."
-        )
-        st.caption(
-            "**v2.67.38** — Slow-mover stock-reduction "
-            "workspace. Three things bundled. (1) Overview gets "
-            "a new 4-tile panel showing slow SKUs flagged, "
-            "value-on-shelf, value cleared month-to-date "
-            "(cost basis), and revenue cleared month-to-date. "
-            "AI-attributed clearance is reserved as a "
-            "placeholder until we wire a salesperson→AI-query→"
-            "sale signal source. (2) New dedicated 🪫 Slow "
-            "Movers page in the sidebar nav: header tiles "
-            "(SKU count / units / value / avg days dormant) + "
-            "pie chart of slow stock by family + sortable "
-            "detail table sorted by days_dormant descending + "
-            "manual dismiss control. (3) New "
-            "weekly_slow_movers_email.py script that sends a "
-            "Friday digest to a configurable recipient list — "
-            "top-20 slow movers by stock value + newcomers in "
-            "the past 7d + cleared cost basis + units + SKU "
-            "counts. HTML + plain-text body. Wired into Render "
-            "sync_loop.sh on Fridays (skips the rest of the "
-            "week). Local Windows users register via the new "
-            "schedule_weekly_email.bat. Silent no-op until "
-            "SLOW_MOVERS_EMAIL_TO env var is set."
-        )
-        st.caption(
-            "**v2.67.37** — Stock-value reconciliation across "
-            "Overview / Ordering / Monthly Metrics. The three "
-            "pages had diverged: Overview and Monthly Metrics "
-            "summed CIN7's StockOnHand directly ($721,528 in "
-            "the user's data), while the Ordering 'Current "
-            "stock value' summed engine_df.OnHandValue which "
-            "falls back to OnHand × AverageCost when CIN7's "
-            "FIFO field is empty ($798,248 — ~$77k higher). "
-            "Sales-team commissions are computed off the Monthly "
-            "Metrics report, so the discrepancy mattered. New "
-            "shared helper `_headline_stock_value(stock, "
-            "products)` is the single source of truth — all "
-            "three pages now use it. The richer fallback-aware "
-            "OnHandValue column on engine_df is preserved for "
-            "per-SKU excess/optimum math (where each row needs "
-            "a sensible cost basis even when CIN7 hasn't "
-            "published a FIFO value), but it's no longer the "
-            "headline number."
-        )
-        st.caption(
-            "**v2.67.36** — Engine pre-warm via post-sync hook. "
-            "New `warm_engine.py` + `warm_engine_helpers.py` "
-            "imports the lifted `_abc_engine` and calls it once "
-            "with the freshest CSVs after every sync iteration. "
-            "Wired into Render's `sync_loop.sh` and the Windows "
-            "`daily_sync.bat` + `nearsync.bat`. Result: the first "
-            "user post-sync hits a hot @st.cache_data cache "
-            "instead of waiting for the engine to recompute. "
-            "Sidebar caption above shows cache age — green if "
-            "<24h, yellow otherwise. Best-effort: a warmer "
-            "failure logs but never blocks the sync exit."
-        )
-        st.caption(
-            "**v2.67.35** — Bin location now flows through to "
-            "the AI assistant (merged from stock_on_hand into "
-            "engine_df after the cached engine returns). Plus "
-            "dormancy provenance: new sku_dormancy_log table "
-            "tracks every is_dormant=True observation, and the "
-            "Ordering page renders ❗ + auto-note for SKUs that "
-            "were once slow movers. The note explains: 'Sales "
-            "is actively pushing this — verify demand is real "
-            "before reordering. Warning auto-lifts after 90d "
-            "sustained activity.' This guards against the "
-            "stock-reduction fly-wheel from accidentally re-"
-            "ordering items that are only moving because we're "
-            "actively clearing them. Manual dismissals persist "
-            "across re-dormancy (buyer's intent overrides "
-            "automatic re-flagging)."
-        )
-        st.caption(
-            "**v2.67.34** — Profile/channel auto-exclude list. "
-            "Mirrors the v2.67.28 strip-accessory exclude. "
-            "search_products_by_text now detects 'profile', "
-            "'channel', or 'extrusion' in the query and auto-"
-            "unions a _DEFAULT_EXCLUDES_FOR_PROFILES list "
-            "(mounting bracket, fixing kit, end cap, LED strip, "
-            "driver, connector, etc.) so the user sees the "
-            "actual profile extrusions, not the brackets that "
-            "mount them. Strip-vs-profile detection is "
-            "mutually exclusive — a query is one or the other. "
-            "Bare 'mount'/'mounting' is preserved so legit "
-            "names like 'Surface Mount Profile' aren't dropped."
-        )
-        st.caption(
-            "**v2.67.33** — Feedback fly-wheel. Replaced the "
-            "👍/👎 buttons + separate Feedback page with an "
-            "inline correction textbox under each AI answer. "
-            "When a user types a correction (e.g. \"don't "
-            "show 12V variants\" or \"missed the King Protea "
-            "series\"), it's stored against the audit row AND "
-            "automatically injected into the system prompt on "
-            "every subsequent question — so the model gets "
-            "sharper from team feedback in real time, no code "
-            "changes needed. New 🧠 Active corrections panel "
-            "above the chat input lets the user see and "
-            "archive standing rules. Built on existing "
-            "ai_audit_logs.feedback_note column — no schema "
-            "migration."
-        )
-        st.caption(
-            "**v2.67.32** — THE root cause. The AI Assistant "
-            "page was building a lightweight engine_df from "
-            "products + stock only — the full _abc_engine "
-            "function was nested inside the `elif page == "
-            "'Ordering':` block and unreachable from any other "
-            "page. So when the AI called search_products_by_text "
-            "with parents_only=true, the filter was a silent "
-            "no-op (`is_non_master_tube` column didn't exist). "
-            "Same for trend_flag, is_dormant, excess_units, ABC. "
-            "Every fix shipped today (v2.67.20-31) was a band-"
-            "aid because the underlying engine signals never "
-            "reached the AI. Now lifted to module scope; "
-            "@st.cache_data(persist='disk') means zero "
-            "recomputation cost when called from a second page."
-        )
-        st.caption(
-            "**v2.67.31** — Two issues addressed. (1) Schema "
-            "description for parents_only said 'Default false' "
-            "when v2.67.29 actually flipped the code default to "
-            "True; the AI was reading the old text and "
-            "explicitly passing parents_only=false, which is why "
-            "child SKUs (LEDIRIS3000-60-0305 etc.) kept leaking. "
-            "Schema now matches code: TRUE is default, false "
-            "should not be used for stock questions. "
-            "(2) Added 🪫 REMNANT flag for bulk-roll parents "
-            "with OnHand<1.0 (less than one full roll left). "
-            "These items are 'active' per the engine because "
-            "per-foot child sales roll up to them, but they're "
-            "practically stock-to-clear from a sales "
-            "perspective. Plus a system prompt rule: when no "
-            "rows trigger any flag, the AI must explain the "
-            "rollup logic so the user doesn't think the AI "
-            "missed slow movers."
-        )
-        st.caption(
-            "**v2.67.30** — Stock trend indicator always "
-            "visible. v2.67.29's rule appended trend_flag only "
-            "when non-Stable; v2.67.30 makes it mandatory on "
-            "every row so sales staff can scan the rating "
-            "consistently."
-        )
-        st.caption(
-            "**v2.67.29** — Two failure modes locked down. "
-            "(1) parents_only default flipped to True at the "
-            "search_products_by_text layer — the AI was "
-            "inconsistently passing this arg, so child SKUs "
-            "(LEDIRIS3000-60-0305 etc.) kept slipping through. "
-            "Making it the default eliminates that variable. "
-            "(2) Answer format rule made HARD: every row with "
-            "is_dormant=true must be prefixed with ⚠️ SLOW; "
-            "OnHand>0 with zero 12mo demand gets 🔴 DEAD; "
-            "excess_units>0 gets 📦 EXCESS; non-Stable "
-            "trend_flag appended. The whole point of the app "
-            "is shrinking stock holding — the AI was hiding the "
-            "very signal that drives that decision."
-        )
-        st.caption(
-            "**v2.67.28** — Coverage discipline for stock "
-            "answers. White Iris / White Lily / Cardinal Flower "
-            "/ Honey Suckle were dropping out because the AI "
-            "passed limit=50 and 25+ accessory rows ate those "
-            "slots. Two fixes: (1) search_products_by_text now "
-            "auto-unions the strip-accessory exclude list "
-            "(matching find_products' behaviour) when query "
-            "contains 'strip' — drivers, controllers, dimmers, "
-            "channels, profiles etc. don't pollute results "
-            "anymore. (2) System prompt mandates limit=200 + "
-            "parents_only=true + in_stock_only=true for any "
-            "stock-listing question, AND requires the AI to "
-            "verify family coverage (Iris/Lily/Cardinal/Honey/"
-            "Decor/Elite Gold/Liatris/etc.) before answering. "
-            "If a known family is missing, the AI must call "
-            "again with broader filters or family=NAME."
-        )
-        st.caption(
-            "**v2.67.27** — Stop synthesising, lean on what's "
-            "already there. The `_ensure_classification_column` "
-            "helper introduced in v2.67.22 was duplicating work "
-            "the ABC engine already does AND throwing 'Array "
-            "conditional must be same shape as self' runtime "
-            "errors that broke the assistant's tool calls "
-            "intermittently. Removed entirely. Tools now pass "
-            "the engine's authoritative columns through to the "
-            "AI: ABC class, trend_flag (Stable / 📈 Trend / 🎯 "
-            "Project / 🔀 Mixed / 📉 Decline), is_dormant (the "
-            "engine's slow-mover flag), excess_units, "
-            "effective_units_12mo. Classification args ('slow', "
-            "'dead', 'excess') now map to those columns via "
-            "RULES.md §3+§4 rather than a synthesised label, so "
-            "those filters actually fire instead of silently "
-            "no-op-ing. System prompt rewritten to read these "
-            "columns directly."
-        )
-        st.caption(
-            "**v2.67.26** — Yesterday tile breakdown. Adds a "
-            "small caption beneath the Today/MTD tiles that "
-            "splits yesterday's invoiced orders by their "
-            "actual OrderDate: same-day vs from the most-recent "
-            "weekend (Sat-Sun within the past 6 days) vs "
-            "earlier. Only renders when there's a meaningful "
-            "split (weekend or earlier > 0); otherwise stays "
-            "out of the way. Resolves the 'is Monday's number "
-            "actually a big Monday or weekend orders posting "
-            "late' question."
-        )
-        st.caption(
-            "**v2.67.25** — System prompt refactor. The "
-            "long-running 'find_products returns 70 Shopify-"
-            "only fallback rows' symptom was caused by the AI "
-            "calling find_products for STOCK questions ('what "
-            "warm white strips do we have'). find_products "
-            "unions Shopify catalog with CIN7, but customer-"
-            "facing Shopify .md files don't list bulk-roll "
-            "parent SKUs — only per-foot variants. With the "
-            "parents_only filter on, every Shopify family "
-            "page falls into 'Found in Shopify; stock data not "
-            "available'. New routing: stock → "
-            "search_products_by_text with parents_only=true "
-            "(CIN7 stock truth, clean qty + classification + "
-            "trend_flag rows); product-knowledge → "
-            "find_products (catalog descriptions). When the "
-            "intent is ambiguous, the assistant now asks one "
-            "clarifying question instead of guessing."
-        )
-        st.caption(
-            "**v2.67.24** — Dashboard label + ordering cleanup "
-            "on the Today & Month-to-date vs prior years section. "
-            "New column order: Today → Same weekday 1 yr ago → "
-            "YoY % → Yesterday. The YoY % now sits between its "
-            "two operands so the comparison reads left-to-right; "
-            "Yesterday is supporting context, not part of the "
-            "YoY chain. Yesterday tile gets its date and "
-            "orders/units delta (was a bare $-value before). "
-            "Third tile shortened from 'Matching weekday last "
-            "year (Tue May 06, 2025)' to 'Same Tue, 1 yr ago "
-            "(May 6, '25)'. YoY tile renamed 'Today vs same Tue' "
-            "so it's obvious what's being compared."
-        )
-        st.caption(
-            "**v2.67.23** — Hotfix for the v2.67.22 regression "
-            "where parents_only filter at search_products_by_text "
-            "level shrank cin7_matched_skus so much that "
-            "find_products' Shopify scoring loop saw empty "
-            "sp_skus_passing for every hit — every family fell "
-            "into 'Found in Shopify; stock data not available' "
-            "fallback (70 rows, all stock_status='unknown'). The "
-            "filter is now applied at emission time inside "
-            "find_products: cin7_matched_skus stays wide so family "
-            "coverage signal is preserved, but pass-1 / pass-2 / "
-            "CIN7-only emission skips children. Also added "
-            "`trend_flag` to result rows (Stable / 📈 Trend / 🎯 "
-            "Project / 🔀 Mixed / 📉 Decline) — the Ordering "
-            "page's sales-staff rating, now visible in product-"
-            "discovery answers so sales can prioritise selling "
-            "slow movers and Decline-flagged stock. System prompt "
-            "updated: stock qty leads every row, classification + "
-            "trend annotate it."
-        )
-        st.caption(
-            "**v2.67.22** — Two big changes for stock-reduction "
-            "visibility. (1) `parents_only=true` is the new "
-            "default for find_products / search_products / "
-            "search_products_by_text — child SKUs (per-foot "
-            "cuts, voltage variants, BOM derivatives) are "
-            "hidden in favor of the supplier-orderable parent. "
-            "Reuses the Ordering page's `is_non_master_tube` "
-            "column so the same authoritative rules (BOM "
-            "membership, sourcing-rule SourceFraction, "
-            "supplier assignment) apply. (2) Each result row "
-            "now carries a `classification` field "
-            "(active/slow/dead/excess) derived from the "
-            "engine's dormancy + excess + 12mo-demand signals "
-            "via _ensure_classification_column(). The Assistant "
-            "prompt now requires every non-active SKU to be "
-            "flagged inline so buyers can see what's ripe for "
-            "discount/discontinue at a glance."
-        )
-        st.caption(
-            "**v2.67.21** — Assistant prompt rule added: when "
-            "find_products returns N rows, list every one "
-            "individually. The 3-6 bullet conciseness rule was "
-            "collapsing density variants into 'multiple other "
-            "Iris variants (60/120/180 LEDs/m)', so the 60-LEDs/m "
-            "parent never appeared by SKU even when the tool "
-            "returned it. Buyer crew needs every parent (family "
-            "× kelvin × density × voltage × length) visible to "
-            "make stock decisions — long is the right shape "
-            "here, not curated highlights."
-        )
-        st.caption(
-            "**v2.67.20** — find_products comprehensive-mode "
-            "fix. Pass-1 (family + kelvin breadth) was filling "
-            "the entire limit-60 budget on warm-white queries, "
-            "starving pass-2 (density depth). The 60-LEDs/m "
-            "Iris/Lily variants — which always landed 3rd in "
-            "the diversified bucket order, after 120 + 180 — "
-            "never surfaced. Default limit bumped 60 → 100, "
-            "hard max 80 → 200, and pass-1 capped at 70% of "
-            "limit so pass-2 round-robin always runs. The crew "
-            "now sees every parent (family × kelvin × density)."
-        )
-        st.caption(
-            "**v2.67.19** — get_sales_totals gained "
-            "`start_date` / `end_date` params (ISO YYYY-MM-DD, "
-            "inclusive). Previously the tool only accepted a "
-            "fixed `period` enum (today / mtd / last_30_days / "
-            "ytd / last_year etc.), so questions like 'how did "
-            "April do?' or 'Q1 2026 revenue' forced Claude to "
-            "either guess via group_by='month' inference or "
-            "admit the limitation. Now custom ranges are first-"
-            "class — Claude passes the explicit dates and the "
-            "tool does header-revenue + line-item-units + "
-            "order-count aggregation exactly as for the pre-"
-            "defined periods. Schema's `required` was relaxed "
-            "(period no longer mandatory). Dates win over period "
-            "if both are passed; malformed dates return a clear "
-            "error rather than mis-aggregating.\n\n"
-            "**v2.67.18** — Cap raised from 2 to 3 SKUs per "
-            "(family, kelvin) bucket in pass 1, paired with "
-            "v2.67.17's density-aware diversification. Each kelvin "
-            "now emits 3 distinct-density variants — for Iris "
-            "2700K: LEDIRIS2700-120-0305 (120 LED/m), "
-            "LEDIRIS2700-180-0305 (180 LED/m), and "
-            "LEDIRIS2700-60-0305 (60 LED/m). Total Iris pass-1 "
-            "emissions: 9 (3 densities × 3 warm kelvins).\n\n"
-            "**v2.67.17** — Within each (family, kelvin) bucket, "
-            "reorder SKUs to interleave by first varying segment. "
-            "v2.67.16's pass-1 cap=2 was emitting two same-density "
-            "variants (120-0305 + 120-100M) because alphabetical "
-            "order kept all 120-density SKUs at the front of the "
-            "Iris 2700K bucket. The new _diversify_skus helper "
-            "splits on '-' and groups by first varying part, then "
-            "round-robins across groups: 120-0305, 180-0305, "
-            "60-0305, 120-100M, 180-100M, … Generic — works for "
-            "any SKU pattern with a varying middle segment.\n\n"
-            "**v2.67.16** — Two depth-distribution fixes. "
-            "(a) Pass-1 per-(family, kelvin) cap raised 1 → 2 so "
-            "each kelvin bucket emits 2 SKUs upfront (e.g. both "
-            "the per-foot AND the bulk-roll variant of a kelvin "
-            "appear together). (b) Pass 2 reorganized as a round-"
-            "robin drain across (family, kelvin) tuples — each "
-            "tuple emits one SKU per round, cycling through "
-            "non-empty buckets until limit reached. v2.67.7's "
-            "append-order pass 2 was dumping high-scored families' "
-            "depth before low-scored families got any share, so "
-            "Iris (low score) couldn't surface variants like "
-            "LEDIRIS2700-180-100M (6th alphabetical in the 2700K "
-            "bucket). Now Iris 2700K should land 4-5 SKUs total "
-            "within the limit-60 budget.\n\n"
-            "**v2.67.15** — Apply exclude_types to collection "
-            "titles before scoring. v2.67.14's first run matched "
-            "49 collections for a warm-white-strip query, "
-            "including 'LED Drivers', 'Casambi Bluetooth LED "
-            "controllers', 'LED Modules for Signs', 'LED Strip "
-            "Soldering Services' — accessory collections whose "
-            "descriptions mention 'led strip' generically but "
-            "aren't actually strips. Their member products were "
-            "filtered at expansion time anyway, but the noise "
-            "in collections_matched / collection_titles_matched "
-            "was misleading. Now we drop these at the collection "
-            "scoring step, keeping the matched-collection list "
-            "tight to actual strip-relevant groupings.\n\n"
-            "**v2.67.14** — find_products now walks "
-            "/data/shopify/collections/*.md, scores each collection "
-            "against the query, and uses matches to (a) boost member "
-            "products' scores in shopify_hits and (b) add member "
-            "products that didn't directly match. Honors spec point "
-            "1's 'Shopify collections' source that v2.67-v2.67.13 "
-            "silently skipped. Result dict now reports "
-            "collections_indexed, collections_matched, and the "
-            "titles of matched collections for transparency.\n\n"
-            "**v2.67.13** — Two complementary fixes after v2.67.12 "
-            "still missed 2700K Iris. (a) Family detector splits "
-            "RGBW Iris into its own family (IRIS_RGBW) so it "
-            "doesn't share the WHITE_IRIS cap=3 budget; pure-white "
-            "Iris now emits 2200K/2700K/3000K cleanly without RGBW "
-            "competition. (b) When a SKU's CIN7 Name has no "
-            "explicit kelvin number, classify by color keyword "
-            "(warm/cool/natural). Previously the v2.67.12 "
-            "_unknown bucket was a blanket exemption that let "
-            "RGBW Cool variants (Name: 'RGB + Cool white') slip "
-            "into warm-white answers. Now `_cool` and `_natural` "
-            "buckets are explicitly blocked on warm-white queries, "
-            "while `_warm` and truly-unknown stay allowed.\n\n"
-            "**v2.67.12** — Extracted kelvin tokens from "
-            "any_of_terms become a 'preferred kelvins' set; pass-1 "
-            "kelvin emission and CIN7-only rows skip kelvin "
-            "buckets outside the set. Diagnosis showed Iris's "
-            "family cap=3 was being filled by RGBW variants in 3 "
-            "DIFFERENT kelvin buckets (Warm + Natural + Cool), "
-            "blocking pure-white LEDIRIS2700-* from emitting. "
-            "Same root cause polluted answers with non-warm "
-            "Cardinal Flower 4000K/6000K, Decor 4000K, etc. The "
-            "_unknown kelvin bucket is exempt from the filter so "
-            "RGBW pages whose Name says 'Warm white' (no explicit "
-            "kelvin) still emit.\n\n"
-            "**v2.67.11** — find_products passes limit=1000 (was "
-            "200) to search_products_by_text; the latter's internal "
-            "cap raised 500 → 2000. Diagnostic dump showed LEDIRIS* "
-            "and LED-WL* SKUs entirely absent from cin7_matched_"
-            "skus — CIN7 has thousands of warm-white 'led strip' "
-            "matches and LED-31.* + LED-DECOR-* alone consumed the "
-            "first 200 in CSV order, truncating Iris and Lily off "
-            "the bottom. Bumped limits ensure the full warm-white "
-            "candidate pool flows through.\n\n"
-            "**v2.67.10** — Claude has been passing its own "
-            "exclude_types list (almost-complete but missing "
-            "'driver'), so the v2.67.9 default never kicked in "
-            "and LED drivers still polluted strip results. Now we "
-            "union Claude's exclude_types with the defaults when "
-            "the query mentions 'strip'. Critical tokens like "
-            "'driver' are always blocked regardless of what Claude "
-            "passes.\n\n"
-            "**v2.67.9** — _DEFAULT_EXCLUDES_FOR_STRIPS extended "
-            "with `driver`, `fixture`, `kit`, `module`, "
-            "`accessory`, `service`, `transformer`. Driver page "
-            "LED-NANO-60W-24 was appearing as the FIRST result of "
-            "a warm-white-strips query because driver titles "
-            "contain 'led' and their compatibility text mentions "
-            "'warm white' -- they passed both filter legs and "
-            "consumed limit-60 budget that should have gone to "
-            "Iris/Lily/etc.\n\n"
-            "**v2.67.8** — Pass-1 emission grouped by kelvin within "
-            "each family so multi-kelvin families show real variety. "
-            "Iris .md lists SKUs alphabetically (LEDIRIS2200-* before "
-            "LEDIRIS2700-* before LEDIRIS3000-*); v2.67.7 always "
-            "picked the first one (2200K), so 2700K and 3000K Iris "
-            "got pushed to deferred and never emitted within budget. "
-            "Now pass-1 picks one SKU per (family, kelvin) bucket up "
-            "to the per-family cap of 3 -- Iris emits 2200K + 2700K "
-            "+ 3000K, Honey Suckle emits 2700K + 3000K + 3200K, and "
-            "so on. Kelvin extracted from CIN7 Name via "
-            "`\\b(\\d{4})\\s*[Kk]\\b` (matches '(2700K)' patterns).\n\n"
-            "**v2.67.7** — Two union-loop bugs from v2.67.6 fixed: "
-            "(a) Lily's older 'lilly' Shopify page was emitting a "
-            "misleading 'stock data not available' note before the "
-            "newer 'lily' page (with real LED-WLWW-* CIN7 stock) "
-            "could emit; precompute `family_has_any_passing` so a "
-            "hit's shopify-only fallback yields when a sibling hit "
-            "in the family has real coverage. (b) Iris RGBW ate "
-            "the family's cap=1 slot before pure-white Iris hits "
-            "could emit; pass-1 now emits one row per shopify_hit "
-            "(not per family), with per-family cap raised 1 → 3 so "
-            "Iris gets RGBW + pure-white IP20 + pure-white IP68 "
-            "in pass 1. Pass 2 still drains deferred for depth.\n\n"
-            "**v2.67.6** — _PER_FAMILY_PASS_1 lowered 4 → 1. With "
-            "cap=4 the limit=60 budget was filled by the top "
-            "9-15 high-scored families before lower-ranked ones "
-            "(Iris, Lily) were reached. Iris title has no warm-"
-            "white token → score 6.0 vs 8+ for families with "
-            "kelvin in their title → ranked too low for pass 1. "
-            "Cap=1 guarantees every matched family gets pass-1 "
-            "representation; pass 2 drains deferred SKUs for "
-            "depth from higher-scored families.\n\n"
-            "**v2.67.5** — Bumped search_products_by_text internal "
-            "cap 50 → 500. find_products requested 200 internal "
-            "rows but the underlying tool capped at 50, dropping "
-            "LEDIRIS warm SKUs off the bottom and incorrectly "
-            "routing the Iris Shopify hit into the 'may be "
-            "discontinued' fallback. Schema description for direct "
-            "LLM callers stays at 50.\n\n"
-            "**v2.67.4** — Sidebar version banner trimmed to a one-"
-            "liner; per-version detail moved into this expander "
-            "(was eating ~half the sidebar).\n\n"
-            "**v2.67.3** — Parser folds ## Variants into body so "
-            "kelvin tokens (Ultra Wm, 2700K, …) score; body cap "
-            "raised 4KB → 12KB.\n\n"
-            "**v2.67.2** — Two find_products union fixes: shopify-"
-            "only fallback now fires whenever no variants pass the "
-            "per-row filter (was missing Lily); 4-variant-per-"
-            "family cap on pass 1 with deferred pass 2 (limit "
-            "40 → 60) so families like Iris/Lily/Cardinal Flower "
-            "share the budget instead of being starved by Elite "
-            "Gold.\n\n"
-            "**v2.67.1** — Re-attempt of v2.67 after a Render OOM "
-            "(later traced to v2.66.6 session accumulation, not "
-            "v2.67). Drops ShopifyProduct.raw_text, caps body, "
-            "logs find_products entry/exit for future diagnosis.\n\n"
-            "**v2.67** — find_products tool unifies CIN7 inventory "
-            "with the Shopify product KB. Each result tagged "
-            "source ∈ {cin7, shopify, both}; Shopify-only rows "
-            "come back with stock_status='unknown' and an explicit "
-            "note. Family detector (Elite Gold, White Iris, White "
-            "Lily, Decor, Cardinal Flower, Liatris, Baltic Ivy, "
-            "Honey Suckle, Sierra, Smokies, Oslo, Slim8, Slim, "
-            "PLW80, PLW70, Disa) is a placeholder until "
-            "product_attributes (Tier-A1) ships. AI Assistant page "
-            "shows a red/amber banner if /data/shopify/ is missing "
-            "or older than 48h.\n\n"
-            "**v2.66.6** — Slow-stock promotion disabled (kept "
-            "exhausting the tool-use loop on product-list "
-            "questions). Tool function stays in ai_tools.py for a "
-            "future rebuild as a separate post-answer pass."
-        )
+    st.caption(_sidebar_abc_status())
+    st.caption(_sidebar_sync_status())
+    # Detailed release history lives in GitHub; keep the primary
+    # sidebar focused on daily work rather than changelog text.
     # Old v2.66.2 caption kept here for reference, hidden:
     _ = (
         "🟢 v2.66.2 — Slow-stock rule tightened, MAX_TURNS bumped 6 to 10. "
@@ -2230,28 +1112,6 @@ with st.sidebar:
         "form, no free-text), My Profile page, default_page jump, "
         "user.login audit, get_relevant_slow_stock tool."
     )
-
-    # --- Data freshness indicator ---------------------------------------
-    # Shows how stale the on-disk sync data is (independent of the browser's
-    # cache). The CIN7 nearsync Task Scheduler entry fires every 15 minutes
-    # and overwrites stock_on_hand_*.csv, so "minutes since" on that file
-    # is the honest heartbeat.
-    _sync_time, _sync_age_min, _sync_file = _freshness_from_output_dir()
-    if _sync_time is not None:
-        # Use literal emoji characters — Streamlit's shortcode map doesn't
-        # include :large_green_circle: etc., so they render as plain text.
-        if _sync_age_min < 20:
-            dot, color_label = "🟢", "fresh"
-        elif _sync_age_min < 60:
-            dot, color_label = "🟡", "ageing"
-        else:
-            dot, color_label = "🔴", "stale"
-        st.markdown(
-            f"{dot} **Last sync:** {_sync_time:%H:%M} "
-            f"({int(_sync_age_min)} min ago — {color_label})"
-        )
-    else:
-        st.markdown("⚪ **Last sync:** unknown (no stock file found)")
 
     # --- SKU-rename pending indicator ------------------------------------
     # When the team renames a SKU in CIN7 (catalog code prefix, version
@@ -2698,6 +1558,97 @@ with st.sidebar:
                     pass
                 st.session_state.pop("_qbo_oauth_state", None)
 
+    # ---- Navigation -----------------------------------------------------
+    st.divider()
+    st.subheader("Navigate")
+    _visible_pages = _visible_pages_for_profile(current_user_profile)
+    if not _visible_pages:
+        st.error("No pages are available for your profile.")
+        st.stop()
+
+    _default_page = (current_user_profile or {}).get("default_page")
+    _previous_page = st.session_state.get("_sidebar_selected_page")
+    if (_default_page
+            and _default_page in _visible_pages
+            and not st.session_state.get("_default_page_consumed")):
+        _initial_page = _default_page
+        st.session_state["_default_page_consumed"] = True
+    elif _previous_page in _visible_pages:
+        _initial_page = _previous_page
+    else:
+        _initial_page = _visible_pages[0]
+
+    _visible_groups = [
+        group for group, pages in PAGE_GROUPS.items()
+        if any(p in _visible_pages for p in pages)
+    ]
+    _initial_group = PAGE_GROUP_BY_NAME.get(
+        _initial_page, _visible_groups[0])
+    _group_index = (
+        _visible_groups.index(_initial_group)
+        if _initial_group in _visible_groups else 0)
+    _nav_group = st.selectbox(
+        "Section",
+        options=_visible_groups,
+        index=_group_index,
+        key="_sidebar_nav_group",
+    )
+    _group_pages = [
+        p for p in PAGE_GROUPS.get(_nav_group, [])
+        if p in _visible_pages
+    ]
+    _page_index = (
+        _group_pages.index(_initial_page)
+        if _initial_page in _group_pages else 0)
+    page = st.radio(
+        "Page",
+        _group_pages,
+        index=_page_index,
+        key=f"_sidebar_nav_page_{_nav_group}",
+    )
+    st.session_state["_sidebar_selected_page"] = page
+    st.caption(PAGE_DESCRIPTIONS.get(page, ""))
+
+    with st.expander("All pages", expanded=False):
+        for _group, _pages in PAGE_GROUPS.items():
+            _group_pages = [p for p in _pages if p in _visible_pages]
+            if not _group_pages:
+                continue
+            st.markdown(f"**{_group}**")
+            for _opt in _group_pages:
+                _cap = PAGE_DESCRIPTIONS.get(_opt, "")
+                st.markdown(
+                    f"- **{_opt}** — <small>{_cap}</small>",
+                    unsafe_allow_html=True)
+
+    # ---- Global controls ------------------------------------------------
+    st.divider()
+    st.subheader("Controls")
+    stock_only = st.toggle(
+        "Stock items only",
+        value=True,
+        help="Hide Service and Non-Inventory items from stock / reorder "
+             "analysis. Recommended default. Uncheck to see everything.",
+    )
+
+    with st.expander("Data controls", expanded=False):
+        st.caption(_sidebar_abc_status())
+        st.caption(_sidebar_sync_status())
+        if st.button(
+            ":arrows_counterclockwise: Reload local data",
+            width="stretch",
+            help="Clear in-app caches and reload from the CSV snapshots "
+                 "already on the server. CIN7 sync itself runs in the "
+                 "background.",
+        ):
+            _clear_app_caches_for_sidebar()
+            st.rerun()
+        st.caption(
+            "Automatic sync and ABC refresh run in the background. "
+            "Use reload only if the screen looks stale.")
+        st.caption(
+            f":email: Support: {_LEGAL_CONTACT_EMAIL}")
+
     # ---- Quick-capture demand signal ----------------------------------
     # Available from every page so sales/buyers can log a customer
     # inquiry, quote request, lost sale, etc. in 15 seconds without
@@ -3064,162 +2015,6 @@ with st.sidebar:
                     st.markdown(f"- {_line}")
         except Exception:
             pass
-
-    _page_options = list(PAGE_OPTIONS)
-    _page_captions = list(PAGE_CAPTIONS)
-    # v2.67.185 — filter _page_options by per-user permissions.
-    # Unconfigured users (no rows in user_page_permissions) see
-    # everything (backwards compat).
-    # v2.67.207 — three-tier visibility:
-    #   super_admin → everything INCLUDING User Permissions
-    #   admin       → everything EXCEPT User Permissions
-    #   others      → per-page permission filter
-    _user_role = (current_user_profile or {}).get("role") or "sales"
-    _user_id = (current_user_profile or {}).get("user_id") or 0
-    _user_name = ((current_user_profile or {}).get("display_name")
-                     or st.session_state.get("current_user", ""))
-    _is_super_admin = db.is_super_admin(_user_name, _user_role)
-    if _is_super_admin:
-        _visible_pages = list(_page_options)
-    elif (_user_role or "").strip().lower() == "admin":
-        # Regular admin: full page access but NOT the
-        # super-admin-only User Permissions page.
-        _visible_pages = [p for p in _page_options
-                              if p != "User Permissions"]
-    else:
-        try:
-            _visible_pages = [
-                p for p in _page_options
-                if (p != "User Permissions"
-                    and db.can_user_access_page(
-                        _user_id, p, _user_role))]
-        except Exception:
-            # Defensive — never break the sidebar over a DB hiccup.
-            _visible_pages = [
-                p for p in _page_options
-                if p != "User Permissions"]
-    # Pair the visible options with their captions in lockstep.
-    _visible_captions = [
-        _page_captions[i]
-        for i, opt in enumerate(_page_options)
-        if opt in _visible_pages]
-
-    # v2.66: if the user has a default_page in their profile, jump
-    # straight to it on first sign-in. We only honour it once per
-    # session so the user can navigate freely afterwards.
-    _default_page = (current_user_profile or {}).get("default_page")
-    if (_default_page
-            and _default_page in _visible_pages
-            and not st.session_state.get("_default_page_consumed")):
-        _start_idx = _visible_pages.index(_default_page)
-        st.session_state["_default_page_consumed"] = True
-    else:
-        _start_idx = 0
-    page = st.radio(
-        "View",
-        _visible_pages,
-        index=_start_idx if _visible_pages else 0,
-        label_visibility="collapsed",
-    )
-    # v2.67.45 — collapsible "what does each section do" expander
-    # under the radio. v2.67.41 rendered the descriptions as
-    # captions BELOW each option which made the sidebar twice as
-    # tall and visually noisy. The expander keeps the sidebar
-    # tight by default; click to read all descriptions on one
-    # screen.
-    with st.expander("ⓘ What does each section do?",
-                       expanded=False):
-        _caption_by_page = dict(zip(_visible_pages, _visible_captions))
-        for _group, _pages in PAGE_GROUPS.items():
-            _group_pages = [p for p in _pages if p in _visible_pages]
-            if not _group_pages:
-                continue
-            st.markdown(f"**{_group}**")
-            for _opt in _group_pages:
-                _cap = _caption_by_page.get(_opt, "")
-                st.markdown(f"- **{_opt}** — <small>{_cap}</small>",
-                              unsafe_allow_html=True)
-
-    st.divider()
-    st.subheader("Global filters")
-    stock_only = st.toggle(
-        "Stock items only",
-        value=True,
-        help="Hide Service and Non-Inventory items from stock / reorder "
-             "analysis. Recommended default. Uncheck to see everything.",
-    )
-
-    st.divider()
-
-    # Single consolidated refresh button. CIN7 data is auto-pulled by
-    # the nightly sync (02:00 UTC). This button just clears in-app
-    # caches if you suspect the screen is showing stale numbers.
-    if st.button(":arrows_counterclockwise: Refresh data",
-                  width="stretch",
-                  help="Clear in-app caches and reload from the CSV files "
-                       "on the server. CIN7 itself is auto-synced nightly "
-                       "at 02:00 UTC — you don't normally need this."):
-        # v2.67.210 — race-safe cache clear (see _safe_cache_clear).
-        _safe_cache_clear()
-        # v2.67.45 — _get_engine_df is now @st.cache_resource. Clear
-        # both cache stores so the next page render forces a fresh
-        # _abc_engine call against the freshly-loaded data.
-        try:
-            st.cache_resource.clear()
-        except Exception:  # noqa: BLE001
-            pass
-        # Belt-and-braces: legacy session_state key from v2.67.41.
-        if "_engine_df_cached" in st.session_state:
-            del st.session_state["_engine_df_cached"]
-        st.rerun()
-
-    # The rest of this block is the legacy 'Force sync from CIN7' that
-    # used to subprocess.run cin7_sync.py from inside Streamlit. It's
-    # disabled on the deployed app because the cron-equivalent
-    # background loop already handles incremental syncs every night.
-    # Operators who really need to trigger a manual sync should use
-    # the Render Shell to run `python cin7_sync.py nearsync --days 1`.
-    if False:  # kept for reference only — see comment above
-        with st.spinner("Syncing from CIN7… please wait 1-2 minutes…"):
-            try:
-                result = subprocess.run(
-                    [sys.executable, "cin7_sync.py", "nearsync", "--days", "1"],
-                    cwd=str(APP_DIR),
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                if result.returncode == 0:
-                    _safe_cache_clear()
-                    st.success(":white_check_mark: Sync complete — data "
-                               "refreshed. Rerunning page…")
-                    # Show the last few log lines for confidence
-                    tail = "\n".join(result.stdout.strip().splitlines()[-6:])
-                    if tail:
-                        st.code(tail, language="text")
-                    st.rerun()
-                else:
-                    st.error(f":x: Sync failed (exit {result.returncode})")
-                    st.code(result.stderr[-1000:] or result.stdout[-1000:],
-                            language="text")
-            except subprocess.TimeoutExpired:
-                st.error(":x: Sync timed out after 5 minutes. "
-                         "Check `output/nearsync.log` for details.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f":x: Could not run sync: {exc}")
-
-    st.caption(
-        "Scheduled nearsync runs every 15 min via Windows Task Scheduler. "
-        "The button triggers a manual pull on demand."
-    )
-
-    # v2.67.217 — in-app support contact. Required by Intuit's
-    # QuickBooks Online app review ("a way for users to contact
-    # you for support from within your app") and useful anyway.
-    st.divider()
-    st.caption(
-        f":email: **Need help?** Contact support: "
-        f"{_LEGAL_CONTACT_EMAIL}")
 
 
 # ---------------------------------------------------------------------------
@@ -22556,7 +21351,7 @@ elif page == "Slow Movers":
 elif page == "My Profile":
     render_my_profile(
         current_user_profile=current_user_profile,
-        page_options=_page_options,
+        page_options=list(PAGE_OPTIONS),
         db_module=db,
     )
 
@@ -25427,11 +24222,11 @@ elif page == "User Permissions":
         _n_allowed = sum(1 for v in _current_perms.values() if v)
         st.success(
             f"**{_sel_name}** currently sees {_n_allowed} of "
-            f"{len(_page_options) - 1} pages "
+            f"{len(PAGE_OPTIONS) - 1} pages "
             "(the User Permissions page itself is admin-only).")
 
     # ---- Select-All / Clear-All / Reset to default --------------
-    _editable_pages = [p for p in _page_options
+    _editable_pages = [p for p in PAGE_OPTIONS
                           if p != "User Permissions"]
     _state_key = f"up_state_{_sel_uid}"
     if (_state_key not in st.session_state
