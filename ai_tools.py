@@ -110,6 +110,37 @@ TOOL_SCHEMAS: list[dict] = [
         },
     },
     {
+        "name": "get_stock_position",
+        "description": (
+            "Full stock-position summary for ONE resolved SKU. Use "
+            "this for questions like 'what is the stock like for X', "
+            "'how are we looking on X?', 'do we have enough X?', "
+            "'stock position for X', or 'what's the situation with X'. "
+            "Returns OnHand, Available, Allocated, OnOrder, "
+            "backorders/unfulfilled, ABC, trend, dormancy, excess, "
+            "storage dimensions, bin, and open incoming PO lines. "
+            "This is the dashboard-equivalent of the Slack bot's "
+            "rich stock answer; prefer it over get_sku_details alone "
+            "when the user asks about stock health/position."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sku": {
+                    "type": "string",
+                    "description": "Exact resolved SKU. If unsure, "
+                                   "search first, then call this.",
+                },
+                "incoming_limit": {
+                    "type": "integer",
+                    "description": "Max incoming PO lines to include "
+                                   "(default 8, cap 20).",
+                },
+            },
+            "required": ["sku"],
+        },
+    },
+    {
         "name": "get_velocity",
         "description": (
             "Sales velocity / units sold / revenue for a SKU over the "
@@ -1911,6 +1942,132 @@ def get_sku_details(engine_df: pd.DataFrame,
     if _notes:
         detail["assistant_notes"] = _notes
     return detail
+
+
+def get_stock_position(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """Return the full stock-health answer ingredients for one SKU."""
+    sku = (args.get("sku") or "").strip()
+    if not sku:
+        return {"error": "sku is required"}
+
+    try:
+        incoming_limit = max(1, min(
+            int(args.get("incoming_limit", 8) or 8), 20))
+    except Exception:
+        incoming_limit = 8
+
+    detail = get_sku_details(engine_df, sale_lines_df, {"sku": sku})
+    if detail.get("error"):
+        return detail
+
+    def _num(key: str):
+        value = pd.to_numeric(detail.get(key), errors="coerce")
+        if pd.isna(value):
+            return None
+        return round(float(value), 2)
+
+    def _text(key: str) -> str:
+        value = detail.get(key)
+        if value is None or pd.isna(value):
+            return ""
+        return str(value).strip()
+
+    incoming = get_incoming_stock(
+        engine_df,
+        sale_lines_df,
+        {"sku": sku, "limit": incoming_limit},
+    )
+
+    on_hand = _num("OnHand")
+    allocated = _num("Allocated")
+    available = _num("Available")
+    on_order = _num("OnOrder")
+    unfulfilled = _num("unfulfilled")
+    if unfulfilled is None and allocated is not None and on_hand is not None:
+        unfulfilled = round(max(0.0, allocated - on_hand), 2)
+
+    incoming_stock_on_order = incoming.get("cin7_stock_on_order")
+    if incoming_stock_on_order is not None:
+        incoming_stock_on_order = pd.to_numeric(
+            incoming_stock_on_order, errors="coerce")
+        if not pd.isna(incoming_stock_on_order):
+            on_order = round(float(incoming_stock_on_order), 2)
+
+    if available is not None and available < 0:
+        stock_state = "oversold / backordered"
+    elif available == 0:
+        stock_state = "no free stock"
+    elif available is not None and available > 0:
+        stock_state = "available"
+    elif on_hand is not None and on_hand > 0:
+        stock_state = "on hand, availability unknown"
+    else:
+        stock_state = "stock position unknown"
+
+    storage_dim = _text("storage_dim")
+    trend_flag = _text("trend_flag") or "Stable"
+    is_dormant = bool(detail.get("is_dormant") or False)
+    excess_units = _num("excess_units")
+    effective_units_12mo = _num("effective_units_12mo")
+
+    position = {
+        "matched": 1,
+        "sku": sku,
+        "name": detail.get("Name"),
+        "stock_state": stock_state,
+        "stock": {
+            "on_hand": on_hand,
+            "available": available,
+            "allocated": allocated,
+            "on_order": on_order,
+            "unfulfilled_backorders": unfulfilled,
+            "bin": detail.get("Bin"),
+            "storage_dim": storage_dim or None,
+            "storage_dim_missing": not bool(storage_dim),
+        },
+        "engine_signals": {
+            "ABC": detail.get("ABC"),
+            "trend_flag": trend_flag,
+            "is_dormant": is_dormant,
+            "effective_units_12mo": effective_units_12mo,
+            "DoC_days": _num("DoC_days"),
+            "target_stock": _num("target_stock"),
+            "reorder_qty": _num("reorder_qty"),
+            "excess_units": excess_units,
+            "excess_value": _num("excess_value"),
+            "classification": detail.get("Classification"),
+        },
+        "incoming_stock": {
+            "matched": incoming.get("matched"),
+            "error": incoming.get("error"),
+            "date_field_used": incoming.get("date_field_used"),
+            "lines": incoming.get("lines") or [],
+            "open_po_quantity_total": incoming.get(
+                "open_po_quantity_total"),
+            "cin7_stock_on_order": incoming.get("cin7_stock_on_order"),
+            "data_gap": incoming.get("data_gap"),
+            "reconciliation_note": incoming.get("reconciliation_note"),
+            "suppressed_lines": incoming.get(
+                "stock_on_order_suppressed_lines"),
+            "note": incoming.get("note"),
+        },
+        "assistant_notes": detail.get("assistant_notes"),
+        "formatting_guidance": (
+            "For stock-position questions, answer in this order: "
+            "1) SKU + name. 2) OnHand, Available, Allocated, "
+            "OnOrder, and backorders/unfulfilled. 3) Bin and storage "
+            "dimension (append 'not set' if missing). 4) Incoming PO "
+            "lines with PO number, supplier, quantity, ETA, status, "
+            "and freight/progress notes when present. 5) ABC, trend, "
+            "dormancy, excess, days of cover, and a short buying "
+            "summary. If incoming_stock.reconciliation_note or "
+            "incoming_stock.data_gap is present, state it plainly "
+            "before giving a confident recommendation."
+        ),
+    }
+    return _serialise_row(position)
 
 
 def get_velocity(engine_df: pd.DataFrame,
@@ -6854,6 +7011,7 @@ TOOL_HANDLERS = {
     # the file for tomorrow's rebuild as a separate post-answer call.
     # "get_relevant_slow_stock": get_relevant_slow_stock,
     "get_sku_details": get_sku_details,
+    "get_stock_position": get_stock_position,
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,
     "get_migration_chain": get_migration_chain,
