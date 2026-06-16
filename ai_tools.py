@@ -1866,14 +1866,34 @@ def search_products(engine_df: pd.DataFrame,
     if in_stock_only and "OnHand" in df.columns:
         df = df[df["OnHand"].fillna(0) > 0]
 
+    _loc_cols = [
+        c for c in (
+            "StockLocator", "Stock Locator", "Stock locator",
+            "stock_locator", "StockLocator_x", "StockLocator_y",
+            "Stock Locator_x", "Stock Locator_y")
+        if c in df.columns]
+    if _loc_cols:
+        def _first_stock_locator(row):
+            for _col in _loc_cols:
+                val = row.get(_col)
+                if val is None or pd.isna(val):
+                    continue
+                text = str(val).strip()
+                if text and text.lower() not in {"nan", "none", "null"}:
+                    return text
+            return None
+        df = df.copy()
+        df["StockLocator"] = df.apply(_first_stock_locator, axis=1)
+
     # v2.67.27 — surface the engine's actual signal columns so the
     # AI can read them directly instead of hoping for a synthesised
     # Classification field.
-    # v2.67.274 — include Bin (warehouse shelf location) so the AI
-    # always reports WHERE a SKU is stored alongside how much is on hand.
+    # v2.67.274 — include CIN7 Stock locator so the AI reports the
+    # pick-face shelf code alongside how much is on hand. Do not surface
+    # Default location / warehouse Location as the shelf locator.
     cols_we_want = [c for c in [
         "SKU", "Name", "Family", "ABC", "Classification",
-        "OnHand", "Bin", "TargetStock", "ReorderSuggested",
+        "OnHand", "StockLocator", "TargetStock", "ReorderSuggested",
         "trend_flag", "is_dormant", "excess_units",
         "effective_units_12mo",
     ] if c in df.columns]
@@ -2008,8 +2028,9 @@ def get_stock_position(engine_df: pd.DataFrame,
 
     storage_dim = _text("storage_dim")
     bin_location = None
-    for c in ("Bin", "BinLocation", "StockLocator", "Stock Locator",
-              "StockLocation", "Stock Location", "Location"):
+    for c in ("StockLocator", "Stock Locator", "Stock locator",
+              "stock_locator", "StockLocator_x", "StockLocator_y",
+              "Stock Locator_x", "Stock Locator_y"):
         val = detail.get(c)
         if val is None or pd.isna(val):
             continue
@@ -2067,9 +2088,11 @@ def get_stock_position(engine_df: pd.DataFrame,
         "formatting_guidance": (
             "For stock-position questions, answer in this order: "
             "1) SKU + name. 2) OnHand, Available, Allocated, "
-            "OnOrder, and backorders/unfulfilled. 3) Bin and storage "
-            "dimension (append 'not set' if missing). 4) Incoming PO "
-            "lines with PO number, supplier, quantity, ETA, status, "
+            "OnOrder, and backorders/unfulfilled. 3) Stock locator "
+            "(from CIN7's Stock locator field only; never Default "
+            "location / Location) and storage dimension (append 'not "
+            "set' if missing). 4) Incoming PO lines with PO number, "
+            "supplier, quantity, ETA, status, "
             "and freight/progress notes when present. 5) ABC, trend, "
             "dormancy, excess, days of cover, and a short buying "
             "summary. If incoming_stock.reconciliation_note or "
