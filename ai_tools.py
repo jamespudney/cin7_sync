@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
@@ -139,6 +141,31 @@ TOOL_SCHEMAS: list[dict] = [
                 },
             },
             "required": ["sku"],
+        },
+    },
+    {
+        "name": "get_data_freshness",
+        "description": (
+            "Report how current the local CSV snapshots are. Use when "
+            "the user asks how fresh/current the bot's data is, whether "
+            "Slack is up to date, when product master/stock/PO data last "
+            "synced, or when a stock answer may depend on stale data."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["stock_position", "core", "all"],
+                    "description": (
+                        "stock_position = products/stock/purchase-lines/"
+                        "sale-lines used for a SKU stock answer; core = "
+                        "main operational feeds; all = the dashboard data "
+                        "catalog."
+                    ),
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -1968,6 +1995,126 @@ def get_sku_details(engine_df: pd.DataFrame,
     return detail
 
 
+_FRESHNESS_SCOPES: dict[str, tuple[tuple[str, str, float | None], ...]] = {
+    "stock_position": (
+        ("products", "Products / CIN7 product master", 24.0),
+        ("stock_on_hand", "Stock on hand", 0.5),
+        ("purchase_lines_last", "Purchase lines / incoming POs", 24.0),
+        ("sale_lines_last", "Sale lines / demand signals", 24.0),
+    ),
+    "core": (
+        ("products", "Products / CIN7 product master", 24.0),
+        ("stock_on_hand", "Stock on hand", 0.5),
+        ("sales_last_30d", "Sales headers", 24.0),
+        ("sale_lines_last", "Sale lines", 24.0),
+        ("purchases_last_30d", "Purchase headers", 24.0),
+        ("purchase_lines_last", "Purchase lines", 24.0),
+        ("engine_output", "ABC engine output", 1.0),
+    ),
+}
+
+
+def _snapshot_freshness(prefix: str,
+                        label: str,
+                        expected_hours: float | None,
+                        *,
+                        output_dir: Path | str | None = None,
+                        now: datetime | None = None) -> dict:
+    """Return freshness metadata for the latest local CSV snapshot."""
+    from data_catalog import latest_file
+    from data_paths import OUTPUT_DIR
+
+    root = Path(output_dir) if output_dir is not None else OUTPUT_DIR
+    current = now or datetime.now()
+    path = latest_file(prefix, root)
+    if path is None:
+        return {
+            "label": label,
+            "prefix": prefix,
+            "latest_file": None,
+            "last_sync": None,
+            "age_hours": None,
+            "expected_cadence_hours": expected_hours,
+            "status": "missing",
+        }
+
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    age_hours = max(0.0, (current - mtime).total_seconds() / 3600.0)
+    status = "fresh"
+    if expected_hours is not None:
+        if age_hours > expected_hours * 2:
+            status = "stale"
+        elif age_hours > expected_hours:
+            status = "aging"
+
+    return {
+        "label": label,
+        "prefix": prefix,
+        "latest_file": path.name,
+        "last_sync": mtime.strftime("%Y-%m-%d %H:%M"),
+        "age_hours": round(age_hours, 2),
+        "expected_cadence_hours": expected_hours,
+        "status": status,
+    }
+
+
+def _data_freshness_report(scope: str = "stock_position",
+                           *,
+                           output_dir: Path | str | None = None,
+                           now: datetime | None = None) -> dict:
+    """Return freshness rows for the requested operational data scope."""
+    from data_catalog import DATASETS
+
+    requested = (scope or "stock_position").strip().lower()
+    if requested == "all":
+        specs = tuple(
+            (spec.prefix, spec.label, spec.expected_cadence_hours)
+            for spec in DATASETS
+        )
+    else:
+        specs = _FRESHNESS_SCOPES.get(
+            requested, _FRESHNESS_SCOPES["stock_position"])
+        requested = requested if requested in _FRESHNESS_SCOPES else "stock_position"
+
+    generated_at = now or datetime.now()
+    rows = [
+        _snapshot_freshness(prefix, label, cadence,
+                            output_dir=output_dir, now=generated_at)
+        for prefix, label, cadence in specs
+    ]
+    stale_or_missing = [
+        row for row in rows
+        if row.get("status") in {"missing", "stale"}
+    ]
+    aging = [
+        row for row in rows
+        if row.get("status") == "aging"
+    ]
+    return {
+        "scope": requested,
+        "generated_at": generated_at.strftime("%Y-%m-%d %H:%M"),
+        "datasets": rows,
+        "stale_or_missing": stale_or_missing,
+        "aging": aging,
+        "all_fresh": all(row.get("status") == "fresh" for row in rows),
+        "guidance": (
+            "Only add a freshness note to the final answer when the user "
+            "asks about data currency or when stale_or_missing is not empty. "
+            "For stock answers, Products carries product-master fields like "
+            "Stock locator and Storage L x W x H In; Stock on hand carries "
+            "current quantities; Purchase lines carry incoming PO detail."
+        ),
+    }
+
+
+def get_data_freshness(engine_df: pd.DataFrame,
+                       sale_lines_df: pd.DataFrame,
+                       args: dict) -> dict:
+    """Tool wrapper for data freshness reporting."""
+    scope = (args.get("scope") or "core").strip().lower()
+    return _data_freshness_report(scope)
+
+
 def get_stock_position(engine_df: pd.DataFrame,
                        sale_lines_df: pd.DataFrame,
                        args: dict) -> dict:
@@ -2092,6 +2239,7 @@ def get_stock_position(engine_df: pd.DataFrame,
                 "stock_on_order_suppressed_lines"),
             "note": incoming.get("note"),
         },
+        "data_freshness": _data_freshness_report("stock_position"),
         "assistant_notes": detail.get("assistant_notes"),
         "formatting_guidance": (
             "For stock-position questions, answer in this order: "
@@ -2105,7 +2253,10 @@ def get_stock_position(engine_df: pd.DataFrame,
             "dormancy, excess, days of cover, and a short buying "
             "summary. If incoming_stock.reconciliation_note or "
             "incoming_stock.data_gap is present, state it plainly "
-            "before giving a confident recommendation."
+            "before giving a confident recommendation. Only include a "
+            "data-freshness note when data_freshness.stale_or_missing "
+            "has entries or the user specifically asks how current the "
+            "data is."
         ),
     }
     return _serialise_row(position)
@@ -7238,6 +7389,7 @@ TOOL_HANDLERS = {
     # "get_relevant_slow_stock": get_relevant_slow_stock,
     "get_sku_details": get_sku_details,
     "get_stock_position": get_stock_position,
+    "get_data_freshness": get_data_freshness,
     "get_velocity": get_velocity,
     "get_dead_stock": get_dead_stock,
     "get_migration_chain": get_migration_chain,
