@@ -1364,7 +1364,9 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
                 exc)
             stock_cols = ["SKU"]
             for opt in ("OnHand", "Bin", "Location",
-                          "OnOrder", "Available", "StockOnHand"):
+                          "BinLocation", "StockLocator", "Stock Locator",
+                          "StockLocation", "Stock Location", "OnOrder",
+                          "Available", "StockOnHand"):
                 if opt in stock.columns:
                     stock_cols.append(opt)
             engine_df = products.merge(

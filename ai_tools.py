@@ -2007,15 +2007,16 @@ def get_stock_position(engine_df: pd.DataFrame,
         stock_state = "stock position unknown"
 
     storage_dim = _text("storage_dim")
-    bin_location = next(
-        (str(detail.get(c)).strip()
-         for c in ("Bin", "BinLocation", "StockLocator",
-                   "Stock Locator", "Location")
-         if detail.get(c) is not None
-         and not pd.isna(detail.get(c))
-         and str(detail.get(c)).strip()),
-        None,
-    )
+    bin_location = None
+    for c in ("Bin", "BinLocation", "StockLocator", "Stock Locator",
+              "StockLocation", "Stock Location", "Location"):
+        val = detail.get(c)
+        if val is None or pd.isna(val):
+            continue
+        text = str(val).strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            bin_location = text
+            break
     trend_flag = _text("trend_flag") or "Stable"
     is_dormant = bool(detail.get("is_dormant") or False)
     excess_units = _num("excess_units")

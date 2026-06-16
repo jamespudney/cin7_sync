@@ -53,9 +53,52 @@ import pandas as pd
 
 log = logging.getLogger("worker_engine")
 
+_BIN_ALIAS_COLUMNS = (
+    "Bin",
+    "BinLocation",
+    "StockLocator",
+    "Stock Locator",
+    "StockLocation",
+    "Stock Location",
+    "Location",
+)
+
 
 def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
+
+
+def _normalise_bin_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """Populate Bin from the first non-empty locator alias per row."""
+    bin_cols: list[str] = []
+    for col in _BIN_ALIAS_COLUMNS:
+        # Prefer unsuffixed/current stock values, then pandas merge
+        # suffixes. If products and stock both contain a locator column,
+        # stock is usually the fresher shelf signal.
+        for candidate in (
+            col,
+            f"{col}_stock",
+            f"{col}_y",
+            f"{col}_product",
+            f"{col}_x",
+        ):
+            if candidate in df.columns and candidate not in bin_cols:
+                bin_cols.append(candidate)
+    if not bin_cols:
+        return df
+
+    def _first_locator(row) -> str:
+        for col in bin_cols:
+            val = row.get(col)
+            if val is None or pd.isna(val):
+                continue
+            text = str(val).strip()
+            if text and text.lower() not in {"nan", "none", "null"}:
+                return text
+        return ""
+
+    df["Bin"] = df.apply(_first_locator, axis=1)
+    return df
 
 
 def compute_engine_signals(products: pd.DataFrame,
@@ -80,11 +123,13 @@ def compute_engine_signals(products: pd.DataFrame,
         # the spaced UI label verbatim.
         for c in ("OnHand", "OnOrder", "Available", "Bin",
                     "BinLocation", "StockLocator", "Stock Locator",
-                    "Location", "StockOnHand"):
+                    "StockLocation", "Stock Location", "Location",
+                    "StockOnHand"):
             if c in stock_view.columns:
                 cols_to_pull.append(c)
         df = df.merge(stock_view[cols_to_pull].drop_duplicates(
             subset=["SKU"], keep="last"), on="SKU", how="left")
+        df = _normalise_bin_aliases(df)
 
     # 2. Family resolution.
     if "AdditionalAttribute1" in df.columns:

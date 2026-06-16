@@ -999,37 +999,49 @@ with st.sidebar:
     # stale; the current deploy is now shown as a small caption
     # below the navigation, and the per-version detail still lives
     # in the "Recent versions" expander further down.
-    # v2.67.36 — engine cache age indicator. Reads the mtime of
-    # Streamlit's persisted cache directory. Mostly informational —
-    # if it shows an age in seconds you know the warmer is running;
-    # if it shows hours, the cache is stale or the warmer broke.
+    # v2.67.36 — ABC snapshot indicator. This used to inspect
+    # Streamlit's generic cache directory, which became misleading
+    # after background refresh moved the source of truth to
+    # engine_output.csv. Keep this tied to the real engine snapshot.
     try:
-        from pathlib import Path as _Path
-        from datetime import datetime as _dt
-        _cache_root = _Path(
-            os.environ.get("STREAMLIT_HOME") or
-            (DATA_DIR / ".streamlit"))
-        _cache_dir = _cache_root / "cache"
-        if _cache_dir.exists():
-            _files = list(_cache_dir.glob("*"))
-            if _files:
-                _newest = max(f.stat().st_mtime for f in _files)
-                _age_min = (_dt.now().timestamp() - _newest) / 60.0
-                if _age_min < 60:
-                    _age_str = f"{_age_min:.0f}m ago"
-                elif _age_min < 1440:
-                    _age_str = f"{_age_min / 60:.1f}h ago"
-                else:
-                    _age_str = f"{_age_min / 1440:.1f}d ago"
-                _icon = "🟢" if _age_min < 1440 else "🟡"
+        _eng_path = OUTPUT_DIR / "engine_output.csv"
+        _lock_path = OUTPUT_DIR / "engine_refresh.lock"
+        _eng_mtime = (
+            _eng_path.stat().st_mtime if _eng_path.exists() else None)
+        _refresh_running = False
+        if _lock_path.exists():
+            _lock_age_min = (
+                datetime.now().timestamp()
+                - _lock_path.stat().st_mtime
+            ) / 60.0
+            _refresh_running = _lock_age_min <= 45
+
+        def _fmt_sidebar_engine_age(_dt: datetime) -> str:
+            _age_min = (datetime.now() - _dt).total_seconds() / 60.0
+            if _age_min < 1:
+                return "just now"
+            if _age_min < 60:
+                return f"{_age_min:.0f}m ago"
+            if _age_min < 1440:
+                return f"{_age_min / 60:.1f}h ago"
+            return f"{_age_min / 1440:.1f}d ago"
+
+        if _refresh_running:
+            if _eng_mtime:
+                _eng_at = datetime.fromtimestamp(_eng_mtime)
                 st.caption(
-                    f"{_icon} ABC engine cache: warmed {_age_str}")
+                    "🟡 ABC refresh running · using snapshot from "
+                    f"{_eng_at.strftime('%Y-%m-%d %H:%M')}")
             else:
-                st.caption(
-                    "🟡 ABC engine cache: empty — first user "
-                    "after the next sync will trigger a recompute")
+                st.caption("🟡 ABC refresh running · first snapshot pending")
+        elif _eng_mtime:
+            _eng_at = datetime.fromtimestamp(_eng_mtime)
+            _age_min = (datetime.now() - _eng_at).total_seconds() / 60.0
+            _icon = "🟢" if _age_min < 1440 else "🟡"
+            st.caption(
+                f"{_icon} ABC updated {_fmt_sidebar_engine_age(_eng_at)}")
         else:
-            st.caption("🟡 ABC engine cache: not yet created")
+            st.caption("🟡 ABC snapshot not yet created")
     except Exception:  # noqa: BLE001
         # Don't break the sidebar over a status caption.
         pass
@@ -3281,6 +3293,15 @@ _ENGINE_OUTPUT_PATH = OUTPUT_DIR / "engine_output.csv"
 _ENGINE_REFRESH_LOCK = OUTPUT_DIR / "engine_refresh.lock"
 _ENGINE_REFRESH_STATUS = OUTPUT_DIR / "engine_refresh_status.json"
 _ENGINE_REFRESH_LOG = OUTPUT_DIR / "engine_refresh.log"
+_BIN_ALIAS_COLUMNS = (
+    "Bin",
+    "BinLocation",
+    "StockLocator",
+    "Stock Locator",
+    "StockLocation",
+    "Stock Location",
+    "Location",
+)
 
 
 def _engine_output_mtime() -> Optional[float]:
@@ -3352,22 +3373,43 @@ def _load_engine_output_snapshot() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _stock_bin_view(stock_df: pd.DataFrame) -> pd.DataFrame:
-    """Return SKU -> Bin using any CIN7 stock-locator column name."""
-    if stock_df is None or stock_df.empty or "SKU" not in stock_df.columns:
+def _sku_bin_view(df: pd.DataFrame) -> pd.DataFrame:
+    """Return SKU -> Bin using the first non-empty locator alias per row."""
+    if df is None or df.empty or "SKU" not in df.columns:
         return pd.DataFrame(columns=["SKU", "Bin"])
-    bin_col = next(
-        (c for c in ("Bin", "BinLocation", "StockLocator",
-                     "Stock Locator", "Location")
-         if c in stock_df.columns),
-        None)
-    if not bin_col:
+    bin_cols = [c for c in _BIN_ALIAS_COLUMNS if c in df.columns]
+    if not bin_cols:
         return pd.DataFrame(columns=["SKU", "Bin"])
-    view = stock_df[["SKU", bin_col]].copy()
+
+    def _first_non_empty_locator(row) -> str:
+        for col in bin_cols:
+            val = row.get(col)
+            if val is None or pd.isna(val):
+                continue
+            text = str(val).strip()
+            if text and text.lower() not in {"nan", "none", "null"}:
+                return text
+        return ""
+
+    view = df[["SKU", *bin_cols]].copy()
     view["SKU"] = view["SKU"].astype(str)
-    view["Bin"] = view[bin_col].fillna("").astype(str).str.strip()
+    view["Bin"] = view.apply(_first_non_empty_locator, axis=1)
     view = view[view["Bin"] != ""]
     return view[["SKU", "Bin"]].drop_duplicates(subset=["SKU"])
+
+
+def _stock_bin_view(stock_df: pd.DataFrame,
+                    products_df: Optional[pd.DataFrame] = None
+                    ) -> pd.DataFrame:
+    """Return SKU -> Bin from stock data, falling back to products."""
+    stock_view = _sku_bin_view(stock_df)
+    product_view = _sku_bin_view(products_df)
+    if stock_view.empty:
+        return product_view
+    if product_view.empty:
+        return stock_view
+    return pd.concat([stock_view, product_view], ignore_index=True
+                     ).drop_duplicates(subset=["SKU"], keep="first")
 
 
 def _engine_refresh_running(max_age_minutes: int = 45) -> bool:
@@ -3381,6 +3423,25 @@ def _engine_refresh_running(max_age_minutes: int = 45) -> bool:
         return age_min <= max_age_minutes
     except OSError:
         return False
+
+
+def _read_engine_refresh_status() -> dict:
+    try:
+        if not _ENGINE_REFRESH_STATUS.exists():
+            return {}
+        return json.loads(
+            _ENGINE_REFRESH_STATUS.read_text(encoding="utf-8") or "{}")
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _format_engine_age(dt: datetime) -> str:
+    age_min = (datetime.now() - dt).total_seconds() / 60.0
+    if age_min < 1:
+        return "just now"
+    if age_min < 60:
+        return f"{age_min:.0f} min ago"
+    return f"{age_min/60:.1f} h ago"
 
 
 def _write_engine_refresh_status(payload: dict) -> None:
@@ -10940,18 +11001,29 @@ elif page == "Ordering":
     _rc1, _rc2, _rc3 = st.columns([6, 2, 2])
     with _rc2:
         _eng_mtime = _engine_output_mtime()
+        _eng_status = _read_engine_refresh_status()
         if _engine_refresh_running():
-            st.caption("ABC refresh **running in background**")
+            if _eng_mtime:
+                _eng_at = datetime.fromtimestamp(_eng_mtime)
+                _stamp = _eng_at.strftime("%Y-%m-%d %H:%M")
+                st.caption(
+                    "ABC refresh **running in background** · using "
+                    f"snapshot from {_stamp} server time")
+            else:
+                st.caption("ABC refresh **running in background**")
         elif _eng_mtime:
             _eng_at = datetime.fromtimestamp(_eng_mtime)
-            _age_min = (datetime.now() - _eng_at).total_seconds() / 60.0
-            if _age_min < 1:
-                _age_str = "just now"
-            elif _age_min < 60:
-                _age_str = f"{_age_min:.0f} min ago"
+            _age_str = _format_engine_age(_eng_at)
+            _stamp = _eng_at.strftime("%Y-%m-%d %H:%M")
+            _state = str(_eng_status.get("state") or "").lower()
+            if _state == "failed":
+                st.caption(
+                    f"ABC using last-good snapshot **{_age_str}** "
+                    f"({_stamp} server time). Last refresh failed.")
             else:
-                _age_str = f"{_age_min/60:.1f} h ago"
-            st.caption(f"Engine snapshot updated **{_age_str}**")
+                st.caption(
+                    f"ABC updated **{_age_str}** "
+                    f"({_stamp} server time)")
         else:
             st.caption("Engine snapshot **not created yet**")
     with _rc3:
@@ -20189,7 +20261,7 @@ elif page == "AI Assistant":
             # the AI needs it. Take the first non-empty Bin per
             # SKU (a SKU can be in multiple bins — first one is a
             # reasonable default for a single-line answer).
-            _bin_view = _stock_bin_view(stock)
+            _bin_view = _stock_bin_view(stock, products)
             if not _bin_view.empty:
                 engine_df = engine_df.copy()  # don't mutate cache
                 if "Bin" in engine_df.columns:
@@ -20214,7 +20286,7 @@ elif page == "AI Assistant":
                     if _col in stock.columns:
                         _stock_view[_col] = pd.to_numeric(
                             stock[_col], errors="coerce")
-                _bin_view = _stock_bin_view(stock)
+                _bin_view = _stock_bin_view(stock, products)
                 if not _bin_view.empty:
                     _stock_view = _stock_view.merge(
                         _bin_view, on="SKU", how="left")
@@ -20239,7 +20311,7 @@ elif page == "AI Assistant":
                 if _col in stock.columns:
                     _stock_view[_col] = pd.to_numeric(
                         stock[_col], errors="coerce")
-            _bin_view = _stock_bin_view(stock)
+            _bin_view = _stock_bin_view(stock, products)
             if not _bin_view.empty:
                 _stock_view = _stock_view.merge(
                     _bin_view, on="SKU", how="left")
