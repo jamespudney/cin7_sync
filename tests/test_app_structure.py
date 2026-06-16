@@ -263,6 +263,81 @@ class IncomingStockTests(unittest.TestCase):
             "PO-6816")
         self.assertIn("suppressed", result["reconciliation_note"])
 
+    def test_stock_position_tool_is_registered_for_assistant(self) -> None:
+        schema_names = {schema["name"] for schema in ai_tools.TOOL_SCHEMAS}
+        self.assertIn("get_stock_position", schema_names)
+        self.assertIn("get_stock_position", ai_tools.TOOL_HANDLERS)
+
+    def test_stock_position_includes_stock_and_incoming_po_summary(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "OnHand": 133.75,
+            "Allocated": 29,
+            "Available": 104.75,
+            "OnOrder": 160,
+            "unfulfilled": 0,
+            "Bin": "D29B",
+            "storage_dim": "2m profile",
+            "ABC": "A",
+            "trend_flag": "Trend",
+            "is_dormant": False,
+            "effective_units_12mo": 69,
+            "DoC_days": 700,
+            "target_stock": 69,
+            "reorder_qty": 0,
+            "excess_units": 64.75,
+            "excess_value": 423,
+        }])
+        purchase_lines = pd.DataFrame([
+            {
+                "PurchaseID": "7071",
+                "OrderNumber": "PO-7071",
+                "RequiredBy": "2026-06-18",
+                "Status": "INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 80,
+                "Comments": "Sea Freight",
+                "ShippingNotes": "ETA CHS 6/11",
+            },
+            {
+                "PurchaseID": "7210",
+                "OrderNumber": "PO-7210",
+                "RequiredBy": "2026-07-16",
+                "Status": "PARTIALLY INVOICED",
+                "Supplier": "Topmet",
+                "SKU": sku,
+                "Name": "Slim8 Black 2m",
+                "Quantity": 80,
+                "Comments": "Sea Freight",
+                "ShippingNotes": "Ship 6/11 ETA CHS 7/9",
+            },
+        ])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        result = ai_tools.get_stock_position(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["stock"]["on_hand"], 133.75)
+        self.assertEqual(result["stock"]["available"], 104.75)
+        self.assertEqual(result["stock"]["allocated"], 29)
+        self.assertEqual(result["stock"]["on_order"], 160)
+        self.assertEqual(result["stock"]["bin"], "D29B")
+        self.assertEqual(result["stock"]["storage_dim"], "2m profile")
+        self.assertEqual(result["engine_signals"]["ABC"], "A")
+        self.assertEqual(result["engine_signals"]["trend_flag"], "Trend")
+        self.assertEqual(result["incoming_stock"]["matched"], 2)
+        self.assertEqual(
+            result["incoming_stock"]["open_po_quantity_total"], 160)
+        self.assertEqual(
+            {line["po_number"] for line in result["incoming_stock"]["lines"]},
+            {"PO-7071", "PO-7210"})
+        self.assertIn("OnOrder", result["formatting_guidance"])
+
 
 class SkuRuleTests(unittest.TestCase):
     def test_sourcing_rule_parses_purchase_and_assembly_logic(self) -> None:
