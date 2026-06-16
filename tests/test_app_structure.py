@@ -279,7 +279,7 @@ class IncomingStockTests(unittest.TestCase):
             "Available": 104.75,
             "OnOrder": 160,
             "unfulfilled": 0,
-            "Bin": "D29B",
+            "StockLocator": "D29B",
             "storage_dim": "2m profile",
             "ABC": "A",
             "trend_flag": "Trend",
@@ -369,6 +369,7 @@ class IncomingStockTests(unittest.TestCase):
             "Available": 104.75,
             "OnOrder": 160,
             "Bin": "",
+            "Location": "Main Warehouse",
             "StockLocator": "D29B",
         }])
 
@@ -377,6 +378,22 @@ class IncomingStockTests(unittest.TestCase):
             engine_df, pd.DataFrame(), {"sku": sku})
 
         self.assertEqual(result["stock"]["bin"], "D29B")
+
+    def test_stock_position_ignores_default_location(self) -> None:
+        sku = "LED-89030021-2"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "OnHand": 133.75,
+            "Available": 104.75,
+            "Location": "Main Warehouse",
+        }])
+
+        ai_tools.set_purchase_lines(pd.DataFrame())
+        result = ai_tools.get_stock_position(
+            engine_df, pd.DataFrame(), {"sku": sku})
+
+        self.assertIsNone(result["stock"]["bin"])
 
     def test_worker_engine_normalises_stock_locator_to_bin(self) -> None:
         sku = "LED-89030021-2"
@@ -389,6 +406,7 @@ class IncomingStockTests(unittest.TestCase):
             "SKU": sku,
             "OnHand": 133.75,
             "Bin": "",
+            "Location": "Main Warehouse",
             "StockLocator": "D29B",
         }])
 
@@ -396,6 +414,24 @@ class IncomingStockTests(unittest.TestCase):
             products, stock, pd.DataFrame())
 
         self.assertEqual(result.iloc[0]["Bin"], "D29B")
+
+    def test_worker_engine_ignores_default_location(self) -> None:
+        sku = "LED-89030021-2"
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Slim8 Black 2m",
+            "AverageCost": 1.0,
+        }])
+        stock = pd.DataFrame([{
+            "SKU": sku,
+            "OnHand": 133.75,
+            "Location": "Main Warehouse",
+        }])
+
+        result = worker_engine.compute_engine_signals(
+            products, stock, pd.DataFrame())
+
+        self.assertEqual(result.iloc[0].get("Bin", ""), "")
 
 
 class SkuRuleTests(unittest.TestCase):

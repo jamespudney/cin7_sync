@@ -53,14 +53,11 @@ import pandas as pd
 
 log = logging.getLogger("worker_engine")
 
-_BIN_ALIAS_COLUMNS = (
-    "Bin",
-    "BinLocation",
+_STOCK_LOCATOR_COLUMNS = (
     "StockLocator",
     "Stock Locator",
-    "StockLocation",
-    "Stock Location",
-    "Location",
+    "Stock locator",
+    "stock_locator",
 )
 
 
@@ -69,12 +66,12 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 
 def _normalise_bin_aliases(df: pd.DataFrame) -> pd.DataFrame:
-    """Populate Bin from the first non-empty locator alias per row."""
+    """Populate Bin from CIN7's Stock locator field only."""
     bin_cols: list[str] = []
-    for col in _BIN_ALIAS_COLUMNS:
-        # Prefer unsuffixed/current stock values, then pandas merge
-        # suffixes. If products and stock both contain a locator column,
-        # stock is usually the fresher shelf signal.
+    for col in _STOCK_LOCATOR_COLUMNS:
+        # Prefer unsuffixed values, then pandas merge suffixes. These
+        # candidates are still strictly Stock locator fields; never use
+        # Default location / warehouse Location as a shelf code.
         for candidate in (
             col,
             f"{col}_stock",
@@ -85,6 +82,8 @@ def _normalise_bin_aliases(df: pd.DataFrame) -> pd.DataFrame:
             if candidate in df.columns and candidate not in bin_cols:
                 bin_cols.append(candidate)
     if not bin_cols:
+        if "Bin" in df.columns:
+            df["Bin"] = ""
         return df
 
     def _first_locator(row) -> str:
@@ -118,18 +117,17 @@ def compute_engine_signals(products: pd.DataFrame,
         stock_view = stock.copy()
         stock_view["SKU"] = stock_view["SKU"].astype(str)
         cols_to_pull = ["SKU"]
-        # v2.67.190 — include CIN7's newer "Stock Locator" /
-        # "StockLocator" column names too. Some CSV exports use
-        # the spaced UI label verbatim.
-        for c in ("OnHand", "OnOrder", "Available", "Bin",
-                    "BinLocation", "StockLocator", "Stock Locator",
-                    "StockLocation", "Stock Location", "Location",
+        # Pull only CIN7's Stock locator field for shelf position.
+        # Do not use Location/Default location; that is the warehouse,
+        # not the shelf locator staff are asking for.
+        for c in ("OnHand", "OnOrder", "Available", "StockLocator",
+                    "Stock Locator", "Stock locator", "stock_locator",
                     "StockOnHand"):
             if c in stock_view.columns:
                 cols_to_pull.append(c)
         df = df.merge(stock_view[cols_to_pull].drop_duplicates(
             subset=["SKU"], keep="last"), on="SKU", how="left")
-        df = _normalise_bin_aliases(df)
+    df = _normalise_bin_aliases(df)
 
     # 2. Family resolution.
     if "AdditionalAttribute1" in df.columns:

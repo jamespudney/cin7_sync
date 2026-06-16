@@ -3293,14 +3293,11 @@ _ENGINE_OUTPUT_PATH = OUTPUT_DIR / "engine_output.csv"
 _ENGINE_REFRESH_LOCK = OUTPUT_DIR / "engine_refresh.lock"
 _ENGINE_REFRESH_STATUS = OUTPUT_DIR / "engine_refresh_status.json"
 _ENGINE_REFRESH_LOG = OUTPUT_DIR / "engine_refresh.log"
-_BIN_ALIAS_COLUMNS = (
-    "Bin",
-    "BinLocation",
+_STOCK_LOCATOR_COLUMNS = (
     "StockLocator",
     "Stock Locator",
-    "StockLocation",
-    "Stock Location",
-    "Location",
+    "Stock locator",
+    "stock_locator",
 )
 
 
@@ -3374,12 +3371,12 @@ def _load_engine_output_snapshot() -> pd.DataFrame:
 
 
 def _sku_bin_view(df: pd.DataFrame) -> pd.DataFrame:
-    """Return SKU -> Bin using the first non-empty locator alias per row."""
+    """Return SKU -> Bin using only CIN7's Stock locator field."""
     if df is None or df.empty or "SKU" not in df.columns:
-        return pd.DataFrame(columns=["SKU", "Bin"])
-    bin_cols = [c for c in _BIN_ALIAS_COLUMNS if c in df.columns]
+        return pd.DataFrame(columns=["SKU", "StockLocator", "Bin"])
+    bin_cols = [c for c in _STOCK_LOCATOR_COLUMNS if c in df.columns]
     if not bin_cols:
-        return pd.DataFrame(columns=["SKU", "Bin"])
+        return pd.DataFrame(columns=["SKU", "StockLocator", "Bin"])
 
     def _first_non_empty_locator(row) -> str:
         for col in bin_cols:
@@ -3393,9 +3390,11 @@ def _sku_bin_view(df: pd.DataFrame) -> pd.DataFrame:
 
     view = df[["SKU", *bin_cols]].copy()
     view["SKU"] = view["SKU"].astype(str)
-    view["Bin"] = view.apply(_first_non_empty_locator, axis=1)
-    view = view[view["Bin"] != ""]
-    return view[["SKU", "Bin"]].drop_duplicates(subset=["SKU"])
+    view["StockLocator"] = view.apply(_first_non_empty_locator, axis=1)
+    view = view[view["StockLocator"] != ""]
+    view["Bin"] = view["StockLocator"]
+    return view[["SKU", "StockLocator", "Bin"]].drop_duplicates(
+        subset=["SKU"])
 
 
 def _stock_bin_view(stock_df: pd.DataFrame,
@@ -20254,18 +20253,17 @@ elif page == "AI Assistant":
         try:
             # v2.67.41 — session-cached engine accessor.
             engine_df = _get_engine_df()
-            # v2.67.35 — merge Bin (warehouse shelf location) from
-            # stock_on_hand. Engine doesn't include Bin natively
-            # because it's not a velocity-relevant signal, but
-            # buyers/sales staff often ask "where do we keep X" so
-            # the AI needs it. Take the first non-empty Bin per
-            # SKU (a SKU can be in multiple bins — first one is a
-            # reasonable default for a single-line answer).
+            # v2.67.35 — merge CIN7 Stock locator for pick-face
+            # answers. Never use Default location / Location here;
+            # that is the warehouse, not the shelf locator.
             _bin_view = _stock_bin_view(stock, products)
             if not _bin_view.empty:
                 engine_df = engine_df.copy()  # don't mutate cache
-                if "Bin" in engine_df.columns:
-                    engine_df = engine_df.drop(columns=["Bin"])
+                _drop_locator_cols = [
+                    c for c in ("Bin", "StockLocator")
+                    if c in engine_df.columns]
+                if _drop_locator_cols:
+                    engine_df = engine_df.drop(columns=_drop_locator_cols)
                 engine_df = engine_df.merge(
                     _bin_view, on="SKU", how="left")
         except Exception as _engine_err:  # noqa: BLE001
@@ -20288,6 +20286,11 @@ elif page == "AI Assistant":
                             stock[_col], errors="coerce")
                 _bin_view = _stock_bin_view(stock, products)
                 if not _bin_view.empty:
+                    engine_df = engine_df.drop(
+                        columns=[
+                            c for c in ("Bin", "StockLocator")
+                            if c in engine_df.columns],
+                        errors="ignore")
                     _stock_view = _stock_view.merge(
                         _bin_view, on="SKU", how="left")
                 engine_df = engine_df.merge(
@@ -20313,6 +20316,11 @@ elif page == "AI Assistant":
                         stock[_col], errors="coerce")
             _bin_view = _stock_bin_view(stock, products)
             if not _bin_view.empty:
+                engine_df = engine_df.drop(
+                    columns=[
+                        c for c in ("Bin", "StockLocator")
+                        if c in engine_df.columns],
+                    errors="ignore")
                 _stock_view = _stock_view.merge(
                     _bin_view, on="SKU", how="left")
             engine_df = engine_df.merge(

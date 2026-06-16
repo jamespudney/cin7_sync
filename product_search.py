@@ -78,19 +78,20 @@ if not log.handlers:
     # handler that double-prints.
     log.propagate = False
 
-_BIN_ALIAS_COLUMNS = (
-    "Bin",
-    "BinLocation",
+_STOCK_LOCATOR_COLUMNS = (
     "StockLocator",
     "Stock Locator",
-    "StockLocation",
-    "Stock Location",
-    "Location",
+    "Stock locator",
+    "stock_locator",
+    "StockLocator_x",
+    "StockLocator_y",
+    "Stock Locator_x",
+    "Stock Locator_y",
 )
 
 
 def _first_locator(row: dict) -> Optional[str]:
-    for col in _BIN_ALIAS_COLUMNS:
+    for col in _STOCK_LOCATOR_COLUMNS:
         val = row.get(col)
         if val is None or pd.isna(val):
             continue
@@ -1087,7 +1088,7 @@ def find_products(engine_df: pd.DataFrame,
     if (engine_df is not None and not engine_df.empty
             and "SKU" in engine_df.columns):
         cols = ["SKU", "Name"] + [
-            c for c in ("OnHand", "Available", *_BIN_ALIAS_COLUMNS)
+            c for c in ("OnHand", "Available", *_STOCK_LOCATOR_COLUMNS)
             if c in engine_df.columns]
         for r in engine_df[cols].to_dict(orient="records"):
             sku = str(r.get("SKU") or "").strip()

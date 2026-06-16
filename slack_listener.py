@@ -979,23 +979,21 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
         "have failed the response standard. The reason Triple "
         "Whale was cancellable is BECAUSE this team can now get "
         "this depth from you — don't underdeliver.\n\n"
-        # v2.67.65 — bin/location surfacing. User: 'on the "
-        # stock-issues-queries chats and any other query on "
-        # product it would be good to tell the user the bin or "
-        # location of the stock'. The data IS in engine_df (Bin "
-        # column merged from stock_on_hand) — just need the prompt "
-        # to actually surface it in answers.
-        "• **Always include Bin location for stock answers.** "
+        # v2.67.65 — Stock locator surfacing. CIN7 also has a
+        # Default location / warehouse Location field; never treat that
+        # as the pick-face shelf code. The app feeds only CIN7's Stock
+        # locator value into Bin for compatibility with older tools.
+        "• **Always include Stock locator for stock answers.** "
         "When listing SKUs with their stock counts, ALSO show "
-        "the Bin location (warehouse shelf code) when known. "
-        "Format: `<SKU> · <name> · OnHand <X> · Bin <bin>`. "
-        "If Bin is unknown / null for a SKU, just omit it for "
-        "that row (don't say 'Bin: unknown'). The warehouse "
-        "team needs to know WHERE to pick from, not just "
+        "the Stock locator (warehouse shelf code) when known. "
+        "Format: `<SKU> · <name> · OnHand <X> · Stock locator <code>`. "
+        "If Stock locator is unknown / null for a SKU, just omit it "
+        "for that row. Never use Default location / Location as the "
+        "stock locator. The warehouse team needs to know WHERE to pick from, not just "
         "whether stock exists.\n"
         "• When showing one SKU in detail (single-SKU lookup), "
         "call get_sku_details and surface the full set: "
-        "OnHand, OnOrder, Available, Bin, Location, ABC, "
+        "OnHand, OnOrder, Available, Stock locator, ABC, "
         "trend_flag, is_dormant if true.\n"
         # v2.67.67 — slow-mover responses MUST include unit count
         # AND dollar value of overstock. The whole point of slow-
@@ -1363,9 +1361,8 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
                 "%s — falling back to slim products+stock merge",
                 exc)
             stock_cols = ["SKU"]
-            for opt in ("OnHand", "Bin", "Location",
-                          "BinLocation", "StockLocator", "Stock Locator",
-                          "StockLocation", "Stock Location", "OnOrder",
+            for opt in ("OnHand", "StockLocator", "Stock Locator",
+                          "Stock locator", "stock_locator", "OnOrder",
                           "Available", "StockOnHand"):
                 if opt in stock.columns:
                     stock_cols.append(opt)
