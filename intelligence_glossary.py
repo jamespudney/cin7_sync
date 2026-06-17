@@ -422,6 +422,15 @@ Three tools, picked by what kind of number the user mentions:
   Reference. Per-SKU line detail is NOT in the local sync;
   the AI tells the user to view the line breakdown in CIN7.
 
+#### PO dispatch reminders
+When a received PO has SO references in its comments, the worker posts a
+fulfillment reminder so customer backorders are picked first. Escalations
+are **line-level**: the worker checks whether each specific SO/SKU from
+the PO still needs dispatch. If an SO remains open only because it owes a
+different item, but the PO-linked SKU has already shipped/invoiced, the PO
+is stamped as handled and no "STILL hasn't shipped" alert is sent for that
+line.
+
 #### Local sync windows (v2.67.51)
 The AI's transaction tools read from local CSVs the daily sync
 drops:

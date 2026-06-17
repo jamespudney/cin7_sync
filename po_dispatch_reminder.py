@@ -37,7 +37,7 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -96,6 +96,46 @@ def _find_latest_csv(pattern: str) -> Optional[Path]:
     if not matches:
         return None
     return Path(max(matches, key=os.path.getmtime))
+
+
+def _normalise_so_number(value) -> str:
+    """Normalise sale order references to SO-XXXXX."""
+    if value is None or pd.isna(value):
+        return ""
+    raw = str(value).strip().upper()
+    if not raw:
+        return ""
+    if raw.startswith("SO-"):
+        return raw
+    if raw.startswith("SO") and raw[2:].isdigit():
+        return f"SO-{raw[2:]}"
+    if raw.isdigit():
+        return f"SO-{raw}"
+    return raw
+
+
+def _normalise_sku(value) -> str:
+    """Uppercase SKU key used for SO/SKU matching."""
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
+def _qty_float(value) -> float:
+    """Best-effort numeric quantity coercion."""
+    if value is None or pd.isna(value):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _truthy_flag(value) -> bool:
+    """Parse CIN7/API booleans that may arrive as bools or strings."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().upper() in {"TRUE", "YES", "1"}
 
 
 # v2.67.186 — terminal sale statuses. A SO in any of these
@@ -243,6 +283,23 @@ def _find_widest_sale_lines() -> Optional[Path]:
     return Path(best) if best else None
 
 
+def _find_widest_sales() -> Optional[Path]:
+    """Pick the sales header CSV covering the widest day-window."""
+    best = None
+    best_days = -1
+    best_mtime = -1.0
+    for p in glob.glob(str(OUTPUT_DIR / "sales_last_*d_*.csv")):
+        m = re.search(r"sales_last_(\d+)d_", os.path.basename(p))
+        if not m:
+            continue
+        days = int(m.group(1))
+        mtime = os.path.getmtime(p)
+        if days > best_days or (days == best_days
+                                  and mtime > best_mtime):
+            best, best_days, best_mtime = p, days, mtime
+    return Path(best) if best else None
+
+
 def _load_so_line_skus() -> Dict[str, set]:
     """Return {SO-number: set of SKUs on that sale order}, from
     the widest sale_lines CSV. Empty dict if no data — callers
@@ -274,6 +331,296 @@ def _load_so_line_skus() -> Dict[str, set]:
     log.info("Loaded SO->SKU map: %d sale orders from %s",
               len(out), path.name)
     return out
+
+
+def _load_so_sale_ids() -> Dict[str, str]:
+    """Return {SO-number: CIN7 SaleID UUID} from the latest sales CSV.
+
+    Used by the escalation pass for a live CIN7 detail check when a
+    sale is still open at header level but one specific SKU may already
+    have shipped.
+    """
+    sales_path = _find_widest_sales()
+    if not sales_path:
+        return {}
+    try:
+        df = pd.read_csv(sales_path, low_memory=False)
+    except Exception as exc:
+        log.warning("Failed to read %s for SO SaleID lookup: %s",
+                    sales_path, exc)
+        return {}
+    so_col = next(
+        (c for c in ("OrderNumber", "SaleNumber", "InvoiceNumber")
+         if c in df.columns), None)
+    id_col = next(
+        (c for c in ("SaleID", "ID", "Id") if c in df.columns), None)
+    if not so_col or not id_col:
+        return {}
+    out: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        so = _normalise_so_number(row.get(so_col))
+        sale_id = str(row.get(id_col) or "").strip()
+        if so and sale_id and sale_id.lower() != "nan":
+            out[so] = sale_id
+    log.info("Loaded SO->SaleID map: %d sales from %s",
+             len(out), sales_path.name)
+    return out
+
+
+def _load_local_invoiced_so_sku_qtys() -> Dict[Tuple[str, str], float]:
+    """Return {(SO, SKU): invoiced_qty} from local sale_lines.
+
+    cin7_sync documents invoice lines as shipped qty. We only count rows
+    with an InvoiceNumber or InvoiceDate so order-line fallback rows do
+    not masquerade as dispatch.
+    """
+    path = _find_widest_sale_lines()
+    if not path:
+        return {}
+    try:
+        df = pd.read_csv(path, low_memory=False)
+    except Exception as exc:
+        log.warning("Failed to read %s for invoiced SO/SKU lookup: %s",
+                    path, exc)
+        return {}
+    if "OrderNumber" not in df.columns or "SKU" not in df.columns:
+        return {}
+    invoice_cols = [c for c in ("InvoiceNumber", "InvoiceDate")
+                    if c in df.columns]
+    if not invoice_cols:
+        return {}
+    out: Dict[Tuple[str, str], float] = {}
+    for _, row in df.iterrows():
+        has_invoice = any(
+            str(row.get(c) or "").strip().lower() not in ("", "nan")
+            for c in invoice_cols)
+        if not has_invoice:
+            continue
+        so = _normalise_so_number(row.get("OrderNumber"))
+        sku = _normalise_sku(row.get("SKU"))
+        if not so or not sku:
+            continue
+        out[(so, sku)] = out.get((so, sku), 0.0) + _qty_float(
+            row.get("Quantity"))
+    log.info("Loaded invoiced SO/SKU map: %d pairs from %s",
+             len(out), path.name)
+    return out
+
+
+def _cin7_client_from_env():
+    """Best-effort CIN7 client for live sale detail checks."""
+    account_id = os.environ.get("CIN7_ACCOUNT_ID", "").strip()
+    app_key = os.environ.get("CIN7_APPLICATION_KEY", "").strip()
+    if not (account_id and app_key):
+        return None
+    try:
+        from cin7_sync import Cin7Client
+        return Cin7Client(account_id, app_key)
+    except Exception as exc:
+        log.warning("CIN7 live sale checker unavailable: %s", exc)
+        return None
+
+
+def _sale_order_qty_for_sku(sale: Dict[str, Any], sku: str) -> float:
+    """Ordered quantity for one SKU inside a full CIN7 sale object."""
+    sku_u = _normalise_sku(sku)
+    if not sku_u or not isinstance(sale, dict):
+        return 0.0
+    lines: List[dict] = []
+    order = sale.get("Order") or {}
+    if isinstance(order, dict):
+        lines.extend(order.get("Lines") or [])
+    if not lines:
+        lines.extend(sale.get("Lines") or [])
+    qty = 0.0
+    for line in lines:
+        if isinstance(line, dict) and _normalise_sku(
+                line.get("SKU")) == sku_u:
+            qty += _qty_float(line.get("Quantity"))
+    return qty
+
+
+def _sale_invoiced_qty_for_sku(sale: Dict[str, Any], sku: str) -> float:
+    """Invoiced/shipped quantity for one SKU inside a full CIN7 sale."""
+    sku_u = _normalise_sku(sku)
+    if not sku_u or not isinstance(sale, dict):
+        return 0.0
+    qty = 0.0
+    for invoice in (sale.get("Invoices") or []):
+        if not isinstance(invoice, dict):
+            continue
+        status = str(invoice.get("Status") or "").strip().upper()
+        if status in ("VOIDED", "NOT AVAILABLE"):
+            continue
+        for line in (invoice.get("Lines") or []):
+            if isinstance(line, dict) and _normalise_sku(
+                    line.get("SKU")) == sku_u:
+                qty += _qty_float(line.get("Quantity"))
+    return qty
+
+
+def _split_box_refs(value) -> Set[str]:
+    """Normalise CIN7 box references such as 'Box 1, Box 2'."""
+    if value is None or pd.isna(value):
+        return set()
+    return {
+        part.strip().upper()
+        for part in str(value).split(",")
+        if part.strip()
+    }
+
+
+def _sale_shipped_qty_for_sku(sale: Dict[str, Any], sku: str) -> float:
+    """Quantity of one SKU in shipped CIN7 fulfilment boxes.
+
+    CIN7 stores product quantities on Fulfilments[].Pack.Lines and the
+    actual dispatch flag on Fulfilments[].Ship.Lines. Ship lines reference
+    box names, so we join shipped boxes back to their packed SKU lines.
+    """
+    sku_u = _normalise_sku(sku)
+    if not sku_u or not isinstance(sale, dict):
+        return 0.0
+    qty = 0.0
+    for fulfilment in (sale.get("Fulfilments") or []):
+        if not isinstance(fulfilment, dict):
+            continue
+        fulfil_status = str(
+            fulfilment.get("FulFilmentStatus") or "").strip().upper()
+        if fulfil_status == "VOIDED":
+            continue
+        ship = fulfilment.get("Ship") or {}
+        shipped_boxes: Set[str] = set()
+        shipped_without_box_ref = False
+        for ship_line in (ship.get("Lines") or []):
+            if not isinstance(ship_line, dict):
+                continue
+            is_shipped = _truthy_flag(ship_line.get("IsShipped"))
+            if not is_shipped:
+                continue
+            boxes = (_split_box_refs(ship_line.get("Boxes"))
+                     or _split_box_refs(ship_line.get("Box")))
+            if boxes:
+                shipped_boxes.update(boxes)
+            else:
+                shipped_without_box_ref = True
+        if not shipped_boxes and not shipped_without_box_ref:
+            continue
+
+        pack = fulfilment.get("Pack") or {}
+        pick = fulfilment.get("Pick") or {}
+        product_lines = pack.get("Lines") or pick.get("Lines") or []
+        for line in product_lines:
+            if not isinstance(line, dict):
+                continue
+            if _normalise_sku(line.get("SKU")) != sku_u:
+                continue
+            line_box = _normalise_sku(line.get("Box"))
+            if (shipped_without_box_ref
+                    or not shipped_boxes
+                    or line_box in shipped_boxes):
+                qty += _qty_float(line.get("Quantity"))
+    return qty
+
+
+def _sale_sku_fulfilment_state(sale: Dict[str, Any],
+                               sku: str) -> Optional[str]:
+    """Return 'fulfilled', 'pending', or None for a SKU on a CIN7 sale.
+
+    None means the sale detail did not include enough SKU information to
+    make a line-level call, so callers should fall back to local caches.
+    """
+    ordered_qty = _sale_order_qty_for_sku(sale, sku)
+    invoiced_qty = _sale_invoiced_qty_for_sku(sale, sku)
+    shipped_qty = _sale_shipped_qty_for_sku(sale, sku)
+    dispatched_qty = max(invoiced_qty, shipped_qty)
+    if ordered_qty > 0:
+        if dispatched_qty + 0.0001 >= ordered_qty:
+            return "fulfilled"
+        return "pending"
+    if dispatched_qty > 0:
+        return "fulfilled"
+    return None
+
+
+def _live_sale_sku_state(so: str,
+                         sku: str,
+                         sale_ids: Dict[str, str],
+                         client,
+                         sale_cache: Dict[str, Optional[dict]]
+                         ) -> Optional[str]:
+    """Fetch CIN7 sale detail once per SO and return the SKU state."""
+    so_u = _normalise_so_number(so)
+    if not so_u or client is None:
+        return None
+    sale_id = sale_ids.get(so_u)
+    if not sale_id:
+        return None
+    if so_u not in sale_cache:
+        try:
+            sale_cache[so_u] = client.get_sale(sale_id)
+        except Exception as exc:
+            log.warning("Live sale check failed for %s/%s: %s",
+                        so_u, sku, exc)
+            sale_cache[so_u] = None
+    sale = sale_cache.get(so_u)
+    if not isinstance(sale, dict):
+        return None
+    return _sale_sku_fulfilment_state(sale, sku)
+
+
+def _so_sku_still_needs_dispatch(so: str,
+                                 sku: str,
+                                 sale_ids: Dict[str, str],
+                                 client,
+                                 sale_cache: Dict[str, Optional[dict]],
+                                 local_invoiced_qtys: Dict[
+                                     Tuple[str, str], float]) -> bool:
+    """Line-level reminder gate: does this SO still need this SKU?
+
+    Header-level SO status alone is not enough: a sale can stay open
+    because it still owes a different item. If the PO-linked SKU has
+    already shipped/invoiced, suppress the escalation for that line.
+    """
+    so_u = _normalise_so_number(so)
+    sku_u = _normalise_sku(sku)
+    if not so_u or not sku_u or sku_u in {"—", "-", "(SEE PO)"}:
+        return True
+
+    live_state = _live_sale_sku_state(so_u, sku_u, sale_ids, client,
+                                      sale_cache)
+    if live_state == "fulfilled":
+        return False
+    if live_state == "pending":
+        return True
+
+    # Fallback for worker runs where live credentials are unavailable
+    # or the SaleID is outside the local sales header window.
+    return local_invoiced_qtys.get((so_u, sku_u), 0.0) <= 0
+
+
+def _filter_line_sos_needing_dispatch(
+        line_sos: List[str],
+        sku: str,
+        unshipped_sos: Set[str],
+        sale_ids: Dict[str, str],
+        client,
+        sale_cache: Dict[str, Optional[dict]],
+        local_invoiced_qtys: Dict[Tuple[str, str], float]
+        ) -> Tuple[List[str], List[str]]:
+    """Keep only SOs that still need this specific PO line SKU."""
+    kept: List[str] = []
+    suppressed: List[str] = []
+    for so in line_sos:
+        so_u = _normalise_so_number(so)
+        if so_u not in unshipped_sos:
+            continue
+        if _so_sku_still_needs_dispatch(
+                so_u, sku, sale_ids, client, sale_cache,
+                local_invoiced_qtys):
+            kept.append(so_u)
+        else:
+            suppressed.append(so_u)
+    return kept, suppressed
 
 
 def _po_sku_qty(po_lines: pd.DataFrame) -> List[Tuple[str, object]]:
@@ -916,6 +1263,10 @@ def check_and_escalate(dryrun: bool = False,
     # "shipped/done" if EITHER ShipStation has it OR CIN7 has
     # it in a terminal status.
     open_so_set = _load_open_so_set()
+    sale_ids = _load_so_sale_ids()
+    local_invoiced_qtys = _load_local_invoiced_so_sku_qtys()
+    cin7_client = _cin7_client_from_env()
+    sale_cache: Dict[str, Optional[dict]] = {}
 
     # We also need the per-line context (SKU, qty) — pull it on
     # demand from the latest purchase_lines CSV.
@@ -949,7 +1300,7 @@ def check_and_escalate(dryrun: bool = False,
             cin7_open = (not open_so_set
                               or s.upper() in open_so_set)
             if not in_shipstation and cin7_open:
-                unshipped_sos.append(s)
+                unshipped_sos.append(_normalise_so_number(s))
         if not unshipped_sos:
             log.info("PO %s: all %d SOs accounted for (shipped "
                       "per ShipStation OR closed per CIN7) — "
@@ -967,6 +1318,10 @@ def check_and_escalate(dryrun: bool = False,
         # Build per-line context for the unshipped SOs only.
         po_lines = lines_by_po.get(po_number)
         unshipped_ctx: List[dict] = []
+        unshipped_so_set = set(unshipped_sos)
+        saw_line_level_so_context = False
+        line_context_unshipped_sos_seen: Set[str] = set()
+        line_level_suppressed: List[Tuple[str, str]] = []
         if po_lines is not None and not po_lines.empty:
             for _, row in po_lines.iterrows():
                 line_sos: List[str] = []
@@ -974,8 +1329,25 @@ def check_and_escalate(dryrun: bool = False,
                     if f in po_lines.columns:
                         line_sos.extend(
                             _extract_sos_from_text(row.get(f)))
-                line_unshipped = [s for s in line_sos
-                                      if s in unshipped_sos]
+                if line_sos:
+                    saw_line_level_so_context = True
+                    line_context_unshipped_sos_seen.update(
+                        so for so in (_normalise_so_number(s)
+                                      for s in line_sos)
+                        if so in unshipped_so_set)
+                line_unshipped, suppressed = (
+                    _filter_line_sos_needing_dispatch(
+                        line_sos=line_sos,
+                        sku=row.get("SKU"),
+                        unshipped_sos=unshipped_so_set,
+                        sale_ids=sale_ids,
+                        client=cin7_client,
+                        sale_cache=sale_cache,
+                        local_invoiced_qtys=local_invoiced_qtys,
+                    ))
+                for so in suppressed:
+                    line_level_suppressed.append(
+                        (so, _normalise_sku(row.get("SKU"))))
                 if line_unshipped:
                     unshipped_ctx.append({
                         "sku": row.get("SKU"),
@@ -983,6 +1355,24 @@ def check_and_escalate(dryrun: bool = False,
                         "quantity": row.get("Quantity"),
                         "sos": sorted(set(line_unshipped)),
                     })
+        if (saw_line_level_so_context
+                and line_context_unshipped_sos_seen == unshipped_so_set
+                and not unshipped_ctx):
+            reason = ("all PO-linked SO/SKU lines shipped/invoiced; "
+                      "SO may still be open for other items")
+            log.info(
+                "PO %s: suppressing escalation after line-level check "
+                "(%d SO/SKU pairs already shipped): %s",
+                po_number, len(line_level_suppressed),
+                line_level_suppressed[:10])
+            if not dryrun:
+                db.record_po_dispatch_escalation(
+                    po_number=po_number,
+                    posted_ts=None,
+                    reason=reason,
+                )
+            n_all_shipped += 1
+            continue
         if not unshipped_ctx:
             # Couldn't reconstruct per-line context (probably the
             # PO is now outside the purchase_lines window). Fall

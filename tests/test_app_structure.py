@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pandas as pd
 
 import ai_tools
+import po_dispatch_reminder
 import worker_engine
 from app_config import (
     PAGE_CAPTIONS,
@@ -170,6 +171,149 @@ class WorkerLoopTests(unittest.TestCase):
         self.assertLess(products_refresh, sales_refresh)
         self.assertIn("NearSync", script)
         self.assertIn("Storage L x W x H In", script)
+
+
+class PoDispatchReminderTests(unittest.TestCase):
+    def test_sale_sku_state_is_line_level_not_header_level(self) -> None:
+        sale = {
+            "Order": {"Lines": [
+                {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                {"SKU": "LED-STRIP-OWED", "Quantity": 1},
+            ]},
+            "Invoices": [{
+                "Status": "AUTHORISED",
+                "Lines": [
+                    {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                ],
+            }],
+        }
+
+        self.assertEqual(
+            po_dispatch_reminder._sale_sku_fulfilment_state(
+                sale, "LED-MX2-192W-24"),
+            "fulfilled",
+        )
+        self.assertEqual(
+            po_dispatch_reminder._sale_sku_fulfilment_state(
+                sale, "LED-STRIP-OWED"),
+            "pending",
+        )
+
+    def test_dispatch_escalation_suppresses_shipped_po_sku(self) -> None:
+        class FakeClient:
+            def get_sale(self, sale_id):
+                self.sale_id = sale_id
+                return {
+                    "Order": {"Lines": [
+                        {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                        {"SKU": "LED-STRIP-OWED", "Quantity": 1},
+                    ]},
+                    "Invoices": [{
+                        "Status": "AUTHORISED",
+                        "Lines": [
+                            {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                        ],
+                    }],
+                }
+
+        kept, suppressed = (
+            po_dispatch_reminder._filter_line_sos_needing_dispatch(
+                line_sos=["SO-57569"],
+                sku="LED-MX2-192W-24",
+                unshipped_sos={"SO-57569"},
+                sale_ids={"SO-57569": "sale-uuid"},
+                client=FakeClient(),
+                sale_cache={},
+                local_invoiced_qtys={},
+            ))
+
+        self.assertEqual(kept, [])
+        self.assertEqual(suppressed, ["SO-57569"])
+
+    def test_dispatch_escalation_suppresses_shipped_pack_line(self) -> None:
+        class FakeClient:
+            def get_sale(self, sale_id):
+                return {
+                    "Order": {"Lines": [
+                        {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                        {"SKU": "LED-STRIP-OWED", "Quantity": 1},
+                    ]},
+                    "Fulfilments": [{
+                        "FulFilmentStatus": "PARTIALLY FULFILLED",
+                        "Pack": {"Lines": [
+                            {
+                                "SKU": "LED-MX2-192W-24",
+                                "Quantity": 3,
+                                "Box": "Box 1",
+                            },
+                        ]},
+                        "Ship": {"Lines": [
+                            {"Boxes": "Box 1", "IsShipped": True},
+                        ]},
+                    }],
+                    "Invoices": [],
+                }
+
+        kept, suppressed = (
+            po_dispatch_reminder._filter_line_sos_needing_dispatch(
+                line_sos=["SO-57569"],
+                sku="LED-MX2-192W-24",
+                unshipped_sos={"SO-57569"},
+                sale_ids={"SO-57569": "sale-uuid"},
+                client=FakeClient(),
+                sale_cache={},
+                local_invoiced_qtys={},
+            ))
+
+        self.assertEqual(kept, [])
+        self.assertEqual(suppressed, ["SO-57569"])
+
+    def test_dispatch_escalation_keeps_other_pending_sku(self) -> None:
+        class FakeClient:
+            def get_sale(self, sale_id):
+                return {
+                    "Order": {"Lines": [
+                        {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                        {"SKU": "LED-STRIP-OWED", "Quantity": 1},
+                    ]},
+                    "Invoices": [{
+                        "Status": "AUTHORISED",
+                        "Lines": [
+                            {"SKU": "LED-MX2-192W-24", "Quantity": 3},
+                        ],
+                    }],
+                }
+
+        kept, suppressed = (
+            po_dispatch_reminder._filter_line_sos_needing_dispatch(
+                line_sos=["SO-57569"],
+                sku="LED-STRIP-OWED",
+                unshipped_sos={"SO-57569"},
+                sale_ids={"SO-57569": "sale-uuid"},
+                client=FakeClient(),
+                sale_cache={},
+                local_invoiced_qtys={},
+            ))
+
+        self.assertEqual(kept, ["SO-57569"])
+        self.assertEqual(suppressed, [])
+
+    def test_dispatch_escalation_uses_local_invoice_fallback(self) -> None:
+        kept, suppressed = (
+            po_dispatch_reminder._filter_line_sos_needing_dispatch(
+                line_sos=["SO-57569"],
+                sku="LED-MX2-192W-24",
+                unshipped_sos={"SO-57569"},
+                sale_ids={},
+                client=None,
+                sale_cache={},
+                local_invoiced_qtys={
+                    ("SO-57569", "LED-MX2-192W-24"): 3,
+                },
+            ))
+
+        self.assertEqual(kept, [])
+        self.assertEqual(suppressed, ["SO-57569"])
 
 
 class Cin7ClientTests(unittest.TestCase):
