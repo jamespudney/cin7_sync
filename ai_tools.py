@@ -772,10 +772,11 @@ TOOL_SCHEMAS: list[dict] = [
             "window). Use this when get_purchase_order returns "
             "matched=0 for a recent PO — the PO was likely "
             "created in the last few hours and hasn't synced "
-            "yet. Returns each line's SKU, name, qty, current "
-            "OnHand. Slower than get_purchase_order (one CIN7 "
-            "API call) so ONLY call this when the cached "
-            "lookup misses."),
+            "yet. PurchaseAdvanced URL UUIDs are fetched through "
+            "CIN7's /advanced-purchase endpoint first. Returns each "
+            "line's SKU, name, qty, current OnHand. Slower than "
+            "get_purchase_order (one CIN7 API call) so ONLY call "
+            "this when the cached lookup misses."),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -4897,23 +4898,20 @@ def get_purchase_live(engine_df: pd.DataFrame,
         client = Cin7Client(account_id, app_key)
         purchase = client.get_purchase(po_ref)
     except Exception as exc:
-        return {"error": f"CIN7 GET /purchase failed: {exc}"}
+        return {"error": f"CIN7 live purchase lookup failed: {exc}"}
     if not isinstance(purchase, dict) or not purchase:
         return {
             "matched": 0,
             "note": (
-                f"CIN7 /purchaseList?Search={po_ref} returned no "
-                f"match. v2.67.312 — this lookup uses the correct "
-                f"endpoint and DOES return DRAFT POs (the prior "
-                f"endpoint silently skipped drafts), so a missing "
-                f"result now genuinely means the PO doesn't exist "
-                f"in CIN7. Don't tell the user to 'wait 2-3 "
-                f"minutes for propagation' — that was a wrong "
-                f"guess in the old code. Instead, ask them to "
-                f"double-check the PO number, confirm it was "
-                f"actually saved (not just opened-but-not-saved "
-                f"in CIN7's UI), or check whether it was voided/"
-                f"deleted."),
+                f"CIN7 live lookup could not see {po_ref} in either "
+                f"the local PO cache or the live CIN7 purchase API. "
+                f"For PurchaseAdvanced links the client now tries "
+                f"/advanced-purchase by UUID first, then falls back "
+                f"to purchaseList/legacy purchase lookup. Do NOT ask "
+                f"the user to paste SKU lines as the normal fallback. "
+                f"Say the PO is not visible to the API yet and ask "
+                f"them to save/refresh the PO in CIN7, then repost "
+                f"or retry the same link/PO number."),
         }
 
     # Extract lines + enrich with current OnHand.

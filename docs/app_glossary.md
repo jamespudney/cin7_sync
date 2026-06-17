@@ -299,6 +299,13 @@ Three tools, picked by what kind of number the user mentions:
   Returns supplier, every line item (SKU / qty / price), Status,
   Required-By, Comments + Shipping notes. Includes received /
   closed POs (unlike `get_incoming_stock` which is open-only).
+- **`get_purchase_live(po_number=... / purchase_id=...)`** — live
+  CIN7 fallback for fresh or draft POs that are not in the CSV sync yet.
+  PurchaseAdvanced UI links carry the CIN7 UUID after `PurchaseAdvanced#`;
+  those must be fetched through `/advanced-purchase` first, with legacy
+  `/purchase` only as a fallback. If the live API still cannot see the PO,
+  the bot should ask the user to save/refresh/retry the CIN7 PO link, not
+  ask them to paste SKU lines as the normal workflow.
 - **`get_sale_order(order_number / invoice_number / customer +
   date_from)`** — full sale lookup. Returns customer, every line
   item, line_total. Useful for "what did Acme buy on SO-12345"
