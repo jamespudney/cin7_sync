@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -107,6 +108,36 @@ class DataCatalogTests(unittest.TestCase):
                 output_dir=root,
             )
             self.assertEqual(missing[0]["Status"], "missing")
+
+    def test_ai_data_freshness_reports_stale_and_missing_feeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = datetime(2026, 6, 16, 12, 0)
+            products = root / "products_2026-06-16.csv"
+            stock = root / "stock_on_hand_2026-06-16.csv"
+            products.write_text("SKU\nA\n", encoding="utf-8")
+            stock.write_text("SKU\nA\n", encoding="utf-8")
+            os.utime(products, (now.timestamp(), now.timestamp()))
+            stale_ts = (now - timedelta(hours=2)).timestamp()
+            os.utime(stock, (stale_ts, stale_ts))
+
+            report = ai_tools._data_freshness_report(
+                "stock_position", output_dir=root, now=now)
+
+        by_prefix = {
+            row["prefix"]: row["status"]
+            for row in report["datasets"]
+        }
+        self.assertEqual(by_prefix["products"], "fresh")
+        self.assertEqual(by_prefix["stock_on_hand"], "stale")
+        self.assertEqual(by_prefix["purchase_lines_last"], "missing")
+        self.assertFalse(report["all_fresh"])
+
+    def test_data_freshness_tool_is_registered(self) -> None:
+        schema_names = {schema["name"] for schema in ai_tools.TOOL_SCHEMAS}
+
+        self.assertIn("get_data_freshness", schema_names)
+        self.assertIn("get_data_freshness", ai_tools.TOOL_HANDLERS)
 
 
 class WorkerLoopTests(unittest.TestCase):
@@ -355,7 +386,9 @@ class IncomingStockTests(unittest.TestCase):
         self.assertEqual(
             {line["po_number"] for line in result["incoming_stock"]["lines"]},
             {"PO-7071", "PO-7210"})
+        self.assertEqual(result["data_freshness"]["scope"], "stock_position")
         self.assertIn("OnOrder", result["formatting_guidance"])
+        self.assertIn("data-freshness", result["formatting_guidance"])
 
     def test_stock_position_uses_stock_locator_as_bin_alias(self) -> None:
         sku = "LED-89030021-2"
