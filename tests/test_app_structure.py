@@ -25,6 +25,7 @@ from app_pages.my_profile import (
     missing_slack_oauth_env_vars,
 )
 from app_pages.ordering_layout import ORDERING_PO_EDITOR_VIEW
+from cin7_sync import Cin7Client
 from data_catalog import DatasetSpec, catalog_rows, latest_file
 from engine.sku_rules import (
     _is_strip_sku,
@@ -169,6 +170,58 @@ class WorkerLoopTests(unittest.TestCase):
         self.assertLess(products_refresh, sales_refresh)
         self.assertIn("NearSync", script)
         self.assertIn("Storage L x W x H In", script)
+
+
+class Cin7ClientTests(unittest.TestCase):
+    def test_purchase_uuid_uses_advanced_purchase_endpoint_first(self) -> None:
+        client = Cin7Client("acct", "key")
+        calls = []
+
+        def fake_get(path, params=None):
+            calls.append((path, params))
+            if path == "advanced-purchase":
+                return {
+                    "ID": params["ID"],
+                    "OrderNumber": "PO-7303",
+                    "Order": {"Lines": [{"SKU": "LED-TEST"}]},
+                }
+            raise AssertionError(f"unexpected endpoint {path}")
+
+        client.get = fake_get
+        result = client.get_purchase("ac1e4559-c63a-4028-abec-5a4ad00d22fb")
+
+        self.assertEqual(calls[0][0], "advanced-purchase")
+        self.assertEqual(result["_cin7_detail_endpoint"], "advanced-purchase")
+        self.assertEqual(result["Order"]["Lines"][0]["SKU"], "LED-TEST")
+
+    def test_purchase_number_uses_advanced_detail_after_list_match(self) -> None:
+        client = Cin7Client("acct", "key")
+        calls = []
+
+        def fake_get(path, params=None):
+            calls.append((path, params))
+            if path == "purchaseList":
+                return {
+                    "PurchaseList": [{
+                        "ID": "ac1e4559-c63a-4028-abec-5a4ad00d22fb",
+                        "OrderNumber": "PO-7303",
+                        "Type": "Advanced Purchase",
+                    }],
+                }
+            if path == "advanced-purchase":
+                return {
+                    "ID": params["ID"],
+                    "OrderNumber": "PO-7303",
+                    "Order": {"Lines": []},
+                }
+            raise AssertionError(f"unexpected endpoint {path}")
+
+        client.get = fake_get
+        result = client.get_purchase("PO-7303")
+
+        self.assertEqual([call[0] for call in calls],
+                         ["purchaseList", "advanced-purchase"])
+        self.assertEqual(result["_cin7_detail_endpoint"], "advanced-purchase")
 
 
 class IncomingStockTests(unittest.TestCase):

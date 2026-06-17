@@ -264,13 +264,46 @@ class Cin7Client:
                 "update_sale: sale_body must include 'ID'")
         return self.put("sale", sale_body)
 
+    def _purchase_detail_by_id(self,
+                               purchase_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch full purchase detail by CIN7 task ID.
+
+        Prefer /advanced-purchase because CIN7's docs say it supports
+        Simple, Advanced, and Service purchases, and PurchaseAdvanced UI
+        links point at that object. Fall back to deprecated /purchase for
+        legacy/simple-account compatibility.
+        """
+        if not purchase_id:
+            return None
+        errors = []
+        for path in ("advanced-purchase", "purchase"):
+            try:
+                detail = self.get(path, params={"ID": purchase_id})
+            except Exception as exc:
+                errors.append(f"{path}: {exc}")
+                continue
+            if isinstance(detail, dict) and detail:
+                detail["_cin7_detail_endpoint"] = path
+                return detail
+        if errors:
+            log.warning(
+                "CIN7 purchase detail lookup failed for %s via %s",
+                purchase_id, "; ".join(errors))
+        return None
+
+    @staticmethod
+    def _normalise_po_ref(ref: str) -> str:
+        text = str(ref or "").strip().upper()
+        return text[3:] if text.startswith("PO-") else text
+
     def get_purchase(self, ref: str) -> Optional[Dict[str, Any]]:
-        """v2.67.312 — Fetch a full Purchase object live from CIN7.
+        """Fetch a full Purchase object live from CIN7.
         Accepts either:
-          • a UUID (queried via /purchase?ID=<uuid>)
+          • a UUID (queried via /advanced-purchase?ID=<uuid>, with
+            /purchase fallback)
           • a PO number like "PO-7213" or "7213" (looked up via
-            /purchaseList?Search=PO-7213 to find the UUID, then
-            fetched via /purchase?ID=<uuid> for full Order+Lines)
+            /purchaseList?Search=PO-7213 to find the UUID, then fetched
+            via /advanced-purchase?ID=<uuid> for full Order+Lines)
 
         BUG HISTORY: v2.67.196-v2.67.311 passed OrderNumber directly
         to /purchase, but per CIN7 docs (dearinventory.apib §Purchase
@@ -290,6 +323,10 @@ class Cin7Client:
         commentary which is the most valuable moment to intervene
         (before AUTHORISED is hit).
 
+        v2.67.372 — PurchaseAdvanced URLs must use /advanced-purchase
+        first. /purchase is deprecated and may miss Advanced Purchase
+        draft links copied from the CIN7 UI.
+
         Used by get_purchase_live AI tool when the local
         purchase_lines CSV doesn't have a freshly-created PO yet.
         Returns None on failure (logs the error so the caller can
@@ -302,14 +339,14 @@ class Cin7Client:
                       and not ref.upper().startswith("PO-"))
         try:
             if is_uuid:
-                return self.get("purchase", params={"ID": ref})
+                return self._purchase_detail_by_id(ref)
             # PO-number lookup: /purchaseList?Search=<PO-NNNN> to
             # find the UUID, then /purchase?ID=<uuid> for full
             # Order+Lines detail. /purchaseList returns headers
             # only and the response key is `PurchaseList`. Search
             # matches OrderNumber substring (per CIN7 docs at line
             # 13298) across all statuses including DRAFT.
-            ref_norm = ref.strip().upper().lstrip("PO-")
+            ref_norm = self._normalise_po_ref(ref)
             search_term = f"PO-{ref_norm}"
             resp = self.get(
                 "purchaseList",
@@ -328,14 +365,15 @@ class Cin7Client:
                 if not isinstance(it, dict):
                     continue
                 ord_n = str(it.get("OrderNumber") or "").upper()
-                if ord_n.lstrip("PO-") == ref_norm:
+                if self._normalise_po_ref(ord_n) == ref_norm:
                     pid = it.get("ID")
                     if pid:
-                        # Always follow up with /purchase?ID=<uuid>
-                        # for the full Order+Lines structure.
+                        # Always follow up with detail by ID for the
+                        # full Order+Lines structure.
                         # /purchaseList returns header summary only.
-                        return self.get("purchase",
-                                            params={"ID": pid})
+                        detail = self._purchase_detail_by_id(pid)
+                        if detail:
+                            return detail
                     # Defensive: missing ID — return the thin
                     # header so the caller at least gets the
                     # status/supplier/dates, even without lines.
