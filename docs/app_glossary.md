@@ -82,6 +82,15 @@ qty recalculates with the new lead time on next refresh.
 - 📦 **Dropship** — order-on-demand, we don't stock it.
 - Active, Deprecated, Discontinued — from CIN7's product status.
 
+#### Sidebar build chip
+The small footer in the dashboard sidebar shows the currently running
+web build. It is no longer manually bumped per release. On Render,
+`start.sh` exports `APP_BUILD_COMMIT` from the deployed Git commit and
+`APP_BUILD_DATE` from the service start date; `app_config.py` turns
+those into the displayed label, e.g. `build 84d9db4 · deployed
+2026-06-17`. If Render/Git metadata is unavailable, the app falls back
+to the old static version string.
+
 #### Trend signal (📈 / 🎯 / 🔀 / 📉)
 A secondary check the engine runs to detect when the last-45-day sales
 pattern has diverged from the prior 45 days (days 45-90 ago). Uses

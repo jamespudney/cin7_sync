@@ -20,6 +20,19 @@ set -euo pipefail
 mkdir -p "${DATA_DIR:-/data}/output"
 mkdir -p "${DATA_DIR:-/data}/.streamlit"
 
+# Stamp the web process with build metadata for the sidebar version chip.
+# Render exposes RENDER_GIT_COMMIT on deploys; git fallback keeps local runs
+# useful. APP_BUILD_DATE is the service start date, so it moves on every
+# redeploy instead of relying on a manually bumped constant.
+APP_BUILD_COMMIT="${APP_BUILD_COMMIT:-${RENDER_GIT_COMMIT:-}}"
+if [ -z "$APP_BUILD_COMMIT" ] && command -v git >/dev/null 2>&1; then
+    APP_BUILD_COMMIT="$(git rev-parse --short=7 HEAD 2>/dev/null || true)"
+fi
+export APP_BUILD_COMMIT="${APP_BUILD_COMMIT:0:7}"
+export APP_BUILD_DATE="${APP_BUILD_DATE:-$(date +%Y-%m-%d)}"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] web build ${APP_BUILD_COMMIT:-unknown} deployed ${APP_BUILD_DATE}" \
+    >> "${DATA_DIR:-/data}/output/build_info.log"
+
 # v2.67.335 — one-time 365-day backfill of assemblies (FG-XXXX) the
 # first time this boots after the v2.67.334 assembly-consumption
 # pipeline ships. Without this, the engine only sees assemblies from
