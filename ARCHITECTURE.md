@@ -30,7 +30,8 @@ through the database layer in `db.py`.
 
 - `cin7_sync.py`: CIN7 snapshot pulls.
 - `app.py`: Streamlit entrypoint and remaining page orchestration.
-- `app_config.py`: app version plus grouped dashboard navigation metadata.
+- `app_config.py`: build/version display plus grouped dashboard navigation
+  metadata.
 - `app_pages/`: extracted dashboard page renderers and page-specific constants.
 - `engine/`: Streamlit-free engine helpers that can be tested independently.
 - `data_catalog.py`: snapshot discovery, freshness, and row-count reporting.
@@ -68,6 +69,12 @@ on that key.
 Render watches the GitHub repo. A pushed commit triggers redeploys for the
 dashboard and Slack bot, using `render.yaml` as the deployment blueprint.
 
+The dashboard sidebar build chip is generated at runtime. `start.sh` stamps
+the web service with `APP_BUILD_COMMIT` and `APP_BUILD_DATE`; `app_config.py`
+falls back to Render/Git metadata, then the old static version only if metadata
+is unavailable. Do not rely on manually editing a version/date string for
+normal deploys.
+
 The normal release flow is:
 
 1. Make a scoped code change.
@@ -75,6 +82,17 @@ The normal release flow is:
 3. Commit and push to GitHub.
 4. Render deploys the updated services.
 5. Verify the live dashboard and bot behavior.
+
+## Documentation Discipline
+
+Behavior changes should update the knowledge sources at the same time as code.
+The dashboard AI Assistant, Slack bot, and human users all depend on the docs
+and glossary to understand how the platform works.
+
+When a change affects workflow, source-of-truth rules, sync cadence, AI tool
+behavior, engine logic, deployment behavior, or UI terminology, update the
+relevant files in `docs/`, `ARCHITECTURE.md`, `README.md`, or
+`intelligence_glossary.py` in the same PR.
 
 ## Structural Direction
 

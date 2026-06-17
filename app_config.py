@@ -7,10 +7,92 @@ profile defaults all read from one small source of truth.
 from __future__ import annotations
 
 from collections import OrderedDict
+from datetime import datetime
+import os
+from pathlib import Path
+import subprocess
 
 
-APP_VERSION = "v2.67.360"
-APP_DEPLOYED = "2026-06-03"
+_STATIC_APP_VERSION = "v2.67.360"
+_STATIC_APP_DEPLOYED = "2026-06-03"
+
+
+def _git_output(*args: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=Path(__file__).resolve().parent,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _short_commit(value: str) -> str:
+    text = (value or "").strip()
+    return text[:7] if text else ""
+
+
+def _normalise_date(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        try:
+            return datetime.fromtimestamp(int(text)).strftime("%Y-%m-%d")
+        except Exception:
+            return ""
+    return text[:10]
+
+
+def _build_commit() -> str:
+    for key in (
+        "APP_BUILD_COMMIT",
+        "RENDER_GIT_COMMIT",
+        "COMMIT_SHA",
+        "GIT_COMMIT",
+        "SOURCE_VERSION",
+    ):
+        commit = _short_commit(os.environ.get(key, ""))
+        if commit:
+            return commit
+    return _short_commit(_git_output("rev-parse", "--short=7", "HEAD"))
+
+
+def _build_date() -> str:
+    for key in (
+        "APP_BUILD_DATE",
+        "RENDER_DEPLOYED_AT",
+        "RENDER_DEPLOY_CREATED_AT",
+        "BUILD_DATE",
+        "SOURCE_DATE_EPOCH",
+    ):
+        deployed = _normalise_date(os.environ.get(key, ""))
+        if deployed:
+            return deployed
+    deployed = _normalise_date(
+        _git_output("show", "-s", "--format=%cs", "HEAD"))
+    if deployed:
+        return deployed
+    try:
+        return datetime.fromtimestamp(
+            Path(__file__).stat().st_mtime).strftime("%Y-%m-%d")
+    except Exception:
+        return _STATIC_APP_DEPLOYED
+
+
+def _app_version_label() -> str:
+    explicit = os.environ.get("APP_VERSION", "").strip()
+    if explicit:
+        return explicit
+    commit = _build_commit()
+    return f"build {commit}" if commit else _STATIC_APP_VERSION
+
+
+APP_VERSION = _app_version_label()
+APP_DEPLOYED = os.environ.get("APP_DEPLOYED", "").strip() or _build_date()
 
 
 PAGE_GROUPS = OrderedDict({
@@ -90,4 +172,3 @@ PAGE_GROUP_BY_NAME = {
     for group, pages in PAGE_GROUPS.items()
     for page in pages
 }
-

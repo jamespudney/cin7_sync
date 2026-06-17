@@ -17,6 +17,8 @@ from app_config import (
     PAGE_GROUP_BY_NAME,
     PAGE_GROUPS,
     PAGE_OPTIONS,
+    _app_version_label,
+    _build_date,
 )
 from app_pages.my_profile import (
     SLACK_OAUTH_ENV_VARS,
@@ -48,6 +50,18 @@ class PageConfigTests(unittest.TestCase):
         configured = {name: "set" for name in SLACK_OAUTH_ENV_VARS}
         with patch.dict("os.environ", configured, clear=True):
             self.assertEqual(missing_slack_oauth_env_vars(), [])
+
+    def test_app_version_label_uses_build_metadata(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "APP_BUILD_COMMIT": "84d9db4e6fd7976fda609de0f8b53e31fd5e6def",
+                "APP_BUILD_DATE": "2026-06-17",
+            },
+            clear=True,
+        ), patch("app_config._git_output", return_value=""):
+            self.assertEqual(_app_version_label(), "build 84d9db4")
+            self.assertEqual(_build_date(), "2026-06-17")
 
     def test_page_metadata_is_consistent(self) -> None:
         self.assertEqual(len(PAGE_OPTIONS), len(PAGE_CAPTIONS))

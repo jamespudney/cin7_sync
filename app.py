@@ -6470,7 +6470,8 @@ _auto_invalidate_engine_if_stale()
 # appends sidebar elements in call order, and the main `with st.
 # sidebar:` block above has already finished, so this lands after
 # the navigation, sign-out, Recent versions expander — out of the
-# prime UX space at the top. Update the string with each release.
+# prime UX space at the top. The values come from Render/Git build metadata
+# via app_config.py, with the old static version only as a fallback.
 st.sidebar.caption(
     "ㅤ\n\n"
     f"🔹 **{APP_VERSION}** · deployed {APP_DEPLOYED}")
