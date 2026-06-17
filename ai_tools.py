@@ -4634,12 +4634,12 @@ def get_sale_order(engine_df: pd.DataFrame,
                 "date_to": date_to or None,
             },
             "note": ("No sale matches in the local sync window. "
-                     "Sale-line detail covers the last ~30 days. "
-                     "v2.67.179 — if an order_number was provided "
-                     "and you suspect the sale was created in the "
-                     "last few hours, call get_sale_live with the "
-                     "same order_number to bypass the cache via a "
-                     "live CIN7 API fetch."),
+                     "Sale-line detail is intentionally shorter than "
+                     "the sales-header index, because older backorders "
+                     "can still be live-fetched from CIN7. If an "
+                     "order_number was provided, call get_sale_live "
+                     "with the same order_number before telling the "
+                     "user to check CIN7 manually."),
         }
 
     # Group by sale (SaleID preferred — order_number can be reused
@@ -4767,9 +4767,15 @@ def get_sale_live(engine_df: pd.DataFrame,
         return {
             "matched": 0,
             "note": (f"Couldn't resolve {order_number} to a CIN7 "
-                      f"SaleID in the local sales CSV. The sale "
-                      f"may pre-date even the longest local sync "
-                      f"window. Direct the user to check CIN7."),
+                      f"SaleID in the local sales-header CSV. The "
+                      f"Slack worker normally keeps a wider sales "
+                      f"header window than sale-line detail because "
+                      f"backorders can be older than a month. This "
+                      f"usually means the worker sales-header cache is "
+                      f"missing/stale or the SO number was entered "
+                      f"differently. Say that the live lookup could not "
+                      f"resolve the SO yet; retry after the sales-header "
+                      f"sync or check CIN7 directly."),
         }
 
     # 2. Live CIN7 GET /sale
@@ -4858,6 +4864,43 @@ def get_sale_live(engine_df: pd.DataFrame,
             "requested qty. Surface every line with availability "
             "status so the user gets a per-SKU answer."),
     }
+
+
+def _float_or_none(value) -> Optional[float]:
+    """Small local coercion helper for live API quantities."""
+    if value is None:
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(n):
+        return None
+    return n
+
+
+def _purchase_receipts_by_sku(purchase: dict) -> dict:
+    """Summarise CIN7 StockReceived lines as {SKU: {qty, dates}}."""
+    receipts: dict = {}
+    for rec in (purchase.get("StockReceived") or []):
+        if not isinstance(rec, dict):
+            continue
+        rec_date = rec.get("Date") or rec.get("StockReceivedDate")
+        for line in (rec.get("Lines") or []):
+            if not isinstance(line, dict):
+                continue
+            sku = str(line.get("SKU") or "").strip().upper()
+            if not sku:
+                continue
+            qty = _float_or_none(
+                line.get("ReceivedQuantity") or line.get("Quantity"))
+            if qty is None:
+                continue
+            bucket = receipts.setdefault(sku, {"quantity": 0.0, "dates": []})
+            bucket["quantity"] += qty
+            if rec_date:
+                bucket["dates"].append(str(rec_date))
+    return receipts
 
 
 def get_purchase_live(engine_df: pd.DataFrame,
@@ -5052,17 +5095,45 @@ def get_purchase_live(engine_df: pd.DataFrame,
         v = row.get(col)
         return default if v is None or (isinstance(v, float) and __import__("math").isnan(v)) else v
 
+    receipt_totals = _purchase_receipts_by_sku(purchase)
+    receipt_remaining = {
+        sku: float(info.get("quantity") or 0)
+        for sku, info in receipt_totals.items()
+    }
+
     line_rows = []
     missing_dim_skus: list = []
     incomplete_dim_skus: list = []
     for line in lines:
         sku = str(line.get("SKU") or "").strip()
+        sku_u = sku.upper()
         qty = line.get("Quantity")
         try:
             qty_n = float(qty) if qty is not None else None
         except (TypeError, ValueError):
             qty_n = None
         oh = on_hand_map.get(sku.upper())
+        if receipt_totals:
+            remaining_receipt_qty = receipt_remaining.get(sku_u, 0.0)
+            ordered_for_receipt = qty_n or 0.0
+            received_on_line = min(ordered_for_receipt, remaining_receipt_qty)
+            receipt_remaining[sku_u] = max(
+                0.0, remaining_receipt_qty - received_on_line)
+            outstanding_on_line = (
+                max(0.0, ordered_for_receipt - received_on_line)
+                if qty_n is not None else None)
+            if received_on_line <= 0:
+                receipt_state = "not_received"
+            elif outstanding_on_line is not None and outstanding_on_line <= 0:
+                receipt_state = "fully_received"
+            else:
+                receipt_state = "partially_received"
+            receipt_dates = receipt_totals.get(sku_u, {}).get("dates", [])
+        else:
+            received_on_line = None
+            outstanding_on_line = None
+            receipt_state = "not_recorded"
+            receipt_dates = []
         # v2.67.369 — use storage_dim from engine (synced from products CSV)
         # instead of making a live CIN7 API call per SKU.
         _sdim = str(_eng(sku, "storage_dim", "") or "").strip()
@@ -5095,6 +5166,11 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "sku": sku,
             "name": line.get("Name") or "",
             "quantity": qty_n,
+            "quantity_ordered": qty_n,
+            "quantity_received_on_po": received_on_line,
+            "quantity_outstanding_on_po": outstanding_on_line,
+            "receipt_status_on_po": receipt_state,
+            "receipt_dates": receipt_dates,
             "on_hand_now": oh,
             "price": line.get("Price"),
             "discount": line.get("Discount"),
@@ -5157,6 +5233,17 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "Data fetched LIVE from CIN7 (bypasses the 30-day "
             "local sync window). For each line, compose engine "
             "commentary per the existing po_review prompt: "
+            "RECEIPT RULE: `quantity`, `quantity_ordered`, "
+            "`quantity_received_on_po`, `quantity_outstanding_on_po`, "
+            "and `receipt_status_on_po` are about THIS PO. Use only "
+            "those fields when saying whether this PO line was received "
+            "or is still outstanding. If receipt_status_on_po is "
+            "`not_recorded`, CIN7 returned no StockReceived lines for "
+            "this purchase, so do NOT claim received/not received from "
+            "OnHand or Available. `available`, `on_hand_now`, "
+            "`allocated`, and `on_order` are GLOBAL stock position "
+            "signals across all customer orders and all POs; they can "
+            "explain current shortage, but they are not receipt proof. "
             "OnHand is in `on_hand_now`; for ABC / trend / "
             "12mo demand / dormancy, call get_sku_details or "
             "search_products_by_text with the SKU. Use the "

@@ -11,6 +11,8 @@ import pandas as pd
 
 import ai_tools
 import po_dispatch_reminder
+import slack_listener
+import so_lookup
 import worker_engine
 from app_config import (
     PAGE_CAPTIONS,
@@ -162,7 +164,7 @@ class WorkerLoopTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "slack_loop.sh"
         ).read_text(encoding="utf-8")
 
-        daily_refresh = script.index("launching daily 30d refresh chain")
+        daily_refresh = script.index("launching daily worker data refresh chain")
         products_refresh = script.index("python cin7_sync.py products",
                                         daily_refresh)
         sales_refresh = script.index("python cin7_sync.py salelines --days 30",
@@ -171,6 +173,71 @@ class WorkerLoopTests(unittest.TestCase):
         self.assertLess(products_refresh, sales_refresh)
         self.assertIn("NearSync", script)
         self.assertIn("Storage L x W x H In", script)
+        self.assertIn("python cin7_sync.py sales --days 365", script)
+
+    def test_worker_uses_widest_sale_line_window_not_lexicographic_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            three_day = root / "sale_lines_last_3d_2026-06-17.csv"
+            thirty_day = root / "sale_lines_last_30d_2026-06-17.csv"
+            three_day.write_text("OrderNumber\nSO-NEW\n", encoding="utf-8")
+            thirty_day.write_text("OrderNumber\nSO-57284\n", encoding="utf-8")
+
+            picked = slack_listener._widest_window_file(
+                [str(three_day), str(thirty_day)], "sale_lines_last")
+
+        self.assertEqual(Path(picked).name, thirty_day.name)
+
+    def test_so_lookup_uses_widest_sales_header_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            three_day = root / "sales_last_3d_2026-06-17.csv"
+            thirty_day = root / "sales_last_30d_2026-06-17.csv"
+            three_day.write_text(
+                "SaleID,OrderNumber,CustomerReference\n"
+                "new-id,SO-58000,#43000\n",
+                encoding="utf-8",
+            )
+            thirty_day.write_text(
+                "SaleID,OrderNumber,CustomerReference\n"
+                "sale-57284,SO-57284,#42555\n",
+                encoding="utf-8",
+            )
+            os.utime(thirty_day, (1, 1))
+            os.utime(three_day, (2, 2))
+
+            old_cache = dict(so_lookup._cache)
+            so_lookup._cache.update({
+                "by_so": None,
+                "by_shop_num": None,
+                "loaded_at": 0.0,
+            })
+            try:
+                with patch.object(so_lookup, "OUTPUT_DIR", root):
+                    result = so_lookup.lookup_so("SO-57284")
+            finally:
+                so_lookup._cache.update(old_cache)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["cin7_id"], "sale-57284")
+
+    def test_purchase_receipts_by_sku_sums_stock_received_lines(self) -> None:
+        purchase = {
+            "StockReceived": [{
+                "Date": "2026-06-17",
+                "Lines": [
+                    {"SKU": "LED-A", "ReceivedQuantity": 2},
+                    {"SKU": "LED-A", "Quantity": 1},
+                    {"SKU": "LED-B", "ReceivedQuantity": 4},
+                ],
+            }],
+        }
+
+        receipts = ai_tools._purchase_receipts_by_sku(purchase)
+
+        self.assertEqual(receipts["LED-A"]["quantity"], 3)
+        self.assertEqual(receipts["LED-B"]["quantity"], 4)
+        self.assertEqual(receipts["LED-A"]["dates"], ["2026-06-17", "2026-06-17"])
 
 
 class PoDispatchReminderTests(unittest.TestCase):
