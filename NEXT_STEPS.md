@@ -183,6 +183,15 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   CIN7 sale-line movement for strip families in master-roll equivalents,
   including direct master sales, child/cut rollup, recent family rows,
   and top-customer concentration.
+- **Calendar-month sales audit** — Ordering's Last 6 months buckets now
+  use real calendar months by CIN7 InvoiceDate, and Inspect includes a
+  per-SKU sales audit comparing InvoiceDate demand with OrderDate rows
+  so current-month zeroes can be reconciled quickly.
+- **Ordering grid focus UX** — the PO editor keeps its existing saved
+  column layouts, but now adds a browser-side active-row guide and
+  horizontal-scroll helpers so buyers can stay on the row they clicked
+  while moving across wide columns without hunting for the bottom
+  scrollbar.
 - **PO dispatch + receipt correctness** — dispatch reminders are
   line-level by SO/SKU and PO commentary now uses CIN7 StockReceived
   fields for PO-specific receipt wording rather than global stock

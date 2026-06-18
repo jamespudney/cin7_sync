@@ -30,6 +30,133 @@ def _empty_audit(reason: str) -> dict[str, Any]:
     }
 
 
+def _clean_sale_lines(sale_lines_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Return sale lines with safe date/quantity columns and status filter."""
+    sl = sale_lines_df.copy() if sale_lines_df is not None else pd.DataFrame()
+    if sl.empty:
+        sl = pd.DataFrame()
+    for col in ("SKU", "InvoiceDate", "OrderDate", "Quantity", "Status"):
+        if col not in sl.columns:
+            sl[col] = pd.NA
+    sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
+    sl["OrderDate"] = pd.to_datetime(sl["OrderDate"], errors="coerce")
+    sl["Quantity"] = pd.to_numeric(sl["Quantity"], errors="coerce").fillna(0)
+    sl["SKU"] = sl["SKU"].astype(str)
+    if "Status" in sl.columns:
+        sl = sl[~sl["Status"].astype(str).str.upper().isin(
+            EXCLUDED_SALE_STATUSES)]
+    return sl
+
+
+def calendar_month_periods(today=None, periods: int = 12) -> list[pd.Period]:
+    """Return oldest-to-newest calendar-month periods ending this month."""
+    now = pd.Timestamp(today if today is not None else datetime.now().date())
+    return list(pd.period_range(end=now.to_period("M"),
+                                periods=int(periods),
+                                freq="M"))
+
+
+def build_sku_sales_audit(sku: str,
+                          sale_lines_df: pd.DataFrame,
+                          *,
+                          today=None,
+                          months: int = 6) -> dict[str, Any]:
+    """Audit exact-SKU movement by calendar month.
+
+    The ABC engine counts invoiced demand by `InvoiceDate`. Buyers often
+    sanity-check against sales/orders they remember by `OrderDate`. This
+    audit shows both so a current-month zero can be explained without
+    exporting CSVs.
+    """
+    sku_s = str(sku or "").strip()
+    if not sku_s:
+        return {
+            "ok": False,
+            "reason": "No SKU supplied.",
+            "monthly_rows": pd.DataFrame(),
+            "recent_rows": pd.DataFrame(),
+            "summary": {},
+        }
+
+    sl = _clean_sale_lines(sale_lines_df)
+    sku_lines = sl[sl["SKU"].astype(str) == sku_s].copy()
+    periods = calendar_month_periods(today=today, periods=months)
+    labels = [str(p) for p in periods]
+    current_period = periods[-1] if periods else pd.Timestamp(
+        datetime.now().date()).to_period("M")
+
+    rows = []
+    for period in periods:
+        inv_mask = sku_lines["InvoiceDate"].dt.to_period("M") == period
+        order_mask = sku_lines["OrderDate"].dt.to_period("M") == period
+        # Order-date rows that are not in the same invoice month are useful
+        # for "I know we sold this" checks. They are not engine demand until
+        # they have a counted InvoiceDate in the period.
+        not_counted_mask = order_mask & ~inv_mask
+        rows.append({
+            "Month": str(period),
+            "Invoice qty (engine)": float(
+                sku_lines.loc[inv_mask, "Quantity"].sum()),
+            "OrderDate qty": float(
+                sku_lines.loc[order_mask, "Quantity"].sum()),
+            "OrderDate not in invoice month": float(
+                sku_lines.loc[not_counted_mask, "Quantity"].sum()),
+            "Invoice lines": int(inv_mask.sum()),
+            "OrderDate lines": int(order_mask.sum()),
+        })
+    monthly_rows = pd.DataFrame(rows)
+
+    current_inv = float(monthly_rows.iloc[-1]["Invoice qty (engine)"]
+                        if not monthly_rows.empty else 0)
+    current_order = float(monthly_rows.iloc[-1]["OrderDate qty"]
+                          if not monthly_rows.empty else 0)
+    current_not_counted = float(
+        monthly_rows.iloc[-1]["OrderDate not in invoice month"]
+        if not monthly_rows.empty else 0)
+
+    recent_cols = [c for c in [
+        "InvoiceDate", "OrderDate", "SKU", "Customer", "Quantity", "SaleID",
+        "OrderNumber", "InvoiceNumber", "Status",
+    ] if c in sku_lines.columns]
+    recent_rows = sku_lines.sort_values(
+        ["InvoiceDate", "OrderDate"], ascending=False,
+        na_position="last").head(30).copy()
+    if not recent_rows.empty:
+        recent_rows = recent_rows[recent_cols].copy()
+        for date_col in ("InvoiceDate", "OrderDate"):
+            if date_col in recent_rows.columns:
+                recent_rows[date_col] = pd.to_datetime(
+                    recent_rows[date_col], errors="coerce").dt.date.astype(str)
+
+    return {
+        "ok": True,
+        "reason": "",
+        "monthly_rows": monthly_rows,
+        "recent_rows": recent_rows,
+        "summary": {
+            "sku": sku_s,
+            "months": labels,
+            "current_month": str(current_period),
+            "current_invoice_qty": current_inv,
+            "current_order_qty": current_order,
+            "current_order_not_in_invoice_month_qty": current_not_counted,
+            "total_invoice_qty": float(
+                monthly_rows["Invoice qty (engine)"].sum()
+                if not monthly_rows.empty else 0),
+            "last_invoice_date": (
+                sku_lines["InvoiceDate"].max().date().isoformat()
+                if not sku_lines.empty
+                and pd.notna(sku_lines["InvoiceDate"].max()) else "—"
+            ),
+            "last_order_date": (
+                sku_lines["OrderDate"].max().date().isoformat()
+                if not sku_lines.empty
+                and pd.notna(sku_lines["OrderDate"].max()) else "—"
+            ),
+        },
+    }
+
+
 def build_strip_movement_audit(sku: str,
                                products_df: pd.DataFrame,
                                sale_lines_df: pd.DataFrame,
@@ -83,21 +210,12 @@ def build_strip_movement_audit(sku: str,
     # largest family roll so the audit answers "what should we buy?"
     normalise_len = master_len if master_len >= selected_len else selected_len
 
-    sl = sale_lines_df.copy() if sale_lines_df is not None else pd.DataFrame()
+    sl = _clean_sale_lines(sale_lines_df)
     if sl.empty or "SKU" not in sl.columns:
         sl = pd.DataFrame(columns=[
             "SKU", "InvoiceDate", "Quantity", "Customer", "CustomerID",
             "Status", "SaleID", "OrderNumber", "InvoiceNumber",
         ])
-    if "InvoiceDate" not in sl.columns:
-        sl["InvoiceDate"] = pd.NaT
-    if "Quantity" not in sl.columns:
-        sl["Quantity"] = 0
-    sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
-    sl["Quantity"] = pd.to_numeric(sl["Quantity"], errors="coerce").fillna(0)
-    if "Status" in sl.columns:
-        sl = sl[~sl["Status"].astype(str).str.upper().isin(
-            EXCLUDED_SALE_STATUSES)]
 
     now = pd.Timestamp(today if today is not None else datetime.now().date())
     cutoff_365 = now - pd.Timedelta(days=window_days)

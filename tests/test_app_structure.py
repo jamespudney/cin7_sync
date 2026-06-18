@@ -37,7 +37,11 @@ from engine.sku_rules import (
     _parse_tube_sku,
     parse_sourcing_rule,
 )
-from engine.sku_movement_audit import build_strip_movement_audit
+from engine.sku_movement_audit import (
+    build_sku_sales_audit,
+    build_strip_movement_audit,
+    calendar_month_periods,
+)
 from engine.reorder_math import (
     bulk_residue_floor_units,
     excess_units_over_target,
@@ -136,6 +140,17 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn('engine_df = engine_df.drop(columns=["calc_trace"])',
                       script)
         self.assertIn("include_trace=True).get(\"calc_trace\")", script)
+
+    def test_ordering_editor_has_focus_scroll_enhancer(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _render_ordering_editor_enhancer", script)
+        self.assertIn("w4s-ordering-active-row", script)
+        self.assertIn("w4s-ordering-editor-", script)
+        self.assertIn("_render_ordering_editor_enhancer(_ordering_grid_anchor)",
+                      script)
 
 
 class ReorderMathTests(unittest.TestCase):
@@ -276,6 +291,59 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertAlmostEqual(
             audit["summary"]["total_master_rolls_12mo"],
             0.5305,
+        )
+
+    def test_sku_sales_audit_separates_invoice_month_from_order_month(self) -> None:
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": "LED-V3000938S-20",
+                "InvoiceDate": "2026-05-31",
+                "OrderDate": "2026-06-02",
+                "Quantity": 7,
+                "Customer": "Customer A",
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LED-V3000938S-20",
+                "InvoiceDate": None,
+                "OrderDate": "2026-06-10",
+                "Quantity": 3,
+                "Customer": "Customer B",
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LED-V3000938S-20",
+                "InvoiceDate": "2026-06-12",
+                "OrderDate": "2026-06-11",
+                "Quantity": 2,
+                "Customer": "Customer C",
+                "Status": "CREDITED",
+            },
+        ])
+
+        audit = build_sku_sales_audit(
+            "LED-V3000938S-20",
+            sale_lines,
+            today=pd.Timestamp("2026-06-18"),
+            months=2,
+        )
+
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["summary"]["current_month"], "2026-06")
+        # Credited invoice is excluded; open/current OrderDate lines are
+        # visible but not counted by the engine's InvoiceDate bucket.
+        self.assertEqual(audit["summary"]["current_invoice_qty"], 0)
+        self.assertEqual(audit["summary"]["current_order_qty"], 10)
+        self.assertEqual(
+            audit["summary"]["current_order_not_in_invoice_month_qty"],
+            10,
+        )
+
+    def test_calendar_month_periods_end_on_current_calendar_month(self) -> None:
+        self.assertEqual(
+            [str(p) for p in calendar_month_periods(
+                today=pd.Timestamp("2026-06-18"), periods=3)],
+            ["2026-04", "2026-05", "2026-06"],
         )
 
 

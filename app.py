@@ -62,7 +62,11 @@ from engine.reorder_math import (
     fractional_bulk_order_allowed,
     normalise_planning_quantity,
 )
-from engine.sku_movement_audit import build_strip_movement_audit
+from engine.sku_movement_audit import (
+    build_sku_sales_audit,
+    build_strip_movement_audit,
+    calendar_month_periods,
+)
 from storage_dimensions import (
     ensure_storage_dim_column,
     storage_dim_source_columns,
@@ -997,6 +1001,169 @@ def rows_selector(label: str = "Rows to show", key: str = "rows",
     index = options.index(default) if default in options else 2
     choice = st.selectbox(label, options, index=index, key=key)
     return 10**9 if choice == "All" else int(choice)
+
+
+def _render_ordering_editor_enhancer(anchor_id: str) -> None:
+    """Attach small browser-side niceties to the Ordering data editor."""
+    import streamlit.components.v1 as _stc
+
+    _anchor_js = json.dumps(anchor_id)
+    _stc.html("""
+<script>
+(() => {
+  const ANCHOR_ID = %s;
+  let doc = null;
+  try {
+    doc = window.parent && window.parent.document;
+  } catch (e) {
+    return;
+  }
+  if (!doc) return;
+
+  const STYLE_ID = "w4s-ordering-editor-enhancer-style";
+  if (!doc.getElementById(STYLE_ID)) {
+    const style = doc.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      .w4s-ordering-editor-frame {
+        outline: none;
+      }
+      .w4s-ordering-active-row {
+        position: absolute;
+        left: 0;
+        right: 0;
+        height: 40px;
+        display: none;
+        pointer-events: none;
+        z-index: 20;
+        background: rgba(250, 204, 21, 0.16);
+        border-top: 1px solid rgba(245, 158, 11, 0.45);
+        border-bottom: 1px solid rgba(245, 158, 11, 0.45);
+        box-shadow: inset 4px 0 0 rgba(217, 119, 6, 0.92);
+      }
+    `;
+    doc.head.appendChild(style);
+  }
+
+  function isAfter(anchor, el) {
+    return !!(anchor.compareDocumentPosition(el)
+      & 4);
+  }
+
+  function findEditorFrame(anchor) {
+    const selectors = [
+      '[data-testid="stDataFrame"]',
+      '[data-testid="stDataFrameResizable"]'
+    ].join(",");
+    return Array.from(doc.querySelectorAll(selectors))
+      .find((el) => isAfter(anchor, el));
+  }
+
+  function widestScroller(root) {
+    const candidates = Array.from(root.querySelectorAll("*"))
+      .filter((el) => (el.scrollWidth - el.clientWidth) > 12);
+    candidates.sort((a, b) =>
+      (b.scrollWidth - b.clientWidth) - (a.scrollWidth - a.clientWidth));
+    return candidates[0] || root;
+  }
+
+  function install() {
+    const anchor = doc.getElementById(ANCHOR_ID);
+    if (!anchor) return false;
+    const frame = findEditorFrame(anchor);
+    if (!frame) return false;
+    if (frame.dataset.w4sOrderingEnhancer === ANCHOR_ID) return true;
+    frame.dataset.w4sOrderingEnhancer = ANCHOR_ID;
+    frame.classList.add("w4s-ordering-editor-frame");
+    frame.setAttribute("tabindex", "0");
+
+    const canvas = frame.querySelector("canvas");
+    const host = (canvas && canvas.parentElement) || frame;
+    if (!host.style.position || host.style.position === "static") {
+      host.style.position = "relative";
+    }
+
+    let guide = host.querySelector(":scope > .w4s-ordering-active-row");
+    if (!guide) {
+      guide = doc.createElement("div");
+      guide.className = "w4s-ordering-active-row";
+      host.appendChild(guide);
+    }
+
+    function showGuide(ev) {
+      const currentCanvas = frame.querySelector("canvas");
+      const surface = currentCanvas || frame;
+      const rect = surface.getBoundingClientRect();
+      const hostRect = host.getBoundingClientRect();
+      const header = 36;
+      const rowHeight = 40;
+      const y = ev.clientY - rect.top;
+      if (y < header || y > rect.height) return;
+      const top = Math.max(
+        header,
+        Math.min(y + rect.top - hostRect.top - (rowHeight / 2),
+                 hostRect.height - rowHeight)
+      );
+      guide.style.top = `${top}px`;
+      guide.style.display = "block";
+      try { frame.focus({preventScroll: true}); } catch (e) { frame.focus(); }
+    }
+
+    function scrollHoriz(dx) {
+      const scroller = widestScroller(frame);
+      if (!scroller) return false;
+      const before = scroller.scrollLeft || 0;
+      scroller.scrollLeft = before + dx;
+      return (scroller.scrollLeft || 0) !== before;
+    }
+
+    frame.addEventListener("pointerdown", showGuide, true);
+    frame.addEventListener("click", showGuide, true);
+    frame.addEventListener("wheel", (ev) => {
+      const sideways = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
+      if (!ev.shiftKey && !sideways) return;
+      const dx = sideways ? ev.deltaX : ev.deltaY;
+      if (!dx) return;
+      if (scrollHoriz(dx)) {
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    }, {passive: false, capture: true});
+
+    doc.addEventListener("keydown", (ev) => {
+      const active = doc.activeElement;
+      const tag = (active && active.tagName || "").toUpperCase();
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)
+          || (active && active.isContentEditable)) {
+        return;
+      }
+      const gridHasFocus = active === frame || frame.contains(active);
+      const gridIsHovered = frame.matches(":hover");
+      if (!gridHasFocus && !gridIsHovered) return;
+      const plainBodyFocus = active === doc.body || active === null;
+      const modified = ev.shiftKey || ev.altKey || ev.metaKey;
+      if (ev.key === "ArrowRight" && (modified || plainBodyFocus)) {
+        if (scrollHoriz(ev.shiftKey ? 260 : 160)) ev.preventDefault();
+      } else if (ev.key === "ArrowLeft" && (modified || plainBodyFocus)) {
+        if (scrollHoriz(ev.shiftKey ? -260 : -160)) ev.preventDefault();
+      } else if ((ev.key === "Home" || ev.key === "End") && modified) {
+        const scroller = widestScroller(frame);
+        if (scroller) {
+          scroller.scrollLeft = ev.key === "Home" ? 0 : scroller.scrollWidth;
+          ev.preventDefault();
+        }
+      }
+    }, true);
+    return true;
+  }
+
+  if (!install()) {
+    setTimeout(install, 300);
+    setTimeout(install, 900);
+  }
+})();
+</script>
+""" % _anchor_js, height=0)
 
 
 # ---------------------------------------------------------------------------
@@ -4496,23 +4663,28 @@ def _abc_engine(products: pd.DataFrame,
             if not _a90.empty:
                 assembly_units_90d_map = (
                     _a90.groupby("_sku")["Quantity"].sum().to_dict())
-            # Monthly buckets (added to monthly_12 / monthly_24 below)
-            _months_ago = (today_naive - a["_dt"]).dt.days / 30.437
-            a["_b12"] = (11 - _months_ago.astype(int)).clip(lower=0, upper=11)
-            a["_b24"] = (23 - _months_ago.astype(int)).clip(lower=0, upper=23)
-            _am12 = a[_months_ago < 12]
+            # Monthly buckets (added to monthly_12 / monthly_24 below).
+            # Use real calendar months, not rolling 30.437-day windows,
+            # so "this month" in the Ordering grid ties to CIN7's
+            # month view and to buyer expectations.
+            _periods12 = calendar_month_periods(today=today_naive, periods=12)
+            _periods24 = calendar_month_periods(today=today_naive, periods=24)
+            _pidx12 = {p: i for i, p in enumerate(_periods12)}
+            _pidx24 = {p: i for i, p in enumerate(_periods24)}
+            a["_period"] = a["_dt"].dt.to_period("M")
+            _am12 = a[a["_period"].isin(_pidx12.keys())]
             for _sku_g, _grp in _am12.groupby("_sku"):
                 _buckets = [0.0] * 12
-                for _bidx, _qsum in (_grp.groupby("_b12")["Quantity"]
+                for _period, _qsum in (_grp.groupby("_period")["Quantity"]
                                        .sum().items()):
-                    _buckets[int(_bidx)] = float(_qsum)
+                    _buckets[int(_pidx12[_period])] = float(_qsum)
                 assembly_monthly_12_map[_sku_g] = _buckets
-            _am24 = a[_months_ago < 24]
+            _am24 = a[a["_period"].isin(_pidx24.keys())]
             for _sku_g, _grp in _am24.groupby("_sku"):
                 _buckets = [0.0] * 24
-                for _bidx, _qsum in (_grp.groupby("_b24")["Quantity"]
+                for _period, _qsum in (_grp.groupby("_period")["Quantity"]
                                        .sum().items()):
-                    _buckets[int(_bidx)] = float(_qsum)
+                    _buckets[int(_pidx24[_period])] = float(_qsum)
                 assembly_monthly_24_map[_sku_g] = _buckets
             assembly_components = set(a["_sku"].unique())
             try:
@@ -5638,19 +5810,21 @@ def _abc_engine(products: pd.DataFrame,
     from collections import defaultdict as _dd
     monthly_12 = _dd(lambda: [0.0] * 12)
     monthly_24 = _dd(lambda: [0.0] * 24)
+    _periods12 = calendar_month_periods(today=today_ts, periods=12)
+    _periods24 = calendar_month_periods(today=today_ts, periods=24)
+    _pidx12 = {p: i for i, p in enumerate(_periods12)}
+    _pidx24 = {p: i for i, p in enumerate(_periods24)}
     for _, r in sl.iterrows():
         d = r["InvoiceDate"]
         if pd.isna(d):
             continue
-        months_ago = (today_ts - d).days / 30.437
+        period = d.to_period("M")
         q = float(r["Quantity"] or 0)
         sku_r = r["SKU"]
-        if 0 <= months_ago < 12:
-            b12 = 11 - int(months_ago)
-            monthly_12[sku_r][b12] += q
-        if 0 <= months_ago < 24:
-            b24 = 23 - int(months_ago)
-            monthly_24[sku_r][b24] += q
+        if period in _pidx12:
+            monthly_12[sku_r][_pidx12[period]] += q
+        if period in _pidx24:
+            monthly_24[sku_r][_pidx24[period]] += q
     # v2.67.339 — fold assembly consumption per-SKU per-bucket into the
     # monthly arrays we just built from direct sales. Pre-aggregated
     # above into assembly_monthly_{12,24}_map keyed by ComponentSKU.
@@ -11264,6 +11438,62 @@ elif page == "Ordering":
             with st.expander("Full reorder math", expanded=False):
                 st.markdown(_trace)
 
+        try:
+            _sales_audit = build_sku_sales_audit(_sku, sale_lines)
+            if _sales_audit.get("ok"):
+                _summary = _sales_audit.get("summary", {})
+                with st.expander("SKU sales audit (calendar months)",
+                                 expanded=False):
+                    st.caption(
+                        "Source: synced CIN7 sale_lines. The engine's "
+                        "monthly buckets use InvoiceDate and exclude "
+                        "credited, voided, and cancelled lines. OrderDate "
+                        "is shown beside it to catch open/uninvoiced orders.")
+                    _sa = st.columns(4)
+                    _sa[0].metric(
+                        f"{_summary.get('current_month')} invoice qty",
+                        f"{float(_summary.get('current_invoice_qty') or 0):.2f}")
+                    _sa[1].metric(
+                        f"{_summary.get('current_month')} OrderDate qty",
+                        f"{float(_summary.get('current_order_qty') or 0):.2f}")
+                    _sa[2].metric(
+                        "OrderDate not counted",
+                        f"{float(_summary.get('current_order_not_in_invoice_month_qty') or 0):.2f}")
+                    _sa[3].metric(
+                        "Last invoice",
+                        str(_summary.get("last_invoice_date") or "—"))
+
+                    _monthly_rows = _sales_audit.get("monthly_rows")
+                    if isinstance(_monthly_rows, pd.DataFrame) and not _monthly_rows.empty:
+                        st.dataframe(
+                            _monthly_rows,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=250,
+                            column_config={
+                                "Invoice qty (engine)":
+                                    st.column_config.NumberColumn(format="%.2f"),
+                                "OrderDate qty":
+                                    st.column_config.NumberColumn(format="%.2f"),
+                                "OrderDate not in invoice month":
+                                    st.column_config.NumberColumn(format="%.2f"),
+                            },
+                        )
+                    _recent_sku_rows = _sales_audit.get("recent_rows")
+                    if isinstance(_recent_sku_rows, pd.DataFrame) and not _recent_sku_rows.empty:
+                        with st.expander(
+                            f"Recent exact-SKU sale lines ({len(_recent_sku_rows)} shown)",
+                            expanded=False,
+                        ):
+                            st.dataframe(
+                                _recent_sku_rows,
+                                hide_index=True,
+                                use_container_width=True,
+                                height=280,
+                            )
+        except Exception:  # noqa: BLE001
+            pass
+
         # Live synced movement audit for LED strip / bulk-roll families.
         # This answers the operational question that raw same-SKU rows
         # cannot: "which child/cut SKUs are actually feeding this 100m
@@ -13810,10 +14040,10 @@ elif page == "Ordering":
             ),
             "last_6mo_series": st.column_config.TextColumn(
                 "Last 6 months",
-                help="Units sold each of the last 6 months — oldest on the "
-                     "left, newest on the right. Numeric version of the "
-                     "12mo sparkline; quickly shows trend direction "
-                     "(rising / falling / spiky).",
+                help="Units sold in each of the last 6 calendar months — "
+                     "oldest on the left, current month on the right. "
+                     "Numeric version of the 12mo sparkline; quickly "
+                     "shows trend direction (rising / falling / spiky).",
                 disabled=True,
                 width="medium",
             ),
@@ -14322,12 +14552,21 @@ elif page == "Ordering":
         # for typical supplier views; scrollbar appears for larger sets.
         _stc.html(_chip_html, height=170)
 
+    _supplier_anchor_slug = "".join(
+        ch if ch.isalnum() else "-" for ch in str(sel_sup).lower()
+    )[:64]
+    _ordering_grid_anchor = f"w4s-ordering-editor-{_supplier_anchor_slug}"
+    st.markdown(
+        f'<div id="{_ordering_grid_anchor}"></div>',
+        unsafe_allow_html=True,
+    )
     edited = st.data_editor(
         editable,
         width="stretch", hide_index=True, height=500,
         key=f"po_editor_ord_{sel_sup}",
         column_config=_po_col_cfg,
     )
+    _render_ordering_editor_enhancer(_ordering_grid_anchor)
 
     # --- LIVE EDIT PREVIEW --------------------------------------------
     # Streamlit's data_editor doesn't automatically update disabled
@@ -15681,9 +15920,10 @@ elif page == "Ordering":
                         "📈 Trend", disabled=True, width="small"),
                     "last_6mo_series": st.column_config.TextColumn(
                         "Last 6 months", disabled=True, width="medium",
-                        help="Units sold each of the last 6 months — "
-                             "oldest on the left, newest on the right. "
-                             "Same column as the main reorder table."),
+                        help="Units sold in each of the last 6 calendar "
+                             "months — oldest on the left, current month "
+                             "on the right. Same column as the main "
+                             "reorder table."),
                     "OnHand": st.column_config.NumberColumn(
                         disabled=True, format="%.0f"),
                     "OnOrder": st.column_config.NumberColumn(

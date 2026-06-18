@@ -177,6 +177,15 @@ The Inspect panel's calc trace shows the reason next to the lead-time
 line, e.g. `Lead time: 35 days (sea (category rule: Profiles -
 Channels at ~3m → sea))`.
 
+#### Ordering PO editor row focus
+The Ordering page's PO editor preserves the saved per-user column
+layout and width settings. A browser-side enhancer adds an active-row
+guide after the buyer clicks inside the editor, and supports sideways
+movement across wide column sets with horizontal wheel/trackpad input
+or modified left/right arrow keys. This is a UI aid only: it does not
+change the underlying reorder calculations, saved layout keys, draft
+qtys, or CIN7 write logic.
+
 #### Status badges (Ordering page)
 Computed in `_status()` using **Available** (not OnHand) so a SKU that's
 oversold (Allocated > OnHand) reads as urgent, not as Overstocked
@@ -248,6 +257,15 @@ panel at the bottom when you drill into any flagged SKU.
 For the full step-by-step math on any individual SKU, scroll to the
 **transparency panel** below the PO table and pick the SKU — the
 engine shows every input and how it got to the suggestion.
+
+#### Last 6 months column
+The Ordering page's **Last 6 months** column uses real calendar-month
+buckets, oldest on the left and the current calendar month on the right.
+It is based on synced CIN7 `sale_lines` by `InvoiceDate`, with credited,
+voided, and cancelled lines excluded. The Inspect panel's **SKU sales
+audit** shows the same calendar-month invoice totals beside `OrderDate`
+totals, so buyers can spot open/current orders that are not yet counted
+as invoiced demand.
 
 #### Slow movers / dormancy (v2.67.36+)
 A SKU is **dormant** when its 90-day demand has dropped sharply
