@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-05-22 (v2.67.267)
+Last updated: 2026-06-18
 
 ---
 
@@ -153,7 +153,20 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ## Shipped (since 2026-04-30)
 
-### 2026-05-22 (today)
+### 2026-06-18
+
+- **Dashboard memory hardening** — reduced Streamlit/Render OOM risk
+  by removing eager duplicate sale-line fallback loads and making the
+  merged sale, sales-header, and purchase-line CSV loaders read only
+  the columns the dashboard/AI actually consume. Cold ABC-engine
+  rebuilds now start from leaner DataFrames instead of full-width CSV
+  snapshots.
+- **PO dispatch + receipt correctness** — dispatch reminders are
+  line-level by SO/SKU and PO commentary now uses CIN7 StockReceived
+  fields for PO-specific receipt wording rather than global stock
+  availability.
+
+### 2026-05-22
 
 - **v2.67.267** — Fix `get_slack_messages` correlated subquery alias
   (`slack_messages.channel_id` → `m.channel_id`; was breaking all

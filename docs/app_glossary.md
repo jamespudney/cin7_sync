@@ -353,6 +353,19 @@ drops:
   returns no PO lines but `OnOrder>0`, the tool flags this as a
   data gap rather than claiming "no PO exists".
 
+#### Dashboard memory posture
+The dashboard runs on Render with a hard memory ceiling, so large
+historical CSVs must be loaded leanly. The app uses one merged
+longest-window sale-lines DataFrame as the source of truth and no
+longer pre-loads separate 3-day / 30-day sale-line fallback frames
+beside it. The big merged sale, sales-header, and purchase-line
+loaders read only the columns consumed by the dashboard and AI tools,
+then downcast numeric columns where safe. This keeps cold ABC-engine
+rebuilds and normal Streamlit reruns from holding multiple full-width
+copies of the same CIN7 exports in memory. If Render still reports
+OOM, inspect live memory metrics before increasing the instance size
+or moving more computations into the background worker.
+
 #### Cost basis chain — how the engine values stock (v2.67.180)
 The engine values inventory at `OnHand × EffectiveUnitCost`.
 EffectiveUnitCost is resolved per SKU via a fall-back chain — the
