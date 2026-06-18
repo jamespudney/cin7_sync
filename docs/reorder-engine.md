@@ -10,8 +10,11 @@ For each Stock-typed SKU, the engine looks at:
 
 1. **12-month effective demand.** Sum of units sold in the last 365
    days, INCLUDING units rolled up from migration predecessors and
-   BOM children. Migration-aware so a successor inherits its
-   predecessor's velocity.
+   BOM children. LED strip cut variants also roll up to their bulk
+   master by shared SKU base, for example
+   `LED-TSB2835-300-24-6000-0305` credits demand to
+   `LED-TSB2835-300-24-6000-100M`. Migration-aware so a successor
+   inherits its predecessor's velocity.
 2. **On-hand stock.** Current physical inventory.
 3. **Available stock.** Physical minus reserved/allocated.
 4. **Open POs.** Quantity already on order with the supplier.
@@ -75,6 +78,14 @@ Where:
   This prevents tiny CIN7 decimal leftovers (for example 0.0025 of
   a 100m roll) from showing as overstock or hiding an effectively
   out-of-stock item.
+- **Neonica 100m roll decimals** — 100m bulk rolls from Neonica are
+  bought as decimal roll quantities. If the engine needs 40m, the PO
+  quantity is `0.40`, not `1.00`; MOQ/full-roll rounding is skipped for
+  those rows.
+- **LED strip family rollups** — known strip prefixes, including
+  `LED-TSB`, are parsed by SKU rather than relying on product-title
+  wording. Short-cut suffixes such as `0305` are converted to metres
+  and rolled into the longest/bulk master in the same base family.
 - **Override flags** — `db.sku_policy_overrides` rows take
   precedence over the engine's suggestion if present.
 

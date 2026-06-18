@@ -62,6 +62,12 @@ short cut variants (5m, 1ft, 0305mm).
 the bulk variants are NOT classified as slow/dead. The bulk roll is
 treated as raw material for the cut variants.
 
+The parser recognises known strip families by SKU prefix, including
+`LED-TSB`, so demand from a child such as
+`LED-TSB2835-300-24-6000-0305` rolls into the 100m master
+`LED-TSB2835-300-24-6000-100M` even if the product title does not
+contain the word "strip".
+
 **Example:** LED-XYZ-100M (bulk) is dead stock by raw movement, but
 LED-XYZ-5M (cut) is selling well. The 100M roll should NOT be flagged
 as dead — the 5M cuts are made from it. Only when the entire family

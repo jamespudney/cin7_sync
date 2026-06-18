@@ -205,6 +205,7 @@ STRIP_FAMILY_PREFIXES = (
     "LEDAW",
     "LEDRGB",
     "LED-STRIP",
+    "LED-TSB",
 )
 
 STRIP_NAME_KEYWORDS = ("STRIP", "LED TAPE", "FLEX LED")
@@ -267,4 +268,3 @@ def _parse_strip_base(sku: str) -> Optional[tuple]:
     if voltage:
         base = f"{base}-{voltage}"
     return (base, length_m)
-

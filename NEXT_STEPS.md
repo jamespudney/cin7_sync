@@ -171,6 +171,14 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   excess, out-of-stock, and Status calculations. Fixes 100m rolls with
   tiny CIN7 decimal leftovers showing as "Overstocked" while the UI
   rounds OnHand to 0.
+- **TSB strip-family rollup hardening** — `LED-TSB` is now an explicit
+  strip SKU prefix, so sales of child cuts such as
+  `LED-TSB2835-300-24-6000-0305` roll into the 100m master
+  `LED-TSB2835-300-24-6000-100M` without relying on the product title
+  containing "strip".
+- **Neonica 100m fractional ordering guard** — Neonica 100m bulk rolls
+  remain decimal-orderable (`0.40` for 40m) even if supplier config is
+  later tightened for full-roll-only suppliers.
 - **PO dispatch + receipt correctness** — dispatch reminders are
   line-level by SO/SKU and PO commentary now uses CIN7 StockReceived
   fields for PO-specific receipt wording rather than global stock
