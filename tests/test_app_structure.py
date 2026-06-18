@@ -84,6 +84,38 @@ class PageConfigTests(unittest.TestCase):
             self.assertTrue(PAGE_DESCRIPTIONS[page])
 
 
+class AppMemoryStructureTests(unittest.TestCase):
+    def test_dashboard_avoids_duplicate_sale_line_loads(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn('sale_lines_3d = load("sale_lines_last_3d")',
+                         script)
+        self.assertNotIn('sale_lines_30d = load("sale_lines_last_30d")',
+                         script)
+        self.assertNotIn('purchase_lines = load("purchase_lines_last_90d")',
+                         script)
+        self.assertIn("sale_lines_3d = pd.DataFrame()", script)
+        self.assertIn("sale_lines_30d = pd.DataFrame()", script)
+
+    def test_big_dashboard_loaders_use_lean_csv_columns(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _read_csv_lean", script)
+        self.assertIn("_SALE_LINES_USECOLS", script)
+        self.assertIn("_SALES_HEADERS_USECOLS", script)
+        self.assertIn("_PURCHASE_LINES_USECOLS", script)
+        self.assertIn("_read_csv_lean(base_file, _SALE_LINES_USECOLS",
+                      script)
+        self.assertIn("_read_csv_lean(base_file, _SALES_HEADERS_USECOLS",
+                      script)
+        self.assertIn("_read_csv_lean(base_file, _PURCHASE_LINES_USECOLS",
+                      script)
+
+
 class DataCatalogTests(unittest.TestCase):
     def test_latest_file_prefers_newest_timestamp_or_stable_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

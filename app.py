@@ -665,6 +665,38 @@ def load(prefix: str) -> pd.DataFrame:
     return _read_csv_cached(str(p), p.stat().st_mtime)
 
 
+def _read_csv_lean(path: Path,
+                   usecols: list[str],
+                   numeric_cols: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Read only the CSV columns the app actually consumes.
+
+    The rolling CIN7 exports keep gaining fields. Loading every column
+    across multi-year sale/purchase snapshots pushes Render's memory limit
+    during Streamlit reruns, so the big merged loaders use this helper.
+    """
+    try:
+        header = pd.read_csv(path, nrows=0).columns.tolist()
+        cols = [c for c in usecols if c in header]
+        if not cols:
+            return pd.DataFrame()
+        df = pd.read_csv(path, usecols=cols, low_memory=False)
+    except Exception:
+        return pd.DataFrame()
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col], errors="coerce", downcast="float")
+    return df
+
+
+def _ensure_columns(df: pd.DataFrame,
+                    columns: list[str]) -> pd.DataFrame:
+    for col in columns:
+        if col not in df.columns:
+            df[col] = pd.NA
+    return df
+
+
 def file_mtime(prefix: str) -> Optional[datetime]:
     return catalog_file_mtime(prefix, OUTPUT_DIR)
 
@@ -2035,9 +2067,9 @@ purchase_headers = load("purchases_last_30d")
 # inside the 14-day gap between the Apr 21 snapshot and today). The
 # real assignment lives next to `sales_full = _load_longest_sales()`
 # which uses the identical merge pattern for sale headers.
-purchase_lines = load("purchase_lines_last_90d")  # rebound below
-sale_lines_3d = load("sale_lines_last_3d")
-sale_lines_30d = load("sale_lines_last_30d")
+purchase_lines = pd.DataFrame()  # rebound below
+sale_lines_3d = pd.DataFrame()
+sale_lines_30d = pd.DataFrame()
 # v2.67.54 — ShipStation shipments. Module-level placeholder; the
 # real merged DataFrame is built below after _load_longest_shipments
 # is defined. Loader gracefully returns an empty frame if shipping
@@ -2317,14 +2349,42 @@ def _start_background_engine_refresh(reason: str,
 # A consumer doing `df["InvoiceDate"]` then gets an empty Series instead
 # of a KeyError. Keeps the deploy bring-up much smoother.
 _EMPTY_SALE_LINES_COLS = [
-    "SaleID", "OrderNumber", "InvoiceDate", "Customer",
-    "SKU", "Name", "Quantity", "Price", "Discount", "Tax", "Total"]
+    "SaleID", "OrderNumber", "InvoiceNumber", "InvoiceDate", "OrderDate",
+    "Customer", "CustomerID", "SKU", "ProductID", "Name", "Quantity",
+    "Price", "Discount", "Tax", "Total", "AverageCost", "Status",
+    "SourceChannel", "SalesRepresentative", "CustomerReference",
+    "ShippingNotes", "Terms", "Memo", "Note", "SaleType", "UOM"]
 _EMPTY_SALES_COLS = [
-    "SaleID", "OrderNumber", "InvoiceDate", "OrderDate", "Customer",
-    "Status", "Total", "InvoiceAmount"]
+    "SaleID", "OrderNumber", "InvoiceNumber", "InvoiceDate", "OrderDate",
+    "Customer", "CustomerID", "Status", "Total", "InvoiceAmount",
+    "GrandTotal", "Tax", "CustomerReference", "SourceChannel",
+    "SalesRepresentative", "SaleType", "ShippingNotes", "Terms",
+    "Memo", "Note", "CombinedShippingStatus", "FulFilmentStatus"]
 _EMPTY_PURCHASE_LINES_COLS = [
-    "PurchaseID", "OrderNumber", "OrderDate", "Supplier",
-    "SKU", "Name", "Quantity", "Price", "Total"]
+    "PurchaseID", "OrderNumber", "OrderDate", "RequiredBy", "Supplier",
+    "SupplierID", "Status", "SKU", "ProductID", "Name", "Quantity",
+    "Price", "Discount", "Tax", "Total", "UOM", "Comments",
+    "ShippingNotes", "AttributeNotes", "Memo", "Note", "Terms"]
+
+_SALE_LINES_USECOLS = _EMPTY_SALE_LINES_COLS + [
+    "Location", "LocationID", "InvoiceAmount"]
+_SALE_LINES_NUMERIC_COLS = (
+    "Quantity", "Price", "Discount", "Tax", "Total", "AverageCost",
+    "InvoiceAmount")
+_SALES_HEADERS_USECOLS = _EMPTY_SALES_COLS + [
+    "Type", "FulfillmentStatus", "ShipBy", "RequiredBy"]
+_SALES_HEADERS_NUMERIC_COLS = (
+    "Total", "InvoiceAmount", "GrandTotal", "Tax")
+_PURCHASE_LINES_USECOLS = _EMPTY_PURCHASE_LINES_COLS + [
+    "AverageCost", "InvoiceDate", "InvoiceNumber", "SupplierSKU",
+    "Supplier SKU", "Currency", "BaseCurrency", "SupplierCurrency",
+    "ShipDate", "TrackingNumber", "ShippingMethod", "DeliveryDate",
+    "ExpectedDate", "Location", "LocationID", "QuantityReceived",
+    "ReceivedQuantity", "ReceivedAgainstOrder", "QuantityRemaining"]
+_PURCHASE_LINES_NUMERIC_COLS = (
+    "Quantity", "Price", "Discount", "Tax", "Total", "AverageCost",
+    "QuantityReceived", "ReceivedQuantity", "ReceivedAgainstOrder",
+    "QuantityRemaining")
 
 
 # Load the most comprehensive sale_lines picture:
@@ -2349,20 +2409,20 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
-    try:
-        base = pd.read_csv(base_file, low_memory=False)
-    except Exception:
+    base = _read_csv_lean(base_file, _SALE_LINES_USECOLS,
+                          _SALE_LINES_NUMERIC_COLS)
+    if len(base.columns) == 0:
         return pd.DataFrame(columns=_EMPTY_SALE_LINES_COLS)
 
     # Union any file that was written MORE RECENTLY than the base
     for days, mtime, p in files[1:]:
         if mtime <= base_mtime:
             continue
-        try:
-            more = pd.read_csv(p, low_memory=False)
-            base = pd.concat([base, more], ignore_index=True)
-        except Exception:
+        more = _read_csv_lean(p, _SALE_LINES_USECOLS,
+                              _SALE_LINES_NUMERIC_COLS)
+        if more.empty:
             continue
+        base = pd.concat([base, more], ignore_index=True)
 
     # Dedupe keeping LAST occurrence (the more-recent file's data).
     #
@@ -2415,6 +2475,7 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
         base = base.sort_values(
             "InvoiceDate", na_position="first", kind="stable")
         base = base.drop_duplicates(subset=second_key, keep="last")
+    base = _ensure_columns(base, _EMPTY_SALE_LINES_COLS)
     return base.reset_index(drop=True)
 
 
@@ -2505,20 +2566,21 @@ def _load_longest_sales_cached(fingerprint: tuple) -> pd.DataFrame:
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
-    try:
-        base = pd.read_csv(base_file, low_memory=False)
-    except Exception:
+    base = _read_csv_lean(base_file, _SALES_HEADERS_USECOLS,
+                          _SALES_HEADERS_NUMERIC_COLS)
+    if len(base.columns) == 0:
         return pd.DataFrame(columns=_EMPTY_SALES_COLS)
     for days, mtime, p in files[1:]:
         if mtime <= base_mtime:
             continue
-        try:
-            more = pd.read_csv(p, low_memory=False)
-            base = pd.concat([base, more], ignore_index=True)
-        except Exception:
+        more = _read_csv_lean(p, _SALES_HEADERS_USECOLS,
+                              _SALES_HEADERS_NUMERIC_COLS)
+        if more.empty:
             continue
+        base = pd.concat([base, more], ignore_index=True)
     if "SaleID" in base.columns:
         base = base.drop_duplicates(subset=["SaleID"], keep="last")
+    base = _ensure_columns(base, _EMPTY_SALES_COLS)
     return base.reset_index(drop=True)
 
 
@@ -2540,16 +2602,16 @@ def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     files.sort(key=lambda x: (-x[0], -x[1]))
     base_file = files[0][2]
     base_mtime = files[0][1]
-    try:
-        base = pd.read_csv(base_file, low_memory=False)
-    except Exception:
+    base = _read_csv_lean(base_file, _PURCHASE_LINES_USECOLS,
+                          _PURCHASE_LINES_NUMERIC_COLS)
+    if len(base.columns) == 0:
         return pd.DataFrame(columns=_EMPTY_PURCHASE_LINES_COLS)
     for days, mtime, p in files[1:]:
         if mtime <= base_mtime:
             continue
-        try:
-            more = pd.read_csv(p, low_memory=False)
-        except Exception:
+        more = _read_csv_lean(p, _PURCHASE_LINES_USECOLS,
+                              _PURCHASE_LINES_NUMERIC_COLS)
+        if more.empty:
             continue
         # v2.67.275 — PO-level replacement: if the newer file has a
         # fresher sync for a PurchaseID, drop ALL rows for that ID from
@@ -2570,6 +2632,7 @@ def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
                     if c in base.columns]
     if dedupe_cols:
         base = base.drop_duplicates(subset=dedupe_cols, keep="last")
+    base = _ensure_columns(base, _EMPTY_PURCHASE_LINES_COLS)
     return base.reset_index(drop=True)
 
 
