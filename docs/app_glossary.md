@@ -509,6 +509,21 @@ page must not call it "Overstocked" or show dollars tied up. The Inspect
 panel prints a note when it ignores this residue. Meaningful remnants
 above 5m still count and can surface as cleanup stock.
 
+For Neonica 100m master rolls, the Order qty is allowed to be a
+decimal of the roll: 40m required becomes `0.40`, not a full `1.00`
+roll. The engine skips MOQ/full-roll rounding on those fractional
+bulk rows.
+
+#### LED strip family rollup
+LED strip cut variants roll up to the bulk-roll master by shared SKU
+base. Known strip prefixes, including `LED-TSB`, are recognised by
+SKU, so `LED-TSB2835-300-24-6000-0305` contributes demand to
+`LED-TSB2835-300-24-6000-100M` without depending on the product name
+containing the word "strip". If the engine still suggests zero after
+the rollup, check concentration/project logic: one-customer demand may
+be shown for manual review rather than converted into an automatic
+buy.
+
 #### Monthly Metrics — formulas & commission caveats (v2.67.290)
 The Monthly Metrics page is the commission base, so every metric
 needs to be auditable. The full methodology lives in an in-app

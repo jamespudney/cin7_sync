@@ -40,6 +40,7 @@ from engine.sku_rules import (
 from engine.reorder_math import (
     bulk_residue_floor_units,
     excess_units_over_target,
+    fractional_bulk_order_allowed,
     normalise_planning_quantity,
 )
 from storage_dimensions import extract_storage_dim
@@ -166,6 +167,49 @@ class ReorderMathTests(unittest.TestCase):
             excess_units_over_target(
                 0.08, 0, is_bulk_master=True, bulk_length_m=100),
             0.08,
+        )
+
+    def test_neonica_100m_bulk_rolls_allow_decimal_order_qtys(self) -> None:
+        self.assertTrue(
+            fractional_bulk_order_allowed(
+                "Neonica Polska Sp. z o.o.",
+                True,
+                100,
+                {"allow_fractional_qty": False},
+            )
+        )
+        self.assertFalse(
+            fractional_bulk_order_allowed(
+                "Topmet Light (EUR)",
+                True,
+                100,
+                {"allow_fractional_qty": False},
+            )
+        )
+        self.assertFalse(
+            fractional_bulk_order_allowed(
+                "Neonica Polska Sp. z o.o.",
+                False,
+                100,
+                {"allow_fractional_qty": True},
+            )
+        )
+
+
+class StripRollupParsingTests(unittest.TestCase):
+    def test_tsb_0305_child_links_to_100m_master_base(self) -> None:
+        master = "LED-TSB2835-300-24-6000-100M"
+        child = "LED-TSB2835-300-24-6000-0305"
+
+        self.assertTrue(_is_strip_sku(master, ""))
+        self.assertTrue(_is_strip_sku(child, ""))
+        self.assertEqual(
+            _parse_strip_base(master),
+            ("LED-TSB2835-300-24-6000", 100.0),
+        )
+        self.assertEqual(
+            _parse_strip_base(child),
+            ("LED-TSB2835-300-24-6000", 0.305),
         )
 
 

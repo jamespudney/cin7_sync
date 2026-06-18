@@ -59,6 +59,7 @@ from engine.sku_rules import _parse_tube_sku
 from engine.sku_rules import parse_sourcing_rule
 from engine.reorder_math import (
     excess_units_over_target,
+    fractional_bulk_order_allowed,
     normalise_planning_quantity,
 )
 from storage_dimensions import (
@@ -10453,14 +10454,13 @@ elif page == "Ordering":
         unfulfilled = float(row.get("unfulfilled") or 0)
         # Fractional ordering — for bulk-roll masters where the supplier
         # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
-        # rounding up to 1 full 100m roll). The supplier-level
-        # `allow_fractional_qty` config flag gates this — defaults to
-        # True, but suppliers like Topmet that only sell full rolls can
-        # set it to False to keep integer ordering.
+        # rounding up to 1 full 100m roll). Neonica's 100m rolls are
+        # explicitly fractional; other suppliers use the supplier-level
+        # `allow_fractional_qty` config flag, defaulting to True.
         is_bulk = bool(row.get("is_bulk_master", False))
-        supplier_allows_frac = bool(cfg.get("allow_fractional_qty", True))
-        use_fractional = is_bulk and supplier_allows_frac
         bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
+        use_fractional = fractional_bulk_order_allowed(
+            supplier, is_bulk, bulk_len_m, cfg)
         planning_onhand = normalise_planning_quantity(
             onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
         planning_available = normalise_planning_quantity(
