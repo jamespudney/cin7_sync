@@ -366,6 +366,13 @@ copies of the same CIN7 exports in memory. If Render still reports
 OOM, inspect live memory metrics before increasing the instance size
 or moving more computations into the background worker.
 
+Ordering-page reorder calculations are also split into two layers:
+numeric fields (`target_stock`, `reorder_qty`, `lead_time_days`,
+`excess_units`, etc.) are computed table-wide, but the long markdown
+`calc_trace` is built lazily only for the SKU currently being inspected.
+Do not store `calc_trace` on `engine_df`; thousands of per-SKU markdown
+strings can push the Render web instance over memory.
+
 #### Cost basis chain — how the engine values stock (v2.67.180)
 The engine values inventory at `OnHand × EffectiveUnitCost`.
 EffectiveUnitCost is resolved per SKU via a fall-back chain — the
