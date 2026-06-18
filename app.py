@@ -10214,9 +10214,10 @@ elif page == "Ordering":
     _FREIGHT_SEA_LEN_MIN_MM = 2950.0
     _FREIGHT_SEA_LEN_MAX_MM = 3050.0
 
-    def _compute_target_and_reorder(row: pd.Series) -> dict:
+    def _compute_target_and_reorder(row: pd.Series,
+                                    include_trace: bool = False) -> dict:
         """Return dict with target_stock, reorder_qty, lead_time_used,
-        freight_mode_used, calc_trace (markdown-ready)."""
+        freight_mode_used, and optionally calc_trace (markdown-ready)."""
         supplier = row.get("Supplier") or ""
         # v2.67.349 — normalise the engine-side supplier string before
         # lookup to match db.all_supplier_configs's now-normalised
@@ -10589,6 +10590,17 @@ elif page == "Ordering":
             bulk_length_m=bulk_len_m,
         )
         excess_value = excess_units * row["AverageCost"]
+        result = {
+            "target_stock": target,
+            "reorder_qty": reorder,
+            "lead_time_days": lead_time_days,
+            "freight_mode": freight_mode_used,
+            "excess_units": excess_units,
+            "excess_value": excess_value,
+        }
+        if not include_trace:
+            return result
+
         residue_note = ""
         if is_bulk and bulk_len_m > 0:
             ignored = []
@@ -10983,15 +10995,8 @@ elif page == "Ordering":
             f"**Excess stock** (over target): {excess_units:.0f} units × "
             f"${row['AverageCost']:.2f} = **${excess_value:,.0f} tied up**"
         )
-        return {
-            "target_stock": target,
-            "reorder_qty": reorder,
-            "lead_time_days": lead_time_days,
-            "freight_mode": freight_mode_used,
-            "excess_units": excess_units,
-            "excess_value": excess_value,
-            "calc_trace": trace,
-        }
+        result["calc_trace"] = trace
+        return result
 
     # v2.67.289 — skip the apply when nothing changed. engine_df
     # is cached via @st.cache_resource — Streamlit returns the
@@ -11003,8 +11008,7 @@ elif page == "Ordering":
     # rebuild that was spiking memory and crashing Render on every
     # navigation, holiday save, and cadence save.
     _reorder_cols = ("target_stock", "reorder_qty", "lead_time_days",
-                       "freight_mode", "excess_units", "excess_value",
-                       "calc_trace")
+                       "freight_mode", "excess_units", "excess_value")
     try:
         _cache_sig = json.dumps({
             "supp": supp_configs,
@@ -11028,9 +11032,12 @@ elif page == "Ordering":
         engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
         engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
         engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
-        engine_df["calc_trace"] = applied.apply(lambda x: x["calc_trace"])
         if _cache_sig is not None:
             st.session_state["_reorder_apply_sig"] = _cache_sig
+    # Never keep per-SKU markdown traces on the table DataFrame. They are
+    # large and only one is viewed at a time, so Inspect builds them lazily.
+    if "calc_trace" in engine_df.columns:
+        engine_df = engine_df.drop(columns=["calc_trace"])
 
     # Dropship override: these SKUs are order-on-demand. Zero the target
     # and reorder, override Status badge, leave everything else (sales
@@ -11250,7 +11257,8 @@ elif page == "Ordering":
             f"{float(_r.get('lead_time_days') or 0):.0f}d "
             f"({_r.get('freight_mode') or '—'})"
         )
-        _trace = _r.get("calc_trace")
+        _trace = _compute_target_and_reorder(
+            _r, include_trace=True).get("calc_trace")
         if isinstance(_trace, str) and _trace.strip():
             with st.expander("Full reorder math", expanded=False):
                 st.markdown(_trace)
@@ -15804,7 +15812,9 @@ elif page == "Ordering":
 
         # --- Calculation trace below chart ---
         st.markdown("#### :gear: Reorder calculation")
-        st.markdown(row_detail["calc_trace"])
+        row_trace = _compute_target_and_reorder(
+            row_detail, include_trace=True).get("calc_trace", "")
+        st.markdown(row_trace)
 
 
 # ---------------------------------------------------------------------------

@@ -161,6 +161,11 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   the columns the dashboard/AI actually consume. Cold ABC-engine
   rebuilds now start from leaner DataFrames instead of full-width CSV
   snapshots.
+- **Ordering calc-trace memory hardening** — Ordering still computes
+  numeric target/reorder/excess fields table-wide, but now builds the
+  long markdown `calc_trace` only for the SKU being inspected. This
+  avoids storing thousands of large explanation strings on `engine_df`
+  during cold Render page loads.
 - **Bulk-roll residue floor** — bulk-roll masters now treat less than
   5m worth of residual stock/target/position as zero for reorder,
   excess, out-of-stock, and Status calculations. Fixes 100m rolls with

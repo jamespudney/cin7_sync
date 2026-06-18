@@ -120,6 +120,21 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_read_csv_lean(base_file, _PURCHASE_LINES_USECOLS",
                       script)
 
+    def test_ordering_reorder_trace_is_built_lazily(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        reorder_cols_start = script.index("_reorder_cols = (")
+        reorder_cols_end = script.index(")", reorder_cols_start)
+        reorder_cols_block = script[reorder_cols_start:reorder_cols_end]
+
+        self.assertNotIn("calc_trace", reorder_cols_block)
+        self.assertIn("include_trace: bool = False", script)
+        self.assertIn('engine_df = engine_df.drop(columns=["calc_trace"])',
+                      script)
+        self.assertIn("include_trace=True).get(\"calc_trace\")", script)
+
 
 class ReorderMathTests(unittest.TestCase):
     def test_bulk_roll_residue_is_ignored_for_planning(self) -> None:
