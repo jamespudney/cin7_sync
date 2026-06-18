@@ -492,6 +492,16 @@ basis for each term — so when the engine suggests fewer units
 than before, the buyer can see exactly why ("you reorder Topmet
 every 7d", "Topmet closed Wk 32–34: +14d cover").
 
+#### Bulk-roll residue floor
+For bulk-roll masters (50m/100m rolls), any stock, target, or PO
+position below **5m worth of roll** is treated as operationally zero
+for reorder, excess, out-of-stock, and Status calculations. Example:
+0.0025 of a 100m roll is only 0.25m left. CIN7 may carry that decimal
+because cuts/assemblies consumed a roll fraction, but the Ordering
+page must not call it "Overstocked" or show dollars tied up. The Inspect
+panel prints a note when it ignores this residue. Meaningful remnants
+above 5m still count and can surface as cleanup stock.
+
 #### Monthly Metrics — formulas & commission caveats (v2.67.290)
 The Monthly Metrics page is the commission base, so every metric
 needs to be auditable. The full methodology lives in an in-app

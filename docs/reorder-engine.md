@@ -70,6 +70,11 @@ Where:
   for what's currently in a local PO draft (since drafts may not
   be submitted). The Ordering page shows the qty already in your
   draft as a separate column.
+- **Bulk-roll residue** — for 50m/100m master rolls, less than 5m
+  worth of stock/target/position is treated as zero for planning.
+  This prevents tiny CIN7 decimal leftovers (for example 0.0025 of
+  a 100m roll) from showing as overstock or hiding an effectively
+  out-of-stock item.
 - **Override flags** — `db.sku_policy_overrides` rows take
   precedence over the engine's suggestion if present.
 

@@ -37,6 +37,11 @@ from engine.sku_rules import (
     _parse_tube_sku,
     parse_sourcing_rule,
 )
+from engine.reorder_math import (
+    bulk_residue_floor_units,
+    excess_units_over_target,
+    normalise_planning_quantity,
+)
 from storage_dimensions import extract_storage_dim
 
 
@@ -114,6 +119,39 @@ class AppMemoryStructureTests(unittest.TestCase):
                       script)
         self.assertIn("_read_csv_lean(base_file, _PURCHASE_LINES_USECOLS",
                       script)
+
+
+class ReorderMathTests(unittest.TestCase):
+    def test_bulk_roll_residue_is_ignored_for_planning(self) -> None:
+        # LED-KP24-6000K-IP20-100M showed ~0.0025 of a 100m roll
+        # left: visually 0 rolls, but enough for the old status rule to
+        # say "Overstocked" when target was 0.
+        self.assertEqual(
+            bulk_residue_floor_units(True, 100),
+            0.05,
+        )
+        self.assertEqual(
+            normalise_planning_quantity(
+                0.0025, is_bulk_master=True, bulk_length_m=100),
+            0.0,
+        )
+        self.assertEqual(
+            excess_units_over_target(
+                0.0025, 0, is_bulk_master=True, bulk_length_m=100),
+            0.0,
+        )
+
+    def test_meaningful_bulk_stock_still_counts(self) -> None:
+        self.assertEqual(
+            normalise_planning_quantity(
+                0.08, is_bulk_master=True, bulk_length_m=100),
+            0.08,
+        )
+        self.assertEqual(
+            excess_units_over_target(
+                0.08, 0, is_bulk_master=True, bulk_length_m=100),
+            0.08,
+        )
 
 
 class DataCatalogTests(unittest.TestCase):
