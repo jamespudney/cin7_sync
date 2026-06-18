@@ -37,6 +37,7 @@ from engine.sku_rules import (
     _parse_tube_sku,
     parse_sourcing_rule,
 )
+from engine.sku_movement_audit import build_strip_movement_audit
 from engine.reorder_math import (
     bulk_residue_floor_units,
     excess_units_over_target,
@@ -210,6 +211,71 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertEqual(
             _parse_strip_base(child),
             ("LED-TSB2835-300-24-6000", 0.305),
+        )
+
+    def test_strip_movement_audit_rolls_child_sales_to_100m_master(self) -> None:
+        products = pd.DataFrame([
+            {
+                "SKU": "LEDIRISRGBCW-11.8-IP20-100M",
+                "Name": "RGB CW Iris 100m",
+            },
+            {
+                "SKU": "LEDIRISRGBCW-11.8-IP20-0305",
+                "Name": "RGB CW Iris 305mm cut",
+            },
+            {
+                "SKU": "LEDIRISRGBCW-11.8-IP20-5M",
+                "Name": "RGB CW Iris 5m",
+            },
+        ])
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": "LEDIRISRGBCW-11.8-IP20-0305",
+                "InvoiceDate": "2026-06-01",
+                "Quantity": 10,
+                "Customer": "Customer A",
+                "CustomerID": "A",
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LEDIRISRGBCW-11.8-IP20-5M",
+                "InvoiceDate": "2026-05-01",
+                "Quantity": 2,
+                "Customer": "Customer B",
+                "CustomerID": "B",
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LEDIRISRGBCW-11.8-IP20-100M",
+                "InvoiceDate": "2026-04-01",
+                "Quantity": 0.4,
+                "Customer": "Customer A",
+                "CustomerID": "A",
+                "Status": "AUTHORISED",
+            },
+        ])
+
+        audit = build_strip_movement_audit(
+            "LEDIRISRGBCW-11.8-IP20-100M",
+            products,
+            sale_lines,
+            today=pd.Timestamp("2026-06-18"),
+        )
+
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["base"], "LEDIRISRGBCW-11.8-IP20")
+        self.assertAlmostEqual(
+            audit["summary"]["direct_master_rolls_12mo"],
+            0.4,
+        )
+        # 10 x 0.305m + 2 x 5m = 13.05m = 0.1305 of a 100m roll.
+        self.assertAlmostEqual(
+            audit["summary"]["child_master_rolls_12mo"],
+            0.1305,
+        )
+        self.assertAlmostEqual(
+            audit["summary"]["total_master_rolls_12mo"],
+            0.5305,
         )
 
 

@@ -179,6 +179,10 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 - **Neonica 100m fractional ordering guard** — Neonica 100m bulk rolls
   remain decimal-orderable (`0.40` for 40m) even if supplier config is
   later tightened for full-roll-only suppliers.
+- **Strip family movement audit** — Ordering Inspect now shows synced
+  CIN7 sale-line movement for strip families in master-roll equivalents,
+  including direct master sales, child/cut rollup, recent family rows,
+  and top-customer concentration.
 - **PO dispatch + receipt correctness** — dispatch reminders are
   line-level by SO/SKU and PO commentary now uses CIN7 StockReceived
   fields for PO-specific receipt wording rather than global stock

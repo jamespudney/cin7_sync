@@ -631,6 +631,14 @@ the rollup, check concentration/project logic: one-customer demand may
 be shown for manual review rather than converted into an automatic
 buy.
 
+The Ordering Inspect panel includes a **Strip family movement audit**
+for these rows. It reads the synced CIN7 `sale_lines`, excludes credited
+/ voided / cancelled lines, and shows direct master sales plus child/cut
+sales normalised into master-roll equivalents. For a 100m roll, 40m of
+family movement appears as `0.40` roll equivalent. The audit also shows
+the top customer's share so buyers can tell whether a zero reorder is
+coming from missing movement or from project/concentration logic.
+
 #### Monthly Metrics — formulas & commission caveats (v2.67.290)
 The Monthly Metrics page is the commission base, so every metric
 needs to be auditable. The full methodology lives in an in-app

@@ -86,6 +86,9 @@ Where:
   `LED-TSB`, are parsed by SKU rather than relying on product-title
   wording. Short-cut suffixes such as `0305` are converted to metres
   and rolled into the longest/bulk master in the same base family.
+  The Ordering Inspect panel's strip movement audit shows the exact
+  synced CIN7 sale lines behind that rollup, normalised to master-roll
+  equivalents, plus top-customer concentration.
 - **Override flags** — `db.sku_policy_overrides` rows take
   precedence over the engine's suggestion if present.
 

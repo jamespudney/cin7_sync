@@ -62,6 +62,7 @@ from engine.reorder_math import (
     fractional_bulk_order_allowed,
     normalise_planning_quantity,
 )
+from engine.sku_movement_audit import build_strip_movement_audit
 from storage_dimensions import (
     ensure_storage_dim_column,
     storage_dim_source_columns,
@@ -11262,6 +11263,96 @@ elif page == "Ordering":
         if isinstance(_trace, str) and _trace.strip():
             with st.expander("Full reorder math", expanded=False):
                 st.markdown(_trace)
+
+        # Live synced movement audit for LED strip / bulk-roll families.
+        # This answers the operational question that raw same-SKU rows
+        # cannot: "which child/cut SKUs are actually feeding this 100m
+        # roll's demand, and does the top-customer/project signal explain
+        # a zero reorder suggestion?"
+        try:
+            _audit = build_strip_movement_audit(_sku, products, sale_lines)
+            if _audit.get("ok"):
+                _summary = _audit.get("summary", {})
+                _master_len = float(_audit.get("master_length_m") or 0)
+                with st.expander(
+                    "Strip family movement audit "
+                    f"({int(_master_len) if _master_len else 'master'}m "
+                    "roll equivalents)",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Source: synced CIN7 sale_lines. Credited, voided, "
+                        "and cancelled lines are excluded, matching the ABC "
+                        "engine's demand filter.")
+                    _a = st.columns(5)
+                    _a[0].metric(
+                        "Direct 12mo",
+                        f"{float(_summary.get('direct_master_rolls_12mo') or 0):.2f}")
+                    _a[1].metric(
+                        "Child/cut rollup",
+                        f"{float(_summary.get('child_master_rolls_12mo') or 0):.2f}")
+                    _a[2].metric(
+                        "Family total",
+                        f"{float(_summary.get('total_master_rolls_12mo') or 0):.2f}")
+                    _a[3].metric(
+                        "Metres",
+                        f"{float(_summary.get('total_metres_12mo') or 0):.0f}")
+                    _a[4].metric(
+                        "Last family sale",
+                        str(_summary.get("last_family_sale") or "—"))
+
+                    _top_pct = float(
+                        _summary.get("top_customer_pct_12mo") or 0)
+                    st.markdown(
+                        f"**Family base:** `{_audit.get('base')}`  \n"
+                        f"**Top customer:** "
+                        f"{_summary.get('top_customer') or '—'} "
+                        f"({float(_summary.get('top_customer_rolls_12mo') or 0):.2f} "
+                        f"roll equivalents, {_top_pct:.0f}% of 12mo family movement)"
+                    )
+
+                    _family_rows = _audit.get("family_rows")
+                    if isinstance(_family_rows, pd.DataFrame) and not _family_rows.empty:
+                        st.dataframe(
+                            _family_rows,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=260,
+                            column_config={
+                                "Length m": st.column_config.NumberColumn(
+                                    format="%.3g"),
+                                "12mo qty": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                                "90d qty": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                                "45d qty": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                                "12mo metres": st.column_config.NumberColumn(
+                                    format="%.1f"),
+                                "Master roll equiv": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                            },
+                        )
+
+                    _recent_rows = _audit.get("recent_rows")
+                    if isinstance(_recent_rows, pd.DataFrame) and not _recent_rows.empty:
+                        with st.expander(
+                            f"Recent family sale lines ({len(_recent_rows)} shown)",
+                            expanded=False,
+                        ):
+                            st.dataframe(
+                                _recent_rows,
+                                hide_index=True,
+                                use_container_width=True,
+                                height=280,
+                                column_config={
+                                    "Master roll equiv":
+                                        st.column_config.NumberColumn(
+                                            format="%.3f"),
+                                },
+                            )
+        except Exception:  # noqa: BLE001
+            pass
 
         # v2.67.332 — raw sale_lines records for THIS SKU, post-dedup.
         # Lets staff (and Claude) see exactly which records the engine
