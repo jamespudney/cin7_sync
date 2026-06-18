@@ -70,6 +70,33 @@ def _find_latest_csv(pattern: str) -> Optional[Path]:
     return Path(max(matches, key=os.path.getmtime))
 
 
+def _find_widest_window_csv(pattern: str,
+                            prefix: str) -> Optional[Path]:
+    """Pick the widest rolling-window CSV, newest within that window."""
+    best = None
+    best_days = -1
+    best_mtime = -1.0
+    pat = re.compile(rf"{re.escape(prefix)}_(\d+)d_", re.IGNORECASE)
+    for path in glob.glob(str(OUTPUT_DIR / pattern)):
+        p = Path(path)
+        m = pat.search(p.name)
+        if not m:
+            continue
+        try:
+            days = int(m.group(1))
+        except ValueError:
+            continue
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            mtime = 0.0
+        if days > best_days or (days == best_days and mtime > best_mtime):
+            best = p
+            best_days = days
+            best_mtime = mtime
+    return best
+
+
 def _load_indexes() -> None:
     """Build SO→Shopify and Shopify-#→Shopify-id lookup tables.
     Cached for _CACHE_TTL_S. Re-runs on TTL expiry."""
@@ -85,7 +112,8 @@ def _load_indexes() -> None:
     # from production CSV: SaleID (UUID) + OrderNumber (SO-) +
     # CustomerReference (the Shopify Order # as '#42514').
     # Earlier code searched 'ID' and 'Reference' which don't exist.
-    sales_path = _find_latest_csv("sales_last_*d_*.csv")
+    sales_path = _find_widest_window_csv(
+        "sales_last_*d_*.csv", "sales_last")
     if sales_path:
         try:
             df = pd.read_csv(sales_path, low_memory=False)

@@ -324,6 +324,16 @@ different item, but the PO-linked SKU has already shipped/invoiced, the PO
 is stamped as handled and no "STILL hasn't shipped" alert is sent for that
 line.
 
+#### PO receipt wording
+For PO commentary, `Available`, `OnHand`, `Allocated`, and `OnOrder` are
+global stock-position fields across all sales and POs. They must not be
+used as proof that a specific PO line was received. Only the PO receipt
+fields (`quantity_received_on_po`, `quantity_outstanding_on_po`,
+`receipt_status_on_po`) describe what CIN7 has recorded against that PO's
+StockReceived tasks. If receipt status is `not_recorded`, say CIN7 has no
+StockReceived lines visible for that PO and treat global Available only as
+shortage context.
+
 #### Local sync windows (v2.67.51)
 The AI's transaction tools read from local CSVs the daily sync
 drops:
@@ -332,6 +342,10 @@ drops:
   file is used as the base, with newer 1-day files merged on top.
 - **Sale lines** — 30-day rolling window (bumped from 3d in
   v2.67.43). Plus the 1825-day longest-history file when present.
+- **Slack worker sale headers** — 365-day rolling window. Backorder
+  SOs can be more than a month old, so the worker keeps a wider
+  header index to resolve `SO-xxxxx` to a CIN7 SaleID, then uses live
+  CIN7 lookup for line detail when the local sale-line window misses.
 - **Stock adjustments** — 30-day window, headers only (no per-SKU
   line detail in the bulk endpoint).
 - **Stock-on-hand `OnOrder` field** — the canonical PO total,

@@ -1142,7 +1142,17 @@ def _build_slack_system_prompt(channel_intent: str) -> str:
             "demand hierarchy from case (a): 45d first, never "
             "call dormant if recent activity exists, always "
             "surface ip_notes.\n"
-            "5. If BOTH get_purchase_order AND get_purchase_live fail, "
+            "5. **Receipt / arrived wording:** never infer that a PO "
+            "line was received from `Available`, `OnHand`, or "
+            "`on_hand_now`; those are global stock-position fields "
+            "after all sales/allocations/other POs. Only say a PO "
+            "line was received or remains outstanding when the tool "
+            "returns `quantity_received_on_po`, "
+            "`quantity_outstanding_on_po`, or `receipt_status_on_po`. "
+            "If `receipt_status_on_po` is `not_recorded`, say CIN7 "
+            "has no StockReceived lines visible for that PO and use "
+            "Available only as current shortage context.\n"
+            "6. If BOTH get_purchase_order AND get_purchase_live fail, "
             "surface the API-visibility gap without asking the user "
             "to paste SKU lines. Say which lookup failed and ask them "
             "to save/refresh the PO in CIN7, then repost or retry the "
@@ -1330,6 +1340,37 @@ _LISTENER_DATA_CACHE: Dict[str, Any] = {
 DATA_CACHE_TTL_SECONDS = 600  # 10 min — listener can run staler than UI
 
 
+def _widest_window_file(paths: List[str],
+                        prefix: str) -> Optional[str]:
+    """Pick the widest rolling-window CSV, newest within that window.
+
+    Plain lexicographic sorting puts `*_3d_*` after `*_30d_*`, which can
+    make the worker load a 3-day sale window while claiming it has 30 days
+    of context.
+    """
+    best_path = None
+    best_days = -1
+    best_mtime = -1.0
+    pat = re.compile(rf"{re.escape(prefix)}_(\d+)d_", re.IGNORECASE)
+    for p in paths:
+        m = pat.search(Path(p).name)
+        if not m:
+            continue
+        try:
+            days = int(m.group(1))
+        except ValueError:
+            continue
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            mtime = 0.0
+        if days > best_days or (days == best_days and mtime > best_mtime):
+            best_path = p
+            best_days = days
+            best_mtime = mtime
+    return best_path
+
+
 def _get_data_for_listener() -> Tuple[Any, Any]:
     """Load (and cache) the data the AI tools need. Reads CSVs
     directly — bypasses Streamlit's @cache_resource since this is
@@ -1351,13 +1392,18 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         # search_products_by_text can work against.
         prod_files = sorted(_glob.glob(str(OUTPUT_DIR / "products_*.csv")))
         stk_files = sorted(_glob.glob(str(OUTPUT_DIR / "stock_on_hand_*.csv")))
-        sl_files = sorted(_glob.glob(str(OUTPUT_DIR / "sale_lines_last_*d_*.csv")))
+        sl_files = _glob.glob(str(OUTPUT_DIR / "sale_lines_last_*d_*.csv"))
+        sl_path = _widest_window_file(sl_files, "sale_lines_last")
         if not prod_files or not stk_files:
             log.warning("No products/stock CSV available for listener")
             return (None, None)
         products = pd.read_csv(prod_files[-1], low_memory=False)
         stock = pd.read_csv(stk_files[-1], low_memory=False)
-        sale_lines = pd.read_csv(sl_files[-1], low_memory=False) if sl_files else pd.DataFrame()
+        sale_lines = (
+            pd.read_csv(sl_path, low_memory=False)
+            if sl_path else pd.DataFrame())
+        if sl_path:
+            log.info("Listener loaded sale lines from %s", Path(sl_path).name)
 
         # v2.67.69 — full engine intelligence on the worker.
         # Earlier versions merged products+stock for a slim engine_df
@@ -1397,9 +1443,14 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
             import ai_tools
             import gc
             ai_tools.set_products(products)
-            pl_files = sorted(_glob.glob(str(OUTPUT_DIR / "purchase_lines_last_*d_*.csv")))
-            if pl_files:
-                ai_tools.set_purchase_lines(pd.read_csv(pl_files[-1], low_memory=False))
+            pl_files = _glob.glob(
+                str(OUTPUT_DIR / "purchase_lines_last_*d_*.csv"))
+            pl_path = _widest_window_file(pl_files, "purchase_lines_last")
+            if pl_path:
+                log.info("Listener loaded purchase lines from %s",
+                         Path(pl_path).name)
+                ai_tools.set_purchase_lines(
+                    pd.read_csv(pl_path, low_memory=False))
             # v2.67.61 — memory fix. The Render Starter worker plan
             # has only 512 MB RAM. shipments_full.csv (43k rows) +
             # shopify_orders_full.csv (24k rows) + everything else
@@ -1414,9 +1465,12 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
             # questions are about recent stuff anyway. For older
             # transactions the bot can suggest the user check the
             # source system directly.
-            sh_recent = sorted(_glob.glob(str(OUTPUT_DIR / "shipments_last_*d_*.csv")))
-            if sh_recent:
-                ai_tools.set_shipments(pd.read_csv(sh_recent[-1], low_memory=False))
+            sh_recent = _glob.glob(
+                str(OUTPUT_DIR / "shipments_last_*d_*.csv"))
+            sh_path = _widest_window_file(sh_recent, "shipments_last")
+            if sh_path:
+                ai_tools.set_shipments(
+                    pd.read_csv(sh_path, low_memory=False))
             else:
                 # No windowed file → fall back to full but warn.
                 sh_full = OUTPUT_DIR / "shipments_full.csv"
@@ -1426,11 +1480,12 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
                         "Memory pressure risk on 512MB plans.")
                     ai_tools.set_shipments(
                         pd.read_csv(sh_full, low_memory=False))
-            so_recent = sorted(_glob.glob(
-                str(OUTPUT_DIR / "shopify_orders_last_*d_*.csv")))
-            if so_recent:
+            so_recent = _glob.glob(
+                str(OUTPUT_DIR / "shopify_orders_last_*d_*.csv"))
+            so_path = _widest_window_file(so_recent, "shopify_orders_last")
+            if so_path:
                 ai_tools.set_shopify_orders(
-                    pd.read_csv(so_recent[-1], low_memory=False))
+                    pd.read_csv(so_path, low_memory=False))
             else:
                 so_full = OUTPUT_DIR / "shopify_orders_full.csv"
                 if so_full.exists():

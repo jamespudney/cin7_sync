@@ -9,7 +9,7 @@
 # via in-loop NearSync calls.
 #
 # Lifecycle:
-#   1. First boot: if /data is empty, run a 30-day data bootstrap
+#   1. First boot: if /data is empty, run a data bootstrap
 #      (~30-60 min) so the listener has CSVs to read.
 #   2. Steady state: loop forever, alternating between:
 #        (a) Slack poll → ingest new messages → DB
@@ -98,10 +98,10 @@ fi
 # composer gracefully says "data not loadable" — bot stays silent
 # on data-heavy questions until bootstrap finishes.
 #
-# Bootstrap window: 30 days of data. Captures recent transactions
-# without the full 5-year backfill the web service's manual pull
-# does. Sufficient for "where's INV-XXX" / "what's on PO-YYY" /
-# "do we have warm white in stock" questions.
+# Bootstrap windows: 365 days of sale headers for older backorder SO
+# lookup, 30 days of line-level transaction detail for worker memory/API
+# cost. Older SO detail can then be fetched live from CIN7 once the SO
+# header resolves to a SaleID.
 needs_bootstrap=0
 if ! ls "${DATA_DIR}"/output/products_*.csv >/dev/null 2>&1; then
     needs_bootstrap=1
@@ -119,6 +119,10 @@ if [ "$needs_bootstrap" = "1" ]; then
         echo "[$(stamp)] cin7_sync quick --days 30" >> "$LOG"
         python cin7_sync.py quick --days 30 >> "$LOG" 2>&1 || \
             echo "[$(stamp)] cin7_sync.quick FAILED (continuing)" >> "$LOG"
+
+        echo "[$(stamp)] cin7_sync sales --days 365" >> "$LOG"
+        python cin7_sync.py sales --days 365 >> "$LOG" 2>&1 || \
+            echo "[$(stamp)] cin7_sync.sales365 FAILED" >> "$LOG"
 
         echo "[$(stamp)] cin7_sync salelines --days 30" >> "$LOG"
         python cin7_sync.py salelines --days 30 >> "$LOG" 2>&1 || \
@@ -255,7 +259,7 @@ while true; do
                                 2>/dev/null; then
             echo "[$(stamp)] daily refresh still running (pid=$(cat "$DIM_REFRESH_PID_FILE")); skipping" >> "$LOG"
         else
-            echo "[$(stamp)] launching daily 30d refresh chain in BACKGROUND" >> "$LOG"
+            echo "[$(stamp)] launching daily worker data refresh chain in BACKGROUND" >> "$LOG"
             last_dim_refresh_epoch=$(date -u +%s)
             (
                 if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
@@ -269,8 +273,8 @@ while true; do
                     echo "[$(stamp)] [bg] cin7 salelines 30d" >> "$LOG"
                     python cin7_sync.py salelines --days 30 \
                         >> "$LOG" 2>&1 || true
-                    echo "[$(stamp)] [bg] cin7 sales 30d" >> "$LOG"
-                    python cin7_sync.py sales --days 30 \
+                    echo "[$(stamp)] [bg] cin7 sales 365d" >> "$LOG"
+                    python cin7_sync.py sales --days 365 \
                         >> "$LOG" 2>&1 || true
                     echo "[$(stamp)] [bg] cin7 purchaselines 30d" >> "$LOG"
                     python cin7_sync.py purchaselines --days 30 \
