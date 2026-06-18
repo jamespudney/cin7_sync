@@ -57,6 +57,10 @@ from engine.sku_rules import _parse_length
 from engine.sku_rules import _parse_strip_base
 from engine.sku_rules import _parse_tube_sku
 from engine.sku_rules import parse_sourcing_rule
+from engine.reorder_math import (
+    excess_units_over_target,
+    normalise_planning_quantity,
+)
 from storage_dimensions import (
     ensure_storage_dim_column,
     storage_dim_source_columns,
@@ -10446,6 +10450,24 @@ elif page == "Ordering":
         available = float(row.get("Available") or 0)
         on_order = row["OnOrder"]
         unfulfilled = float(row.get("unfulfilled") or 0)
+        # Fractional ordering — for bulk-roll masters where the supplier
+        # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
+        # rounding up to 1 full 100m roll). The supplier-level
+        # `allow_fractional_qty` config flag gates this — defaults to
+        # True, but suppliers like Topmet that only sell full rolls can
+        # set it to False to keep integer ordering.
+        is_bulk = bool(row.get("is_bulk_master", False))
+        supplier_allows_frac = bool(cfg.get("allow_fractional_qty", True))
+        use_fractional = is_bulk and supplier_allows_frac
+        bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
+        planning_onhand = normalise_planning_quantity(
+            onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        planning_available = normalise_planning_quantity(
+            available, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        planning_on_order = normalise_planning_quantity(
+            on_order, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        target_for_position = normalise_planning_quantity(
+            target, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
         # Effective position = what we'll actually have for future demand.
         #
         # v2.67.319 — Available ALREADY nets Allocated (CIN7's calc:
@@ -10461,19 +10483,8 @@ elif page == "Ordering":
         # the earlier 29-vs-16 reorder inflation). `unfulfilled` is now
         # kept purely for DISPLAY (the Backorders column); it is no
         # longer a term in the reorder math.
-        effective_pos = available + on_order
-        shortfall = max(0, target - effective_pos)
-
-        # Fractional ordering — for bulk-roll masters where the supplier
-        # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
-        # rounding up to 1 full 100m roll). The supplier-level
-        # `allow_fractional_qty` config flag gates this — defaults to
-        # True, but suppliers like Topmet that only sell full rolls can
-        # set it to False to keep integer ordering.
-        is_bulk = bool(row.get("is_bulk_master", False))
-        supplier_allows_frac = bool(cfg.get("allow_fractional_qty", True))
-        use_fractional = is_bulk and supplier_allows_frac
-        bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
+        effective_pos = planning_available + planning_on_order
+        shortfall = max(0, target_for_position - effective_pos)
 
         def _snap_to_10m(value, length_m):
             """Round a fractional reorder qty to the nearest 10m equivalent.
@@ -10569,9 +10580,40 @@ elif page == "Ordering":
         if reorder > 0 and moq and reorder < moq and not use_fractional:
             reorder = int(moq)
 
-        # Excess = OnHand beyond target
-        excess_units = max(0, onhand - target)
+        # Excess = OnHand beyond target. For bulk masters, ignore
+        # non-actionable residue below 5m so 0.002 rolls left on a 100m
+        # SKU doesn't show as "Overstocked" / "$5 tied up".
+        excess_units = excess_units_over_target(
+            onhand, target,
+            is_bulk_master=is_bulk,
+            bulk_length_m=bulk_len_m,
+        )
         excess_value = excess_units * row["AverageCost"]
+        residue_note = ""
+        if is_bulk and bulk_len_m > 0:
+            ignored = []
+            for label, raw_val, planning_val in (
+                ("OnHand", onhand, planning_onhand),
+                ("Available", available, planning_available),
+                ("OnOrder", on_order, planning_on_order),
+                ("Target", target, target_for_position),
+            ):
+                try:
+                    raw_f = float(raw_val or 0)
+                    plan_f = float(planning_val or 0)
+                except (TypeError, ValueError):
+                    continue
+                if raw_f and plan_f == 0:
+                    ignored.append(
+                        f"{label} {raw_f:.3f} rolls "
+                        f"(~{raw_f * bulk_len_m:.1f}m)")
+            if ignored:
+                residue_note = (
+                    "- Tiny bulk-roll residue below 5m is treated as "
+                    "0 for reorder, excess, and status calculations: "
+                    + "; ".join(ignored)
+                    + ".\n"
+                )
 
         # Demand breakdown — show migration + tube rollup + assembly
         # contributions. units_12mo here ALREADY INCLUDES assembly
@@ -10920,12 +10962,14 @@ elif page == "Ordering":
             + ("  ← negative = we're over-committed\n"
                if available < 0 else "\n")
             + f"- OnOrder (incoming POs): {on_order:.0f}\n"
-            f"- Backorder (= max(0, Allocated − OnHand), matches CIN7): "
+            + residue_note
+            + f"- Backorder (= max(0, Allocated − OnHand), matches CIN7): "
             f"{unfulfilled:.0f}  ← already reflected in negative "
             f"Available, NOT subtracted again\n"
-            f"- **Effective position**: {available:.0f} + {on_order:.0f} "
+            f"- **Effective position**: {planning_available:.0f} + "
+            f"{planning_on_order:.0f} "
             f"= **{effective_pos:.0f}**\n\n"
-            f"**Suggested reorder**: max(0, {target:.1f} - "
+            f"**Suggested reorder**: max(0, {target_for_position:.1f} - "
             f"{effective_pos:.0f}) = "
             + (f"**{reorder:.2f}** rolls "
                f"(fractional — supplier accepts decimal qtys; "
@@ -11089,7 +11133,7 @@ elif page == "Ordering":
     def _status(r):
         eff = float(r.get("effective_units_12mo",
                             r.get("units_12mo", 0)) or 0)
-        onhand = float(r.get("OnHand") or 0)
+        raw_onhand = float(r.get("OnHand") or 0)
         allocated = float(r.get("Allocated") or 0)
         # v2.67.333 — Status now uses AVAILABLE (= OnHand − Allocated),
         # not OnHand. The old logic compared OnHand to target_stock,
@@ -11111,8 +11155,19 @@ elif page == "Ordering":
         #   🟠 Reorder soon                (Available < target)
         #   🔵 Overstocked                 (Available > target × 1.5)
         #   🟢 On target                   (everything else)
-        available = onhand - allocated
-        target = float(r.get("target_stock") or 0)
+        raw_available = raw_onhand - allocated
+        is_bulk = bool(r.get("is_bulk_master", False))
+        bulk_len_m = float(r.get("bulk_length_m") or 0)
+        onhand = normalise_planning_quantity(
+            raw_onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        available = normalise_planning_quantity(
+            raw_available, is_bulk_master=is_bulk,
+            bulk_length_m=bulk_len_m)
+        target = normalise_planning_quantity(
+            float(r.get("target_stock") or 0),
+            is_bulk_master=is_bulk,
+            bulk_length_m=bulk_len_m,
+        )
         avg_daily = float(r.get("avg_daily") or 0)
         lead_time = float(r.get("lead_time_days") or 0)
         reorder_qty = float(r.get("reorder_qty") or 0)
@@ -11122,6 +11177,12 @@ elif page == "Ordering":
             base = "⚪ No demand, no stock"
         elif eff == 0 and onhand > 0:
             base = "💀 Dead stock"
+        elif target == 0 and reorder_qty <= 0 and available == 0:
+            # Dormant/project SKUs can correctly have target=0 and
+            # reorder=0. If there is also no meaningful stock left, this
+            # is not "Reorder now" and not "Overstocked"; it is simply at
+            # the engine's current target.
+            base = "🟢 On target"
         elif available <= 0:
             # Oversold or no free stock at all — the engine wants you
             # to reorder regardless of the steady-state target. Same
@@ -12667,8 +12728,14 @@ elif page == "Ordering":
         # presence). Without this, the methodology fixes (v2.67.310-317)
         # made every project SKU vanish from its supplier's view, which
         # is what James hit with Neonica's neon/profile products.
-        _out_of_stock = s_df.get(
-            "OnHand", pd.Series(dtype=float)).fillna(0) <= 0
+        _out_of_stock = s_df.apply(
+            lambda r: normalise_planning_quantity(
+                r.get("OnHand", 0),
+                is_bulk_master=bool(r.get("is_bulk_master", False)),
+                bulk_length_m=float(r.get("bulk_length_m") or 0),
+            ) <= 0,
+            axis=1,
+        )
         keep_mask = (
             (s_df["reorder_qty"] > 0)
             | (_is_dropship & _has_any_demand)
