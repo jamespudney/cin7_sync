@@ -708,6 +708,126 @@ class Cin7ClientTests(unittest.TestCase):
 class IncomingStockTests(unittest.TestCase):
     def tearDown(self) -> None:
         ai_tools.set_purchase_lines(pd.DataFrame())
+        ai_tools.set_products(pd.DataFrame())
+
+    def test_purchase_order_lines_include_stock_locator_from_engine(self) -> None:
+        sku = "LED-22.109"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Wall Support Bracket",
+            "StockLocator": "D29B",
+            "Location": "Main Warehouse",
+            "storage_dim": '___ x 1.669" x 1.457"',
+        }])
+        purchase_lines = pd.DataFrame([{
+            "PurchaseID": "7114",
+            "OrderNumber": "PO-7114",
+            "RequiredBy": "2026-06-22",
+            "Status": "INVOICED",
+            "Supplier": "Luz Negra (EUR)",
+            "SKU": sku,
+            "Name": "Wall Support Bracket for Comenza Profile",
+            "Quantity": 7,
+        }])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        result = ai_tools.get_purchase_order(
+            engine_df, pd.DataFrame(), {"po_number": "PO-7114"})
+
+        line = result["purchase_orders"][0]["lines"][0]
+        self.assertEqual(line["stock_locator"], "D29B")
+
+    def test_purchase_order_stock_locator_falls_back_to_product_master(self) -> None:
+        sku = "LED-12.019-5"
+        purchase_lines = pd.DataFrame([{
+            "PurchaseID": "7114",
+            "OrderNumber": "PO-7114",
+            "Status": "INVOICED",
+            "Supplier": "Luz Negra (EUR)",
+            "SKU": sku,
+            "Name": "Round Stainless Steel LED Handrail Profile",
+            "Quantity": 3,
+        }])
+        products = pd.DataFrame([{
+            "SKU": sku,
+            "Name": "Round Stainless Steel LED Handrail Profile",
+            "StockLocator": "A12C",
+            "Location": "Main Warehouse",
+        }])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        ai_tools.set_products(products)
+        result = ai_tools.get_purchase_order(
+            pd.DataFrame(), pd.DataFrame(), {"po_number": "PO-7114"})
+
+        line = result["purchase_orders"][0]["lines"][0]
+        self.assertEqual(line["stock_locator"], "A12C")
+
+    def test_purchase_order_stock_locator_ignores_default_location(self) -> None:
+        sku = "LED-22.109"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "Location": "Main Warehouse",
+        }])
+        purchase_lines = pd.DataFrame([{
+            "PurchaseID": "7114",
+            "OrderNumber": "PO-7114",
+            "Status": "INVOICED",
+            "Supplier": "Luz Negra (EUR)",
+            "SKU": sku,
+            "Name": "Wall Support Bracket",
+            "Quantity": 7,
+        }])
+
+        ai_tools.set_purchase_lines(purchase_lines)
+        result = ai_tools.get_purchase_order(
+            engine_df, pd.DataFrame(), {"po_number": "PO-7114"})
+
+        line = result["purchase_orders"][0]["lines"][0]
+        self.assertIsNone(line["stock_locator"])
+
+    def test_purchase_live_lines_include_stock_locator_from_engine(self) -> None:
+        sku = "LED-22.109"
+        engine_df = pd.DataFrame([{
+            "SKU": sku,
+            "StockLocator": "D29B",
+            "Location": "Main Warehouse",
+            "storage_dim": '___ x 1.669" x 1.457"',
+        }])
+
+        class FakeClient:
+            def __init__(self, account_id, app_key):
+                self.account_id = account_id
+                self.app_key = app_key
+
+            def get_purchase(self, po_ref):
+                self.po_ref = po_ref
+                return {
+                    "ID": "purchase-id",
+                    "OrderNumber": "PO-7114",
+                    "Supplier": "Luz Negra (EUR)",
+                    "Status": "INVOICED",
+                    "Order": {
+                        "Lines": [{
+                            "SKU": sku,
+                            "Name": "Wall Support Bracket",
+                            "Quantity": 7,
+                        }],
+                    },
+                }
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CIN7_ACCOUNT_ID": "acct",
+                "CIN7_APPLICATION_KEY": "key",
+            },
+        ), patch("cin7_sync.Cin7Client", FakeClient):
+            result = ai_tools.get_purchase_live(
+                engine_df, pd.DataFrame(), {"po_number": "PO-7114"})
+
+        line = result["lines"][0]
+        self.assertEqual(line["stock_locator"], "D29B")
 
     def test_incoming_stock_excludes_fully_received_po_balance(self) -> None:
         sku = "LED-89030021-2"

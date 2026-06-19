@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-06-18
+Last updated: 2026-06-19
 
 ---
 
@@ -152,6 +152,14 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 ---
 
 ## Shipped (since 2026-04-30)
+
+### 2026-06-19
+
+- **PO commentary stock locators** — cached PO lookup and live CIN7 PO
+  lookup now attach `stock_locator` to every line when CIN7's Stock
+  locator field is populated. Slack/app commentary guidance says to
+  show it per line and to omit it when blank, never substituting Default
+  location / warehouse Location.
 
 ### 2026-06-18
 

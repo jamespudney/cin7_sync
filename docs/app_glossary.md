@@ -230,9 +230,10 @@ derivatives in favor of the supplier-orderable parent
 would actually order.
 
 #### Bin location
-Warehouse shelf location for each SKU, pulled from `stock_on_hand`
-and surfaced through the AI Assistant's `get_sku_details`. Answers
-"where do we keep X?".
+Warehouse shelf location for each SKU. Source is CIN7's **Stock
+locator** field only; never use Default location / warehouse Location
+as the shelf code. Surfaced through stock-position answers and PO
+commentary lines when known. Answers "where do we keep X?".
 
 #### PO Comments + Shipping notes (v2.67.44, expanded v2.67.52)
 The AI now surfaces FIVE freeform text fields on every PO — each
@@ -317,10 +318,13 @@ The AI Assistant can pull up specific CIN7 documents on demand.
 Three tools, picked by what kind of number the user mentions:
 - **`get_purchase_order(po_number=PO-XXXX)`** — full PO lookup.
   Returns supplier, every line item (SKU / qty / price), Status,
-  Required-By, Comments + Shipping notes. Includes received /
-  closed POs (unlike `get_incoming_stock` which is open-only).
+  Required-By, Comments + Shipping notes, plus per-line stock locator
+  and storage dimension fields. Includes received / closed POs
+  (unlike `get_incoming_stock` which is open-only).
 - **`get_purchase_live(po_number=... / purchase_id=...)`** — live
   CIN7 fallback for fresh or draft POs that are not in the CSV sync yet.
+  It returns the same per-line stock locator and storage dimension
+  fields as the cached PO lookup.
   PurchaseAdvanced UI links carry the CIN7 UUID after `PurchaseAdvanced#`;
   those must be fetched through `/advanced-purchase` first, with legacy
   `/purchase` only as a fallback. If the live API still cannot see the PO,
@@ -353,6 +357,12 @@ fields (`quantity_received_on_po`, `quantity_outstanding_on_po`,
 StockReceived tasks. If receipt status is `not_recorded`, say CIN7 has no
 StockReceived lines visible for that PO and treat global Available only as
 shortage context.
+
+#### PO line stock locators
+PO commentary should append the CIN7 Stock locator to each line when the
+tool returns `stock_locator` (for example `📍 D29B`). If the locator is
+blank/null, omit it. Do not fill the gap with Default location, warehouse
+Location, or any other non-shelf field.
 
 #### Local sync windows (v2.67.51)
 The AI's transaction tools read from local CSVs the daily sync

@@ -652,7 +652,10 @@ TOOL_SCHEMAS: list[dict] = [
             "out the PO Memo wasn't being surfaced. Use this when "
             "the user asks about a SPECIFIC PO ('what's on PO-7109', "
             "'what did we order from Topmet', 'show me purchase "
-            "7042'). Returns `matched`=0 with a note if the PO "
+            "7042'). Each line includes `stock_locator` from CIN7's "
+            "Stock locator field when known; never use Default "
+            "location / warehouse Location as a shelf code. Returns "
+            "`matched`=0 with a note if the PO "
             "isn't in the local sync window — sync covers ~30 "
             "days for line detail."
         ),
@@ -774,7 +777,9 @@ TOOL_SCHEMAS: list[dict] = [
             "created in the last few hours and hasn't synced "
             "yet. PurchaseAdvanced URL UUIDs are fetched through "
             "CIN7's /advanced-purchase endpoint first. Returns each "
-            "line's SKU, name, qty, current OnHand. Slower than "
+            "line's SKU, name, qty, current OnHand, and "
+            "`stock_locator` from CIN7's Stock locator field when "
+            "known. Slower than "
             "get_purchase_order (one CIN7 API call) so ONLY call "
             "this when the cached lookup misses."),
         "input_schema": {
@@ -1818,6 +1823,39 @@ TOOL_SCHEMAS: list[dict] = [
 # page; we don't recompute it per-tool-call (would be too slow).
 # ---------------------------------------------------------------------------
 
+_STOCK_LOCATOR_COLUMNS = (
+    "StockLocator",
+    "Stock Locator",
+    "Stock locator",
+    "stock_locator",
+    "StockLocator_x",
+    "StockLocator_y",
+    "Stock Locator_x",
+    "Stock Locator_y",
+    "StockLocator_stock",
+    "StockLocator_product",
+    "Stock Locator_stock",
+    "Stock Locator_product",
+)
+
+
+def _first_stock_locator_value(row: Any) -> str:
+    """Return CIN7's Stock locator field only; never warehouse Location."""
+    for col in _STOCK_LOCATOR_COLUMNS:
+        val = row.get(col) if hasattr(row, "get") else None
+        if val is None:
+            continue
+        try:
+            if pd.isna(val):
+                continue
+        except (TypeError, ValueError):
+            pass
+        text = str(val).strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            return text
+    return ""
+
+
 def _serialise_row(row: dict) -> dict:
     """Make a row JSON-friendly: convert NaN/None, dates to strings.
     v2.67.51 — list/dict values pass through unchanged so nested
@@ -2705,6 +2743,35 @@ def _storage_dim_from_product_master(sku: str) -> str:
     if dim:
         return dim
     return _storage_dim_from_products_df(sku, _latest_products_df_for_dims())
+
+
+def _stock_locator_from_products_df(sku: str, products_df: Any) -> str:
+    if (
+        products_df is None
+        or getattr(products_df, "empty", True)
+        or "SKU" not in products_df.columns
+    ):
+        return ""
+    sku_norm = str(sku or "").strip().upper()
+    if not sku_norm:
+        return ""
+    try:
+        subset = products_df[
+            products_df["SKU"].astype(str).str.strip().str.upper()
+            == sku_norm
+        ]
+    except Exception:  # noqa: BLE001
+        return ""
+    if subset.empty:
+        return ""
+    return _first_stock_locator_value(subset.iloc[-1])
+
+
+def _stock_locator_from_product_master(sku: str) -> str:
+    loc = _stock_locator_from_products_df(sku, _PRODUCTS_HOLDER.get("df"))
+    if loc:
+        return loc
+    return _stock_locator_from_products_df(sku, _latest_products_df_for_dims())
 
 
 def _storage_dim_match_from_df(query: str, products_df: Any) -> dict:
@@ -4433,10 +4500,19 @@ def get_purchase_order(engine_df: pd.DataFrame,
                     return dim
             return _storage_dim_from_product_master(sku)
 
+        def _stock_locator_for_po_line(sku: str) -> str:
+            row = _eng_map_po.get(str(sku or "").strip().upper())
+            if row is not None:
+                loc = _first_stock_locator_value(row)
+                if loc:
+                    return loc
+            return _stock_locator_from_product_master(sku)
+
         line_rows = []
         for _, lr in gdf.iterrows():
             _lsku = str(lr.get("SKU") or "").strip()
             _storage_dim = _storage_dim_for_po_line(_lsku)
+            _stock_locator = _stock_locator_for_po_line(_lsku)
             line_rows.append(_serialise_row({
                 "sku": _lsku,
                 "name": lr.get("Name"),
@@ -4453,6 +4529,7 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 # Storage dim from engine (v2.67.369 — from synced products CSV)
                 "storage_dim": _storage_dim,
                 "storage_dim_missing": not bool(_storage_dim),
+                "stock_locator": _stock_locator or None,
                 # Engine signals — real data, not AI inference
                 "on_hand_now": _epо(_lsku, "OnHand"),
                 "abc_class": _epо(_lsku, "ABC", ""),
@@ -5095,6 +5172,14 @@ def get_purchase_live(engine_df: pd.DataFrame,
         v = row.get(col)
         return default if v is None or (isinstance(v, float) and __import__("math").isnan(v)) else v
 
+    def _stock_locator_for_live_line(sku: str) -> str:
+        row = eng_map.get(str(sku or "").strip().upper())
+        if row is not None:
+            loc = _first_stock_locator_value(row)
+            if loc:
+                return loc
+        return _stock_locator_from_product_master(sku)
+
     receipt_totals = _purchase_receipts_by_sku(purchase)
     receipt_remaining = {
         sku: float(info.get("quantity") or 0)
@@ -5182,6 +5267,7 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "storage_dim": _sdim,
             "storage_dim_missing": _sdim_missing,
             "storage_dim_incomplete": _sdim_incomplete,
+            "stock_locator": _stock_locator_for_live_line(sku) or None,
             # IP notes — buyer/planner notes from Inventory Planner
             "ip_notes": "; ".join(
                 n["text"] for n in _IP_NOTES_HOLDER.get(sku, [])
@@ -5258,9 +5344,14 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "`trend_flag`, `is_dormant`, `units_12mo`, "
             "`effective_units_12mo`, `units_45d`, `available`, "
             "`on_order`, `allocated`, `excess_units`, "
-            "`suggested_reorder`, `reorder_status`. "
+            "`suggested_reorder`, `reorder_status`, and "
+            "`stock_locator`. "
             "ALWAYS use these fields — NEVER infer demand or "
             "classification from OnHand alone. "
+            "For EVERY line: append `📍 <stock_locator>` when "
+            "`stock_locator` is present. If it is blank/null, omit "
+            "the locator; never substitute Default Location / "
+            "warehouse Location. "
             "If `units_12mo` is 0 but `effective_units_12mo` > 0, "
             "report the effective figure. "
             "If engine data is missing for a SKU (fields null/0), "
