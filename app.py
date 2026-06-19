@@ -1012,7 +1012,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
 <script>
 (() => {
   const ANCHOR_ID = %s;
-  const ENHANCER_VERSION = "drag-pan-v1";
+  const ENHANCER_VERSION = "persistent-row-pan-v1";
   let doc = null;
   try {
     doc = window.parent && window.parent.document;
@@ -1108,13 +1108,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     guide.className = "w4s-ordering-active-row";
     host.appendChild(guide);
 
-    let guideTimer = null;
-
     function hideGuide() {
-      if (guideTimer) {
-        clearTimeout(guideTimer);
-        guideTimer = null;
-      }
       guide.style.opacity = "0";
       setTimeout(() => {
         if (guide.style.opacity === "0") {
@@ -1142,8 +1136,6 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
       requestAnimationFrame(() => {
         guide.style.opacity = "1";
       });
-      if (guideTimer) clearTimeout(guideTimer);
-      guideTimer = setTimeout(hideGuide, 950);
       try { frame.focus({preventScroll: true}); } catch (e) { frame.focus(); }
     }
 
@@ -1193,7 +1185,6 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
           return;
         }
         dragState.dragging = true;
-        hideGuide();
         frame.classList.add("w4s-ordering-dragging");
       }
       dragState.scroller.scrollLeft = dragState.startScrollLeft - dx;
@@ -1207,11 +1198,12 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     }, true);
     frame.addEventListener("pointerleave", hideGuide, true);
     frame.addEventListener("blur", hideGuide, true);
-    frame.addEventListener("scroll", hideGuide, true);
     frame.addEventListener("wheel", (ev) => {
-      hideGuide();
       const sideways = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
-      if (!ev.shiftKey && !sideways) return;
+      if (!ev.shiftKey && !sideways) {
+        hideGuide();
+        return;
+      }
       const dx = sideways ? ev.deltaX : ev.deltaY;
       if (!dx) return;
       if (scrollHoriz(dx)) {
@@ -1230,7 +1222,10 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
       const gridHasFocus = active === frame || frame.contains(active);
       const gridIsHovered = frame.matches(":hover");
       if (!gridHasFocus && !gridIsHovered) return;
-      hideGuide();
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Escape"].includes(
+          ev.key)) {
+        hideGuide();
+      }
       const plainBodyFocus = active === doc.body || active === null;
       const modified = ev.shiftKey || ev.altKey || ev.metaKey;
       if (ev.key === "ArrowRight" && (modified || plainBodyFocus)) {
