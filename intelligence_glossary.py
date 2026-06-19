@@ -457,7 +457,10 @@ are **line-level**: the worker checks whether each specific SO/SKU from
 the PO still needs dispatch. If an SO remains open only because it owes a
 different item, but the PO-linked SKU has already shipped/invoiced, the PO
 is stamped as handled and no "STILL hasn't shipped" alert is sent for that
-line.
+line. If a referenced SO is older than the local sale-line CSV window, the
+worker uses the sales-header SaleID to live-fetch CIN7 sale lines before
+posting, so reminders name confirmed SO/SKU matches instead of telling the
+warehouse to pick unconfirmed orders.
 
 #### PO receipt wording
 For PO commentary, `Available`, `OnHand`, `Allocated`, and `OnOrder` are

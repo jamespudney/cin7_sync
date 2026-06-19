@@ -653,6 +653,76 @@ class PoDispatchReminderTests(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(suppressed, ["SO-57569"])
 
+    def test_build_so_needs_uses_live_sale_lines_when_csv_misses_so(self) -> None:
+        class FakeClient:
+            def get_sale(self, sale_id):
+                self.sale_id = sale_id
+                return {
+                    "Order": {"Lines": [
+                        {"SKU": "LED-22.109", "Quantity": 7},
+                        {"SKU": "LED-OTHER", "Quantity": 1},
+                    ]},
+                }
+
+        sale_cache = {}
+        needs = po_dispatch_reminder._build_so_needs(
+            ["SO-55871"],
+            {"LED-12.019-5", "LED-22.109"},
+            {},
+            {"SO-55871": "sale-uuid"},
+            FakeClient(),
+            sale_cache,
+        )
+
+        self.assertEqual(needs, [("SO-55871", ["LED-22.109"])])
+        self.assertIn("SO-55871", sale_cache)
+
+    def test_build_so_needs_drops_resolved_so_with_no_po_sku_match(self) -> None:
+        class FakeClient:
+            def get_sale(self, sale_id):
+                return {
+                    "Order": {"Lines": [
+                        {"SKU": "LED-NOT-ON-PO", "Quantity": 1},
+                    ]},
+                }
+
+        needs = po_dispatch_reminder._build_so_needs(
+            ["SO-56149"],
+            {"LED-01.014-2", "LED-13.025"},
+            {},
+            {"SO-56149": "sale-uuid"},
+            FakeClient(),
+            {},
+        )
+
+        self.assertEqual(needs, [])
+
+    def test_build_so_needs_keeps_unknown_so_as_unconfirmed(self) -> None:
+        needs = po_dispatch_reminder._build_so_needs(
+            ["SO-55871"],
+            {"LED-12.019-5"},
+            {},
+            {},
+            None,
+            {},
+        )
+
+        self.assertEqual(needs, [("SO-55871", None)])
+
+    def test_po_dispatch_message_uses_received_wording(self) -> None:
+        msg = po_dispatch_reminder._compose_reminder(
+            "PO-7114",
+            "Luz Negra (EUR)",
+            "FULLY RECEIVED",
+            "2026-06-19",
+            [("LED-22.109", 7)],
+            [("SO-55871", ["LED-22.109"])],
+        )
+
+        self.assertIn("SO-55871 — needs `LED-22.109`", msg)
+        self.assertIn("now that this PO has arrived", msg)
+        self.assertNotIn("when this PO arrives", msg)
+
 
 class Cin7ClientTests(unittest.TestCase):
     def test_purchase_uuid_uses_advanced_purchase_endpoint_first(self) -> None:

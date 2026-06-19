@@ -164,6 +164,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   highlight is now positioned against the full editor frame, not a
   particular canvas layer, so clicking a lower row after horizontal
   scrolling highlights the row the buyer is actually working on.
+- **PO dispatch SO/SKU confirmation** — received-PO reminders now
+  live-fetch CIN7 sale lines for referenced SOs when the local
+  sale-line window cannot identify the SKU match. The Slack wording
+  now says to pick confirmed lines now that the PO has arrived, and
+  suppresses warehouse reminders when a resolved SO needs none of the
+  PO's SKUs.
 
 ### 2026-06-18
 

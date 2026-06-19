@@ -440,6 +440,26 @@ def _sale_order_qty_for_sku(sale: Dict[str, Any], sku: str) -> float:
     return qty
 
 
+def _sale_order_skus(sale: Dict[str, Any]) -> Set[str]:
+    """Return SKUs ordered on a full CIN7 sale object."""
+    if not isinstance(sale, dict):
+        return set()
+    lines: List[dict] = []
+    order = sale.get("Order") or {}
+    if isinstance(order, dict):
+        lines.extend(order.get("Lines") or [])
+    if not lines:
+        lines.extend(sale.get("Lines") or [])
+    out: Set[str] = set()
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        sku = _normalise_sku(line.get("SKU"))
+        if sku:
+            out.add(sku)
+    return out
+
+
 def _sale_invoiced_qty_for_sku(sale: Dict[str, Any], sku: str) -> float:
     """Invoiced/shipped quantity for one SKU inside a full CIN7 sale."""
     sku_u = _normalise_sku(sku)
@@ -568,6 +588,31 @@ def _live_sale_sku_state(so: str,
     return _sale_sku_fulfilment_state(sale, sku)
 
 
+def _live_sale_line_skus(so: str,
+                         sale_ids: Dict[str, str],
+                         client,
+                         sale_cache: Dict[str, Optional[dict]]
+                         ) -> Optional[Set[str]]:
+    """Fetch a SO once and return its ordered SKUs, if resolvable."""
+    so_u = _normalise_so_number(so)
+    if not so_u or client is None:
+        return None
+    sale_id = sale_ids.get(so_u)
+    if not sale_id:
+        return None
+    if so_u not in sale_cache:
+        try:
+            sale_cache[so_u] = client.get_sale(sale_id)
+        except Exception as exc:
+            log.warning("Live sale line lookup failed for %s: %s",
+                        so_u, exc)
+            sale_cache[so_u] = None
+    sale = sale_cache.get(so_u)
+    if not isinstance(sale, dict):
+        return None
+    return _sale_order_skus(sale)
+
+
 def _so_sku_still_needs_dispatch(so: str,
                                  sku: str,
                                  sale_ids: Dict[str, str],
@@ -638,30 +683,43 @@ def _po_sku_qty(po_lines: pd.DataFrame) -> List[Tuple[str, object]]:
     return out
 
 
-def _build_so_needs(all_sos: List[str], po_sku_set: Set[str],
-                      so_line_skus: Dict[str, set]
-                      ) -> List[Tuple[str, Optional[List[str]]]]:
+def _build_so_needs(all_sos: List[str],
+                    po_sku_set: Set[str],
+                    so_line_skus: Dict[str, set],
+                    sale_ids: Optional[Dict[str, str]] = None,
+                    client=None,
+                    sale_cache: Optional[
+                        Dict[str, Optional[dict]]] = None
+                    ) -> List[Tuple[str, Optional[List[str]]]]:
     """For each backorder SO, work out which of the PO's SKUs it
     ACTUALLY needs (intersection of the SO's line items with the
     PO's SKUs). Returns (so, [skus]) — or (so, None) when the
     SO's lines can't be looked up.
 
     SOs proven to need NONE of the PO's SKUs are dropped (those
-    are the cross-tag false positives). If that would drop every
-    SO, all are kept as 'unconfirmed' rather than posting an
-    empty reminder."""
+    are the cross-tag false positives). If every SO is unknown,
+    keep them as 'unconfirmed'; if every SO is successfully resolved
+    and none match this PO's SKUs, return an empty list so callers can
+    suppress the warehouse reminder."""
     needs: List[Tuple[str, Optional[List[str]]]] = []
+    unknowns: List[str] = []
+    sale_ids = sale_ids or {}
+    sale_cache = sale_cache if sale_cache is not None else {}
     for so in all_sos:
-        so_skus = so_line_skus.get(so)
+        so_u = _normalise_so_number(so)
+        so_skus = so_line_skus.get(so_u)
         if so_skus is None:
-            needs.append((so, None))      # couldn't look it up
-        else:
-            need = sorted(so_skus & po_sku_set)
-            if need:
-                needs.append((so, need))
-            # else: SO needs nothing from this PO — drop it.
-    if not needs and all_sos:
-        needs = [(so, None) for so in all_sos]
+            so_skus = _live_sale_line_skus(
+                so_u, sale_ids, client, sale_cache)
+        if so_skus is None:
+            unknowns.append(so_u)
+            continue
+        need = sorted({str(s).upper() for s in so_skus} & po_sku_set)
+        if need:
+            needs.append((so_u, need))
+        # else: SO needs nothing from this PO — drop it.
+    if not needs and unknowns:
+        needs = [(so, None) for so in unknowns]
     return needs
 
 
@@ -813,20 +871,31 @@ def _compose_reminder(po_number: str,
     lines.append("")
     lines.append("*Sales orders waiting on one or more of these "
                   "SKUs:*")
+    confirmed_needs = False
     if so_needs:
         for so, skus in so_needs:
             if skus:
+                confirmed_needs = True
                 _s = " · ".join(f"`{s}`" for s in skus)
                 lines.append(f"• {so} — needs {_s}")
             else:
                 lines.append(
-                    f"• {so} — _which SKUs unconfirmed; check "
-                    f"the SO_")
+                    f"• {so} — _SO referenced on the PO, but this "
+                    f"worker could not confirm which SKU lines; check "
+                    f"the SO before picking_")
     else:
         lines.append("• _(none identified)_")
     lines.append("")
-    lines.append("_Please pick these orders first when this PO "
-                  "arrives in the warehouse._")
+    if confirmed_needs:
+        if "PARTIAL" in (received_status or "").upper():
+            lines.append("_Please pick the confirmed available lines "
+                         "from this partial delivery first._")
+        else:
+            lines.append("_Please pick these confirmed lines first now "
+                         "that this PO has arrived._")
+    else:
+        lines.append("_No confirmed SO/SKU pick instruction was created; "
+                     "verify the SO directly before warehouse action._")
     return "\n".join(lines)
 
 
@@ -920,6 +989,7 @@ def scan_and_notify(dryrun: bool = False,
 
     n_posted = 0
     n_no_sos = 0
+    n_no_actionable_sku_match = 0
     n_already_notified = 0
     n_errors = 0
 
@@ -937,6 +1007,9 @@ def scan_and_notify(dryrun: bool = False,
     open_so_set = _load_open_so_set()
     # v2.67.240 — SO->SKU map for the per-SO SKU breakdown.
     so_line_skus = _load_so_line_skus()
+    sale_ids = _load_so_sale_ids()
+    live_client = _cin7_client_from_env()
+    sale_cache: Dict[str, Optional[dict]] = {}
 
     for _, po in eligible.iterrows():
         po_number = str(po.get("OrderNumber") or "").strip()
@@ -1074,7 +1147,15 @@ def scan_and_notify(dryrun: bool = False,
         po_sku_qty = _po_sku_qty(po_lines)
         po_sku_set = {s.upper() for s, _ in po_sku_qty}
         so_needs = _build_so_needs(all_sos, po_sku_set,
-                                     so_line_skus)
+                                     so_line_skus, sale_ids,
+                                     live_client, sale_cache)
+        if not so_needs:
+            n_no_actionable_sku_match += 1
+            log.info(
+                "PO %s: SO refs resolved but none need this PO's "
+                "SKUs; suppressing warehouse reminder. SOs=%s",
+                po_number, all_sos)
+            continue
         msg = _compose_reminder(po_number, supplier, status,
                                     received_date, po_sku_qty,
                                     so_needs)
@@ -1117,6 +1198,7 @@ def scan_and_notify(dryrun: bool = False,
         "eligible": len(eligible),
         "posted": n_posted,
         "skipped_no_sos": n_no_sos,
+        "skipped_no_actionable_sku_match": n_no_actionable_sku_match,
         "skipped_already_notified": n_already_notified,
         "errors": n_errors,
     }
@@ -1534,7 +1616,12 @@ def cmd_one(args: argparse.Namespace) -> int:
     po_sku_qty = _po_sku_qty(lines_for)
     po_sku_set = {s.upper() for s, _ in po_sku_qty}
     so_needs = _build_so_needs(
-        all_sos, po_sku_set, _load_so_line_skus())
+        all_sos, po_sku_set, _load_so_line_skus(),
+        _load_so_sale_ids(), _cin7_client_from_env(), {})
+    if not so_needs:
+        log.info("No actionable SO/SKU match for %s after resolving "
+                 "sale lines.", args.po)
+        return 0
     msg = _compose_reminder(
         args.po,
         po.get("Supplier"),
