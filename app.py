@@ -1012,7 +1012,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
 <script>
 (() => {
   const ANCHOR_ID = %s;
-  const ENHANCER_VERSION = "persistent-row-pan-v1";
+  const ENHANCER_VERSION = "persistent-row-pan-v2";
   let doc = null;
   try {
     doc = window.parent && window.parent.document;
@@ -1093,8 +1093,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     frame.classList.add("w4s-ordering-editor-frame");
     frame.setAttribute("tabindex", "0");
 
-    const canvas = frame.querySelector("canvas");
-    const host = (canvas && canvas.parentElement) || frame;
+    const host = frame;
     if (!host.style.position || host.style.position === "static") {
       host.style.position = "relative";
     }
@@ -1118,17 +1117,17 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     }
 
     function showGuide(ev) {
-      const currentCanvas = frame.querySelector("canvas");
-      const surface = currentCanvas || frame;
-      const rect = surface.getBoundingClientRect();
       const hostRect = host.getBoundingClientRect();
       const header = 36;
       const rowHeight = 40;
-      const y = ev.clientY - rect.top;
-      if (y < header || y > rect.height) return;
+      const y = ev.clientY - hostRect.top;
+      if (y < header || y > hostRect.height) {
+        hideGuide();
+        return;
+      }
       const top = Math.max(
         header,
-        Math.min(y + rect.top - hostRect.top - (rowHeight / 2),
+        Math.min(y - (rowHeight / 2),
                  hostRect.height - rowHeight)
       );
       guide.style.top = `${top}px`;

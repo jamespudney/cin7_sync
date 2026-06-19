@@ -85,7 +85,9 @@ movement across wide column sets with horizontal wheel/trackpad input
 or modified left/right arrow keys. Buyers can also click-hold inside
 the grid and drag left/right to pan horizontally. The clicked-row cue
 stays visible while moving sideways and clears when the buyer leaves
-the grid, clicks elsewhere, or moves vertically. This is a UI aid only:
+the grid, clicks elsewhere, or moves vertically. The cue is positioned
+against the full editor frame so frozen/scrolling canvas layers do not
+make it jump to the first visible row. This is a UI aid only:
 it does not change the underlying reorder calculations, saved layout
 keys, draft qtys, or CIN7 write logic.
 

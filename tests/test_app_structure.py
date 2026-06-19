@@ -149,8 +149,9 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _render_ordering_editor_enhancer", script)
         self.assertIn("w4s-ordering-active-row", script)
         self.assertIn("function hideGuide()", script)
-        self.assertIn("ENHANCER_VERSION = \"persistent-row-pan-v1\"",
+        self.assertIn("ENHANCER_VERSION = \"persistent-row-pan-v2\"",
                       script)
+        self.assertIn("const host = frame;", script)
         self.assertIn("function handlePointerMove", script)
         self.assertIn("\"ArrowUp\", \"ArrowDown\", \"PageUp\", \"PageDown\", \"Escape\"",
                       script)

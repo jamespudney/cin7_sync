@@ -160,6 +160,10 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   locator field is populated. Slack/app commentary guidance says to
   show it per line and to omit it when blank, never substituting Default
   location / warehouse Location.
+- **Ordering row cue alignment** — the PO editor's clicked-row
+  highlight is now positioned against the full editor frame, not a
+  particular canvas layer, so clicking a lower row after horizontal
+  scrolling highlights the row the buyer is actually working on.
 
 ### 2026-06-18
 
