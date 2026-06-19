@@ -188,10 +188,10 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   per-SKU sales audit comparing InvoiceDate demand with OrderDate rows
   so current-month zeroes can be reconciled quickly.
 - **Ordering grid focus UX** — the PO editor keeps its existing saved
-  column layouts, but now adds a browser-side active-row guide and
-  horizontal-scroll helpers so buyers can stay on the row they clicked
-  while moving across wide columns without hunting for the bottom
-  scrollbar.
+  column layouts, but now adds browser-side horizontal-scroll helpers
+  so buyers can move across wide columns without hunting for the
+  bottom scrollbar. The row cue is intentionally temporary so it cannot
+  get stuck on the wrong line while Streamlit moves the active cell.
 - **PO dispatch + receipt correctness** — dispatch reminders are
   line-level by SO/SKU and PO commentary now uses CIN7 StockReceived
   fields for PO-specific receipt wording rather than global stock

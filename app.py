@@ -1034,12 +1034,14 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
         right: 0;
         height: 40px;
         display: none;
+        opacity: 0;
         pointer-events: none;
         z-index: 20;
         background: rgba(250, 204, 21, 0.16);
         border-top: 1px solid rgba(245, 158, 11, 0.45);
         border-bottom: 1px solid rgba(245, 158, 11, 0.45);
         box-shadow: inset 4px 0 0 rgba(217, 119, 6, 0.92);
+        transition: opacity 0.18s ease;
       }
     `;
     doc.head.appendChild(style);
@@ -1083,11 +1085,28 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
       host.style.position = "relative";
     }
 
+    doc.querySelectorAll(".w4s-ordering-active-row").forEach((el) => {
+      if (el.parentElement !== host) el.remove();
+    });
     let guide = host.querySelector(":scope > .w4s-ordering-active-row");
-    if (!guide) {
-      guide = doc.createElement("div");
-      guide.className = "w4s-ordering-active-row";
-      host.appendChild(guide);
+    if (guide) guide.remove();
+    guide = doc.createElement("div");
+    guide.className = "w4s-ordering-active-row";
+    host.appendChild(guide);
+
+    let guideTimer = null;
+
+    function hideGuide() {
+      if (guideTimer) {
+        clearTimeout(guideTimer);
+        guideTimer = null;
+      }
+      guide.style.opacity = "0";
+      setTimeout(() => {
+        if (guide.style.opacity === "0") {
+          guide.style.display = "none";
+        }
+      }, 220);
     }
 
     function showGuide(ev) {
@@ -1106,6 +1125,11 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
       );
       guide.style.top = `${top}px`;
       guide.style.display = "block";
+      requestAnimationFrame(() => {
+        guide.style.opacity = "1";
+      });
+      if (guideTimer) clearTimeout(guideTimer);
+      guideTimer = setTimeout(hideGuide, 950);
       try { frame.focus({preventScroll: true}); } catch (e) { frame.focus(); }
     }
 
@@ -1118,8 +1142,11 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     }
 
     frame.addEventListener("pointerdown", showGuide, true);
-    frame.addEventListener("click", showGuide, true);
+    frame.addEventListener("pointerleave", hideGuide, true);
+    frame.addEventListener("blur", hideGuide, true);
+    frame.addEventListener("scroll", hideGuide, true);
     frame.addEventListener("wheel", (ev) => {
+      hideGuide();
       const sideways = Math.abs(ev.deltaX) > Math.abs(ev.deltaY);
       if (!ev.shiftKey && !sideways) return;
       const dx = sideways ? ev.deltaX : ev.deltaY;
@@ -1140,6 +1167,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
       const gridHasFocus = active === frame || frame.contains(active);
       const gridIsHovered = frame.matches(":hover");
       if (!gridHasFocus && !gridIsHovered) return;
+      hideGuide();
       const plainBodyFocus = active === doc.body || active === null;
       const modified = ev.shiftKey || ev.altKey || ev.metaKey;
       if (ev.key === "ArrowRight" && (modified || plainBodyFocus)) {
@@ -1153,6 +1181,9 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
           ev.preventDefault();
         }
       }
+    }, true);
+    doc.addEventListener("pointerdown", (ev) => {
+      if (!frame.contains(ev.target)) hideGuide();
     }, true);
     return true;
   }

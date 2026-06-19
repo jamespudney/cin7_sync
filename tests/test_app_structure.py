@@ -148,6 +148,8 @@ class AppMemoryStructureTests(unittest.TestCase):
 
         self.assertIn("def _render_ordering_editor_enhancer", script)
         self.assertIn("w4s-ordering-active-row", script)
+        self.assertIn("function hideGuide()", script)
+        self.assertIn("guideTimer = setTimeout(hideGuide", script)
         self.assertIn("w4s-ordering-editor-", script)
         self.assertIn("_render_ordering_editor_enhancer(_ordering_grid_anchor)",
                       script)
