@@ -189,9 +189,11 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   so current-month zeroes can be reconciled quickly.
 - **Ordering grid focus UX** — the PO editor keeps its existing saved
   column layouts, but now adds browser-side horizontal-scroll helpers
-  so buyers can move across wide columns without hunting for the
-  bottom scrollbar. The row cue is intentionally temporary so it cannot
-  get stuck on the wrong line while Streamlit moves the active cell.
+  so buyers can move across wide columns with trackpads, Shift+wheel,
+  modified arrow keys, or click-hold-and-drag panning instead of
+  hunting for the bottom scrollbar. The row cue is intentionally
+  temporary so it cannot get stuck on the wrong line while Streamlit
+  moves the active cell.
 - **PO dispatch + receipt correctness** — dispatch reminders are
   line-level by SO/SKU and PO commentary now uses CIN7 StockReceived
   fields for PO-specific receipt wording rather than global stock

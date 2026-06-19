@@ -1012,6 +1012,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
 <script>
 (() => {
   const ANCHOR_ID = %s;
+  const ENHANCER_VERSION = "drag-pan-v1";
   let doc = null;
   try {
     doc = window.parent && window.parent.document;
@@ -1027,6 +1028,11 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     style.textContent = `
       .w4s-ordering-editor-frame {
         outline: none;
+      }
+      .w4s-ordering-editor-frame.w4s-ordering-dragging,
+      .w4s-ordering-editor-frame.w4s-ordering-dragging * {
+        cursor: ew-resize !important;
+        user-select: none !important;
       }
       .w4s-ordering-active-row {
         position: absolute;
@@ -1069,13 +1075,21 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     return candidates[0] || root;
   }
 
+  function isEditableTarget(target) {
+    const el = target && target.closest
+      ? target.closest("input, textarea, select, button, [contenteditable='true']")
+      : null;
+    return !!el;
+  }
+
   function install() {
     const anchor = doc.getElementById(ANCHOR_ID);
     if (!anchor) return false;
     const frame = findEditorFrame(anchor);
     if (!frame) return false;
-    if (frame.dataset.w4sOrderingEnhancer === ANCHOR_ID) return true;
-    frame.dataset.w4sOrderingEnhancer = ANCHOR_ID;
+    const installId = `${ANCHOR_ID}:${ENHANCER_VERSION}`;
+    if (frame.dataset.w4sOrderingEnhancer === installId) return true;
+    frame.dataset.w4sOrderingEnhancer = installId;
     frame.classList.add("w4s-ordering-editor-frame");
     frame.setAttribute("tabindex", "0");
 
@@ -1141,7 +1155,56 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
       return (scroller.scrollLeft || 0) !== before;
     }
 
-    frame.addEventListener("pointerdown", showGuide, true);
+    let dragState = null;
+
+    function clearDrag() {
+      if (dragState && dragState.dragging) {
+        frame.classList.remove("w4s-ordering-dragging");
+      }
+      dragState = null;
+    }
+
+    function beginDragCandidate(ev) {
+      if (ev.button !== 0 || isEditableTarget(ev.target)) return;
+      const scroller = widestScroller(frame);
+      if (!scroller || (scroller.scrollWidth - scroller.clientWidth) <= 12) {
+        return;
+      }
+      dragState = {
+        pointerId: ev.pointerId,
+        startX: ev.clientX,
+        startY: ev.clientY,
+        startScrollLeft: scroller.scrollLeft || 0,
+        scroller,
+        dragging: false,
+      };
+    }
+
+    function handlePointerMove(ev) {
+      if (!dragState || ev.pointerId !== dragState.pointerId) return;
+      if ((ev.buttons & 1) !== 1) {
+        clearDrag();
+        return;
+      }
+      const dx = ev.clientX - dragState.startX;
+      const dy = ev.clientY - dragState.startY;
+      if (!dragState.dragging) {
+        if (Math.abs(dx) < 8 || Math.abs(dx) < Math.abs(dy) * 1.2) {
+          return;
+        }
+        dragState.dragging = true;
+        hideGuide();
+        frame.classList.add("w4s-ordering-dragging");
+      }
+      dragState.scroller.scrollLeft = dragState.startScrollLeft - dx;
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+
+    frame.addEventListener("pointerdown", (ev) => {
+      showGuide(ev);
+      beginDragCandidate(ev);
+    }, true);
     frame.addEventListener("pointerleave", hideGuide, true);
     frame.addEventListener("blur", hideGuide, true);
     frame.addEventListener("scroll", hideGuide, true);
@@ -1182,6 +1245,9 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
         }
       }
     }, true);
+    doc.addEventListener("pointermove", handlePointerMove, true);
+    doc.addEventListener("pointerup", clearDrag, true);
+    doc.addEventListener("pointercancel", clearDrag, true);
     doc.addEventListener("pointerdown", (ev) => {
       if (!frame.contains(ev.target)) hideGuide();
     }, true);

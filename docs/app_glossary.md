@@ -82,11 +82,12 @@ qty recalculates with the new lead time on next refresh.
 The Ordering page's PO editor preserves the saved per-user column
 layout and width settings. A browser-side enhancer supports sideways
 movement across wide column sets with horizontal wheel/trackpad input
-or modified left/right arrow keys. A clicked row may flash briefly as
-a location cue, but the cue clears on movement so it cannot get stuck
-on the wrong line. This is a UI aid only: it does not change the
-underlying reorder calculations, saved layout keys, draft qtys, or
-CIN7 write logic.
+or modified left/right arrow keys. Buyers can also click-hold inside
+the grid and drag left/right to pan horizontally. A clicked row may
+flash briefly as a location cue, but the cue clears on movement so it
+cannot get stuck on the wrong line. This is a UI aid only: it does not
+change the underlying reorder calculations, saved layout keys, draft
+qtys, or CIN7 write logic.
 
 #### Status badges
 - 📦 **Dropship** — order-on-demand, we don't stock it.
