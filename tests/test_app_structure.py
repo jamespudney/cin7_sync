@@ -215,6 +215,25 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("qbo_client.is_ready()", sync_script)
         self.assertIn("def cmd_sync", sync_script)
 
+    def test_warm_engine_runs_detached_with_memory_guard(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        sync_loop = (root / "sync_loop.sh").read_text(encoding="utf-8")
+        warm_engine = (root / "warm_engine.py").read_text(encoding="utf-8")
+        render_config = (root / "render.yaml").read_text(encoding="utf-8")
+
+        self.assertIn("_start_warm_engine", sync_loop)
+        self.assertIn("WARM_ENGINE_BOOT_DELAY_MIN", sync_loop)
+        self.assertIn("ENGINE_REFRESH_LOCK_PATH", sync_loop)
+        self.assertIn("timeout \"$WARM_ENGINE_TIMEOUT_SECONDS\"",
+                      sync_loop)
+        self.assertIn("engine_refresh_status.json", sync_loop)
+        self.assertNotIn("python warm_engine.py 2>&1 | tee -a \"$LOG\"",
+                         sync_loop)
+        self.assertIn("WARM_ENGINE_MIN_AVAILABLE_MB", warm_engine)
+        self.assertIn("MemAvailable:", warm_engine)
+        self.assertIn("skipping cache warm", warm_engine)
+        self.assertIn("WARM_ENGINE_MIN_AVAILABLE_MB", render_config)
+
     def test_mtd_yoy_table_uses_shared_revenue_helper(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"

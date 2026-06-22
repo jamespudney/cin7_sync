@@ -789,3 +789,11 @@ the engine writes these tables, and downstream pages read from
 them. After the v2.67.163 Postgres cutover both live in the
 shared Postgres DB so the worker (Slack bot) and web service
 read the same provenance.
+
+ABC cache warming is opportunistic. `sync_loop.sh` starts
+`warm_engine.py` in the background after syncs, using the same
+`engine_refresh.lock` / `engine_refresh_status.json` files the app
+shows in the sidebar. Deploy catch-up warms are delayed by
+`WARM_ENGINE_BOOT_DELAY_MIN` (default 30 minutes), and the warmer
+skips if available memory is below `WARM_ENGINE_MIN_AVAILABLE_MB`
+(default 1200 MB).

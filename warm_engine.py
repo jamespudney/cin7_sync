@@ -45,6 +45,8 @@ _data_dir = os.environ.get("DATA_DIR", "").strip()
 if _data_dir:
     os.environ.setdefault("STREAMLIT_HOME", str(Path(_data_dir) / ".streamlit"))
 
+_WARM_SKIP_REASON = ""
+
 
 def _emit(msg: str) -> None:
     """Tagged stderr line so the surrounding sync log shows our
@@ -52,6 +54,48 @@ def _emit(msg: str) -> None:
     elsewhere by the calling shell."""
     sys.stderr.write(f"[warm_engine] {msg}\n")
     sys.stderr.flush()
+
+
+def _mem_available_mb() -> int | None:
+    """Linux memory headroom in MB, if /proc/meminfo is available."""
+    try:
+        for line in Path("/proc/meminfo").read_text(
+                encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(int(parts[1]) / 1024)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _memory_guard_allows_warm() -> bool:
+    global _WARM_SKIP_REASON
+    raw_threshold = os.environ.get(
+        "WARM_ENGINE_MIN_AVAILABLE_MB", "1200").strip()
+    try:
+        threshold = int(raw_threshold)
+    except ValueError:
+        threshold = 1200
+    if threshold <= 0:
+        return True
+    available = _mem_available_mb()
+    if available is None:
+        return True
+    if available < threshold:
+        _WARM_SKIP_REASON = (
+            f"only {available}MB available, threshold is {threshold}MB")
+        _emit(
+            "skipping cache warm: only "
+            f"{available}MB available, threshold is {threshold}MB"
+        )
+        return False
+    _emit(
+        f"memory guard ok: {available}MB available "
+        f"(threshold {threshold}MB)"
+    )
+    return True
 
 
 def _finish_background_refresh(exit_code: int) -> None:
@@ -62,10 +106,14 @@ def _finish_background_refresh(exit_code: int) -> None:
 
     if status_path:
         try:
+            state = "complete" if exit_code == 0 else "failed"
+            if exit_code == 0 and _WARM_SKIP_REASON:
+                state = "skipped"
             payload = {
-                "state": "complete" if exit_code == 0 else "failed",
+                "state": state,
                 "exit_code": exit_code,
                 "reason": reason,
+                "skip_reason": _WARM_SKIP_REASON,
                 "updated_at": datetime.utcnow().isoformat() + "Z",
             }
             p = Path(status_path)
@@ -84,6 +132,8 @@ def _finish_background_refresh(exit_code: int) -> None:
 def main() -> int:
     t_start = time.time()
     _emit("starting cache warm")
+    if not _memory_guard_allows_warm():
+        return 0
 
     # Imports are deferred so a missing dep / Streamlit error is
     # visible in the log instead of crashing module-load.

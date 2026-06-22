@@ -11,6 +11,9 @@ set -uo pipefail
 
 DATA_DIR="${DATA_DIR:-/data}"
 SYNC_HOUR_UTC="${SYNC_HOUR_UTC:-2}"   # 0-23
+WARM_ENGINE_BOOT_DELAY_MIN="${WARM_ENGINE_BOOT_DELAY_MIN:-30}"
+WARM_ENGINE_TIMEOUT_SECONDS="${WARM_ENGINE_TIMEOUT_SECONDS:-1200}"
+WARM_ENGINE_MIN_AVAILABLE_MB="${WARM_ENGINE_MIN_AVAILABLE_MB:-1200}"
 LOG="${DATA_DIR}/output/sync_loop.log"
 mkdir -p "${DATA_DIR}/output"
 
@@ -18,6 +21,71 @@ stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 echo "[$(stamp)] sync_loop starting; target hour UTC = $SYNC_HOUR_UTC" \
   | tee -a "$LOG"
+
+_engine_refresh_running() {
+    local lock="${DATA_DIR}/output/engine_refresh.lock"
+    if [ ! -f "$lock" ]; then
+        return 1
+    fi
+    local now_epoch lock_epoch age_s
+    now_epoch=$(date -u +%s)
+    lock_epoch=$(date -u -r "$lock" +%s 2>/dev/null || echo 0)
+    age_s=$((now_epoch - lock_epoch))
+    if [ "$age_s" -le 2700 ]; then
+        return 0
+    fi
+    rm -f "$lock" 2>/dev/null || true
+    return 1
+}
+
+_start_warm_engine() {
+    local reason="$1"
+    local delay_seconds="${2:-0}"
+    local lock="${DATA_DIR}/output/engine_refresh.lock"
+    local status="${DATA_DIR}/output/engine_refresh_status.json"
+    local engine_log="${DATA_DIR}/output/engine_refresh.log"
+
+    if _engine_refresh_running; then
+        echo "[$(stamp)] warm_engine already running; skipped (${reason})" \
+          | tee -a "$LOG"
+        return 0
+    fi
+
+    (
+        if [ "$delay_seconds" -gt 0 ]; then
+            echo "[$(stamp)] warm_engine scheduled in ${delay_seconds}s (${reason})" \
+              >> "$LOG"
+            sleep "$delay_seconds"
+        fi
+        if _engine_refresh_running; then
+            echo "[$(stamp)] warm_engine already running after delay; skipped (${reason})" \
+              >> "$LOG"
+            exit 0
+        fi
+
+        printf '{"state":"running","reason":"%s","updated_at":"%s"}\n' \
+            "$reason" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$lock"
+        cp "$lock" "$status" 2>/dev/null || true
+
+        echo "[$(stamp)] warming engine cache (${reason})" \
+          | tee -a "$LOG" >> "$engine_log"
+        ENGINE_REFRESH_LOCK_PATH="$lock" \
+        ENGINE_REFRESH_STATUS_PATH="$status" \
+        ENGINE_REFRESH_REASON="$reason" \
+        WARM_ENGINE_MIN_AVAILABLE_MB="$WARM_ENGINE_MIN_AVAILABLE_MB" \
+        timeout "$WARM_ENGINE_TIMEOUT_SECONDS" python warm_engine.py \
+            >> "$engine_log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "[$(stamp)] warm_engine failed/timed out (${reason}, rc=${rc})" \
+              | tee -a "$LOG" >> "$engine_log"
+            rm -f "$lock" 2>/dev/null || true
+            printf '{"state":"failed","reason":"%s","exit_code":%s,"updated_at":"%s"}\n' \
+                "$reason" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                > "$status"
+        fi
+    ) &
+}
 
 # v2.67.209 — catch-up-on-boot. sync_loop only runs daily_sync.sh
 # once a day at $SYNC_HOUR_UTC. But EVERY redeploy restarts this
@@ -57,7 +125,8 @@ if [ "$_catchup_needed" = "1" ]; then
     ./daily_sync.sh || \
       echo "[$(stamp)] catch-up daily_sync.sh non-zero status" \
         | tee -a "$LOG"
-    python warm_engine.py 2>&1 | tee -a "$LOG" || true
+    _start_warm_engine "sync_loop catch-up" \
+        $((WARM_ENGINE_BOOT_DELAY_MIN * 60))
 else
     echo "[$(stamp)] catch-up: data fresh, no immediate sync" \
       | tee -a "$LOG"
@@ -85,15 +154,11 @@ while true; do
       echo "[$(stamp)] daily_sync.sh exited with non-zero status" \
         | tee -a "$LOG"
 
-    # v2.67.36 — warm the ABC engine cache after every sync so the
-    # first user post-sync gets a cache hit instead of waiting
-    # 30-60s for the engine to recompute against fresh CSVs. Best-
-    # effort; a failure here is logged but doesn't block the next
-    # iteration.
-    echo "[$(stamp)] warming engine cache" | tee -a "$LOG"
-    python warm_engine.py 2>&1 | tee -a "$LOG" || \
-      echo "[$(stamp)] warm_engine.py exited with non-zero status" \
-        | tee -a "$LOG"
+    # Warm the ABC engine cache after every sync so the first user
+    # post-sync gets a cache hit instead of waiting for the engine to
+    # recompute. It runs detached with a lock, timeout and memory guard
+    # so it cannot block the sync loop or pile onto Streamlit startup.
+    _start_warm_engine "daily sync completed" 0
 
     # v2.67.38 — Friday weekly slow-mover digest email. Fires from
     # the same loop instead of a separate Render cron service.

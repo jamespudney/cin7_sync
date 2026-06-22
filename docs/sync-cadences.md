@@ -37,7 +37,12 @@ Runs `daily_sync.sh`. Calls:
 5. `sync_supplier_names.py --apply` — same for supplier names.
 
 Heavier than nearsync (~10-15 minutes total). Done overnight so
-the workday runs unaffected.
+the workday runs unaffected. After the sync completes, `sync_loop.sh`
+starts `warm_engine.py` in the background to refresh the ABC engine
+snapshot. On deploy catch-up it waits `WARM_ENGINE_BOOT_DELAY_MIN`
+minutes first (default `30`) so the engine warmer does not compete
+with Streamlit startup. The warmer also has a lock, timeout, and
+`WARM_ENGINE_MIN_AVAILABLE_MB` memory guard.
 
 Logs: `/data/output/daily_sync.log`.
 

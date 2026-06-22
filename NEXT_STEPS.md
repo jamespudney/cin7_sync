@@ -166,6 +166,10 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   using CIN7 header revenue when header coverage is complete, but now
   falls back to sale-line `Total` for older periods where sale lines
   exist and the matching header rows are missing/sparse.
+- **ABC cache warmer memory guard** — sync-loop engine warming now
+  runs detached with the dashboard's `engine_refresh.lock`, a timeout,
+  a deploy boot delay and a `WARM_ENGINE_MIN_AVAILABLE_MB` guard so
+  cache rebuilds do not stack on top of Streamlit startup.
 - **Cashflow stale-payables cleanup** — QBO bill sync now pulls the
   full open-bills list and marks mirrored QBO bills paid/zero-balance
   when they are no longer open. Dashboard totals, alerts, weekly

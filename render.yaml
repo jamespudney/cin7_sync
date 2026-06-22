@@ -24,7 +24,8 @@
 # the shared group:
 #   STREAMLIT_SERVER_HEADLESS, STREAMLIT_HOME,
 #   SYNC_HOUR_UTC, NEARSYNC_INTERVAL_MIN,
-#   QBO_CASHFLOW_INTERVAL_HOURS, QBO_CASHFLOW_BOOT_DELAY_MIN
+#   QBO_CASHFLOW_INTERVAL_HOURS, QBO_CASHFLOW_BOOT_DELAY_MIN,
+#   WARM_ENGINE_BOOT_DELAY_MIN, WARM_ENGINE_MIN_AVAILABLE_MB
 #
 # Render disks can't be shared across services — each disk attaches to
 # exactly one service. The app service owns /data; the worker reads
@@ -96,6 +97,11 @@ services:
       # QBO_CASHFLOW_MONTHS_BACK — recent bill-detail window. The sync
       #                      always pulls the full open-bills list too,
       #                      so old paid bills still close locally.
+      # WARM_ENGINE_BOOT_DELAY_MIN — delay ABC cache warm after boot
+      #                      catch-up so it does not compete with
+      #                      Streamlit startup.
+      # WARM_ENGINE_MIN_AVAILABLE_MB — warm_engine.py skips if Linux
+      #                      MemAvailable is below this threshold.
       - key: SYNC_HOUR_UTC
         value: "2"
       - key: NEARSYNC_INTERVAL_MIN
@@ -106,6 +112,12 @@ services:
         value: "30"
       - key: QBO_CASHFLOW_MONTHS_BACK
         value: "6"
+      - key: WARM_ENGINE_BOOT_DELAY_MIN
+        value: "30"
+      - key: WARM_ENGINE_TIMEOUT_SECONDS
+        value: "1200"
+      - key: WARM_ENGINE_MIN_AVAILABLE_MB
+        value: "1200"
       # ---- Secrets (set in Render UI, not here) -----------------------
       - key: APP_PASSWORD
         sync: false        # Team's shared login password.
