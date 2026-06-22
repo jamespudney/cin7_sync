@@ -1,7 +1,7 @@
 # Data sync cadences
 
-The app keeps its data fresh through two scheduled processes plus
-manual triggers. Both run inside the live Render web service
+The app keeps its data fresh through three scheduled processes plus
+manual triggers. They run inside the live Render web service
 container so they share the same persistent disk as Streamlit.
 
 ## Nearsync — every 15 minutes, all day
@@ -40,7 +40,26 @@ the workday runs unaffected.
 
 Logs: `/data/output/daily_sync.log`.
 
-## What is NOT in either sync
+## QBO cashflow sync — every 4 hours by default
+
+Runs `python cashflow_sync.py sync --months-back 6`. Pulls:
+
+- Recent QuickBooks Online supplier Bills for invoice detail.
+- The full QBO open-bills list for authoritative open balances.
+
+This keeps the Cashflow page from showing supplier invoices that
+were already paid in QuickBooks. The dashboard's **Sync from
+QuickBooks** button remains available for an immediate manual
+refresh.
+
+Cadence is controlled by `QBO_CASHFLOW_INTERVAL_HOURS` on Render
+(default `4`). The recent detail window is controlled by
+`QBO_CASHFLOW_MONTHS_BACK` (default `6`); the sync still checks the
+full open-bills list regardless of that window.
+
+Logs: `/data/output/qbo_cashflow_loop.log`.
+
+## What is NOT in these scheduled syncs
 
 - **BOMs** — only refreshed on manual run (`cin7_sync.py boms`).
   ~2 hours full pull. Run when you've added/edited a BOM in CIN7.
@@ -62,8 +81,9 @@ to write to `/data/team_actions.db` and `/data/output/`. Solution:
 the syncs run as background processes inside the web service's
 container, sharing its disk.
 
-`start.sh` launches three things:
+`start.sh` launches four things:
 
 1. `nearsync_loop.sh` — sleep-loop, runs every 15 min.
 2. `sync_loop.sh` — sleep-loop, fires once per day at SYNC_HOUR_UTC.
-3. Streamlit (foreground, so Render's health check reaches it).
+3. `qbo_cashflow_loop.sh` — sleep-loop, refreshes QBO supplier bills.
+4. Streamlit (foreground, so Render's health check reaches it).

@@ -1,14 +1,15 @@
-"""cashflow_sync.py (v2.67.220)
-=================================
+"""cashflow_sync.py
+===================
 
 Glue between QuickBooks Online and the Cashflow Management page.
 
 Two jobs:
   1. sync_bills_from_qbo() — pull supplier Bills from QBO into the
-     cashflow_payables table (the supplier-invoice tracker). Run
-     on demand from the dashboard's "Sync from QuickBooks" button.
-     The sync also pulls QBO's full open-bills list and marks local
-     QBO mirrors paid/closed when they are no longer open in QBO.
+     cashflow_payables table (the supplier-invoice tracker). Run on
+     demand from the dashboard's "Sync from QuickBooks" button and
+     automatically from qbo_cashflow_loop.sh every few hours. The
+     sync also pulls QBO's full open-bills list and marks local QBO
+     mirrors paid/closed when they are no longer open in QBO.
   2. post_approval_to_slack() — when James approves a payable for
      payment, post the go-ahead into a dedicated Slack channel so
      Cheran sees the amount cleared to pay.
@@ -21,9 +22,11 @@ Env vars
 
 from __future__ import annotations
 
+import argparse
 import datetime as _dt
 import logging
 import os
+import sys
 from typing import Optional, Tuple
 
 log = logging.getLogger("cashflow_sync")
@@ -129,6 +132,59 @@ def sync_bills_from_qbo(months_back: int = 6) -> dict:
     return result
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    """CLI entrypoint used by qbo_cashflow_loop.sh.
+
+    The dashboard button still raises sync errors to Streamlit, but the
+    background loop should degrade politely when QuickBooks is not yet
+    connected on a fresh environment.
+    """
+    import qbo_client
+
+    if not qbo_client.is_ready():
+        print("QBO cashflow sync skipped: QuickBooks is not connected.")
+        return 0
+
+    result = sync_bills_from_qbo(months_back=args.months_back)
+    print(
+        "QBO cashflow sync complete: "
+        f"{result.get('upserted', 0)} upserted, "
+        f"{result.get('closed', 0)} closed, "
+        f"{result.get('open_bills_seen', 0)} open bills seen, "
+        f"since {result.get('since')}"
+    )
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="QuickBooks Online cashflow sync helpers.")
+    sub = parser.add_subparsers(dest="command")
+
+    sync_parser = sub.add_parser(
+        "sync",
+        help=("Sync QBO supplier Bills into cashflow_payables and "
+              "close local mirrors that are no longer open in QBO."))
+    sync_parser.add_argument(
+        "--months-back",
+        type=int,
+        default=6,
+        help="How far back to pull recent bill detail. Default: 6.")
+    sync_parser.set_defaults(func=cmd_sync)
+
+    args = parser.parse_args(argv)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 2
+
+    try:
+        return int(args.func(args))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("cashflow_sync command failed")
+        print(f"QBO cashflow sync failed: {exc}", file=sys.stderr)
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # Approval → Slack
 # ---------------------------------------------------------------------------
@@ -199,3 +255,7 @@ def post_approval_to_slack(payable: dict, approved_by: str
         return body.get("ts"), None
     except Exception as exc:  # noqa: BLE001
         return None, f"post error: {exc}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

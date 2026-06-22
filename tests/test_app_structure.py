@@ -193,6 +193,26 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("only_unpaid=True", sync_script)
         self.assertIn("mark_qbo_payables_closed_except", sync_script)
 
+    def test_qbo_cashflow_sync_runs_in_background_loop(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        start_script = (root / "start.sh").read_text(encoding="utf-8")
+        render_config = (root / "render.yaml").read_text(encoding="utf-8")
+        loop_script = (
+            root / "qbo_cashflow_loop.sh").read_text(encoding="utf-8")
+        sync_script = (
+            root / "cashflow_sync.py").read_text(encoding="utf-8")
+
+        self.assertIn("_supervise qbo_cashflow ./qbo_cashflow_loop.sh",
+                      start_script)
+        self.assertIn("QBO_CASHFLOW_PID", start_script)
+        self.assertIn("QBO_CASHFLOW_INTERVAL_HOURS", render_config)
+        self.assertIn("QBO_CASHFLOW_MONTHS_BACK", render_config)
+        self.assertIn("python cashflow_sync.py sync --months-back",
+                      loop_script)
+        self.assertIn("timeout 300", loop_script)
+        self.assertIn("qbo_client.is_ready()", sync_script)
+        self.assertIn("def cmd_sync", sync_script)
+
     def test_mtd_yoy_table_uses_shared_revenue_helper(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"

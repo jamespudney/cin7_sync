@@ -23,7 +23,8 @@
 # The app service additionally sets these Streamlit/sync vars not in
 # the shared group:
 #   STREAMLIT_SERVER_HEADLESS, STREAMLIT_HOME,
-#   SYNC_HOUR_UTC, NEARSYNC_INTERVAL_MIN
+#   SYNC_HOUR_UTC, NEARSYNC_INTERVAL_MIN,
+#   QBO_CASHFLOW_INTERVAL_HOURS
 #
 # Render disks can't be shared across services — each disk attaches to
 # exactly one service. The app service owns /data; the worker reads
@@ -86,10 +87,20 @@ services:
       #                      real-time sync (stock + last-day sales).
       #                      Critical for Ordering page accuracy during
       #                      business hours. Default 15 min.
+      # QBO_CASHFLOW_INTERVAL_HOURS — how often to refresh supplier
+      #                      bills/open balances from QuickBooks Online
+      #                      for Cashflow. Default 4h.
+      # QBO_CASHFLOW_MONTHS_BACK — recent bill-detail window. The sync
+      #                      always pulls the full open-bills list too,
+      #                      so old paid bills still close locally.
       - key: SYNC_HOUR_UTC
         value: "2"
       - key: NEARSYNC_INTERVAL_MIN
         value: "15"
+      - key: QBO_CASHFLOW_INTERVAL_HOURS
+        value: "4"
+      - key: QBO_CASHFLOW_MONTHS_BACK
+        value: "6"
       # ---- Secrets (set in Render UI, not here) -----------------------
       - key: APP_PASSWORD
         sync: false        # Team's shared login password.

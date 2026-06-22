@@ -167,6 +167,11 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   when they are no longer open. Dashboard totals, alerts, weekly
   supplier-payables buckets and the daily calendar all use the same
   open-payable rule so paid invoices stop showing as due.
+- **QBO cashflow auto-sync** — the app service now supervises
+  `qbo_cashflow_loop.sh`, refreshing QuickBooks supplier bills/open
+  balances every `QBO_CASHFLOW_INTERVAL_HOURS` hours (default 4).
+  The manual Cashflow **Sync from QuickBooks** button remains for
+  immediate refreshes.
 
 ### 2026-06-19
 
