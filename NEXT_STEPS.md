@@ -162,6 +162,10 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   Forecast / Actual / Difference sales rows, with a safe action to copy
   CIN7 actuals into the Forecast sales row for cash planning while
   preserving manual edits by default.
+- **MTD prior-year revenue fallback** — Overview's MTD YoY table keeps
+  using CIN7 header revenue when header coverage is complete, but now
+  falls back to sale-line `Total` for older periods where sale lines
+  exist and the matching header rows are missing/sparse.
 - **Cashflow stale-payables cleanup** — QBO bill sync now pulls the
   full open-bills list and marks mirrored QBO bills paid/zero-balance
   when they are no longer open. Dashboard totals, alerts, weekly

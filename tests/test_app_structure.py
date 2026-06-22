@@ -223,6 +223,10 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_mtd_rev_src, _mtd_rev_col", script)
         self.assertIn("hdf[\"__rev\"] = hdf[\"__sales_amount\"]",
                       script)
+        self.assertIn("def _period_order_count", script)
+        self.assertIn("coverage = header_orders / max(line_orders, 1)",
+                      script)
+        self.assertIn("return line_rev", script)
         self.assertIn("\"Revenue\": _rev_for_dates(", script)
         self.assertNotIn("\"Revenue\": float(chunk[\"Total\"].sum())",
                          script)

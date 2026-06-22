@@ -7430,13 +7430,47 @@ if page == "Overview":
             hdf["InvoiceDate"] = hdf["__sales_date"]
             hdf["__rev"] = hdf["__sales_amount"]
 
+        def _period_order_count(frame: pd.DataFrame) -> int:
+            if frame.empty:
+                return 0
+            order_col = next(
+                (c for c in ("SaleID", "SaleNumber", "OrderNumber",
+                             "InvoiceNumber") if c in frame.columns),
+                None,
+            )
+            if order_col:
+                return int(frame[order_col].astype(str).nunique())
+            return int(len(frame))
+
         def _rev_for_dates(date_mask) -> float:
-            """Sum order-level revenue for dates matching the mask.
-            Falls back to line-level Total if header data isn't
-            available (first-deploy scenario)."""
-            if not hdf.empty:
-                return float(hdf[date_mask(hdf)]["__rev"].sum())
-            return float(df[date_mask(df)]["Total"].sum())
+            """Sum revenue for dates matching the mask.
+
+            Header revenue is preferred because it matches CIN7's
+            General Dashboard. For older MTD comparison years, however,
+            we can have line-level sales history without matching
+            header rows. In that case, fall back for that period only
+            so prior-year revenue doesn't show as a missing tiny value.
+            """
+            line_win = df[date_mask(df)]
+            line_rev = float(line_win["Total"].sum())
+            if hdf.empty:
+                return line_rev
+
+            header_win = hdf[date_mask(hdf)]
+            header_rev = float(header_win["__rev"].sum())
+            line_orders = _period_order_count(line_win)
+            header_orders = _period_order_count(header_win)
+            if line_orders and header_orders:
+                coverage = header_orders / max(line_orders, 1)
+                if coverage < 0.5:
+                    return line_rev
+                if (line_rev > 1000
+                        and header_rev < line_rev * 0.1
+                        and coverage < 0.75):
+                    return line_rev
+            elif line_orders and not header_orders:
+                return line_rev
+            return header_rev
 
         today = pd.Timestamp(datetime.now().date())
         today_only = today.date()

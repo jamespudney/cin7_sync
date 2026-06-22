@@ -845,6 +845,12 @@ for the previous/current week (or all shown weeks), stamped as
 `auto:actual_sales`; manual forecast edits are preserved unless
 the user explicitly chooses to overwrite them.
 
+For Overview's month-to-date prior-year comparison, header revenue
+is still preferred. If a historical period has sale-line orders but
+sparse/missing matching sales headers, the app falls back for that
+period only to sale-line `Total` so older years do not show tiny
+missing revenue values.
+
 #### Cashflow supplier payables
 Supplier payables mirror QuickBooks Online Bills plus any manually
 added non-QBO invoices. For QBO-sourced rows, QBO's open balance is
