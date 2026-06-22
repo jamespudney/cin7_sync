@@ -7419,28 +7419,16 @@ if page == "Overview":
             _bad_stat = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
             df = df[~df["Status"].astype(str).str.upper().isin(_bad_stat)]
 
-        # hdf = sales_full headers for REVENUE $. CIN7's dashboard
-        # sums InvoiceAmount which INCLUDES shipping + tax — line-level
-        # Total doesn't, hence the gap users were seeing (today $6,253
-        # in our app vs $9,600 in CIN7). We pick the right column
-        # defensively: InvoiceAmount > GrandTotal > Total.
-        hdf = sales_full.copy() if not sales_full.empty else pd.DataFrame()
+        # hdf = sales headers for REVENUE $. Use the same CIN7
+        # General Dashboard basis as Overview/Cashflow weekly actuals:
+        # InvoiceDate + InvoiceAmount minus Tax, excluding voided /
+        # credited / cancelled sales. This keeps the headline MTD
+        # metric, YoY table and chart on one basis.
+        hdf, _mtd_rev_src, _mtd_rev_col = _sales_actuals_frame(
+            sales_full, sales_headers, sale_lines)
         if not hdf.empty:
-            hdf["InvoiceDate"] = _to_date(
-                hdf["InvoiceDate"]).dt.tz_localize(None)
-            _rev_col = next(
-                (c for c in ("InvoiceAmount", "GrandTotal", "Total")
-                  if c in hdf.columns),
-                None)
-            if _rev_col is None:
-                hdf = pd.DataFrame()
-            else:
-                hdf["__rev"] = _to_num(hdf[_rev_col]).fillna(0)
-                hdf = hdf.dropna(subset=["InvoiceDate"])
-                # Same status filter as the line view.
-                if "Status" in hdf.columns:
-                    hdf = hdf[~hdf["Status"].astype(str).str.upper()
-                              .isin(_bad_stat)]
+            hdf["InvoiceDate"] = hdf["__sales_date"]
+            hdf["__rev"] = hdf["__sales_amount"]
 
         def _rev_for_dates(date_mask) -> float:
             """Sum order-level revenue for dates matching the mask.
@@ -7616,7 +7604,10 @@ if page == "Overview":
                     "Year": y,
                     "Orders": int(chunk["SaleID"].nunique()),
                     "Units": int(chunk["Quantity"].sum()),
-                    "Revenue": float(chunk["Total"].sum()),
+                    "Revenue": _rev_for_dates(
+                        lambda d, sy=start_y, ey=end_y:
+                            (d["InvoiceDate"] >= sy)
+                            & (d["InvoiceDate"] <= ey)),
                 })
             except ValueError:
                 continue
@@ -23355,13 +23346,27 @@ elif page == "Cashflow":
         return (r.get("due_date_override")
                 or r.get("due_date") or "")
 
+    def _cf_payable_is_open(r: dict) -> bool:
+        if (r.get("status") or "pending") == "paid":
+            return False
+        _bal = r.get("qbo_balance")
+        if r.get("source") == "qbo" and _bal is not None:
+            try:
+                if float(_bal) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        return True
+
     # Current cash — the opening-balance cell for this week.
     _dash_cash = _dash_fc.get((_dash_mkey, "opening_balance"))
 
     # Payables — totals + 7/30-day due windows.
-    _dash_out_total = sum(_dash_eff_amt(r) for r in _dash_pay)
+    _dash_out_total = sum(_dash_eff_amt(r) for r in _dash_pay
+                          if _cf_payable_is_open(r))
     _dash_appr = sum(_dash_eff_amt(r) for r in _dash_pay
-                     if r.get("status") == "approved")
+                     if r.get("status") == "approved"
+                     and _cf_payable_is_open(r))
     # v2.67.244 — separate OVERDUE from "Due in next N days".
     # The earlier filter was unbounded on the past, so a bill
     # due 6 months ago was counted as "due in next 7 days",
@@ -23373,6 +23378,8 @@ elif page == "Cashflow":
     _cut7 = _dash_today + pd.Timedelta(days=7)
     _cut30 = _dash_today + pd.Timedelta(days=30)
     for r in _dash_pay:
+        if not _cf_payable_is_open(r):
+            continue
         _d = _dash_eff_due(r)
         if not _d:
             continue
@@ -23412,6 +23419,8 @@ elif page == "Cashflow":
                   for rk, _ in _CF_OUTFLOWS)
     _wk_sup = 0.0
     for r in _dash_pay:
+        if not _cf_payable_is_open(r):
+            continue
         _d = _dash_eff_due(r)
         if not _d:
             continue
@@ -23517,6 +23526,8 @@ elif page == "Cashflow":
                         for rk, _ in _CF_OUTFLOWS)
             _asup = 0.0
             for _p in _dash_pay:
+                if not _cf_payable_is_open(_p):
+                    continue
                 _d = (_p.get("due_date_override")
                       or _p.get("due_date") or "")
                 if not _d:
@@ -23580,6 +23591,8 @@ elif page == "Cashflow":
     # 4. Supplier bills due within 7 days, not yet approved.
     _al_due_soon = []
     for _p in _dash_pay:
+        if not _cf_payable_is_open(_p):
+            continue
         if (_p.get("status") or "pending") in (
                 "approved", "scheduled", "paid"):
             continue
@@ -23646,7 +23659,9 @@ elif page == "Cashflow":
                     st.success(
                         f":white_check_mark: Synced "
                         f"{_res['upserted']} supplier bills from "
-                        f"QuickBooks (since {_res['since']}).")
+                        f"QuickBooks (since {_res['since']}); "
+                        f"marked {_res.get('closed', 0)} old QBO "
+                        f"bill(s) paid/closed.")
                 except Exception as _exc:  # noqa: BLE001
                     st.error(f":x: QBO bill sync failed: {_exc}")
         with _cf_btns[1]:
@@ -23886,10 +23901,11 @@ elif page == "Cashflow":
             # Totals.
             _tot_open = sum(
                 (_eff_amount(r) or 0) for r in _payables_raw
-                if (r.get("status") != "paid"))
+                if _cf_payable_is_open(r))
             _tot_appr = sum(
                 (_eff_amount(r) or 0) for r in _payables_raw
-                if r.get("status") == "approved")
+                if r.get("status") == "approved"
+                and _cf_payable_is_open(r))
             _m1, _m2 = st.columns(2)
             _m1.metric("Outstanding (not paid)",
                        _fmt_money(_tot_open))
@@ -24315,6 +24331,8 @@ elif page == "Cashflow":
     except Exception:  # noqa: BLE001
         _cf_pay_all = []
     for _p in _cf_pay_all:
+        if not _cf_payable_is_open(_p):
+            continue
         _due = (_p.get("due_date_override")
                 or _p.get("due_date") or "")
         if not _due:
@@ -24742,6 +24760,8 @@ elif page == "Cashflow":
     try:
         for _p in db.list_payables(include_dismissed=False,
                                    include_paid=False):
+            if not _cf_payable_is_open(_p):
+                continue
             _d = (_p.get("due_date_override")
                   or _p.get("due_date") or "")
             if _d in _dc_events:

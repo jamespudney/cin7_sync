@@ -2974,6 +2974,45 @@ def upsert_qbo_payable(qbo_bill_id: str, supplier: Optional[str],
                           invoice_date, due_date, qbo_balance))
 
 
+def mark_qbo_payables_closed_except(open_qbo_bill_ids: list[str]) -> int:
+    """Mark mirrored QBO bills as paid when they are no longer open.
+
+    The Cashflow page previously relied on each old bill being
+    re-synced with Balance=0. That fails for bills whose TxnDate
+    falls outside the recent sync window: they remain locally
+    pending forever and pollute the forecast. QBO's open-bills list
+    is the source of truth here; anything mirrored locally but not
+    present there has been settled/closed in QBO.
+    """
+    ids = [str(i).strip() for i in (open_qbo_bill_ids or [])
+           if str(i).strip()]
+    paid_date = datetime.utcnow().date().isoformat()
+    sql = (
+        "UPDATE cashflow_payables SET "
+        "  qbo_balance = 0, "
+        "  status = 'paid', "
+        "  paid_date = COALESCE(paid_date, ?), "
+        "  paid_amount = COALESCE(paid_amount, amount), "
+        "  updated_at = datetime('now'), "
+        "  updated_by = 'auto:qbo_sync' "
+        "WHERE source = 'qbo' "
+        "  AND qbo_bill_id IS NOT NULL "
+    )
+    params: list = [paid_date]
+    if ids:
+        sql += "  AND qbo_bill_id NOT IN ("
+        sql += ",".join("?" for _ in ids)
+        sql += ") "
+        params.extend(ids)
+    sql += (
+        "  AND (qbo_balance IS NULL OR qbo_balance > 0 "
+        "       OR status != 'paid')"
+    )
+    with connect() as c:
+        cur = c.execute(sql, params)
+        return int(cur.rowcount or 0)
+
+
 def add_manual_payable(supplier: Optional[str],
                        reference: Optional[str],
                        description: Optional[str],

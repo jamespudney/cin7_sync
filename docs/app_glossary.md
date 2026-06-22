@@ -736,6 +736,19 @@ for the previous/current week (or all shown weeks), stamped as
 `auto:actual_sales`; manual forecast edits are preserved unless
 the user explicitly chooses to overwrite them.
 
+#### Cashflow supplier payables
+Supplier payables mirror QuickBooks Online Bills plus any manually
+added non-QBO invoices. For QBO-sourced rows, QBO's open balance is
+authoritative: bills with `qbo_balance <= 0` are treated as paid
+even if the local workflow status was still `pending`.
+
+The QBO sync imports recent bill detail and the full QBO open-bills
+list. If an old local QBO mirror is no longer present in QBO's open
+list, the sync marks it `paid` with `qbo_balance = 0`, so months-old
+settled invoices no longer appear as overdue, due in 30 days, weekly
+supplier payables, or daily cashflow calendar items. Manual rows are
+controlled by the local `status` field.
+
 #### is_non_master_tube (engine column)
 True for SKUs that are children of a bulk-roll master (per-foot
 cuts, BOM derivatives). Their stock and demand roll up to the

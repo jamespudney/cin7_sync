@@ -162,6 +162,11 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   Forecast / Actual / Difference sales rows, with a safe action to copy
   CIN7 actuals into the Forecast sales row for cash planning while
   preserving manual edits by default.
+- **Cashflow stale-payables cleanup** — QBO bill sync now pulls the
+  full open-bills list and marks mirrored QBO bills paid/zero-balance
+  when they are no longer open. Dashboard totals, alerts, weekly
+  supplier-payables buckets and the daily calendar all use the same
+  open-payable rule so paid invoices stop showing as due.
 
 ### 2026-06-19
 

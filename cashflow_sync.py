@@ -7,6 +7,8 @@ Two jobs:
   1. sync_bills_from_qbo() — pull supplier Bills from QBO into the
      cashflow_payables table (the supplier-invoice tracker). Run
      on demand from the dashboard's "Sync from QuickBooks" button.
+     The sync also pulls QBO's full open-bills list and marks local
+     QBO mirrors paid/closed when they are no longer open in QBO.
   2. post_approval_to_slack() — when James approves a payable for
      payment, post the go-ahead into a dedicated Slack channel so
      Cheran sees the amount cleared to pay.
@@ -47,8 +49,12 @@ def _bill_description(bill: dict) -> str:
 
 
 def sync_bills_from_qbo(months_back: int = 6) -> dict:
-    """Pull supplier Bills updated within the last `months_back`
-    months from QuickBooks and upsert them into cashflow_payables.
+    """Pull supplier Bills from QuickBooks into cashflow_payables.
+
+    We import recent bills for invoice detail, then separately pull
+    QBO's full open-bills list. Any locally mirrored QBO bill that is
+    not in that open list is marked paid/zero-balance so old paid
+    invoices do not stay due forever in the forecast.
 
     Returns a summary dict. Raises on a hard QBO failure so the
     caller (the dashboard button) can surface the error."""
@@ -57,7 +63,24 @@ def sync_bills_from_qbo(months_back: int = 6) -> dict:
 
     since = (_dt.date.today()
              - _dt.timedelta(days=31 * months_back)).isoformat()
-    bills = qbo_client.get_bills(since_date=since)
+    recent_bills = qbo_client.get_bills(since_date=since)
+    open_bills = qbo_client.get_bills(only_unpaid=True)
+    bills_by_id = {}
+    for bill in recent_bills:
+        bill_id = str(bill.get("Id") or "").strip()
+        if bill_id:
+            bills_by_id[bill_id] = bill
+    for bill in open_bills:
+        bill_id = str(bill.get("Id") or "").strip()
+        if bill_id:
+            # Open bill data wins if the same bill is in both sets.
+            bills_by_id[bill_id] = bill
+    bills = list(bills_by_id.values())
+    open_bill_ids = {
+        str(bill.get("Id") or "").strip()
+        for bill in open_bills
+        if str(bill.get("Id") or "").strip()
+    }
 
     n_upserted = 0
     n_skipped = 0
@@ -90,10 +113,15 @@ def sync_bills_from_qbo(months_back: int = 6) -> dict:
             qbo_balance=balance,
         )
         n_upserted += 1
+    n_closed = db.mark_qbo_payables_closed_except(
+        sorted(open_bill_ids))
 
     result = {
+        "recent_bills_seen": len(recent_bills),
+        "open_bills_seen": len(open_bills),
         "bills_seen": len(bills),
         "upserted": n_upserted,
+        "closed": n_closed,
         "skipped": n_skipped,
         "since": since,
     }

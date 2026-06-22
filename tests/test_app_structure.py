@@ -177,6 +177,34 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_wk_actual = dict(_cf_actual_sales_by_week)",
                       script)
 
+    def test_cashflow_payables_use_qbo_open_balance(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_script = (root / "app.py").read_text(encoding="utf-8")
+        db_script = (root / "db.py").read_text(encoding="utf-8")
+        sync_script = (
+            root / "cashflow_sync.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _cf_payable_is_open", app_script)
+        self.assertIn("qbo_balance", app_script)
+        self.assertIn("if not _cf_payable_is_open", app_script)
+        self.assertIn("def mark_qbo_payables_closed_except", db_script)
+        self.assertIn("status = 'paid'", db_script)
+        self.assertIn("qbo_balance = 0", db_script)
+        self.assertIn("only_unpaid=True", sync_script)
+        self.assertIn("mark_qbo_payables_closed_except", sync_script)
+
+    def test_mtd_yoy_table_uses_shared_revenue_helper(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("_mtd_rev_src, _mtd_rev_col", script)
+        self.assertIn("hdf[\"__rev\"] = hdf[\"__sales_amount\"]",
+                      script)
+        self.assertIn("\"Revenue\": _rev_for_dates(", script)
+        self.assertNotIn("\"Revenue\": float(chunk[\"Total\"].sum())",
+                         script)
+
 
 class ReorderMathTests(unittest.TestCase):
     def test_bulk_roll_residue_is_ignored_for_planning(self) -> None:
