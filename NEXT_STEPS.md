@@ -155,11 +155,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ### 2026-06-22
 
-- **Cashflow actual-sales visibility** — Overview now shows previous
-  Monday-Sunday sales and current week-to-date sales from CIN7
-  InvoiceDate / InvoiceAmount. Cashflow now mirrors the Google sheet's
+- **Cashflow actual-revenue visibility** — Overview now shows previous
+  Monday-Sunday revenue and current week-to-date revenue from CIN7
+  InvoiceDate / InvoiceAmount minus Tax, matching CIN7's General
+  Dashboard Revenue basis. Cashflow now mirrors the Google sheet's
   Forecast / Actual / Difference sales rows, with a safe action to copy
-  CIN7 actual sales into the Forecast sales row for cash planning while
+  CIN7 actuals into the Forecast sales row for cash planning while
   preserving manual edits by default.
 
 ### 2026-06-19

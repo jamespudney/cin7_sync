@@ -160,7 +160,7 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_render_ordering_editor_enhancer(_ordering_grid_anchor)",
                       script)
 
-    def test_cashflow_actual_sales_use_invoice_date(self) -> None:
+    def test_cashflow_actual_revenue_matches_cin7_basis(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"
         ).read_text(encoding="utf-8")
@@ -168,9 +168,11 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _sales_actuals_frame", script)
         self.assertIn("Cashflow actual sales are grouped by InvoiceDate",
                       script)
-        self.assertIn("Actual sales (CIN7)", script)
+        self.assertIn("InvoiceAmount minus tax", script)
+        self.assertIn("General Dashboard Revenue tile", script)
+        self.assertIn("Actual revenue (CIN7)", script)
         self.assertIn("Difference (actual - forecast)", script)
-        self.assertIn("Sales last week (Mon-Sun)", script)
+        self.assertIn("Revenue last week (Mon-Sun)", script)
         self.assertIn("auto:actual_sales", script)
         self.assertIn("_wk_actual = dict(_cf_actual_sales_by_week)",
                       script)

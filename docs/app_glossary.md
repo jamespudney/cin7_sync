@@ -719,15 +719,17 @@ Two new rows in Monthly Metrics → Inventory:
 Both rows tie to the same dormancy set the Slow Movers page
 uses, so the figures across pages stay aligned.
 
-#### Cashflow actual sales
+#### Cashflow actual revenue
 The Overview and Cashflow pages use CIN7 sales headers as the
-source of truth for weekly actual sales. A sale counts in the
-Monday-Sunday week of its `InvoiceDate`, using `InvoiceAmount`
-where available, and VOIDED / CREDITED / CANCELLED sales are
-excluded.
+source of truth for weekly actual revenue. A sale counts in the
+Monday-Sunday week of its `InvoiceDate`, using CIN7's Revenue
+basis (`InvoiceAmount - Tax` where available), and VOIDED /
+CREDITED / CANCELLED sales are excluded. This is intended to
+match CIN7's General Dashboard `Revenue` tile for the same date
+range.
 
 In Cashflow, `Forecast sales` remains the editable planning row.
-`Actual sales (CIN7)` is a read-only comparison row that mirrors
+`Actual revenue (CIN7)` is a read-only comparison row that mirrors
 the old Google cashflow sheet's `Actual` row. The "Use actual
 sales" action can copy those CIN7 actuals into `Forecast sales`
 for the previous/current week (or all shown weeks), stamped as

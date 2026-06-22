@@ -743,13 +743,27 @@ _SALES_ACTUAL_AMOUNT_COLS = (
 def _sales_actuals_frame(
         sales_full_df: Optional[pd.DataFrame],
         sales_headers_df: Optional[pd.DataFrame],
+        sale_lines_df: Optional[pd.DataFrame] = None,
 ) -> tuple[pd.DataFrame, str, str]:
     """Return valid CIN7 sales headers for cashflow actuals.
 
     Cashflow actual sales are grouped by InvoiceDate, not OrderDate.
-    That matches how the old cashflow sheet records actual weekly
-    sales: money is counted once CIN7 has an invoice/actual sale.
+    The amount is CIN7 Revenue basis, not gross InvoiceAmount:
+    InvoiceAmount minus tax, excluding voided/credited/cancelled
+    sales. That matches the General Dashboard Revenue tile.
     """
+    line_tax_by_sale: dict[str, float] = {}
+    if (sale_lines_df is not None and not sale_lines_df.empty
+            and "SaleID" in sale_lines_df.columns
+            and "Tax" in sale_lines_df.columns):
+        try:
+            _sl = sale_lines_df[["SaleID", "Tax"]].copy()
+            _sl["SaleID"] = _sl["SaleID"].astype(str)
+            _sl["Tax"] = _to_num(_sl["Tax"]).fillna(0.0)
+            line_tax_by_sale = _sl.groupby("SaleID")["Tax"].sum().to_dict()
+        except Exception:  # noqa: BLE001
+            line_tax_by_sale = {}
+
     candidates = (
         ("merged sales history", sales_full_df),
         ("sales headers", sales_headers_df),
@@ -769,23 +783,40 @@ def _sales_actuals_frame(
         out["__sales_date"] = pd.to_datetime(
             out["InvoiceDate"], errors="coerce", utc=True
         ).dt.tz_localize(None)
-        out["__sales_amount"] = _to_num(out[amt_col]).fillna(0.0)
+        out["__gross_sales_amount"] = _to_num(out[amt_col]).fillna(0.0)
+        if "Tax" in out.columns:
+            tax = _to_num(out["Tax"]).fillna(0.0)
+        else:
+            tax = pd.Series(0.0, index=out.index)
+        if line_tax_by_sale and "SaleID" in out.columns:
+            line_tax = out["SaleID"].astype(str).map(
+                line_tax_by_sale).fillna(0.0)
+            tax = tax.where(tax != 0, line_tax)
+        if amt_col == "Total":
+            # Header Total is already the closest revenue fallback.
+            out["__sales_amount"] = out["__gross_sales_amount"]
+            amount_label = "Total"
+        else:
+            out["__sales_amount"] = (
+                out["__gross_sales_amount"] - tax)
+            amount_label = f"{amt_col} - Tax"
         out = out.dropna(subset=["__sales_date"])
         if "Status" in out.columns:
             out = out[
                 ~out["Status"].astype(str).str.upper().isin(
                     _BAD_SALE_STATUSES)
             ]
-        return out, source_name, amt_col
+        return out, source_name, amount_label
     return pd.DataFrame(), "", ""
 
 
 def _weekly_actual_sales_amounts(
         sales_full_df: Optional[pd.DataFrame],
         sales_headers_df: Optional[pd.DataFrame],
+        sale_lines_df: Optional[pd.DataFrame] = None,
 ) -> tuple[dict[str, float], str, str]:
     actuals, source_name, amt_col = _sales_actuals_frame(
-        sales_full_df, sales_headers_df)
+        sales_full_df, sales_headers_df, sale_lines_df)
     if actuals.empty:
         return {}, source_name, amt_col
     wk = actuals["__sales_date"].dt.normalize() - pd.to_timedelta(
@@ -3225,12 +3256,13 @@ def _load_longest_shopify_orders() -> pd.DataFrame:
         _dir_fingerprint("shopify_orders_*.csv"))
 
 
-# Order-level (header) sales for revenue calculations that need to
-# match CIN7's dashboard. The line-level `sale_lines.Total` excludes
-# shipping; `sales_full.InvoiceAmount` includes shipping + tax which
-# is what CIN7 shows on its own Revenue tile. We keep BOTH around:
+# Order-level (header) sales for revenue calculations. The line-level
+# `sale_lines.Total` excludes shipping; `sales_full.InvoiceAmount`
+# carries the gross invoiced amount. CIN7's General Dashboard Revenue
+# tile is the pre-tax basis, so `_sales_actuals_frame` subtracts tax
+# when building weekly cashflow/revenue actuals. We keep BOTH around:
 # - sale_lines for unit counts, velocity, customer rollup, ABC engine
-# - sales_full for revenue $ that the user can reconcile to CIN7
+# - sales_full for order-level gross/revenue $ that reconcile to CIN7
 sales_full = _load_longest_sales()
 
 # v2.67.51 — rebind `purchase_lines` to use the merged longest-window
@@ -7175,10 +7207,11 @@ if page == "Overview":
 
     # Weekly actual sales for cashflow projection. These mirror the
     # Google cashflow sheet's Monday-Sunday week buckets and use the
-    # same CIN7 "actual sale" basis as the Cashflow page: InvoiceDate
-    # plus InvoiceAmount, excluding voided/credited/cancelled sales.
+    # same CIN7 Revenue basis as the Cashflow page: InvoiceDate plus
+    # InvoiceAmount minus tax, excluding voided/credited/cancelled
+    # sales.
     _ov_actuals, _ov_actual_src, _ov_actual_amt_col = (
-        _sales_actuals_frame(sales_full, sales_headers))
+        _sales_actuals_frame(sales_full, sales_headers, sale_lines))
     _ov_today = pd.Timestamp(datetime.now().date())
     _ov_this_monday = _ov_today - pd.Timedelta(
         days=_ov_today.weekday())
@@ -7191,30 +7224,30 @@ if page == "Overview":
 
     wk1, wk2 = st.columns(2)
     wk1.metric(
-        "Sales last week (Mon-Sun)",
+        "Revenue last week (Mon-Sun)",
         _fmt_money(_ov_prev_sales),
         delta=f"{_ov_prev_count:,} invoices",
         delta_color="off",
         help=f"{_sales_week_label(_ov_prev_monday)}. Uses CIN7 "
-             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount'}; "
-             "same actual-sales basis used by Cashflow.")
+             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount - Tax'}; "
+             "same Revenue basis used by Cashflow.")
     wk2.metric(
-        "Sales this week to date",
+        "Revenue this week to date",
         _fmt_money(_ov_wtd_sales),
         delta=f"{_ov_wtd_count:,} invoices",
         delta_color="off",
         help=f"Week of {_sales_week_label(_ov_this_monday)} through "
              f"{_ov_today.strftime('%b')} {_ov_today.day}. Uses CIN7 "
-             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount'}; "
+             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount - Tax'}; "
              "updates as the sales sync refreshes.")
     if _ov_actuals.empty:
         st.caption(
-            ":warning: Weekly sales actuals are unavailable because "
+            ":warning: Weekly revenue actuals are unavailable because "
             "no sales history with InvoiceDate and InvoiceAmount was "
             "loaded.")
     elif _ov_actual_src:
         st.caption(
-            f"Weekly cashflow sales source: {_ov_actual_src} "
+            f"Weekly cashflow revenue source: {_ov_actual_src} "
             f"({_ov_actual_amt_col}).")
 
     st.divider()
@@ -23294,7 +23327,7 @@ elif page == "Cashflow":
     _dash_mkey = _dash_monday.strftime("%Y-%m-%d")
     _dash_prev_monday = _dash_monday - pd.Timedelta(days=7)
     _dash_actuals, _dash_actual_src, _dash_actual_amt_col = (
-        _sales_actuals_frame(sales_full, sales_headers))
+        _sales_actuals_frame(sales_full, sales_headers, sale_lines))
     _dash_prev_sales, _dash_prev_sales_count = _sales_actuals_in_window(
         _dash_actuals, _dash_prev_monday, _dash_monday)
     _dash_wtd_sales, _dash_wtd_sales_count = _sales_actuals_in_window(
@@ -23420,14 +23453,15 @@ elif page == "Cashflow":
 
     _as1, _as2, _as3 = st.columns(3)
     _as1.metric(
-        "Actual sales last week",
+        "Actual revenue last week",
         _fmt_money(_dash_prev_sales),
         delta=f"{_dash_prev_sales_count:,} invoices",
         delta_color="off",
         help=f"{_sales_week_label(_dash_prev_monday)}. CIN7 "
-             f"InvoiceDate + {_dash_actual_amt_col or 'InvoiceAmount'}.")
+             f"InvoiceDate + "
+             f"{_dash_actual_amt_col or 'InvoiceAmount - Tax'}.")
     _as2.metric(
-        "Actual sales this week to date",
+        "Actual revenue this week to date",
         _fmt_money(_dash_wtd_sales),
         delta=f"{_dash_wtd_sales_count:,} invoices",
         delta_color="off",
@@ -23446,10 +23480,10 @@ elif page == "Cashflow":
         delta=_dash_sales_gap_txt,
         delta_color="normal",
         help="The saved Forecast sales cell for this week. The delta "
-             "is current actual sales to date minus that forecast.")
+             "is current actual revenue to date minus that forecast.")
     if _dash_actual_src:
         st.caption(
-            f"Actual sales source: {_dash_actual_src} "
+            f"Actual revenue source: {_dash_actual_src} "
             f"({_dash_actual_amt_col}); same basis as the Google "
             "cashflow sheet's Actual row.")
 
@@ -24011,40 +24045,41 @@ elif page == "Cashflow":
             return "—"
 
     _cf_actual_sales_by_week, _cf_actual_src, _cf_actual_amt_col = (
-        _weekly_actual_sales_amounts(sales_full, sales_headers))
+        _weekly_actual_sales_amounts(
+            sales_full, sales_headers, sale_lines))
 
     _cf_sales_compare = pd.DataFrame({
         "Forecast sales": [
             float(_cf_fc.get((wk, "forecast_sales")) or 0.0)
             for wk in _cf_wkey
         ],
-        "Actual sales (CIN7)": [
+        "Actual revenue (CIN7)": [
             float(_cf_actual_sales_by_week.get(wk, 0.0))
             for wk in _cf_wkey
         ],
     }, index=_cf_wcol).T
     _cf_sales_compare.loc["Difference (actual - forecast)"] = (
-        _cf_sales_compare.loc["Actual sales (CIN7)"]
+        _cf_sales_compare.loc["Actual revenue (CIN7)"]
         - _cf_sales_compare.loc["Forecast sales"]
     )
-    st.markdown("**Forecast sales vs actual sales**")
+    st.markdown("**Forecast sales vs actual CIN7 revenue**")
     st.dataframe(
         _cf_sales_compare.style.format(_cf_cell_fmt),
         use_container_width=True)
     if _cf_actual_src:
         st.caption(
-            f"Actual sales are grouped by CIN7 InvoiceDate from "
+            f"Actual revenue is grouped by CIN7 InvoiceDate from "
             f"{_cf_actual_src} ({_cf_actual_amt_col}). This mirrors "
             "the Google cashflow sheet's Actual row.")
     else:
         st.caption(
-            ":warning: No CIN7 actual-sales history is available for "
+            ":warning: No CIN7 actual-revenue history is available for "
             "this comparison yet.")
 
     with st.expander(":white_check_mark: Use CIN7 actual sales in "
                      "the Forecast sales row", expanded=False):
         st.caption(
-            "This writes the read-only **Actual sales (CIN7)** values "
+            "This writes the read-only **Actual revenue (CIN7)** values "
             "into the editable **Forecast sales** row for cashflow "
             "planning. Use it once a week has closed, or during the "
             "current week when you want the forecast anchored to "
