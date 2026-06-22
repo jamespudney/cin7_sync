@@ -193,23 +193,25 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("only_unpaid=True", sync_script)
         self.assertIn("mark_qbo_payables_closed_except", sync_script)
 
-    def test_qbo_cashflow_sync_runs_in_background_loop(self) -> None:
+    def test_qbo_cashflow_sync_runs_from_nearsync_task(self) -> None:
         root = Path(__file__).resolve().parents[1]
         start_script = (root / "start.sh").read_text(encoding="utf-8")
         render_config = (root / "render.yaml").read_text(encoding="utf-8")
-        loop_script = (
-            root / "qbo_cashflow_loop.sh").read_text(encoding="utf-8")
+        nearsync_loop = (
+            root / "nearsync_loop.sh").read_text(encoding="utf-8")
         sync_script = (
             root / "cashflow_sync.py").read_text(encoding="utf-8")
 
-        self.assertIn("_supervise qbo_cashflow ./qbo_cashflow_loop.sh",
-                      start_script)
-        self.assertIn("QBO_CASHFLOW_PID", start_script)
+        self.assertNotIn("_supervise qbo_cashflow", start_script)
+        self.assertNotIn("QBO_CASHFLOW_PID", start_script)
         self.assertIn("QBO_CASHFLOW_INTERVAL_HOURS", render_config)
+        self.assertIn("QBO_CASHFLOW_BOOT_DELAY_MIN", render_config)
         self.assertIn("QBO_CASHFLOW_MONTHS_BACK", render_config)
-        self.assertIn("python cashflow_sync.py sync --months-back",
-                      loop_script)
-        self.assertIn("timeout 300", loop_script)
+        self.assertIn("python cashflow_sync.py sync", nearsync_loop)
+        self.assertIn("--months-back", nearsync_loop)
+        self.assertIn("QBO_CASHFLOW_BOOT_DELAY_MIN", nearsync_loop)
+        self.assertIn(".qbo_cashflow_sync.lock", nearsync_loop)
+        self.assertIn("timeout 300", nearsync_loop)
         self.assertIn("qbo_client.is_ready()", sync_script)
         self.assertIn("def cmd_sync", sync_script)
 

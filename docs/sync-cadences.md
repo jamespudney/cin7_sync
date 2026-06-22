@@ -1,8 +1,9 @@
 # Data sync cadences
 
-The app keeps its data fresh through three scheduled processes plus
-manual triggers. They run inside the live Render web service
-container so they share the same persistent disk as Streamlit.
+The app keeps its data fresh through two long-running scheduled
+loops plus a few lightweight scheduled tasks and manual triggers.
+They run inside the live Render web service container so they share
+the same persistent disk as Streamlit.
 
 ## Nearsync — every 15 minutes, all day
 
@@ -47,10 +48,13 @@ Runs `python cashflow_sync.py sync --months-back 6`. Pulls:
 - Recent QuickBooks Online supplier Bills for invoice detail.
 - The full QBO open-bills list for authoritative open balances.
 
-This keeps the Cashflow page from showing supplier invoices that
-were already paid in QuickBooks. The dashboard's **Sync from
-QuickBooks** button remains available for an immediate manual
-refresh.
+This is triggered by `nearsync_loop.sh` after its own near-sync work,
+not by a third always-on process. It waits
+`QBO_CASHFLOW_BOOT_DELAY_MIN` minutes after deploy (default `30`) so
+QuickBooks work does not compete with Streamlit startup. This keeps
+the Cashflow page from showing supplier invoices that were already
+paid in QuickBooks. The dashboard's **Sync from QuickBooks** button
+remains available for an immediate manual refresh.
 
 Cadence is controlled by `QBO_CASHFLOW_INTERVAL_HOURS` on Render
 (default `4`). The recent detail window is controlled by
@@ -81,9 +85,12 @@ to write to `/data/team_actions.db` and `/data/output/`. Solution:
 the syncs run as background processes inside the web service's
 container, sharing its disk.
 
-`start.sh` launches four things:
+`start.sh` launches three things:
 
 1. `nearsync_loop.sh` — sleep-loop, runs every 15 min.
 2. `sync_loop.sh` — sleep-loop, fires once per day at SYNC_HOUR_UTC.
-3. `qbo_cashflow_loop.sh` — sleep-loop, refreshes QBO supplier bills.
-4. Streamlit (foreground, so Render's health check reaches it).
+3. Streamlit (foreground, so Render's health check reaches it).
+
+QBO supplier-bill refreshes are scheduled from inside
+`nearsync_loop.sh` with a lock, timeout, and boot delay, so they do
+not add another permanent process to the Streamlit container.

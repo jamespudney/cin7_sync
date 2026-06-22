@@ -7,8 +7,8 @@ Two jobs:
   1. sync_bills_from_qbo() — pull supplier Bills from QBO into the
      cashflow_payables table (the supplier-invoice tracker). Run on
      demand from the dashboard's "Sync from QuickBooks" button and
-     automatically from qbo_cashflow_loop.sh every few hours. The
-     sync also pulls QBO's full open-bills list and marks local QBO
+     automatically from nearsync_loop.sh every few hours. The sync
+     also pulls QBO's full open-bills list and marks local QBO
      mirrors paid/closed when they are no longer open in QBO.
   2. post_approval_to_slack() — when James approves a payable for
      payment, post the go-ahead into a dedicated Slack channel so
@@ -133,7 +133,7 @@ def sync_bills_from_qbo(months_back: int = 6) -> dict:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    """CLI entrypoint used by qbo_cashflow_loop.sh.
+    """CLI entrypoint used by the scheduled QBO cashflow task.
 
     The dashboard button still raises sync errors to Streamlit, but the
     background loop should degrade politely when QuickBooks is not yet

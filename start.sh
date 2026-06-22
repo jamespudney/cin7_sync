@@ -12,9 +12,8 @@
 #     the workday. Logs to /data/output/nearsync_loop.log.
 #   sync_loop.sh    — runs once at 02:00 UTC nightly, pulls full
 #     masters + 3-day windows. Logs to /data/output/sync_loop.log.
-#   qbo_cashflow_loop.sh — runs every few hours, pulls QBO supplier
-#     bills/open balances for Cashflow. Logs to
-#     /data/output/qbo_cashflow_loop.log.
+#   QBO cashflow refresh — triggered from nearsync_loop.sh every few
+#     hours after boot, avoiding a third always-on process.
 #   streamlit       — foreground (exec). Must be foreground so
 #     Render's health check on $PORT reaches it.
 set -euo pipefail
@@ -89,9 +88,7 @@ _supervise nearsync ./nearsync_loop.sh &
 NEARSYNC_PID=$!
 _supervise sync ./sync_loop.sh &
 SYNC_PID=$!
-_supervise qbo_cashflow ./qbo_cashflow_loop.sh &
-QBO_CASHFLOW_PID=$!
-trap "kill $NEARSYNC_PID $SYNC_PID $QBO_CASHFLOW_PID 2>/dev/null || true" EXIT
+trap "kill $NEARSYNC_PID $SYNC_PID 2>/dev/null || true" EXIT
 
 # Streamlit in the foreground.
 exec streamlit run app.py \

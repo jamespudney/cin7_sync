@@ -858,9 +858,11 @@ settled invoices no longer appear as overdue, due in 30 days, weekly
 supplier payables, or daily cashflow calendar items. Manual rows are
 controlled by the local `status` field.
 
-The QBO bill sync runs automatically from `qbo_cashflow_loop.sh`
-every `QBO_CASHFLOW_INTERVAL_HOURS` hours (default `4`) and can
-still be run immediately from Cashflow via **Sync from QuickBooks**.
+The QBO bill sync runs automatically from `nearsync_loop.sh` every
+`QBO_CASHFLOW_INTERVAL_HOURS` hours (default `4`) after a
+`QBO_CASHFLOW_BOOT_DELAY_MIN` deploy delay (default `30` minutes).
+It can still be run immediately from Cashflow via **Sync from
+QuickBooks**.
 
 #### is_non_master_tube (engine column)
 True for SKUs that are children of a bulk-roll master (per-foot

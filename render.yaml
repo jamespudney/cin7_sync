@@ -24,7 +24,7 @@
 # the shared group:
 #   STREAMLIT_SERVER_HEADLESS, STREAMLIT_HOME,
 #   SYNC_HOUR_UTC, NEARSYNC_INTERVAL_MIN,
-#   QBO_CASHFLOW_INTERVAL_HOURS
+#   QBO_CASHFLOW_INTERVAL_HOURS, QBO_CASHFLOW_BOOT_DELAY_MIN
 #
 # Render disks can't be shared across services — each disk attaches to
 # exactly one service. The app service owns /data; the worker reads
@@ -90,6 +90,9 @@ services:
       # QBO_CASHFLOW_INTERVAL_HOURS — how often to refresh supplier
       #                      bills/open balances from QuickBooks Online
       #                      for Cashflow. Default 4h.
+      # QBO_CASHFLOW_BOOT_DELAY_MIN — delay the first automatic QBO
+      #                      cashflow refresh after deploy so it does
+      #                      not compete with Streamlit startup.
       # QBO_CASHFLOW_MONTHS_BACK — recent bill-detail window. The sync
       #                      always pulls the full open-bills list too,
       #                      so old paid bills still close locally.
@@ -99,6 +102,8 @@ services:
         value: "15"
       - key: QBO_CASHFLOW_INTERVAL_HOURS
         value: "4"
+      - key: QBO_CASHFLOW_BOOT_DELAY_MIN
+        value: "30"
       - key: QBO_CASHFLOW_MONTHS_BACK
         value: "6"
       # ---- Secrets (set in Render UI, not here) -----------------------
