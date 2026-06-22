@@ -21,6 +21,9 @@ What it deliberately SKIPS
   just inject noise.
 - "Supplier PUR Due / Paid" — the app derives the supplier-
   payables outflow from the live payables tracker.
+- The sheet's "Actual" sales row — the app now derives weekly
+  actual sales directly from CIN7 InvoiceDate / InvoiceAmount so
+  Cashflow and Overview stay current after each sales sync.
 - "Total ..." computed rows.
 
 Notes

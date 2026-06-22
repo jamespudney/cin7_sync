@@ -731,6 +731,105 @@ def _to_num(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+_BAD_SALE_STATUSES = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
+_SALES_ACTUAL_AMOUNT_COLS = (
+    "InvoiceAmount",
+    "GrandTotal",
+    "Total",
+    "InvoiceTotal",
+)
+
+
+def _sales_actuals_frame(
+        sales_full_df: Optional[pd.DataFrame],
+        sales_headers_df: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, str, str]:
+    """Return valid CIN7 sales headers for cashflow actuals.
+
+    Cashflow actual sales are grouped by InvoiceDate, not OrderDate.
+    That matches how the old cashflow sheet records actual weekly
+    sales: money is counted once CIN7 has an invoice/actual sale.
+    """
+    candidates = (
+        ("merged sales history", sales_full_df),
+        ("sales headers", sales_headers_df),
+    )
+    for source_name, df in candidates:
+        if df is None or df.empty:
+            continue
+        if "InvoiceDate" not in df.columns:
+            continue
+        amt_col = next(
+            (c for c in _SALES_ACTUAL_AMOUNT_COLS if c in df.columns),
+            None,
+        )
+        if not amt_col:
+            continue
+        out = df.copy()
+        out["__sales_date"] = pd.to_datetime(
+            out["InvoiceDate"], errors="coerce", utc=True
+        ).dt.tz_localize(None)
+        out["__sales_amount"] = _to_num(out[amt_col]).fillna(0.0)
+        out = out.dropna(subset=["__sales_date"])
+        if "Status" in out.columns:
+            out = out[
+                ~out["Status"].astype(str).str.upper().isin(
+                    _BAD_SALE_STATUSES)
+            ]
+        return out, source_name, amt_col
+    return pd.DataFrame(), "", ""
+
+
+def _weekly_actual_sales_amounts(
+        sales_full_df: Optional[pd.DataFrame],
+        sales_headers_df: Optional[pd.DataFrame],
+) -> tuple[dict[str, float], str, str]:
+    actuals, source_name, amt_col = _sales_actuals_frame(
+        sales_full_df, sales_headers_df)
+    if actuals.empty:
+        return {}, source_name, amt_col
+    wk = actuals["__sales_date"].dt.normalize() - pd.to_timedelta(
+        actuals["__sales_date"].dt.weekday, unit="D")
+    tmp = pd.DataFrame({
+        "week_start": wk.dt.strftime("%Y-%m-%d"),
+        "amount": actuals["__sales_amount"],
+    })
+    weekly = tmp.groupby("week_start")["amount"].sum().to_dict()
+    return {str(k): float(v) for k, v in weekly.items()}, source_name, amt_col
+
+
+def _sales_actuals_in_window(
+        actuals: pd.DataFrame,
+        start,
+        end_exclusive,
+) -> tuple[float, int]:
+    if actuals is None or actuals.empty:
+        return 0.0, 0
+    start_ts = pd.Timestamp(start).normalize()
+    end_ts = pd.Timestamp(end_exclusive).normalize()
+    mask = (
+        (actuals["__sales_date"] >= start_ts)
+        & (actuals["__sales_date"] < end_ts)
+    )
+    win = actuals.loc[mask]
+    if win.empty:
+        return 0.0, 0
+    amount = float(win["__sales_amount"].sum())
+    order_col = next(
+        (c for c in ("SaleID", "SaleNumber", "OrderNumber",
+                     "InvoiceNumber") if c in win.columns),
+        None,
+    )
+    count = int(win[order_col].astype(str).nunique()) if order_col else len(win)
+    return amount, count
+
+
+def _sales_week_label(start_ts) -> str:
+    start = pd.Timestamp(start_ts).normalize()
+    end = start + pd.Timedelta(days=6)
+    return f"{start.strftime('%b')} {start.day} - {end.strftime('%b')} {end.day}"
+
+
 def _safe_cache_clear() -> None:
     """v2.67.210 — race-safe wrapper for Streamlit's cache_data
     clear.
@@ -7073,6 +7172,50 @@ if page == "Overview":
                     "covers (default 90d; weekend sync extends to 5yr).")
     c4.metric("Open PO value", _fmt_money(open_po_value),
                help="Sum of line Total for all open POs.")
+
+    # Weekly actual sales for cashflow projection. These mirror the
+    # Google cashflow sheet's Monday-Sunday week buckets and use the
+    # same CIN7 "actual sale" basis as the Cashflow page: InvoiceDate
+    # plus InvoiceAmount, excluding voided/credited/cancelled sales.
+    _ov_actuals, _ov_actual_src, _ov_actual_amt_col = (
+        _sales_actuals_frame(sales_full, sales_headers))
+    _ov_today = pd.Timestamp(datetime.now().date())
+    _ov_this_monday = _ov_today - pd.Timedelta(
+        days=_ov_today.weekday())
+    _ov_prev_monday = _ov_this_monday - pd.Timedelta(days=7)
+    _ov_next_day = _ov_today + pd.Timedelta(days=1)
+    _ov_prev_sales, _ov_prev_count = _sales_actuals_in_window(
+        _ov_actuals, _ov_prev_monday, _ov_this_monday)
+    _ov_wtd_sales, _ov_wtd_count = _sales_actuals_in_window(
+        _ov_actuals, _ov_this_monday, _ov_next_day)
+
+    wk1, wk2 = st.columns(2)
+    wk1.metric(
+        "Sales last week (Mon-Sun)",
+        _fmt_money(_ov_prev_sales),
+        delta=f"{_ov_prev_count:,} invoices",
+        delta_color="off",
+        help=f"{_sales_week_label(_ov_prev_monday)}. Uses CIN7 "
+             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount'}; "
+             "same actual-sales basis used by Cashflow.")
+    wk2.metric(
+        "Sales this week to date",
+        _fmt_money(_ov_wtd_sales),
+        delta=f"{_ov_wtd_count:,} invoices",
+        delta_color="off",
+        help=f"Week of {_sales_week_label(_ov_this_monday)} through "
+             f"{_ov_today.strftime('%b')} {_ov_today.day}. Uses CIN7 "
+             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount'}; "
+             "updates as the sales sync refreshes.")
+    if _ov_actuals.empty:
+        st.caption(
+            ":warning: Weekly sales actuals are unavailable because "
+            "no sales history with InvoiceDate and InvoiceAmount was "
+            "loaded.")
+    elif _ov_actual_src:
+        st.caption(
+            f"Weekly cashflow sales source: {_ov_actual_src} "
+            f"({_ov_actual_amt_col}).")
 
     st.divider()
 
@@ -23149,6 +23292,13 @@ elif page == "Cashflow":
     _dash_monday = _dash_today - pd.Timedelta(
         days=_dash_today.weekday())
     _dash_mkey = _dash_monday.strftime("%Y-%m-%d")
+    _dash_prev_monday = _dash_monday - pd.Timedelta(days=7)
+    _dash_actuals, _dash_actual_src, _dash_actual_amt_col = (
+        _sales_actuals_frame(sales_full, sales_headers))
+    _dash_prev_sales, _dash_prev_sales_count = _sales_actuals_in_window(
+        _dash_actuals, _dash_prev_monday, _dash_monday)
+    _dash_wtd_sales, _dash_wtd_sales_count = _sales_actuals_in_window(
+        _dash_actuals, _dash_monday, _dash_today + pd.Timedelta(days=1))
 
     try:
         _dash_fc = db.get_forecast()
@@ -23267,6 +23417,41 @@ elif page == "Cashflow":
                _fmt_money(_wk_net),
                help="Forecast inflows minus outflows minus "
                     "supplier bills due this week.")
+
+    _as1, _as2, _as3 = st.columns(3)
+    _as1.metric(
+        "Actual sales last week",
+        _fmt_money(_dash_prev_sales),
+        delta=f"{_dash_prev_sales_count:,} invoices",
+        delta_color="off",
+        help=f"{_sales_week_label(_dash_prev_monday)}. CIN7 "
+             f"InvoiceDate + {_dash_actual_amt_col or 'InvoiceAmount'}.")
+    _as2.metric(
+        "Actual sales this week to date",
+        _fmt_money(_dash_wtd_sales),
+        delta=f"{_dash_wtd_sales_count:,} invoices",
+        delta_color="off",
+        help=f"Week of {_sales_week_label(_dash_monday)} through "
+             f"{_dash_today.strftime('%b')} {_dash_today.day}.")
+    _dash_sales_forecast = float(
+        _dash_fc.get((_dash_mkey, "forecast_sales")) or 0.0)
+    _dash_sales_gap = _dash_wtd_sales - _dash_sales_forecast
+    _dash_sales_gap_txt = (
+        f"+{_fmt_money(abs(_dash_sales_gap))}"
+        if _dash_sales_gap >= 0
+        else f"-{_fmt_money(abs(_dash_sales_gap))}")
+    _as3.metric(
+        "Forecast sales this week",
+        _fmt_money(_dash_sales_forecast),
+        delta=_dash_sales_gap_txt,
+        delta_color="normal",
+        help="The saved Forecast sales cell for this week. The delta "
+             "is current actual sales to date minus that forecast.")
+    if _dash_actual_src:
+        st.caption(
+            f"Actual sales source: {_dash_actual_src} "
+            f"({_dash_actual_amt_col}); same basis as the Google "
+            "cashflow sheet's Actual row.")
 
     if _due30_rows:
         st.markdown("**Payments due in the next 30 days**")
@@ -23817,6 +24002,101 @@ elif page == "Cashflow":
         _cf_fc = {}
         st.error(f"Could not load forecast: {_exc}")
 
+    def _cf_cell_fmt(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        try:
+            return f"{float(v):,.0f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    _cf_actual_sales_by_week, _cf_actual_src, _cf_actual_amt_col = (
+        _weekly_actual_sales_amounts(sales_full, sales_headers))
+
+    _cf_sales_compare = pd.DataFrame({
+        "Forecast sales": [
+            float(_cf_fc.get((wk, "forecast_sales")) or 0.0)
+            for wk in _cf_wkey
+        ],
+        "Actual sales (CIN7)": [
+            float(_cf_actual_sales_by_week.get(wk, 0.0))
+            for wk in _cf_wkey
+        ],
+    }, index=_cf_wcol).T
+    _cf_sales_compare.loc["Difference (actual - forecast)"] = (
+        _cf_sales_compare.loc["Actual sales (CIN7)"]
+        - _cf_sales_compare.loc["Forecast sales"]
+    )
+    st.markdown("**Forecast sales vs actual sales**")
+    st.dataframe(
+        _cf_sales_compare.style.format(_cf_cell_fmt),
+        use_container_width=True)
+    if _cf_actual_src:
+        st.caption(
+            f"Actual sales are grouped by CIN7 InvoiceDate from "
+            f"{_cf_actual_src} ({_cf_actual_amt_col}). This mirrors "
+            "the Google cashflow sheet's Actual row.")
+    else:
+        st.caption(
+            ":warning: No CIN7 actual-sales history is available for "
+            "this comparison yet.")
+
+    with st.expander(":white_check_mark: Use CIN7 actual sales in "
+                     "the Forecast sales row", expanded=False):
+        st.caption(
+            "This writes the read-only **Actual sales (CIN7)** values "
+            "into the editable **Forecast sales** row for cashflow "
+            "planning. Use it once a week has closed, or during the "
+            "current week when you want the forecast anchored to "
+            "sales already invoiced.")
+        _uas_scope = st.radio(
+            "Weeks to update",
+            ["Previous week + current week", "All shown weeks"],
+            horizontal=True,
+            key="_cf_use_actual_sales_scope")
+        _uas_force = st.checkbox(
+            "Overwrite manual Forecast sales edits",
+            value=False,
+            key="_cf_use_actual_sales_force")
+        if st.button("Use actual sales", key="_cf_use_actual_sales"):
+            try:
+                _uas_owners = db.get_forecast_owners(_cf_scenario)
+            except Exception:  # noqa: BLE001
+                _uas_owners = {}
+            if _uas_scope == "All shown weeks":
+                _uas_targets = list(_cf_wkey)
+            else:
+                _uas_targets = [
+                    (_cf_this_monday - pd.Timedelta(days=7)).strftime(
+                        "%Y-%m-%d"),
+                    _cf_this_monday.strftime("%Y-%m-%d"),
+                ]
+            _uas_set = _uas_kept = _uas_missing = 0
+            for _wk in _uas_targets:
+                if _wk not in _cf_wkey:
+                    continue
+                if _wk not in _cf_actual_sales_by_week:
+                    _uas_missing += 1
+                    continue
+                _owner = _uas_owners.get((_wk, "forecast_sales"))
+                _auto_owner = _owner in (None, "auto:sales",
+                                         "auto:actual_sales")
+                if _owner and not _auto_owner and not _uas_force:
+                    _uas_kept += 1
+                    continue
+                db.set_forecast_cell(
+                    _wk, "forecast_sales",
+                    float(_cf_actual_sales_by_week[_wk]),
+                    updated_by="auto:actual_sales",
+                    scenario=_cf_scenario)
+                _uas_set += 1
+            st.success(
+                f":white_check_mark: Updated {_uas_set} week(s). "
+                f"Kept {_uas_kept} manual edit(s); "
+                f"{_uas_missing} week(s) had no actual-sales data.")
+            if _uas_set:
+                st.rerun()
+
     # ---- Project forecast sales from prior-year actuals (v2.67.224)
     with st.expander(":crystal_ball: Project the Forecast sales "
                      "row (prior year + growth)", expanded=False):
@@ -23835,37 +24115,8 @@ elif page == "Cashflow":
         if st.button("Project forecast sales", key="_cf_ps_run"):
             # Weekly actual sales from the longest CIN7 sales
             # history — group InvoiceAmount by the Monday of
-            # OrderDate.
-            _wk_actual = {}
-            try:
-                if (sales_full is not None
-                        and not sales_full.empty
-                        and "OrderDate" in sales_full.columns):
-                    _amt_col = next(
-                        (c for c in ("InvoiceAmount", "Total",
-                                      "InvoiceTotal")
-                          if c in sales_full.columns), None)
-                    if _amt_col:
-                        _sd = pd.to_datetime(
-                            sales_full["OrderDate"],
-                            errors="coerce")
-                        _sa = pd.to_numeric(
-                            sales_full[_amt_col],
-                            errors="coerce").fillna(0.0)
-                        _tmp = pd.DataFrame(
-                            {"d": _sd, "amt": _sa}).dropna(
-                            subset=["d"])
-                        _tmp["mon"] = (
-                            _tmp["d"]
-                            - pd.to_timedelta(
-                                _tmp["d"].dt.weekday, unit="D"))
-                        _wk_actual = (
-                            _tmp.groupby(
-                                _tmp["mon"].dt.strftime(
-                                    "%Y-%m-%d"))["amt"]
-                            .sum().to_dict())
-            except Exception as _exc:  # noqa: BLE001
-                st.error(f"Could not read sales history: {_exc}")
+            # InvoiceDate. This matches the cashflow Actual row.
+            _wk_actual = dict(_cf_actual_sales_by_week)
             if not _wk_actual:
                 st.error(
                     "No CIN7 sales history available to project "
@@ -24205,14 +24456,6 @@ elif page == "Cashflow":
             _variance)
         _closings.append(_closing)
         _running = _closing
-
-    def _cf_cell_fmt(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return "—"
-        try:
-            return f"{float(v):,.0f}"
-        except (TypeError, ValueError):
-            return "—"
 
     _proj_df = pd.DataFrame(_proj_rows, index=_cf_wcol).T
     _proj_df.index.name = "Projection"

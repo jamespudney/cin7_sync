@@ -828,6 +828,21 @@ Two new rows in Monthly Metrics → Inventory:
 Both rows tie to the same dormancy set the Slow Movers page
 uses, so the figures across pages stay aligned.
 
+#### Cashflow actual sales
+The Overview and Cashflow pages use CIN7 sales headers as the
+source of truth for weekly actual sales. A sale counts in the
+Monday-Sunday week of its `InvoiceDate`, using `InvoiceAmount`
+where available, and VOIDED / CREDITED / CANCELLED sales are
+excluded.
+
+In Cashflow, `Forecast sales` remains the editable planning row.
+`Actual sales (CIN7)` is a read-only comparison row that mirrors
+the old Google cashflow sheet's `Actual` row. The "Use actual
+sales" action can copy those CIN7 actuals into `Forecast sales`
+for the previous/current week (or all shown weeks), stamped as
+`auto:actual_sales`; manual forecast edits are preserved unless
+the user explicitly chooses to overwrite them.
+
 #### is_non_master_tube (engine column)
 True for SKUs that are children of a bulk-roll master (per-foot
 cuts, BOM derivatives). Their stock and demand roll up to the
