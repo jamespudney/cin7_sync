@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Read-only CIN7 demand audit for one SKU.
+Read-only CIN7 demand audit for one SKU or a selected SKU batch.
 
 This is deliberately separate from the dashboard and AI prompt path. Run it
 inside Render, where CIN7_ACCOUNT_ID and CIN7_APPLICATION_KEY are set, to
@@ -10,6 +10,7 @@ Examples:
     python audit_live_cin7_demand.py LED-NEON-FLEX-NICHO-3000K-2
     python audit_live_cin7_demand.py LED-NEON-FLEX-NICHO-3000K-2 --from 2026-06-01 --to 2026-06-23 --live-product-movements
     python audit_live_cin7_demand.py LED-NEON-FLEX-NICHO-3000K-2 --live-assemblies --live-sales
+    python audit_live_cin7_demand.py --batch-engine --from 2026-06-01 --to 2026-06-23 --limit 250
 """
 
 from __future__ import annotations
@@ -61,6 +62,9 @@ def _status(row: Dict[str, Any]) -> str:
 def _latest(prefixes: Iterable[str]) -> Optional[Path]:
     files: List[Path] = []
     for prefix in prefixes:
+        stable = OUTPUT_DIR / f"{prefix}.csv"
+        if stable.exists():
+            files.append(stable)
         files.extend(OUTPUT_DIR.glob(f"{prefix}_*.csv"))
     if not files:
         return None
@@ -72,6 +76,21 @@ def _read_csv(path: Optional[Path]) -> List[Dict[str, Any]]:
         return []
     with path.open(newline="", encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
+
+
+def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames: List[str] = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                fieldnames.append(key)
+                seen.add(key)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _in_period(day: Optional[date], start: date, end: date) -> bool:
@@ -207,6 +226,53 @@ def local_assembly_consumption(
         total += qty
         rows.append(row)
     return total, rows, path
+
+
+def local_mtd_maps(
+    start: date,
+    end: date,
+) -> Tuple[Dict[str, float], Dict[str, float], Optional[Path], Optional[Path]]:
+    sale_path = _latest([
+        "sale_lines_last_30d",
+        "sale_lines_last_45d",
+        "sale_lines_last_90d",
+        "sale_lines_last_365d",
+        "sale_lines_last_730d",
+        "sale_lines",
+    ])
+    asm_path = _latest([
+        "assemblies_last_30d",
+        "assemblies_last_45d",
+        "assemblies_last_90d",
+        "assemblies_last_365d",
+        "assemblies",
+    ])
+    direct: Dict[str, float] = defaultdict(float)
+    assemblies: Dict[str, float] = defaultdict(float)
+
+    for row in _read_csv(sale_path):
+        if _status(row) in BAD_SALE_STATUSES:
+            continue
+        day = _parse_day(row.get("InvoiceDate"))
+        if not _in_period(day, start, end):
+            continue
+        sku = str(row.get("SKU") or "").strip()
+        if sku:
+            direct[sku] += _qty(row.get("Quantity"))
+
+    for row in _read_csv(asm_path):
+        if _status(row) in BAD_ASSEMBLY_STATUSES:
+            continue
+        day = _parse_day(row.get("CompletionDate")) or _parse_day(
+            row.get("Date"))
+        if not _in_period(day, start, end):
+            continue
+        sku = str(row.get("ComponentSKU") or "").strip()
+        qty = _qty(row.get("Quantity"))
+        if sku and qty > 0:
+            assemblies[sku] += qty
+
+    return dict(direct), dict(assemblies), sale_path, asm_path
 
 
 def _cin7_client(rate: float) -> Cin7Client:
@@ -356,8 +422,11 @@ def live_product_movements(
     sku: str,
     start: date,
     end: date,
+    *,
+    verbose: bool = True,
 ) -> Tuple[float, List[Dict[str, Any]], Dict[str, float]]:
-    print("\n[Live CIN7 product Movements] GET /product IncludeMovements=true")
+    if verbose:
+        print("\n[Live CIN7 product Movements] GET /product IncludeMovements=true")
     resp = client.get("product", params={
         "Sku": sku,
         "IncludeDeprecated": "true",
@@ -400,12 +469,222 @@ def live_product_movements(
     return demand_qty, rows, dict(by_type)
 
 
+def _latest_engine_rows() -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+    path = _latest(["engine_output", "engine_df"])
+    return _read_csv(path), path
+
+
+def _engine_row_score(row: Dict[str, Any]) -> float:
+    """Rank rows for batch audit when a full catalogue scan is too slow."""
+    status = str(row.get("Status") or "").lower()
+    eff = _qty(row.get("effective_units_12mo"))
+    u45 = _qty(row.get("units_45d"))
+    reorder = _qty(row.get("reorder_qty") or row.get("Suggested reorder"))
+    excess_value = abs(_qty(row.get("excess_value")))
+    on_hand_value = abs(_qty(row.get("OnHandValue")))
+    attention = 0.0
+    if any(token in status for token in ("reorder", "overstock", "slow",
+                                         "dormant")):
+        attention += 10000.0
+    if str(row.get("is_dormant") or "").strip().lower() in {
+            "true", "1", "yes"}:
+        attention += 10000.0
+    return (
+        attention
+        + (reorder * 100.0)
+        + (u45 * 50.0)
+        + (eff * 5.0)
+        + (excess_value / 10.0)
+        + (on_hand_value / 100.0)
+    )
+
+
+def _batch_candidate_skus(
+        *,
+        sku_list: Optional[str],
+        sku_file: Optional[str],
+        batch_engine: bool,
+        all_engine: bool,
+        limit: int) -> Tuple[List[str], Dict[str, Dict[str, Any]], Optional[Path]]:
+    candidates: List[str] = []
+    meta: Dict[str, Dict[str, Any]] = {}
+    engine_path: Optional[Path] = None
+
+    if sku_list:
+        for sku in sku_list.split(","):
+            sku_s = sku.strip()
+            if sku_s:
+                candidates.append(sku_s)
+
+    if sku_file:
+        with Path(sku_file).open(encoding="utf-8") as fh:
+            for line in fh:
+                sku_s = line.strip()
+                if sku_s and not sku_s.startswith("#"):
+                    candidates.append(sku_s)
+
+    if batch_engine:
+        engine_rows, engine_path = _latest_engine_rows()
+        scored = []
+        for row in engine_rows:
+            sku = str(row.get("SKU") or "").strip()
+            if not sku:
+                continue
+            score = _engine_row_score(row)
+            has_attention = (
+                all_engine
+                or score > 0
+                or _qty(row.get("effective_units_12mo")) > 0
+                or _qty(row.get("units_45d")) > 0
+                or _qty(row.get("reorder_qty")) > 0
+                or _qty(row.get("excess_value")) > 0
+            )
+            if has_attention:
+                scored.append((score, sku, row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if limit > 0:
+            scored = scored[:limit]
+        for _score, sku, row in scored:
+            candidates.append(sku)
+            meta.setdefault(sku, row)
+
+    deduped: List[str] = []
+    seen = set()
+    for sku in candidates:
+        if sku in seen:
+            continue
+        seen.add(sku)
+        deduped.append(sku)
+    return deduped, meta, engine_path
+
+
+def _signed_type(by_type: Dict[str, float], label: str) -> float:
+    total = 0.0
+    label_u = label.upper()
+    for typ, qty in by_type.items():
+        if str(typ or "").strip().upper() == label_u:
+            total += float(qty or 0)
+    return total
+
+
+def run_batch_product_movement_audit(args: argparse.Namespace,
+                                     start: date,
+                                     end: date) -> int:
+    skus, engine_meta, engine_path = _batch_candidate_skus(
+        sku_list=args.skus,
+        sku_file=args.sku_file,
+        batch_engine=args.batch_engine,
+        all_engine=args.all_engine,
+        limit=args.limit,
+    )
+    if not skus:
+        print("ERROR: no SKUs selected. Use --batch-engine, --skus, or --sku-file.")
+        return 2
+
+    try:
+        client = _cin7_client(args.rate)
+    except RuntimeError as exc:
+        print(f"\nERROR: {exc}")
+        return 3
+
+    direct_map, asm_map, sale_path, asm_path = local_mtd_maps(start, end)
+    print("=" * 78)
+    print("CIN7 PRODUCT MOVEMENT BATCH AUDIT")
+    print(f"Period: {start.isoformat()} to {end.isoformat()} inclusive")
+    print(f"SKUs selected: {len(skus)}")
+    print(f"Engine source: {engine_path or '(not used)'}")
+    print(f"Sale-line source: {sale_path or '(missing)'}")
+    print(f"Assembly source: {asm_path or '(missing)'}")
+    print("=" * 78)
+
+    rows: List[Dict[str, Any]] = []
+    mismatches = 0
+    for idx, sku in enumerate(skus, 1):
+        if idx == 1 or idx % 25 == 0:
+            print(f"  auditing {idx}/{len(skus)}: {sku}")
+        local_direct = float(direct_map.get(sku, 0.0))
+        local_asm = float(asm_map.get(sku, 0.0))
+        local_total = local_direct + local_asm
+        error = ""
+        live_qty = 0.0
+        live_rows: List[Dict[str, Any]] = []
+        by_type: Dict[str, float] = {}
+        try:
+            live_qty, live_rows, by_type = live_product_movements(
+                client, sku, start, end, verbose=False)
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        delta = float(live_qty - local_total)
+        if abs(delta) >= float(args.min_delta):
+            mismatches += 1
+        meta = engine_meta.get(sku, {})
+        sale_signed = _signed_type(by_type, "Sale")
+        assembly_signed = _signed_type(by_type, "Assembly")
+        purchase_signed = _signed_type(by_type, "Purchase")
+        rows.append({
+            "SKU": sku,
+            "Name": meta.get("Name", ""),
+            "Local direct sale-lines MTD": round(local_direct, 4),
+            "Local FG assembly MTD": round(local_asm, 4),
+            "Local synced MTD": round(local_total, 4),
+            "Live CIN7 Movement demand MTD": round(live_qty, 4),
+            "Delta live minus local": round(delta, 4),
+            "Live Sale demand": round(max(0.0, -sale_signed), 4),
+            "Live Assembly demand": round(max(0.0, -assembly_signed), 4),
+            "Live Purchase inbound": round(max(0.0, purchase_signed), 4),
+            "Movement rows": len(live_rows),
+            "Engine effective_units_12mo": meta.get("effective_units_12mo", ""),
+            "Engine units_45d": meta.get("units_45d", ""),
+            "Engine reorder_qty": meta.get("reorder_qty", ""),
+            "Engine excess_value": meta.get("excess_value", ""),
+            "Engine Status": meta.get("Status", ""),
+            "Error": error,
+        })
+
+    rows.sort(key=lambda r: abs(float(r["Delta live minus local"])),
+              reverse=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = OUTPUT_DIR / f"cin7_product_movement_audit_{stamp}.csv"
+    _write_csv(out_path, rows)
+
+    print("\n[Batch conclusion]")
+    print(f"  Audited SKUs              : {len(rows)}")
+    print(f"  Mismatches >= {args.min_delta:g}: {mismatches}")
+    print(f"  Report CSV                : {out_path}")
+    print("  Top differences:")
+    for row in rows[:20]:
+        delta = float(row["Delta live minus local"])
+        if abs(delta) < float(args.min_delta):
+            continue
+        print(
+            f"    {row['SKU']}: live {row['Live CIN7 Movement demand MTD']:g} "
+            f"vs local {row['Local synced MTD']:g} "
+            f"(delta {delta:+g})"
+        )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Read-only CIN7 demand audit for one SKU.")
-    parser.add_argument("sku")
+        description="Read-only CIN7 demand audit for one SKU or SKU batch.")
+    parser.add_argument("sku", nargs="?")
     parser.add_argument("--from", dest="start", default=None)
     parser.add_argument("--to", dest="end", default=None)
+    parser.add_argument("--batch-engine", action="store_true",
+                        help=("Audit a ranked batch of SKUs from the latest "
+                              "engine output instead of one SKU."))
+    parser.add_argument("--all-engine", action="store_true",
+                        help=("With --batch-engine, include all engine SKUs "
+                              "before applying --limit."))
+    parser.add_argument("--limit", type=int, default=100,
+                        help=("Max SKUs for --batch-engine. Use 0 for no "
+                              "limit, but this may take hours."))
+    parser.add_argument("--skus", default=None,
+                        help="Comma-separated SKUs to batch audit.")
+    parser.add_argument("--sku-file", default=None,
+                        help="Path to a newline-delimited SKU list.")
+    parser.add_argument("--min-delta", type=float, default=1.0,
+                        help="Minimum live-vs-local difference to flag.")
     parser.add_argument("--live-assemblies", action="store_true",
                         help="Pull live /finishedGoods records from CIN7.")
     parser.add_argument("--live-product-movements", action="store_true",
@@ -430,7 +709,13 @@ def main() -> int:
         print("ERROR: --from must be on or before --to.")
         return 2
 
-    sku = str(args.sku).strip()
+    if args.batch_engine or args.skus or args.sku_file:
+        return run_batch_product_movement_audit(args, start, end)
+
+    sku = str(args.sku or "").strip()
+    if not sku:
+        print("ERROR: supply a SKU, or use --batch-engine / --skus / --sku-file.")
+        return 2
     print("=" * 78)
     print(f"CIN7 DEMAND AUDIT: {sku}")
     print(f"Period: {start.isoformat()} to {end.isoformat()} inclusive")

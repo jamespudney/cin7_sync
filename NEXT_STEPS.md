@@ -216,6 +216,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   The Ordering selected-SKU inspect panel uses the same live movement
   fallback for its Current month metric, with a warning when CIN7
   Movements is ahead of the cached ABC bucket.
+- **Batch product-movement reconciliation** — `audit_live_cin7_demand.py`
+  supports `--batch-engine` for checking a ranked set of Ordering/engine
+  SKUs against CIN7's live product Movements ledger. Use this after a
+  demand dispute to find other SKUs where local synced sale-lines +
+  FG assemblies disagree with CIN7 Movements, then rebuild or fix the
+  movement cache before trusting slow-stock/reorder totals.
 - **Slow-stock stale-warning guard** — the Overview slow-stock holding
   KPI no longer lets an old active dormancy warning contribute value
   when the current engine row shows positive 45d/90d movement. Warnings

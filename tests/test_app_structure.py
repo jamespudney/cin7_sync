@@ -285,6 +285,18 @@ class AppMemoryStructureTests(unittest.TestCase):
                       script)
         self.assertIn("assemblies_{days}d_v2_completion", script)
 
+    def test_product_movement_audit_supports_batch_engine_scan(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "audit_live_cin7_demand.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("--batch-engine", script)
+        self.assertIn("--all-engine", script)
+        self.assertIn("cin7_product_movement_audit_", script)
+        self.assertIn("Delta live minus local", script)
+        self.assertIn("Live CIN7 Movement demand MTD", script)
+
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (
             Path(__file__).resolve().parents[1] / "warm_engine_helpers.py"
