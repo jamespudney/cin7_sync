@@ -63,6 +63,7 @@ from engine.reorder_math import (
     normalise_planning_quantity,
 )
 from engine.sku_movement_audit import (
+    build_sku_current_month_movement,
     build_sku_sales_audit,
     build_strip_movement_audit,
     calendar_month_periods,
@@ -1293,6 +1294,21 @@ def _compute_slow_stock_holding(engine_df: pd.DataFrame,
                           else pd.Series(0, index=df.index))
         # Drop only the non-masters WITHOUT direct stock.
         df = df[~(non_master & (on_hand_n <= 0))]
+    # If an old dormancy warning is still active but the current engine
+    # row clearly has recent movement, do not let that stale warning
+    # inflate the slow-stock holding value. The warning can still show in
+    # Ordering until the normal recovery/lift process clears it; this
+    # KPI should represent stock that is slow now.
+    if "is_dormant" in df.columns:
+        dormant_now = df["is_dormant"].fillna(False).astype(bool)
+        recent_90d = (_to_num(df["effective_units_90d"]).fillna(0)
+                      if "effective_units_90d" in df.columns
+                      else pd.Series(0, index=df.index))
+        recent_45d = (_to_num(df["units_45d"]).fillna(0)
+                      if "units_45d" in df.columns
+                      else pd.Series(0, index=df.index))
+        recent_movement = (recent_90d > 0) | (recent_45d > 0)
+        df = df[dormant_now | (~recent_movement)]
     units_held = (float(_to_num(df["OnHand"]).fillna(0).sum())
                    if "OnHand" in df.columns else 0.0)
     value_held = (float(_to_num(df["OnHandValue"]).fillna(0).sum())
@@ -1325,7 +1341,8 @@ def _compute_slow_stock_holding(engine_df: pd.DataFrame,
         "detail_df": detail_df,
         "filter_summary": "parents/standalones + children with "
                             "direct OnHand>0; engine OnHandValue "
-                            "cost chain",
+                            "cost chain; excludes stale warnings when "
+                            "current engine movement is positive",
     }
 
 
@@ -11877,8 +11894,18 @@ elif page == "Ordering":
         _trend_12m = _r.get("trend_12m")
         if not isinstance(_trend_12m, list):
             _trend_12m = _parse_engine_list_cell(_trend_12m)
-        _current_month_units = (
+        _current_month_engine_units = (
             float(_trend_12m[-1]) if _trend_12m else 0.0)
+        _current_month_live = build_sku_current_month_movement(
+            _sku, sale_lines, assemblies)
+        _current_month_live_units = float(
+            _current_month_live.get("total_qty") or 0)
+        # For assembly-heavy SKUs, the engine bucket can lag the live
+        # 30-day assembly sync until the background ABC refresh finishes.
+        # Show the fresher source total when it is ahead so buyers do not
+        # see a stale current-month demand figure.
+        _current_month_units = max(
+            _current_month_engine_units, _current_month_live_units)
         st.markdown(f"#### {_sku}")
         # v2.67.349 — render the SKU as a code block too so Streamlit's
         # built-in hover-copy clipboard icon appears. One-click copy
@@ -11904,8 +11931,13 @@ elif page == "Ordering":
         _d[3].metric("Suggested reorder",
                      f"{float(_r.get('reorder_qty') or 0):.0f}")
         _d2 = st.columns(4)
-        _d2[0].metric("Current month",
-                      f"{_current_month_units:.0f}")
+        _d2[0].metric(
+            "Current month",
+            f"{_current_month_units:.0f}",
+            help=("Uses the ABC monthly bucket, but falls forward to "
+                  "live synced sale-lines + finished-goods assembly "
+                  "consumption when those sources are ahead."),
+        )
         _d2[1].metric("90d units",
                       f"{float(_r.get('units_90d') or 0):.0f}")
         _d2[2].metric("Customers 45d",
@@ -11920,6 +11952,16 @@ elif page == "Ordering":
             f"{float(_r.get('lead_time_days') or 0):.0f}d "
             f"({_r.get('freight_mode') or '—'})"
         )
+        if _current_month_live_units > _current_month_engine_units + 1:
+            st.warning(
+                "Live synced movement shows "
+                f"{_current_month_live_units:.0f} units in "
+                f"{_current_month_live.get('period')}, ahead of the "
+                f"cached ABC monthly bucket "
+                f"({_current_month_engine_units:.0f}). This SKU is "
+                "being displayed from live sale-lines + FG assembly "
+                "consumption until the background ABC refresh catches up."
+            )
         _trace = _compute_target_and_reorder(
             _r, include_trace=True).get("calc_trace")
         if isinstance(_trace, str) and _trace.strip():
@@ -11952,12 +11994,13 @@ elif page == "Ordering":
                         str(_summary.get("last_invoice_date") or "—"))
                     _audit_current_invoice = float(
                         _summary.get("current_invoice_qty") or 0)
-                    if _audit_current_invoice > _current_month_units + 1:
+                    if (_audit_current_invoice
+                            > _current_month_engine_units + 1):
                         st.warning(
                             "Exact synced sale lines show "
                             f"{_audit_current_invoice:.0f} units invoiced "
                             f"this month, but the ABC monthly bucket shows "
-                            f"{_current_month_units:.0f}. The engine "
+                            f"{_current_month_engine_units:.0f}. The engine "
                             "snapshot is likely stale or missing recent "
                             "sale-line files; run/await the background ABC "
                             "refresh after the 30-day sale-line catch-up.")

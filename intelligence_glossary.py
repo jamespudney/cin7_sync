@@ -143,6 +143,12 @@ slow / not dormant** even if direct invoices are sparse — the engine
 sees the real demand, dormancy / Status / reorder all use the
 augmented figure.
 
+MTD/current-month demand for these SKUs depends on
+`assemblies_last_30d_*.csv`, not just `sale_lines_last_30d_*.csv`.
+The daily worker must keep that 30-day assembly file fresh; otherwise
+assembly-heavy components (for example `LED-NEON-FLEX-NICHO-3000K-2`)
+can appear under-demanded and falsely slow.
+
 #### FixedCost / AverageCost / PO cost
 - **FixedCost** — the agreed supplier price on the SKU's supplier record
   in CIN7. What you'll actually pay on the PO.
@@ -826,8 +832,10 @@ Two new rows in Monthly Metrics → Inventory:
 - **Slow Stock Value (EOM)** — month-end value of slow stock on
   shelf, sourced from `slow_mover_value_snapshots` (engine
   writes daily). Current month uses the live
-  `_compute_slow_stock_holding`. The **state** metric: how much
-  slow stock is left to clear. Going DOWN = team is winning.
+  `_compute_slow_stock_holding`. That live holding value excludes
+  stale active dormancy warnings when the current engine row shows
+  positive 45d/90d movement. The **state** metric: how much slow
+  stock is left to clear. Going DOWN = team is winning.
   Sparse for months before v2.67.36 (when the writer was added)
   — that's expected; the row fills out forward.
 

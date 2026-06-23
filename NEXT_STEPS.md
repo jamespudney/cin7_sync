@@ -180,6 +180,20 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   Inventory Planner. SKU detail now surfaces Current month, 90d,
   Customers 45d and Momentum directly, plus a warning when exact
   sale-lines are ahead of the ABC monthly bucket.
+- **MTD assembly-consumption freshness guard** — daily sync now also
+  pulls `assemblies_last_30d_*.csv`, and boot catch-up treats that file
+  as required freshness. The quick pass skips its old 3-day assembly
+  pull during daily sync so the worker does not scan Finished Goods
+  twice. SKU detail's Current month metric now falls forward to live
+  sale-lines + FG assembly component consumption when those sources are
+  ahead of the cached ABC bucket. This fixes
+  assembly-heavy components such as `LED-NEON-FLEX-NICHO-3000K-2`
+  lagging Inventory Planner MTD demand.
+- **Slow-stock stale-warning guard** — the Overview slow-stock holding
+  KPI no longer lets an old active dormancy warning contribute value
+  when the current engine row shows positive 45d/90d movement. Warnings
+  can still remain visible through the normal recovery lifecycle, but
+  the headline value now reflects stock that is slow now.
 - **Slow-stock jump explainability** — Overview's slow-stock value tile
   now carries a "Why did slow-stock value move?" expander showing top
   value contributors and SKUs touched by the latest dormancy run. This

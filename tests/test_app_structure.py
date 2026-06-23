@@ -38,6 +38,7 @@ from engine.sku_rules import (
     parse_sourcing_rule,
 )
 from engine.sku_movement_audit import (
+    build_sku_current_month_movement,
     build_sku_sales_audit,
     build_strip_movement_audit,
     calendar_month_periods,
@@ -210,7 +211,9 @@ class AppMemoryStructureTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "app.py"
         ).read_text(encoding="utf-8")
 
-        self.assertIn('_d2[0].metric("Current month"', script)
+        self.assertIn("_d2[0].metric(", script)
+        self.assertIn('"Current month"', script)
+        self.assertIn("_current_month_live_units", script)
         self.assertIn('_d2[1].metric("90d units"', script)
         self.assertIn('_d2[2].metric("Customers 45d"', script)
         self.assertIn('_d2[3].metric("Momentum"', script)
@@ -231,6 +234,27 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("Top 20 slow-stock value", script)
         self.assertIn("Flagged by latest run", script)
         self.assertIn("Largest SKUs touched by the latest run", script)
+
+    def test_assembly_sync_is_part_of_daily_freshness(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        daily = (root / "daily_sync.sh").read_text(encoding="utf-8")
+        loop = (root / "sync_loop.sh").read_text(encoding="utf-8")
+        cin7_sync = (root / "cin7_sync.py").read_text(encoding="utf-8")
+
+        self.assertIn("cin7_sync assemblies --days 30", daily)
+        self.assertIn("CIN7_QUICK_SKIP_ASSEMBLIES=1", daily)
+        self.assertIn("CIN7_QUICK_SKIP_ASSEMBLIES", cin7_sync)
+        self.assertIn("assemblies_last_30d_*.csv", loop)
+
+    def test_sku_detail_uses_live_current_month_movement(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("build_sku_current_month_movement", script)
+        self.assertIn("_current_month_engine_units", script)
+        self.assertIn("finished-goods assembly", script)
+        self.assertIn("consumption when those sources are ahead", script)
 
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (
@@ -555,6 +579,64 @@ class StripRollupParsingTests(unittest.TestCase):
             audit["summary"]["current_order_not_in_invoice_month_qty"],
             10,
         )
+
+    def test_current_month_movement_includes_assembly_consumption(self) -> None:
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "InvoiceDate": "2026-06-12",
+                "Quantity": 5,
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "InvoiceDate": "2026-06-14",
+                "Quantity": 2,
+                "Status": "CREDITED",
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "InvoiceDate": "2026-05-30",
+                "Quantity": 7,
+                "Status": "AUTHORISED",
+            },
+        ])
+        assemblies = pd.DataFrame([
+            {
+                "ComponentSKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "CompletionDate": "2026-06-11",
+                "Date": "2026-06-10",
+                "Quantity": 30,
+                "Status": "COMPLETED",
+            },
+            {
+                "ComponentSKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "CompletionDate": "2026-06-15",
+                "Date": "2026-06-15",
+                "Quantity": 4,
+                "Status": "DRAFT",
+            },
+            {
+                "ComponentSKU": "LED-OTHER",
+                "CompletionDate": "2026-06-15",
+                "Date": "2026-06-15",
+                "Quantity": 99,
+                "Status": "COMPLETED",
+            },
+        ])
+
+        movement = build_sku_current_month_movement(
+            "LED-NEON-FLEX-NICHO-3000K-2",
+            sale_lines,
+            assemblies,
+            today=pd.Timestamp("2026-06-23"),
+        )
+
+        self.assertTrue(movement["ok"])
+        self.assertEqual(movement["period"], "2026-06")
+        self.assertEqual(movement["direct_invoice_qty"], 5)
+        self.assertEqual(movement["assembly_qty"], 30)
+        self.assertEqual(movement["total_qty"], 35)
 
     def test_calendar_month_periods_end_on_current_calendar_month(self) -> None:
         self.assertEqual(

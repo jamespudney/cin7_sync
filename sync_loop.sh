@@ -130,6 +130,8 @@ _check_daily_output_fresh() {
 _check_daily_output_fresh "sales_last_30d_*.csv" "sales_last_30d CSV"
 _check_daily_output_fresh \
     "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV"
+_check_daily_output_fresh \
+    "assemblies_last_30d_*.csv" "assemblies_last_30d CSV"
 
 if [ "$_catchup_needed" = "1" ]; then
     echo "[$(stamp)] catch-up: running daily_sync.sh now" \

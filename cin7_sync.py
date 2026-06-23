@@ -1713,9 +1713,14 @@ def sync_quick(client: Cin7Client, days: int) -> None:
     sync_purchases(client, days)
     # v2.67.334 — pull assembly (FG-XXXX) consumption so the engine
     # can attribute demand to components that are mostly built into
-    # kits rather than sold directly. Per-task detail fetch is bounded
-    # by the `days` window and skipped if no completed tasks fall in it.
-    sync_assemblies(client, days)
+    # kits rather than sold directly. Daily sync now runs a dedicated
+    # 30-day assembly pull, so it sets CIN7_QUICK_SKIP_ASSEMBLIES=1 to
+    # avoid scanning finishedGoods twice in one run.
+    if os.environ.get("CIN7_QUICK_SKIP_ASSEMBLIES", "").strip() == "1":
+        log.info("Skipping quick assembly pull "
+                 "(CIN7_QUICK_SKIP_ASSEMBLIES=1).")
+    else:
+        sync_assemblies(client, days)
 
 
 def sync_nearsync(client: Cin7Client, days: int = 1) -> None:

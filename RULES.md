@@ -66,6 +66,8 @@ Anything else is a child / phantom / cut / assembly.
 
 **3.4 Trend vs. project detection.** The engine computes a secondary signal per SKU classifying recent demand patterns using a **45-day window** (shorter than 90 days so spikes get caught before the next PO cycle). The 45d / prior-45d / 90d windows are anchored to the newest sales or assembly date in the current snapshot, capped at today, so a stale last-good ABC snapshot does not turn recent-demand columns into zeroes.
 
+**3.4.1 Assembly-heavy MTD demand.** Components consumed through CIN7 finished-goods assemblies (FG-XXXX tasks) must use `assemblies_last_30d_*.csv` for month-to-date demand. `sale_lines_last_30d_*.csv` alone is insufficient for SKUs that mostly leave stock via kit builds, e.g. `LED-NEON-FLEX-NICHO-3000K-2`. If the 30-day assembly file is stale or missing, the engine can understate current-month demand and falsely mark active components as slow/dormant.
+
 **Signals computed**:
 - `units_45d` / `units_prior_45d` → `momentum` ratio (prior = days 45-90 ago).
 - `customers_45d` — distinct customer count in last 45d.

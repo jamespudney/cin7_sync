@@ -29,7 +29,8 @@ echo "  daily_sync.sh start at $(stamp)" >> "$LOG"
 echo "============================================================" >> "$LOG"
 
 echo "[$(stamp)] cin7_sync quick --days 3" >> "$LOG"
-python cin7_sync.py quick --days 3 >> "$LOG" 2>&1 || \
+CIN7_QUICK_SKIP_ASSEMBLIES=1 python cin7_sync.py quick --days 3 \
+    >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync quick FAILED (continuing)" >> "$LOG"
 
 # v2.67.264 — BOM / parent-child structure. Previously refreshed
@@ -67,6 +68,15 @@ python cin7_sync.py purchases --days 30 >> "$LOG" 2>&1 || \
 echo "[$(stamp)] cin7_sync salelines --days 30" >> "$LOG"
 python cin7_sync.py salelines --days 30 >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync salelines FAILED (continuing)" >> "$LOG"
+
+# Finished-goods assemblies are ground-truth demand for components that
+# are consumed into kits rather than sold directly. The quick sync above
+# only pulls a 3-day assembly window, which is not enough for
+# month-to-date demand on assembly-heavy SKUs such as
+# LED-NEON-FLEX-NICHO-3000K-2.
+echo "[$(stamp)] cin7_sync assemblies --days 30" >> "$LOG"
+python cin7_sync.py assemblies --days 30 >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] cin7_sync assemblies FAILED (continuing)" >> "$LOG"
 
 # Purchase lines feed FixedCost audit, supplier-pricing audits, AND
 # the AI Assistant's get_incoming_stock + get_purchase_order tools.

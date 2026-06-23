@@ -157,6 +157,69 @@ def build_sku_sales_audit(sku: str,
     }
 
 
+def build_sku_current_month_movement(
+        sku: str,
+        sale_lines_df: pd.DataFrame | None,
+        assemblies_df: pd.DataFrame | None = None,
+        *,
+        today=None) -> dict[str, Any]:
+    """Return current-calendar-month movement for one SKU.
+
+    Direct sales are counted from sale_lines.InvoiceDate, matching the
+    ABC engine. Component demand consumed through finished-goods builds is
+    counted from assemblies.ComponentSKU using CompletionDate/Date.
+    """
+    sku_s = str(sku or "").strip()
+    if not sku_s:
+        return {
+            "ok": False,
+            "period": "",
+            "direct_invoice_qty": 0.0,
+            "assembly_qty": 0.0,
+            "total_qty": 0.0,
+        }
+
+    period = calendar_month_periods(today=today, periods=1)[-1]
+
+    sl = _clean_sale_lines(sale_lines_df)
+    sku_lines = sl[sl["SKU"].astype(str) == sku_s].copy()
+    direct_qty = 0.0
+    if not sku_lines.empty:
+        inv_period = sku_lines["InvoiceDate"].dt.to_period("M")
+        direct_qty = float(
+            sku_lines.loc[inv_period == period, "Quantity"].sum())
+
+    assembly_qty = 0.0
+    a = assemblies_df.copy() if assemblies_df is not None else pd.DataFrame()
+    if not a.empty:
+        for col in ("ComponentSKU", "CompletionDate", "Date",
+                    "Quantity", "Status"):
+            if col not in a.columns:
+                a[col] = pd.NA
+        comp = a[a["ComponentSKU"].astype(str) == sku_s].copy()
+        if not comp.empty:
+            status = comp["Status"].astype(str).str.upper()
+            comp = comp[~status.isin(
+                {"VOIDED", "CANCELLED", "CANCELED", "DRAFT"})]
+            completed = pd.to_datetime(
+                comp["CompletionDate"], errors="coerce")
+            fallback = pd.to_datetime(comp["Date"], errors="coerce")
+            comp["_movement_date"] = completed.fillna(fallback)
+            comp["Quantity"] = pd.to_numeric(
+                comp["Quantity"], errors="coerce").fillna(0)
+            comp_period = comp["_movement_date"].dt.to_period("M")
+            assembly_qty = float(
+                comp.loc[comp_period == period, "Quantity"].sum())
+
+    return {
+        "ok": True,
+        "period": str(period),
+        "direct_invoice_qty": direct_qty,
+        "assembly_qty": assembly_qty,
+        "total_qty": direct_qty + assembly_qty,
+    }
+
+
 def build_strip_movement_audit(sku: str,
                                products_df: pd.DataFrame,
                                sale_lines_df: pd.DataFrame,
