@@ -73,8 +73,27 @@ git add -A
 git commit -m "your message"
 git push origin main
 ```
-Render auto-deploys on push (configured in `render.yaml`). Build takes
-~5 min. Streamlit users get auto-reloaded into the new version.
+Render auto-deploy is deliberately **off** for the app service. Pushing
+to GitHub stages the new version, but it does not immediately restart
+the live dashboard. This avoids interrupting buyers during the day.
+
+To release:
+1. Push to `main`.
+2. In Render, open `wired4signs-app`.
+3. Click **Manual Deploy** → **Deploy latest commit** during a quiet
+   window.
+4. Tell active users the dashboard may briefly reconnect.
+
+Why: the app service has a persistent disk mounted at `/data`. Render's
+normal zero-downtime deploy handover is disabled for services with
+persistent disks, so a deploy can briefly show a 502/reconnect while
+the service restarts.
+
+Long-term route to true seamless deploys: move runtime state off the
+web service disk. The web dashboard should read shared state from
+Postgres/object storage and run without a persistent disk; sync tasks
+can run separately. Once the dashboard has no disk attached, Render's
+normal zero-downtime deploy path can work for it.
 
 ### Forcing a manual sync
 - In Render's UI, navigate to `wired4signs-sync`

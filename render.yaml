@@ -53,7 +53,7 @@ services:
     plan: standard          # 2GB RAM — plenty for ABC engine + sync loop.
     region: ohio            # Closest to Florida; change if you prefer.
     branch: main            # Deploy from main on push.
-    autoDeploy: true        # Auto-deploy on git push (toggle off later if you want).
+    autoDeploy: false       # Stage pushes in GitHub; deploy manually/off-hours to avoid user-facing 502s.
     rootDir: .
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: ./start.sh

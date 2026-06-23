@@ -719,6 +719,14 @@ Two new rows in Monthly Metrics → Inventory:
 Both rows tie to the same dormancy set the Slow Movers page
 uses, so the figures across pages stay aligned.
 
+#### Staff sign-in
+The app uses one combined sign-in screen in production: staff choose
+their profile and enter the shared team password in the same form.
+Successful sign-in creates a server-side `sid` session token and puts
+it in the URL, so Render restarts can restore both the password gate
+and the selected staff profile without asking the user to sign in
+twice.
+
 #### Cashflow actual revenue
 The Overview and Cashflow pages use CIN7 sales headers as the
 source of truth for weekly actual revenue. A sale counts in the

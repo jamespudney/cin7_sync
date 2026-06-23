@@ -153,6 +153,17 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ## Shipped (since 2026-04-30)
 
+### 2026-06-23
+
+- **One-step app sign-in** — production login now asks for staff
+  profile and team password in the same form, then mints the existing
+  persistent `sid` token so Render restarts restore both the password
+  gate and the selected profile.
+- **Staged Render deploys** — app auto-deploy is now off in
+  `render.yaml`; pushes stage code in GitHub and releases happen via
+  manual Render deploy during a quiet window. This avoids unnecessary
+  business-hours 502s while the app still owns a persistent disk.
+
 ### 2026-06-22
 
 - **Cashflow actual-revenue visibility** — Overview now shows previous

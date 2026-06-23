@@ -432,49 +432,196 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Password gate
+# Password gate + profile sign-in
 # ---------------------------------------------------------------------------
 # Reads expected password from APP_PASSWORD env var. If APP_PASSWORD is
 # NOT set (typical local dev), the gate is bypassed entirely so dev
 # experience stays the same. On Render we set APP_PASSWORD and every
-# new session has to enter it once.
+# new session has to enter it once. The same form also captures the
+# staff profile, so users do not have to "sign in" and then "sign in
+# as" a second time.
 #
 # Why not Streamlit's experimental st.login(): we want zero external
 # auth dependencies for v1. A shared password is fine for a small
 # trusted team. We can swap to Google OAuth or Cloudflare Access later
 # without changing any other code in the app.
+def _profile_from_user_row(user_row) -> dict:
+    return {
+        "user_id": int(user_row["user_id"]),
+        "display_name": user_row["display_name"],
+        "role": user_row["role"],
+        "email": user_row["email"],
+        "default_page": user_row["default_page"],
+        "active": bool(user_row["active"]),
+    }
+
+
+def _audit_user_login(user_row, detail: str) -> None:
+    try:
+        with db.connect() as _c:
+            _c.execute(
+                "INSERT INTO audit_log "
+                "(event, actor, target, detail) VALUES (?,?,?,?)",
+                ("user.login",
+                 user_row["display_name"],
+                 str(user_row["user_id"]),
+                 detail))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _complete_user_signin(user_row, detail: str = "combined login") -> None:
+    profile = _profile_from_user_row(user_row)
+    st.session_state["_app_authed"] = True
+    st.session_state["current_user_id"] = profile["user_id"]
+    st.session_state["current_user"] = profile["display_name"]
+    st.session_state["current_user_profile"] = profile
+    try:
+        tok = db.create_user_session(profile["user_id"])
+        st.session_state["_session_token"] = tok
+        st.query_params["sid"] = tok
+    except Exception:  # noqa: BLE001
+        pass
+    _audit_user_login(user_row, detail)
+
+
+def _restore_user_session_from_url() -> bool:
+    """Restore profile + password-gate state from the persistent sid."""
+    if st.session_state.get("current_user"):
+        return True
+    try:
+        sid = (st.query_params.get("sid") or "").strip()
+    except Exception:  # noqa: BLE001
+        sid = ""
+    if not sid:
+        return False
+    try:
+        restored = db.validate_user_session(sid)
+    except Exception:  # noqa: BLE001
+        restored = None
+    if restored:
+        st.session_state["_app_authed"] = True
+        st.session_state["current_user_id"] = restored["user_id"]
+        st.session_state["current_user"] = restored["display_name"]
+        st.session_state["current_user_profile"] = restored
+        st.session_state["_session_token"] = sid
+        return True
+    try:
+        del st.query_params["sid"]
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
 def _require_password() -> None:
+    if _restore_user_session_from_url():
+        return
     expected = os.environ.get("APP_PASSWORD", "").strip()
     if not expected:
         # No password configured → open access (local dev mode).
         return
-    if st.session_state.get("_app_authed"):
+    if (st.session_state.get("_app_authed")
+            and st.session_state.get("current_user")):
         return
+    try:
+        user_rows = db.list_users(active_only=True)
+    except Exception:  # noqa: BLE001
+        user_rows = []
+    existing_names = [r["display_name"] for r in user_rows]
+
     # Centred prompt — the rest of the page is hidden until they auth.
     st.markdown(
         "<div style='max-width:420px;margin:80px auto;'>",
         unsafe_allow_html=True)
     st.markdown(f"### :lock: {COMPANY_NAME} Analytics")
     st.caption(
-        "Enter the team password to continue. If you don't have it, "
-        "ask your administrator.")
+        "Sign in once with the team password and your staff profile.")
     with st.form("login_form", clear_on_submit=False):
+        if existing_names:
+            picked_name = st.selectbox(
+                "Your name",
+                options=["(select your name)"] + existing_names,
+                index=0,
+                key="_login_profile")
+            typed_name = ""
+        else:
+            picked_name = ""
+            typed_name = st.text_input(
+                "Your name", placeholder="e.g. James",
+                key="_login_first_name")
         pw = st.text_input(
-            "Password", type="password", key="_pw_input",
-            label_visibility="collapsed",
+            "Team password", type="password", key="_pw_input",
             placeholder="Team password")
         submitted = st.form_submit_button(
             "Sign in", type="primary", use_container_width=True)
     if submitted:
-        if pw == expected:
-            st.session_state["_app_authed"] = True
-            # Delete the password from session state so it isn't kept
-            # around longer than needed.
-            if "_pw_input" in st.session_state:
-                del st.session_state["_pw_input"]
-            st.rerun()
-        else:
+        if pw != expected:
             st.error("Wrong password — try again.")
+        else:
+            name = (typed_name or picked_name or "").strip()
+            if not name or name == "(select your name)":
+                st.error("Pick your name to continue.")
+            else:
+                try:
+                    if existing_names:
+                        user = db.get_user_by_name(name)
+                    else:
+                        user = db.get_or_create_user(name)
+                    if user is None:
+                        st.error(
+                            f"Profile for `{name}` was not found. "
+                            "Use Add new user below or ask an admin.")
+                    else:
+                        _complete_user_signin(user)
+                        st.session_state.pop("_pw_input", None)
+                        st.success(f"Welcome, **{user['display_name']}**.")
+                        st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Sign-in failed: {exc}")
+
+    with st.expander(":heavy_plus_sign: Add new user", expanded=False):
+        with st.form("_login_signup_form", clear_on_submit=False):
+            new_name = st.text_input(
+                "Name", placeholder="e.g. Cheran",
+                key="_login_signup_name")
+            self_signup_roles = [
+                r for r in db.USER_ROLES
+                if r not in ("admin", "super_admin")]
+            new_role = st.selectbox(
+                "Role", options=self_signup_roles,
+                index=(self_signup_roles.index("sales")
+                       if "sales" in self_signup_roles else 0),
+                key="_login_signup_role")
+            signup_pw = st.text_input(
+                "Team password", type="password",
+                key="_login_signup_pw")
+            signup_submitted = st.form_submit_button(
+                "Create profile and sign in",
+                type="primary", use_container_width=True)
+        if signup_submitted:
+            name = (new_name or "").strip()
+            if signup_pw != expected:
+                st.error("Wrong password — try again.")
+            elif not name:
+                st.error("Name is required.")
+            elif db.get_user_by_name(name) is not None:
+                st.error(
+                    f"`{name}` already exists. Pick it in the main "
+                    "sign-in form above.")
+            else:
+                try:
+                    db.upsert_user(
+                        display_name=name,
+                        role=new_role,
+                        active=True,
+                        actor=name)
+                    user = db.get_user_by_name(name)
+                    if user is not None:
+                        _complete_user_signin(user, detail="via signup")
+                        st.session_state.pop("_login_signup_pw", None)
+                        st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Signup failed: {exc}")
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop()
 
@@ -1634,39 +1781,10 @@ with st.sidebar:
         _user_rows = []
     _existing_names = [r["display_name"] for r in _user_rows]
 
-    # v2.67.302 — persistent sign-in across Render deploys.
-    # Streamlit's session_state lives in the worker process, so
-    # every push wiped everyone's sign-in. Now: on sign-in we mint
-    # a 24h server-side session token (stored in Postgres) and put
-    # it in the URL as `?sid=...`. On every page load (worker
-    # restart included), we read that token, validate against the
-    # DB, and silently restore session_state if it's still valid.
-    # 24h expiry is SLIDING — refreshed on every access, so an
-    # active user stays signed in indefinitely.
-    try:
-        _sid_from_url = (st.query_params.get("sid") or "").strip()
-    except Exception:  # noqa: BLE001
-        _sid_from_url = ""
-    if (_sid_from_url
-            and not st.session_state.get("current_user")):
-        try:
-            _restored = db.validate_user_session(_sid_from_url)
-        except Exception:  # noqa: BLE001
-            _restored = None
-        if _restored:
-            st.session_state["current_user_id"] = (
-                _restored["user_id"])
-            st.session_state["current_user"] = (
-                _restored["display_name"])
-            st.session_state["current_user_profile"] = _restored
-            st.session_state["_session_token"] = _sid_from_url
-        else:
-            # Token in URL but invalid / expired — strip it so the
-            # user just sees the sign-in picker, not an error.
-            try:
-                del st.query_params["sid"]
-            except Exception:  # noqa: BLE001
-                pass
+    # v2.67.302+ — persistent sign-in across Render deploys. The
+    # password gate restores this before the sidebar renders; this
+    # extra call keeps local-dev/no-password mode compatible.
+    _restore_user_session_from_url()
     # Periodically prune expired rows (cheap — single DELETE
     # bounded by the index). Best-effort.
     try:
@@ -1704,6 +1822,7 @@ with st.sidebar:
                         "current_user_id",
                         "current_user_profile",
                         "_session_token",
+                        "_app_authed",
                         "_signin_pending_name",
                         "_default_page_consumed"):
                 st.session_state.pop(_k, None)
@@ -1740,49 +1859,8 @@ with st.sidebar:
                                 f"Profile for `{_picked}` not found. "
                                 "Try the 'Add new user' flow.")
                         else:
-                            _profile_dict = {
-                                "user_id": int(_user["user_id"]),
-                                "display_name": _user["display_name"],
-                                "role": _user["role"],
-                                "email": _user["email"],
-                                "default_page": _user["default_page"],
-                                "active": bool(_user["active"]),
-                            }
-                            st.session_state["current_user_id"] = (
-                                int(_user["user_id"]))
-                            st.session_state["current_user"] = (
-                                _user["display_name"])
-                            st.session_state["current_user_profile"] = (
-                                _profile_dict)
-                            # v2.67.302 — mint a 24h server-side
-                            # session token and stash it in the
-                            # URL so the user stays signed in
-                            # across worker restarts / deploys.
-                            try:
-                                _tok = db.create_user_session(
-                                    int(_user["user_id"]))
-                                st.session_state[
-                                    "_session_token"] = _tok
-                                st.query_params["sid"] = _tok
-                            except Exception:  # noqa: BLE001
-                                # Don't block sign-in if the token
-                                # mint fails; user is still signed
-                                # in via session_state for this tab.
-                                pass
-                            # Audit the sign-in itself so we know who
-                            # was active when.
-                            try:
-                                with db.connect() as _c:
-                                    _c.execute(
-                                        "INSERT INTO audit_log "
-                                        "(event, actor, target, "
-                                        "detail) VALUES (?,?,?,?)",
-                                        ("user.login",
-                                         _user["display_name"],
-                                         str(_user["user_id"]),
-                                         f"role={_user['role']}"))
-                            except Exception:
-                                pass
+                            _complete_user_signin(
+                                _user, detail=f"role={_user['role']}")
                             st.success(
                                 f":white_check_mark: Welcome, "
                                 f"**{_user['display_name']}** "
@@ -1840,42 +1918,8 @@ with st.sidebar:
                             actor=_name_clean)
                         _user = db.get_user_by_name(_name_clean)
                         if _user is not None:
-                            _profile_dict = {
-                                "user_id": int(_user["user_id"]),
-                                "display_name": _user["display_name"],
-                                "role": _user["role"],
-                                "email": _user["email"],
-                                "default_page": _user["default_page"],
-                                "active": bool(_user["active"]),
-                            }
-                            st.session_state["current_user_id"] = (
-                                int(_user["user_id"]))
-                            st.session_state["current_user"] = (
-                                _user["display_name"])
-                            st.session_state["current_user_profile"] = (
-                                _profile_dict)
-                            # v2.67.302 — same persistent-session
-                            # token mint as the sign-in path.
-                            try:
-                                _tok = db.create_user_session(
-                                    int(_user["user_id"]))
-                                st.session_state[
-                                    "_session_token"] = _tok
-                                st.query_params["sid"] = _tok
-                            except Exception:  # noqa: BLE001
-                                pass
-                            try:
-                                with db.connect() as _c:
-                                    _c.execute(
-                                        "INSERT INTO audit_log "
-                                        "(event, actor, target, "
-                                        "detail) VALUES (?,?,?,?)",
-                                        ("user.login",
-                                         _user["display_name"],
-                                         str(_user["user_id"]),
-                                         "via signup"))
-                            except Exception:
-                                pass
+                            _complete_user_signin(
+                                _user, detail="via signup")
                             st.success(
                                 f":white_check_mark: Profile created. "
                                 f"Welcome, **{_user['display_name']}**"

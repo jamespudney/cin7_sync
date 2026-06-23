@@ -215,6 +215,21 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("qbo_client.is_ready()", sync_script)
         self.assertIn("def cmd_sync", sync_script)
 
+    def test_signin_combines_password_and_profile(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Password gate + profile sign-in", script)
+        self.assertIn("def _complete_user_signin", script)
+        self.assertIn("def _restore_user_session_from_url", script)
+        self.assertIn("st.session_state[\"_app_authed\"] = True", script)
+        self.assertIn("st.query_params[\"sid\"] = tok", script)
+        self.assertIn("Sign in once with the team password and your staff profile",
+                      script)
+        self.assertIn("st.selectbox(\n                \"Your name\"", script)
+        self.assertNotIn("Enter the team password to continue", script)
+
     def test_warm_engine_runs_detached_with_memory_guard(self) -> None:
         root = Path(__file__).resolve().parents[1]
         sync_loop = (root / "sync_loop.sh").read_text(encoding="utf-8")
@@ -233,6 +248,14 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("MemAvailable:", warm_engine)
         self.assertIn("skipping cache warm", warm_engine)
         self.assertIn("WARM_ENGINE_MIN_AVAILABLE_MB", render_config)
+
+    def test_app_deploys_are_staged_not_auto_deployed(self) -> None:
+        render_config = (
+            Path(__file__).resolve().parents[1] / "render.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("autoDeploy: false", render_config)
+        self.assertIn("deploy manually/off-hours", render_config)
 
     def test_mtd_yoy_table_uses_shared_revenue_helper(self) -> None:
         script = (
