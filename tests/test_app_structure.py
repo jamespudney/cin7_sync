@@ -141,6 +141,27 @@ class AppMemoryStructureTests(unittest.TestCase):
                       script)
         self.assertIn("include_trace=True).get(\"calc_trace\")", script)
 
+    def test_abc_engine_does_not_foreground_rebuild_by_default(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        accessor_start = script.index("def _get_engine_df_cached")
+        accessor_end = script.index("\ndef _get_engine_df()", accessor_start)
+        accessor_block = script[accessor_start:accessor_end]
+
+        self.assertIn(
+            '_start_background_engine_refresh("engine snapshot requested '
+            'but missing")',
+            accessor_block,
+        )
+        self.assertIn(
+            'os.environ.get("ABC_ALLOW_FOREGROUND_COMPUTE") != "1"',
+            accessor_block,
+        )
+        self.assertIn("return pd.DataFrame()", accessor_block)
+        self.assertIn("_abc_engine(", accessor_block)
+
     def test_ordering_editor_has_focus_scroll_enhancer(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"
@@ -159,6 +180,44 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("w4s-ordering-editor-", script)
         self.assertIn("_render_ordering_editor_enhancer(_ordering_grid_anchor)",
                       script)
+
+    def test_ordering_recent_demand_anchors_to_snapshot_date(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _analysis_today_from_dates", script)
+        self.assertIn(
+            "today_ts = _analysis_today_from_dates(*_analysis_date_sources)",
+            script,
+        )
+        self.assertIn("cutoff_recent = today_ts - pd.Timedelta(days=45)",
+                      script)
+        self.assertIn("if _d >= cutoff:", script)
+        self.assertNotIn(
+            "cutoff = pd.Timestamp(datetime.now().date()) - "
+            "pd.Timedelta(days=window_days)",
+            script,
+        )
+        self.assertNotIn(
+            "today_ts = pd.Timestamp(datetime.now().date())\n"
+            "    cutoff_recent",
+            script,
+        )
+
+    def test_warm_engine_reuses_app_sale_line_union(self) -> None:
+        helper_script = (
+            Path(__file__).resolve().parents[1] / "warm_engine_helpers.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _dataframes_from_app", helper_script)
+        self.assertIn('"sale_lines": app_module.sale_lines', helper_script)
+        self.assertIn("assemblies_df=assemblies", helper_script)
+        self.assertIn(
+            "keeps engine_output.csv aligned with the grid's",
+            helper_script,
+        )
+        self.assertNotIn("pd.read_csv(sale_lines_csv", helper_script)
 
     def test_cashflow_actual_revenue_matches_cin7_basis(self) -> None:
         script = (

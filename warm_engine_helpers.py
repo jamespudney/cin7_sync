@@ -1,8 +1,8 @@
 """warm_engine_helpers.py
 ==========================
-Helper module that imports `_abc_engine` from app.py and calls it
-with the latest CSV-derived DataFrames, populating Streamlit's
-on-disk cache so the next user gets a hot cache.
+Helper module that imports the dashboard's `_abc_engine` and the same
+already-loaded DataFrames from app.py, populating `engine_output.csv`
+so the next user gets a hot cache.
 
 Why a separate file
 -------------------
@@ -46,56 +46,50 @@ def _latest_csv(output_dir: Path, pattern: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def _load_dataframes() -> dict[str, Any]:
-    """Read the freshest products, stock, sale_lines, purchase_lines
-    CSVs from the OUTPUT_DIR location. Returns a dict ready to pass
-    as kwargs to _abc_engine."""
-    import pandas as pd
+def _source_paths(output_dir: Path) -> dict[str, str]:
+    """Best-effort source paths for warm logs/status output."""
+    sale_line_paths = sorted(
+        output_dir.glob("sale_lines_last_*d_*.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    paths = {
+        "products": _latest_csv(output_dir, "products_*.csv"),
+        "stock": _latest_csv(output_dir, "stock_on_hand_*.csv"),
+        "purchase_lines": _latest_csv(output_dir, "purchase_lines_last_*.csv"),
+        "assemblies": _latest_csv(output_dir, "assemblies_last_*.csv"),
+    }
+    return {
+        **{k: str(v) for k, v in paths.items() if v is not None},
+        "sale_lines": ", ".join(str(p) for p in sale_line_paths),
+    }
+
+
+def _dataframes_from_app(app_module: Any) -> dict[str, Any]:
+    """Use the dashboard's loaded frames instead of re-reading CSVs.
+
+    Importing app.py already runs the same lean/union loaders the user
+    sees in Streamlit. Reusing those objects prevents a second full CSV
+    copy in memory and keeps engine_output.csv aligned with the grid's
+    freshest sale-line union.
+    """
     from data_paths import OUTPUT_DIR
 
-    products_csv = _latest_csv(OUTPUT_DIR, "products_*.csv")
-    stock_csv = _latest_csv(OUTPUT_DIR, "stock_on_hand_*.csv")
-    purchase_lines_csv = _latest_csv(
-        OUTPUT_DIR, "purchase_lines_last_*.csv")
-
-    # sale_lines: pick the longest-window file, mirroring the app's
-    # _load_longest_sale_lines() preference.
-    sale_lines_files = sorted(
-        OUTPUT_DIR.glob("sale_lines_last_*d_*.csv"),
-        key=lambda p: (
-            -int(p.name.split("_last_")[1].split("d_")[0])
-            if "_last_" in p.name and "d_" in p.name else 0,
-            -p.stat().st_mtime,
-        ),
-    )
-    sale_lines_csv = sale_lines_files[0] if sale_lines_files else None
-
     missing = [
-        name for name, path in (
-            ("products", products_csv),
-            ("stock_on_hand", stock_csv),
-            ("sale_lines", sale_lines_csv),
-            ("purchase_lines", purchase_lines_csv),
-        ) if path is None
+        name for name in ("products", "stock", "sale_lines",
+                          "purchase_lines")
+        if getattr(app_module, name, None) is None
     ]
     if missing:
-        raise FileNotFoundError(
-            f"Missing CSVs in {OUTPUT_DIR}: {missing}. "
-            "Has the sync run yet?"
-        )
+        raise RuntimeError(f"app.py did not expose frames: {missing}")
 
     return {
-        "products": pd.read_csv(products_csv, low_memory=False),
-        "stock": pd.read_csv(stock_csv, low_memory=False),
-        "sale_lines": pd.read_csv(sale_lines_csv, low_memory=False),
-        "purchase_lines": pd.read_csv(
-            purchase_lines_csv, low_memory=False),
-        "_source_paths": {
-            "products": str(products_csv),
-            "stock": str(stock_csv),
-            "sale_lines": str(sale_lines_csv),
-            "purchase_lines": str(purchase_lines_csv),
-        },
+        "products": app_module.products,
+        "stock": app_module.stock,
+        "sale_lines": app_module.sale_lines,
+        "purchase_lines": app_module.purchase_lines,
+        "assemblies": getattr(app_module, "assemblies", None),
+        "_source_paths": _source_paths(OUTPUT_DIR),
     }
 
 
@@ -115,15 +109,17 @@ def warm() -> dict[str, Any]:
         _here = Path(__file__).resolve().parent
         if str(_here) not in sys.path:
             sys.path.insert(0, str(_here))
-        from app import _abc_engine
+        import app as _app
+        _abc_engine = _app._abc_engine
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"could not import _abc_engine: {exc!r}") from exc
 
-    bundle = _load_dataframes()
+    bundle = _dataframes_from_app(_app)
     products = bundle["products"]
     stock = bundle["stock"]
     sale_lines = bundle["sale_lines"]
     purchase_lines = bundle["purchase_lines"]
+    assemblies = bundle.get("assemblies")
 
     # Coerce the columns the engine expects. The Streamlit app does
     # this via _to_date / _to_num; we replicate the minimum subset
@@ -149,11 +145,12 @@ def warm() -> dict[str, Any]:
         stock["Available"] = pd.to_numeric(
             stock["Available"], errors="coerce").fillna(0)
 
-    # The actual warm. _abc_engine is @st.cache_data — calling it
-    # populates the disk cache. Discard the return value; the act of
-    # calling is what matters.
+    # The actual warm. _abc_engine is @st.cache_data; calling it
+    # populates the disk cache and we also write the portable CSV
+    # snapshot the web app prefers.
     result_df = _abc_engine(
-        products, stock, sale_lines, purchase_lines)
+        products, stock, sale_lines, purchase_lines,
+        assemblies_df=assemblies)
     out_path = OUTPUT_DIR / "engine_output.csv"
     tmp_path = OUTPUT_DIR / "engine_output.tmp.csv"
     result_df.to_csv(tmp_path, index=False)

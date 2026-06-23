@@ -149,9 +149,12 @@ in Render and ensure no trailing space.
 - Check `/data/output/daily_sync.log` for partial output
 - Run it manually via **Trigger Run** to surface the error
 
-### App is slow on first page load after deploy
-Normal. The disk-persisted ABC engine cache is rebuilt on first request
-after a deploy. Subsequent loads are fast.
+### ABC snapshot is pending after deploy
+Normal. The app serves the last-good `engine_output.csv` while
+`warm_engine.py` rebuilds ABC in the background. If no snapshot exists,
+Ordering shows the pending/empty state instead of rebuilding ABC inside
+the Streamlit web process, which protects Render memory. Foreground
+ABC rebuilds are emergency-only via `ABC_ALLOW_FOREGROUND_COMPUTE=1`.
 
 ### Need to wipe everything and start fresh
 - In Render UI: delete the disk via service → Settings → Disk → Delete

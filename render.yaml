@@ -50,7 +50,7 @@ services:
   - type: web
     name: wired4signs-app
     runtime: python
-    plan: standard          # 2GB RAM — plenty for ABC engine + sync loop.
+    plan: pro               # 4GB RAM — needed for Streamlit + sync loop.
     region: ohio            # Closest to Florida; change if you prefer.
     branch: main            # Deploy from main on push.
     autoDeploy: false       # Stage pushes in GitHub; deploy manually/off-hours to avoid user-facing 502s.

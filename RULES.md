@@ -64,7 +64,7 @@ Anything else is a child / phantom / cut / assembly.
 
 **3.3 Migration: retiring SKU sales roll forward to successor.** Discontinued/phased-out lines (Smokies, Cascade) have their historical demand rolled into the successor (Sierra38, Sierra65) with a configurable share %. UI for managing these lives in the Ordering page's Migrations expander. Store in `sku_migrations` table.
 
-**3.4 Trend vs. project detection.** The engine computes a secondary signal per SKU classifying recent demand patterns using a **45-day window** (shorter than 90 days so spikes get caught before the next PO cycle).
+**3.4 Trend vs. project detection.** The engine computes a secondary signal per SKU classifying recent demand patterns using a **45-day window** (shorter than 90 days so spikes get caught before the next PO cycle). The 45d / prior-45d / 90d windows are anchored to the newest sales or assembly date in the current snapshot, capped at today, so a stale last-good ABC snapshot does not turn recent-demand columns into zeroes.
 
 **Signals computed**:
 - `units_45d` / `units_prior_45d` → `momentum` ratio (prior = days 45-90 ago).
@@ -74,9 +74,9 @@ Anything else is a child / phantom / cut / assembly.
 - `non_top_avg_units` — avg units per customer excluding the top buyer.
 
 **Classification** (tightened April 2026 after real-world feedback — original thresholds were too permissive):
-- **📈 Trend** — ALL of: momentum >1.5, **customers_45d ≥ 4**, **top_cust_pct < 40%**, **non_top_avg_units ≥ 2**. Real broad-based acceleration. Engine overrides `avg_daily` to use last-45d rate.
-- **🎯 Project** — ANY of: **top_cust_pct ≥ 50%**, **top_2_cust_pct ≥ 70%**, or customers_45d ≤ 2. Concentrated to 1-2 buyers — engine subtracts the top customer's 12mo contribution from effective demand before forecasting.
-- **🔀 Mixed** — spike (momentum >1.5) but doesn't meet either pure set. Watch signal; no velocity override.
+- **📈 Trend** — ALL of: momentum >1.5, **customers_45d ≥ 3**, **top_cust_pct < 40%**, **non_top_avg_units ≥ 2**. Real broad-based acceleration. Engine overrides `avg_daily` to use last-45d rate.
+- **🎯 Project** — only when the spike is concentrated to **1-2 distinct customers**. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting.
+- **🔀 Mixed** — spike (momentum >1.5) with 3+ customers involved, but the spread is not broad enough for Trend. Watch signal; no velocity override.
 - **📉 Decline** — momentum < 0.5. Manual review.
 - **Stable** — everything else.
 

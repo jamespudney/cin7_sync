@@ -218,6 +218,12 @@ A secondary check the engine runs to detect when the last-45-day sales
 pattern has diverged from the prior 45 days (days 45-90 ago). Uses
 four signals combined to avoid false-positives:
 
+The rolling windows are measured from the newest sales / assembly date
+available in the current snapshot, capped at today. This keeps
+`45d units`, `customers_45d`, `momentum`, and 90d dormancy meaningful
+when the dashboard is temporarily serving a last-good ABC snapshot while
+the background warmer rebuilds.
+
 **Customer diversity is the deciding signal** (v2.67.325). The old
 top-share thresholds (top ≥ 50%, top-2 ≥ 70%) misfired on bulk rolls
 where order sizes are naturally uneven — one buyer doing a big install

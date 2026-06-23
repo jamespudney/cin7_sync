@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-06-22
+Last updated: 2026-06-23
 
 ---
 
@@ -163,6 +163,25 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   `render.yaml`; pushes stage code in GitHub and releases happen via
   manual Render deploy during a quiet window. This avoids unnecessary
   business-hours 502s while the app still owns a persistent disk.
+- **Ordering recent-demand windows** — ABC's 45d units, customers_45d,
+  momentum, 90d dormancy and monthly buckets now anchor to the newest
+  sales/assembly date in the current snapshot, capped at today, rather
+  than blindly using wall-clock today. This stops stale/last-good
+  snapshots from showing every recent-demand column as zero.
+- **ABC warmer sales-source parity** — `warm_engine.py` now reuses the
+  dashboard's already-loaded, unioned sale-line frame instead of
+  re-reading only the longest CSV window. That keeps `engine_output.csv`
+  aligned with Ordering for all sales-derived columns: 45d, 90d, Last 6
+  months, trend flags, top-customer fields and dormancy.
+- **ABC foreground OOM guard** — the Streamlit web process no longer
+  rebuilds the full ABC engine when `engine_output.csv` is missing.
+  It starts `warm_engine.py` in the background and keeps the UI on the
+  last-good/pending state instead. Foreground rebuild is opt-in only via
+  `ABC_ALLOW_FOREGROUND_COMPUTE=1`.
+- **Render web memory alignment** — `render.yaml` now keeps
+  `wired4signs-app` on Render's Pro web instance type (4 GB RAM),
+  matching the live upgrade and avoiding Blueprint downgrades to
+  Standard/2 GB.
 
 ### 2026-06-22
 

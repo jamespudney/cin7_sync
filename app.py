@@ -190,16 +190,20 @@ A secondary check the engine runs to detect when the last-45-day sales
 pattern has diverged from the prior 45 days (days 45-90 ago). Uses
 four signals combined to avoid false-positives:
 
-- **📈 Trend** — ALL of these must be true: momentum >1.5, **4+ distinct
+The rolling windows are measured from the newest sales / assembly date
+available in the current snapshot, capped at today. This keeps 45d
+units, customers_45d, momentum, and 90d dormancy meaningful while the
+background ABC warmer is rebuilding.
+
+- **📈 Trend** — ALL of these must be true: momentum >1.5, **3+ distinct
   customers**, top customer **under 40%**, and non-top customers averaging
   **at least 2 units each**. Real broad-based demand; engine switches to
   last-45d velocity to keep up.
-- **🎯 Project** — ANY of these triggers: top customer **≥50%** of 45d
-  volume, top **2 customers combined ≥70%**, or fewer than 3 distinct
-  customers. Looks concentrated / one-off; engine subtracts top
+- **🎯 Project** — only when the spike is concentrated to **1-2 distinct
+  customers**. Looks like a genuine one-off; engine subtracts top
   customer's 12mo contribution before forecasting to avoid over-ordering.
-- **🔀 Mixed** — spike exists but fails both sets of rules. Watch
-  signal, no velocity override.
+- **🔀 Mixed** — 3+ customers are involved, but the spread is not broad
+  enough for Trend. Watch signal, no velocity override.
 - **📉 Decline** — units down 50%+ vs prior 45 days. Worth review.
 - **Stable** — everything else.
 
@@ -1051,6 +1055,38 @@ def _safe_cache_clear() -> None:
 
 def _to_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=True)
+
+
+def _analysis_today_from_dates(*date_series: pd.Series) -> pd.Timestamp:
+    """Anchor rolling sales windows to the newest date in the snapshot.
+
+    Render may serve a last-good engine_output.csv while a fresh sync or
+    ABC rebuild is still catching up. Using wall-clock today for recent
+    windows can then make 45d demand look like zero even though the
+    snapshot itself has recent sales relative to its own data date.
+    """
+    wall_today = pd.Timestamp(datetime.now().date())
+    max_seen = pd.NaT
+    for series in date_series:
+        if series is None:
+            continue
+        try:
+            dates = pd.to_datetime(series, errors="coerce", utc=True)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(dates, pd.Series):
+            dates = pd.Series(dates)
+        dates = dates.dt.tz_localize(None).dropna()
+        if dates.empty:
+            continue
+        candidate = dates.max()
+        if pd.isna(max_seen) or candidate > max_seen:
+            max_seen = candidate
+    if pd.notna(max_seen):
+        data_today = pd.Timestamp(max_seen).normalize()
+        if data_today <= wall_today:
+            return data_today
+    return wall_today
 
 
 def _compute_slow_mover_clearance(stock_df: pd.DataFrame,
@@ -3695,11 +3731,6 @@ def render_demand_breakdown(
     st.markdown(f"### :mag: Demand breakdown — `{sku}`")
     st.caption(str(prod_row.get("Name") or "")[:120])
 
-    today = pd.Timestamp(datetime.now().date())
-    cutoff_45 = today - pd.Timedelta(days=45)
-    cutoff_90 = today - pd.Timedelta(days=90)
-    cutoff_365 = today - pd.Timedelta(days=365)
-
     # Defensive copy + date coercion (sale_lines may already be parsed but
     # this is cheap insurance against caller variability).
     # Extra guard: on a fresh deploy the salelines sync may still be
@@ -3721,6 +3752,10 @@ def render_demand_breakdown(
     sl["Quantity"] = pd.to_numeric(
         sl.get("Quantity", pd.Series(dtype="float64")),
         errors="coerce").fillna(0)
+    today = _analysis_today_from_dates(sl["InvoiceDate"])
+    cutoff_45 = today - pd.Timedelta(days=45)
+    cutoff_90 = today - pd.Timedelta(days=90)
+    cutoff_365 = today - pd.Timedelta(days=365)
 
     # Direct sales of the master itself (independent of rollup)
     sl_master = sl[sl["SKU"].astype(str) == str(sku)]
@@ -4848,14 +4883,24 @@ def _abc_engine(products: pd.DataFrame,
     prods["SKU"] = prods["SKU"].astype(str)
     prods["AverageCost"] = _to_num(prods["AverageCost"]).fillna(0)
 
-    # 2. 12-month velocity per SKU — filter by InvoiceDate >= today-window
+    # 2. 12-month velocity per SKU — filter by InvoiceDate >=
+    # snapshot-as-of-window. Anchoring to the newest source date keeps
+    # 45d demand/customer/momentum columns meaningful when Render is
+    # serving a last-good engine cache while sync catches up.
     # EXCLUDE CREDITED lines so returned/refunded units don't inflate
     # demand. A sale that was fully returned should net to zero
     # contribution — CIN7's Status = 'CREDITED' marks invoices that
     # were later credited (returned).
     sl = sale_lines.copy()
     sl["InvoiceDate"] = _to_date(sl["InvoiceDate"]).dt.tz_localize(None)
-    cutoff = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=window_days)
+    _analysis_date_sources = [sl["InvoiceDate"]]
+    if assemblies_df is not None and not assemblies_df.empty:
+        if "CompletionDate" in assemblies_df.columns:
+            _analysis_date_sources.append(assemblies_df["CompletionDate"])
+        if "Date" in assemblies_df.columns:
+            _analysis_date_sources.append(assemblies_df["Date"])
+    today_ts = _analysis_today_from_dates(*_analysis_date_sources)
+    cutoff = today_ts - pd.Timedelta(days=window_days)
     sl = sl[sl["InvoiceDate"] >= cutoff].dropna(subset=["InvoiceDate"])
     # Exclude credited / voided / cancelled to reflect NET demand
     if "Status" in sl.columns:
@@ -4908,7 +4953,7 @@ def _abc_engine(products: pd.DataFrame,
             a["_sku"] = a["ComponentSKU"].astype(str)
             a["_value"] = (_to_num(a.get("Cost", pd.Series(0, index=a.index)))
                             .fillna(0) * a["Quantity"])
-            today_naive = pd.Timestamp(datetime.now().date())
+            today_naive = today_ts
             d45 = today_naive - pd.Timedelta(days=45)
             d90 = today_naive - pd.Timedelta(days=90)
             # 12mo per SKU
@@ -5011,7 +5056,6 @@ def _abc_engine(products: pd.DataFrame,
     # 45 days catches spikes faster than 90 days; the trade-off is a
     # noisier signal on low-volume SKUs (hence the 3-unit low-volume
     # guard below, down from 5 when this was a 90d window).
-    today_ts = pd.Timestamp(datetime.now().date())
     cutoff_recent = today_ts - pd.Timedelta(days=45)
     cutoff_prior = today_ts - pd.Timedelta(days=90)
     cutoff_90 = today_ts - pd.Timedelta(days=90)
@@ -6072,7 +6116,6 @@ def _abc_engine(products: pd.DataFrame,
 
     # 7. Monthly sales trend per SKU (12m + 24m buckets)
     # Build monthly series so we can render sparklines in the table.
-    today_ts = pd.Timestamp(datetime.now().date())
     from collections import defaultdict as _dd
     monthly_12 = _dd(lambda: [0.0] * 12)
     monthly_24 = _dd(lambda: [0.0] * 24)
@@ -6264,7 +6307,7 @@ def _abc_engine(products: pd.DataFrame,
         _d = _r.get("InvoiceDate")
         if pd.isna(_d):
             continue
-        if _d >= cutoff_12mo if False else _d >= today_ts - pd.Timedelta(days=window_days):
+        if _d >= cutoff:
             _cust_qty_12mo.setdefault(_s, {})
             _cust_qty_12mo[_s][_cid] = _cust_qty_12mo[_s].get(_cid, 0) + _q
         if _d >= cutoff_recent:
@@ -6890,13 +6933,17 @@ def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
 
     Prefer the last-good engine_output.csv snapshot written by
     warm_engine.py. That keeps users moving while a fresh ABC run is
-    happening in the background. Only fall back to foreground compute
-    when no snapshot exists yet (fresh install / first boot)."""
+    happening in the background. The web process does not rebuild the
+    full engine by default; foreground rebuilds can spike memory high
+    enough to restart the Render service."""
     if products.empty or sale_lines.empty:
         return pd.DataFrame()
     snapshot = _load_engine_output_snapshot()
     if not snapshot.empty:
         return snapshot
+    _start_background_engine_refresh("engine snapshot requested but missing")
+    if os.environ.get("ABC_ALLOW_FOREGROUND_COMPUTE") != "1":
+        return pd.DataFrame()
     return _normalise_engine_snapshot(_abc_engine(
         products, stock, sale_lines, purchase_lines,
         assemblies_df=assemblies))
@@ -6962,8 +7009,9 @@ def _auto_invalidate_engine_if_stale() -> None:
             source_mtime = _fingerprint_latest_mtime(current_fp)
             if snapshot_mtime is None:
                 # Fresh install / empty cache: ask the warmer to create the
-                # first snapshot. If a page needs the engine before it
-                # finishes, _get_engine_df_cached will still compute once.
+                # first snapshot. Until it finishes, Ordering shows the
+                # existing "Need products + 12-month sales" fallback instead
+                # of making Streamlit rebuild ABC in the foreground.
                 _start_background_engine_refresh(
                     "initial engine snapshot missing", current_fp)
             elif source_mtime > float(snapshot_mtime or 0) + 1.0:
