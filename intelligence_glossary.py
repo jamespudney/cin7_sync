@@ -155,9 +155,9 @@ direct sale-lines alone as the total if assembly rows are available.
 
 For exact-SKU month-to-date disputes, CIN7's live product Movements
 ledger (`/product?Sku=...&IncludeMovements=true`) is the reconciliation
-source. Count outbound `Sale` + `Assembly` rows as demand. Report
-inbound `Purchase` rows separately and never net purchases against
-demand.
+source. Count outbound `Sale` + `Finished Goods` / `Assembly` rows as
+demand. Report inbound `Advanced Purchase` / `Purchase` rows separately
+and never net purchases against demand.
 
 The Ordering and Product Detail demand drill-ins follow the same rule.
 When FG assembly rows exist for the inspected component, the monthly

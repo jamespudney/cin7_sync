@@ -296,6 +296,7 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("cin7_product_movement_audit_", script)
         self.assertIn("Delta live minus local", script)
         self.assertIn("Live CIN7 Movement demand MTD", script)
+        self.assertIn("Live FG/Assembly demand", script)
 
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (
@@ -724,7 +725,7 @@ class StripRollupParsingTests(unittest.TestCase):
                                                                    ) -> None:
         movements = [
             {
-                "Type": "Assembly",
+                "Type": "Finished Goods",
                 "Date": "2026-06-23T00:00:00",
                 "Number": "FG-49408",
                 "Quantity": -50,
@@ -740,7 +741,7 @@ class StripRollupParsingTests(unittest.TestCase):
                 "Location": "Main Warehouse",
             },
             {
-                "Type": "Purchase",
+                "Type": "Advanced Purchase",
                 "Date": "2026-06-12T00:00:00",
                 "Number": "PO-7214",
                 "Quantity": 60,
@@ -748,7 +749,7 @@ class StripRollupParsingTests(unittest.TestCase):
                 "Location": "Main Warehouse",
             },
             {
-                "Type": "Assembly",
+                "Type": "Finished Goods",
                 "Date": "2026-05-31T00:00:00",
                 "Number": "FG-OLD",
                 "Quantity": -99,
@@ -764,8 +765,11 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertEqual(summary["demand_qty"], 52)
         self.assertEqual(summary["outbound_qty_all_types"], 52)
         self.assertEqual(summary["purchase_qty"], 60)
-        self.assertEqual(summary["by_type"]["Assembly"]["outbound_qty"], 50)
+        self.assertEqual(
+            summary["by_type"]["Finished Goods"]["outbound_qty"], 50)
         self.assertEqual(summary["by_type"]["Sale"]["outbound_qty"], 2)
+        self.assertEqual(
+            summary["by_type"]["Advanced Purchase"]["signed_qty"], 60)
 
     def test_calendar_month_periods_end_on_current_calendar_month(self) -> None:
         self.assertEqual(

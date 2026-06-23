@@ -2337,16 +2337,17 @@ def _summarise_product_movements(
 
     CIN7's product detail `IncludeMovements=true` returns the same
     ledger family buyers see on the product Movements screen:
-    Assembly, Sale, Purchase, etc. For demand answers, count outbound
-    Sale + Assembly movements. Purchases are reported separately and
-    must not reduce the demand number.
+    Finished Goods, Sale, Purchase, etc. For demand answers, count
+    outbound Sale + Finished Goods / Assembly movements. Purchases are
+    reported separately and must not reduce the demand number.
     """
     if period is None:
         period = pd.Timestamp(datetime.now().date()).to_period("M").strftime(
             "%Y-%m")
     rows = []
     by_type: dict = {}
-    demand_types = {"SALE", "ASSEMBLY"}
+    demand_types = {"SALE", "ASSEMBLY", "FINISHED GOODS"}
+    purchase_types = {"PURCHASE", "ADVANCED PURCHASE"}
     demand_qty = 0.0
     outbound_qty = 0.0
     purchase_qty = 0.0
@@ -2365,7 +2366,7 @@ def _summarise_product_movements(
             demand_qty += outbound
         if signed_qty < 0:
             outbound_qty += outbound
-        if typ_u == "PURCHASE":
+        if typ_u in purchase_types:
             purchase_qty += max(0.0, signed_qty)
         bucket = by_type.setdefault(typ or "(blank)", {
             "rows": 0,
@@ -2399,7 +2400,8 @@ def _summarise_product_movements(
         "guidance": (
             "For current-month 'sold', 'used', or 'movement' questions, "
             "use demand_qty as the headline. It counts outbound Sale + "
-            "Assembly movements from CIN7's live product movement ledger. "
+            "Finished Goods / Assembly movements from CIN7's live product "
+            "movement ledger. "
             "Purchases are inbound and are reported separately, not netted "
             "against demand."
         ),
@@ -2507,7 +2509,8 @@ def get_velocity(engine_df: pd.DataFrame,
         "current_month_live_product_movements.demand_qty when "
         "current_month_live_product_movements.ok is true. That value "
         "comes from CIN7's live product Movements ledger and counts "
-        "outbound Sale + Assembly movements. If live product movements "
+        "outbound Sale + Finished Goods / Assembly movements. If live "
+        "product movements "
         "are unavailable, use current_month_movement.total_qty; it "
         "includes direct invoiced sale-lines plus synced CIN7 Finished "
         "Goods assembly consumption. units_sold is only the direct "

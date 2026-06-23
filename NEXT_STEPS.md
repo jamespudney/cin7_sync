@@ -208,9 +208,10 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 - **Live product-movement AI reconciliation** — `get_velocity` now also
   checks CIN7's live product Movements ledger for the exact SKU when
   CIN7 credentials are available. For current-month "sold/used" answers
-  the AI must prefer outbound `Sale` + `Assembly` movement from that
-  ledger, report inbound `Purchase` separately, and only fall back to
-  cached sale-lines + FG assembly rows when the live movement ledger is
+  the AI must prefer outbound `Sale` + `Finished Goods` / `Assembly`
+  movement from that ledger, report inbound `Advanced Purchase` /
+  `Purchase` separately, and only fall back to cached sale-lines +
+  FG assembly rows when the live movement ledger is
   unavailable. This matches the CIN7 Movements screen James pasted for
   `LED-NEON-FLEX-NICHO-3000K-2` showing roughly 52 June demand units.
   The Ordering selected-SKU inspect panel uses the same live movement

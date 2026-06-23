@@ -72,7 +72,7 @@ The assembly sync must filter final rows by `finishedGoods` detail `CompletionDa
 
 Demand drill-ins must follow the same rule. If FG component consumption exists for the inspected SKU, the monthly demand chart should use direct sales of that SKU plus FG component consumption as the ground-truth view. Kit sale-line × BOM-ratio rollup may be shown for audit, but must not be added to the chart at the same time because it double-counts the same component movement.
 
-For an exact-SKU month-to-date dispute, CIN7's product **Movements** ledger (`/product?Sku=...&IncludeMovements=true`) is the reconciliation source. Count outbound `Sale` + `Assembly` rows as demand, report inbound `Purchase` rows separately, and do not net purchases against demand. If cached sale-lines/assemblies disagree with product Movements, the cache/sync is wrong and downstream slow-stock/reorder values must be refreshed from the corrected movement basis.
+For an exact-SKU month-to-date dispute, CIN7's product **Movements** ledger (`/product?Sku=...&IncludeMovements=true`) is the reconciliation source. Count outbound `Sale` + `Finished Goods` / `Assembly` rows as demand, report inbound `Purchase` / `Advanced Purchase` rows separately, and do not net purchases against demand. If cached sale-lines/assemblies disagree with product Movements, the cache/sync is wrong and downstream slow-stock/reorder values must be refreshed from the corrected movement basis.
 
 **Signals computed**:
 - `units_45d` / `units_prior_45d` → `momentum` ratio (prior = days 45-90 ago).

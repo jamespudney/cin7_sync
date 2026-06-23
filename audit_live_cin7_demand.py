@@ -31,6 +31,8 @@ from cin7_sync import Cin7Client, OUTPUT_DIR, _extract_sale_lines
 
 BAD_SALE_STATUSES = {"CREDITED", "VOIDED", "CANCELLED", "CANCELED"}
 BAD_ASSEMBLY_STATUSES = {"VOIDED", "CANCELLED", "CANCELED", "DRAFT"}
+LIVE_MOVEMENT_DEMAND_TYPES = {"SALE", "ASSEMBLY", "FINISHED GOODS"}
+LIVE_MOVEMENT_INBOUND_TYPES = {"PURCHASE", "ADVANCED PURCHASE"}
 
 
 def _parse_day(value: Any) -> Optional[date]:
@@ -453,7 +455,7 @@ def live_product_movements(
         typ = str(mv.get("Type") or "")
         qty = _qty(mv.get("Quantity"))
         by_type[typ] += qty
-        if typ.upper() in {"SALE", "ASSEMBLY"} and qty < 0:
+        if typ.upper() in LIVE_MOVEMENT_DEMAND_TYPES and qty < 0:
             demand_qty += -qty
         rows.append({
             "Date": day.isoformat() if day else "",
@@ -619,8 +621,12 @@ def run_batch_product_movement_audit(args: argparse.Namespace,
             mismatches += 1
         meta = engine_meta.get(sku, {})
         sale_signed = _signed_type(by_type, "Sale")
-        assembly_signed = _signed_type(by_type, "Assembly")
-        purchase_signed = _signed_type(by_type, "Purchase")
+        assembly_signed = (
+            _signed_type(by_type, "Assembly")
+            + _signed_type(by_type, "Finished Goods"))
+        purchase_signed = sum(
+            _signed_type(by_type, _typ)
+            for _typ in LIVE_MOVEMENT_INBOUND_TYPES)
         rows.append({
             "SKU": sku,
             "Name": meta.get("Name", ""),
@@ -630,7 +636,7 @@ def run_batch_product_movement_audit(args: argparse.Namespace,
             "Live CIN7 Movement demand MTD": round(live_qty, 4),
             "Delta live minus local": round(delta, 4),
             "Live Sale demand": round(max(0.0, -sale_signed), 4),
-            "Live Assembly demand": round(max(0.0, -assembly_signed), 4),
+            "Live FG/Assembly demand": round(max(0.0, -assembly_signed), 4),
             "Live Purchase inbound": round(max(0.0, purchase_signed), 4),
             "Movement rows": len(live_rows),
             "Engine effective_units_12mo": meta.get("effective_units_12mo", ""),
