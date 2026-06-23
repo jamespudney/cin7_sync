@@ -2645,6 +2645,24 @@ _STOCK_LOCATOR_COLUMNS = (
 )
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_live_product_movements_for_sku(sku: str) -> dict:
+    """Return CIN7 product Movements for one SKU when live creds exist.
+
+    Used only in selected-SKU drill-ins. It is intentionally not applied
+    to the whole Ordering grid because that would require one CIN7 API
+    call per row on every rerun.
+    """
+    try:
+        import ai_tools as _ai_tools
+        return _ai_tools._get_live_product_movements(str(sku or ""))
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "reason": f"live product movement lookup failed: {exc}",
+        }
+
+
 def _engine_output_mtime() -> Optional[float]:
     try:
         if _ENGINE_OUTPUT_PATH.exists():
@@ -12027,12 +12045,21 @@ elif page == "Ordering":
             _sku, sale_lines, assemblies)
         _current_month_live_units = float(
             _current_month_live.get("total_qty") or 0)
+        _current_month_product_movements = (
+            _cached_live_product_movements_for_sku(_sku))
+        _current_month_product_units = 0.0
+        if _current_month_product_movements.get("ok"):
+            _current_month_product_units = float(
+                _current_month_product_movements.get("demand_qty") or 0)
         # For assembly-heavy SKUs, the engine bucket can lag the live
-        # 30-day assembly sync until the background ABC refresh finishes.
-        # Show the fresher source total when it is ahead so buyers do not
-        # see a stale current-month demand figure.
+        # movement evidence until the background ABC refresh finishes.
+        # Prefer CIN7 product Movements when available because that is the
+        # same ledger shown in CIN7's product movement screen.
         _current_month_units = max(
-            _current_month_engine_units, _current_month_live_units)
+            _current_month_engine_units,
+            _current_month_live_units,
+            _current_month_product_units,
+        )
         st.markdown(f"#### {_sku}")
         # v2.67.349 — render the SKU as a code block too so Streamlit's
         # built-in hover-copy clipboard icon appears. One-click copy
@@ -12062,8 +12089,9 @@ elif page == "Ordering":
             "Current month",
             f"{_current_month_units:.0f}",
             help=("Uses the ABC monthly bucket, but falls forward to "
-                  "live synced sale-lines + finished-goods assembly "
-                  "consumption when those sources are ahead."),
+                  "live synced sale-lines + FG assembly consumption, "
+                  "then to CIN7 product Movements when that live ledger "
+                  "is available and ahead."),
         )
         _d2[1].metric("90d units",
                       f"{float(_r.get('units_90d') or 0):.0f}")
@@ -12079,7 +12107,30 @@ elif page == "Ordering":
             f"{float(_r.get('lead_time_days') or 0):.0f}d "
             f"({_r.get('freight_mode') or '—'})"
         )
-        if _current_month_live_units > _current_month_engine_units + 1:
+        if _current_month_product_units > max(
+                _current_month_engine_units, _current_month_live_units) + 1:
+            _by_type = _current_month_product_movements.get("by_type") or {}
+            _type_bits = []
+            for _typ, _vals in _by_type.items():
+                if isinstance(_vals, dict):
+                    _signed = float(_vals.get("signed_qty") or 0)
+                    if _signed:
+                        _type_bits.append(f"{_typ} {_signed:g}")
+            _type_note = (
+                " (" + ", ".join(_type_bits[:4]) + ")"
+                if _type_bits else "")
+            st.warning(
+                "Live CIN7 product Movements show "
+                f"{_current_month_product_units:.0f} demand units in "
+                f"{_current_month_product_movements.get('period')}"
+                f"{_type_note}, ahead of both the cached ABC bucket "
+                f"({_current_month_engine_units:.0f}) and synced "
+                f"sale-line/FG assembly movement "
+                f"({_current_month_live_units:.0f}). Product Movements "
+                "is the displayed source until the movement cache is "
+                "reconciled."
+            )
+        elif _current_month_live_units > _current_month_engine_units + 1:
             st.warning(
                 "Live synced movement shows "
                 f"{_current_month_live_units:.0f} units in "

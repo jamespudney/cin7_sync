@@ -72,6 +72,11 @@ For "how many sold this month?" questions on components, use direct
 invoice movement plus FG assembly consumption. Direct sale-lines alone
 are not the total when assembly rows exist.
 
+For exact-SKU month-to-date disputes, CIN7's product **Movements**
+ledger is the tie-breaker. Count outbound `Sale` + `Assembly` rows as
+demand, show inbound `Purchase` rows separately, and do not net
+purchases against demand.
+
 The Ordering and Product Detail demand drill-ins use the same basis:
 direct component sales + FG component consumption. Kit sale-lines still
 show in the activity feed for audit, but they are not added to the

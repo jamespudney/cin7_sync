@@ -28,6 +28,7 @@ implementation in TOOL_HANDLERS. Both are required.
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -175,7 +176,11 @@ TOOL_SCHEMAS: list[dict] = [
             "Sales velocity / units sold / revenue for a SKU over the "
             "last N days. For assembly-heavy components, also returns "
             "current-calendar-month movement from direct invoice lines "
-            "PLUS CIN7 FG assembly consumption. Returns totals AND "
+            "PLUS CIN7 FG assembly consumption. When CIN7 credentials "
+            "are present, it also checks the live CIN7 product movement "
+            "ledger (IncludeMovements=true), which mirrors the product "
+            "Movements screen and is the preferred answer for current-"
+            "month 'sold/used' questions. Returns totals AND "
             "optionally a daily/weekly/monthly breakdown that the UI "
             "will render as an inline chart. Use when user asks 'how "
             "fast does X sell', 'sales history for X', 'show me the "
@@ -2305,6 +2310,147 @@ def get_stock_position(engine_df: pd.DataFrame,
     return _serialise_row(position)
 
 
+def _parse_cin7_date(value: Any) -> Optional[pd.Timestamp]:
+    if value is None:
+        return None
+    dt = pd.to_datetime(value, errors="coerce")
+    if pd.isna(dt):
+        return None
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.tz_convert(None) if hasattr(dt, "tz_convert") else dt
+    return pd.Timestamp(dt).tz_localize(None)
+
+
+def _movement_num(value: Any) -> float:
+    try:
+        num = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if pd.isna(num) else num
+
+
+def _summarise_product_movements(
+        movements: list,
+        *,
+        period: Optional[str] = None) -> dict:
+    """Summarise CIN7 product Movements for one calendar month.
+
+    CIN7's product detail `IncludeMovements=true` returns the same
+    ledger family buyers see on the product Movements screen:
+    Assembly, Sale, Purchase, etc. For demand answers, count outbound
+    Sale + Assembly movements. Purchases are reported separately and
+    must not reduce the demand number.
+    """
+    if period is None:
+        period = pd.Timestamp(datetime.now().date()).to_period("M").strftime(
+            "%Y-%m")
+    rows = []
+    by_type: dict = {}
+    demand_types = {"SALE", "ASSEMBLY"}
+    demand_qty = 0.0
+    outbound_qty = 0.0
+    purchase_qty = 0.0
+    for mv in movements or []:
+        if not isinstance(mv, dict):
+            continue
+        dt = _parse_cin7_date(mv.get("Date"))
+        if dt is None or dt.to_period("M").strftime("%Y-%m") != period:
+            continue
+        qty = _movement_num(mv.get("Quantity"))
+        typ = str(mv.get("Type") or "").strip()
+        typ_u = typ.upper()
+        signed_qty = float(qty or 0)
+        outbound = max(0.0, -signed_qty)
+        if typ_u in demand_types:
+            demand_qty += outbound
+        if signed_qty < 0:
+            outbound_qty += outbound
+        if typ_u == "PURCHASE":
+            purchase_qty += max(0.0, signed_qty)
+        bucket = by_type.setdefault(typ or "(blank)", {
+            "rows": 0,
+            "signed_qty": 0.0,
+            "outbound_qty": 0.0,
+        })
+        bucket["rows"] += 1
+        bucket["signed_qty"] += signed_qty
+        bucket["outbound_qty"] += outbound
+        rows.append({
+            "date": dt.strftime("%Y-%m-%d"),
+            "type": typ,
+            "number": mv.get("Number"),
+            "from_to": mv.get("FromTo"),
+            "quantity": signed_qty,
+            "amount": _movement_num(mv.get("Amount")),
+            "location": mv.get("Location"),
+        })
+    rows = sorted(rows, key=lambda r: (r["date"], str(r["number"])),
+                  reverse=True)
+    return {
+        "ok": True,
+        "source": "cin7_live_product_movements",
+        "period": period,
+        "movement_rows": len(rows),
+        "demand_qty": demand_qty,
+        "outbound_qty_all_types": outbound_qty,
+        "purchase_qty": purchase_qty,
+        "by_type": by_type,
+        "rows": rows[:80],
+        "guidance": (
+            "For current-month 'sold', 'used', or 'movement' questions, "
+            "use demand_qty as the headline. It counts outbound Sale + "
+            "Assembly movements from CIN7's live product movement ledger. "
+            "Purchases are inbound and are reported separately, not netted "
+            "against demand."
+        ),
+    }
+
+
+def _get_live_product_movements(sku: str) -> dict:
+    sku_s = str(sku or "").strip()
+    if not sku_s:
+        return {"ok": False, "reason": "sku is required"}
+    account_id = os.environ.get("CIN7_ACCOUNT_ID", "").strip()
+    app_key = os.environ.get("CIN7_APPLICATION_KEY", "").strip()
+    if not (account_id and app_key):
+        return {
+            "ok": False,
+            "reason": "CIN7 credentials are not available in this process.",
+        }
+    try:
+        from cin7_sync import Cin7Client
+        client = Cin7Client(account_id, app_key)
+        resp = client.get("product", params={
+            "Sku": sku_s,
+            "IncludeDeprecated": "true",
+            "IncludeMovements": "true",
+            "Limit": 20,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "reason": f"CIN7 live product fetch failed: {exc}"}
+    products = []
+    if isinstance(resp, dict):
+        products = resp.get("Products") or []
+    exact = [
+        p for p in products
+        if isinstance(p, dict) and str(p.get("SKU") or "") == sku_s
+    ]
+    product = exact[0] if exact else (products[0] if products else None)
+    if not isinstance(product, dict):
+        return {
+            "ok": False,
+            "reason": "CIN7 product lookup returned no product.",
+        }
+    summary = _summarise_product_movements(product.get("Movements") or [])
+    summary.update({
+        "ok": True,
+        "sku": product.get("SKU") or sku_s,
+        "name": product.get("Name"),
+        "matched_exact": bool(exact),
+    })
+    return summary
+
+
 def get_velocity(engine_df: pd.DataFrame,
                   sale_lines_df: pd.DataFrame,
                   args: dict) -> dict:
@@ -2354,12 +2500,18 @@ def get_velocity(engine_df: pd.DataFrame,
         assemblies_df,
     )
     result["current_month_movement"] = current_month_movement
+    live_movements = _get_live_product_movements(sku)
+    result["current_month_live_product_movements"] = live_movements
     result["assistant_guidance"] = (
-        "For 'sold this month' / MTD questions, use "
-        "current_month_movement.total_qty as the headline when it is "
-        "available. It includes direct invoiced sale-lines plus CIN7 "
-        "Finished Goods assembly consumption. units_sold is only the "
-        f"direct invoice-line total for the last {days} days."
+        "For 'sold this month' / MTD questions, first use "
+        "current_month_live_product_movements.demand_qty when "
+        "current_month_live_product_movements.ok is true. That value "
+        "comes from CIN7's live product Movements ledger and counts "
+        "outbound Sale + Assembly movements. If live product movements "
+        "are unavailable, use current_month_movement.total_qty; it "
+        "includes direct invoiced sale-lines plus synced CIN7 Finished "
+        "Goods assembly consumption. units_sold is only the direct "
+        f"invoice-line total for the last {days} days."
     )
 
     # v2.67.308 — surface the engine's canonical demand signals so the

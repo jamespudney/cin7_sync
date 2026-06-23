@@ -253,8 +253,11 @@ class AppMemoryStructureTests(unittest.TestCase):
 
         self.assertIn("build_sku_current_month_movement", script)
         self.assertIn("_current_month_engine_units", script)
-        self.assertIn("finished-goods assembly", script)
-        self.assertIn("consumption when those sources are ahead", script)
+        self.assertIn("_cached_live_product_movements_for_sku", script)
+        self.assertIn("_current_month_product_units", script)
+        self.assertIn("Live CIN7 product Movements show", script)
+        self.assertIn("FG assembly consumption", script)
+        self.assertIn("then to CIN7 product Movements", script)
         self.assertIn("ai_tools.set_assemblies(assemblies)", script)
 
     def test_demand_breakdown_uses_finished_goods_consumption(self) -> None:
@@ -703,6 +706,54 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertEqual(movement["total_qty"], 49)
         self.assertIn("Finished Goods assembly consumption",
                       result["assistant_guidance"])
+        self.assertIn("current_month_live_product_movements", result)
+
+    def test_live_product_movements_count_sale_and_assembly_demand(self
+                                                                   ) -> None:
+        movements = [
+            {
+                "Type": "Assembly",
+                "Date": "2026-06-23T00:00:00",
+                "Number": "FG-49408",
+                "Quantity": -50,
+                "Amount": -2451,
+                "Location": "Main Warehouse",
+            },
+            {
+                "Type": "Sale",
+                "Date": "2026-06-18T00:00:00",
+                "Number": "SO-57914",
+                "Quantity": -2,
+                "Amount": -98.04,
+                "Location": "Main Warehouse",
+            },
+            {
+                "Type": "Purchase",
+                "Date": "2026-06-12T00:00:00",
+                "Number": "PO-7214",
+                "Quantity": 60,
+                "Amount": 2941.2,
+                "Location": "Main Warehouse",
+            },
+            {
+                "Type": "Assembly",
+                "Date": "2026-05-31T00:00:00",
+                "Number": "FG-OLD",
+                "Quantity": -99,
+                "Amount": -1,
+                "Location": "Main Warehouse",
+            },
+        ]
+
+        summary = ai_tools._summarise_product_movements(
+            movements, period="2026-06")
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["demand_qty"], 52)
+        self.assertEqual(summary["outbound_qty_all_types"], 52)
+        self.assertEqual(summary["purchase_qty"], 60)
+        self.assertEqual(summary["by_type"]["Assembly"]["outbound_qty"], 50)
+        self.assertEqual(summary["by_type"]["Sale"]["outbound_qty"], 2)
 
     def test_calendar_month_periods_end_on_current_calendar_month(self) -> None:
         self.assertEqual(
