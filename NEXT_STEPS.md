@@ -173,6 +173,13 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   re-reading only the longest CSV window. That keeps `engine_output.csv`
   aligned with Ordering for all sales-derived columns: 45d, 90d, Last 6
   months, trend flags, top-customer fields and dormancy.
+- **MTD sale-line freshness guard** — sync boot catch-up now checks
+  `sale_lines_last_30d_*.csv` as well as sale headers. If the 30-day
+  line-detail window is stale or missing, `daily_sync.sh` runs
+  immediately so current-month Ordering buckets do not lag behind
+  Inventory Planner. SKU detail now surfaces Current month, 90d,
+  Customers 45d and Momentum directly, plus a warning when exact
+  sale-lines are ahead of the ABC monthly bucket.
 - **ABC foreground OOM guard** — the Streamlit web process no longer
   rebuilds the full ABC engine when `engine_output.csv` is missing.
   It starts `warm_engine.py` in the background and keeps the UI on the

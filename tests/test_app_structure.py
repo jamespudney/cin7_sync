@@ -205,6 +205,22 @@ class AppMemoryStructureTests(unittest.TestCase):
             script,
         )
 
+    def test_ordering_sku_detail_surfaces_current_month_audit(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('_d2[0].metric("Current month"', script)
+        self.assertIn('_d2[1].metric("90d units"', script)
+        self.assertIn('_d2[2].metric("Customers 45d"', script)
+        self.assertIn('_d2[3].metric("Momentum"', script)
+        self.assertIn(
+            "Exact synced sale lines show",
+            script,
+        )
+        self.assertIn("snapshot is likely stale or missing recent", script)
+        self.assertIn("sale-line files; run/await", script)
+
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (
             Path(__file__).resolve().parents[1] / "warm_engine_helpers.py"
@@ -273,6 +289,16 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("timeout 300", nearsync_loop)
         self.assertIn("qbo_client.is_ready()", sync_script)
         self.assertIn("def cmd_sync", sync_script)
+
+    def test_sync_catchup_checks_sale_line_window(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "sync_loop.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("_check_daily_output_fresh", script)
+        self.assertIn("sales_last_30d_*.csv", script)
+        self.assertIn("sale_lines_last_30d_*.csv", script)
+        self.assertIn("sale_lines_last_30d CSV", script)
 
     def test_signin_combines_password_and_profile(self) -> None:
         script = (

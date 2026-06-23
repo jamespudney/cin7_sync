@@ -11784,6 +11784,11 @@ elif page == "Ordering":
             st.warning(f"No engine data for `{_sku}`.")
             return
         _r = _hit.iloc[0]
+        _trend_12m = _r.get("trend_12m")
+        if not isinstance(_trend_12m, list):
+            _trend_12m = _parse_engine_list_cell(_trend_12m)
+        _current_month_units = (
+            float(_trend_12m[-1]) if _trend_12m else 0.0)
         st.markdown(f"#### {_sku}")
         # v2.67.349 — render the SKU as a code block too so Streamlit's
         # built-in hover-copy clipboard icon appears. One-click copy
@@ -11808,6 +11813,15 @@ elif page == "Ordering":
                      f"{int(_r.get('customers_12mo') or 0)}")
         _d[3].metric("Suggested reorder",
                      f"{float(_r.get('reorder_qty') or 0):.0f}")
+        _d2 = st.columns(4)
+        _d2[0].metric("Current month",
+                      f"{_current_month_units:.0f}")
+        _d2[1].metric("90d units",
+                      f"{float(_r.get('units_90d') or 0):.0f}")
+        _d2[2].metric("Customers 45d",
+                      f"{int(_r.get('customers_45d') or 0)}")
+        _d2[3].metric("Momentum",
+                      f"{float(_r.get('momentum') or 0):.2f}x")
         st.markdown(
             f"**Supplier:** {_r.get('Supplier') or '—'}  \n"
             f"**Last 6 months:** {_r.get('last_6mo_series') or '—'}  \n"
@@ -11846,6 +11860,17 @@ elif page == "Ordering":
                     _sa[3].metric(
                         "Last invoice",
                         str(_summary.get("last_invoice_date") or "—"))
+                    _audit_current_invoice = float(
+                        _summary.get("current_invoice_qty") or 0)
+                    if _audit_current_invoice > _current_month_units + 1:
+                        st.warning(
+                            "Exact synced sale lines show "
+                            f"{_audit_current_invoice:.0f} units invoiced "
+                            f"this month, but the ABC monthly bucket shows "
+                            f"{_current_month_units:.0f}. The engine "
+                            "snapshot is likely stale or missing recent "
+                            "sale-line files; run/await the background ABC "
+                            "refresh after the 30-day sale-line catch-up.")
 
                     _monthly_rows = _sales_audit.get("monthly_rows")
                     if isinstance(_monthly_rows, pd.DataFrame) and not _monthly_rows.empty:

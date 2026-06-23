@@ -102,23 +102,35 @@ _start_warm_engine() {
 # sleep loop. Mirrors slack_loop.sh's first-boot bootstrap.
 CATCHUP_STALE_HOURS="${SYNC_CATCHUP_STALE_HOURS:-20}"
 _catchup_needed=0
-_freshest_sales=$(ls -t "${DATA_DIR}"/output/sales_last_30d_*.csv \
-    2>/dev/null | head -1)
-if [ -z "$_freshest_sales" ]; then
-    echo "[$(stamp)] catch-up: no sales_last_30d_*.csv found" \
-      | tee -a "$LOG"
-    _catchup_needed=1
-else
-    _age_s=$(( $(date -u +%s) \
-        - $(date -u -r "$_freshest_sales" +%s 2>/dev/null \
-            || echo 0) ))
-    _age_h=$(( _age_s / 3600 ))
-    if [ "$_age_h" -ge "$CATCHUP_STALE_HOURS" ]; then
-        echo "[$(stamp)] catch-up: sales CSV is ${_age_h}h old" \
+
+_check_daily_output_fresh() {
+    local pattern="$1"
+    local label="$2"
+    local freshest
+    freshest=$(ls -t "${DATA_DIR}"/output/${pattern} \
+        2>/dev/null | head -1)
+    if [ -z "$freshest" ]; then
+        echo "[$(stamp)] catch-up: no ${label} found" \
+          | tee -a "$LOG"
+        _catchup_needed=1
+        return
+    fi
+    local age_s
+    local age_h
+    age_s=$(( $(date -u +%s) \
+        - $(date -u -r "$freshest" +%s 2>/dev/null || echo 0) ))
+    age_h=$(( age_s / 3600 ))
+    if [ "$age_h" -ge "$CATCHUP_STALE_HOURS" ]; then
+        echo "[$(stamp)] catch-up: ${label} is ${age_h}h old" \
           | tee -a "$LOG"
         _catchup_needed=1
     fi
-fi
+}
+
+_check_daily_output_fresh "sales_last_30d_*.csv" "sales_last_30d CSV"
+_check_daily_output_fresh \
+    "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV"
+
 if [ "$_catchup_needed" = "1" ]; then
     echo "[$(stamp)] catch-up: running daily_sync.sh now" \
       | tee -a "$LOG"
