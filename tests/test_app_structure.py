@@ -257,6 +257,20 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("consumption when those sources are ahead", script)
         self.assertIn("ai_tools.set_assemblies(assemblies)", script)
 
+    def test_demand_breakdown_uses_finished_goods_consumption(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("assemblies_df: Optional[pd.DataFrame] = None",
+                      script)
+        self.assertGreaterEqual(script.count("assemblies_df=assemblies"), 2)
+        self.assertIn("FG assembly consumption found", script)
+        self.assertIn("Kit-sale BOM estimate", script)
+        self.assertIn("Recent FG assembly consumption", script)
+        self.assertIn("assembly rows are the actual component movement",
+                      script)
+
     def test_assembly_sync_filters_by_detail_completion_date(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "cin7_sync.py"

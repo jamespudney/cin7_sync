@@ -72,6 +72,12 @@ For "how many sold this month?" questions on components, use direct
 invoice movement plus FG assembly consumption. Direct sale-lines alone
 are not the total when assembly rows exist.
 
+The Ordering and Product Detail demand drill-ins use the same basis:
+direct component sales + FG component consumption. Kit sale-lines still
+show in the activity feed for audit, but they are not added to the
+monthly chart when FG rows exist because that would double-count the
+same component movement.
+
 #### FixedCost / AverageCost / PO cost
 - **FixedCost** — the agreed supplier price on the SKU's supplier record
   in CIN7. What you'll actually pay on the PO.

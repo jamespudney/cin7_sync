@@ -70,6 +70,8 @@ Anything else is a child / phantom / cut / assembly.
 
 The assembly sync must filter final rows by `finishedGoods` detail `CompletionDate`, not only by `finishedGoodsList.Date`. CIN7's list-level `Date` can be the task/start/list date, while the component consumption belongs to the completion month. AI velocity answers must use direct sale-lines + assembly consumption for MTD component movement.
 
+Demand drill-ins must follow the same rule. If FG component consumption exists for the inspected SKU, the monthly demand chart should use direct sales of that SKU plus FG component consumption as the ground-truth view. Kit sale-line × BOM-ratio rollup may be shown for audit, but must not be added to the chart at the same time because it double-counts the same component movement.
+
 **Signals computed**:
 - `units_45d` / `units_prior_45d` → `momentum` ratio (prior = days 45-90 ago).
 - `customers_45d` — distinct customer count in last 45d.

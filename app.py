@@ -3729,6 +3729,7 @@ def render_demand_breakdown(
     products_df: pd.DataFrame,
     bom_children: dict,
     bom_parents: dict,
+    assemblies_df: Optional[pd.DataFrame] = None,
     engine_row: Optional[pd.Series] = None,
     engine_df_full: Optional[pd.DataFrame] = None,
     stock_df: Optional[pd.DataFrame] = None,
@@ -3751,7 +3752,9 @@ def render_demand_breakdown(
       2. Demand sources — table of children that roll up into this master,
          each with their 12mo / 90d / 45d sales, BOM ratio, and contribution.
       3. Family monthly sales chart — combined master + children, last 12
-         months. Lets the buyer eyeball whether the family is still active.
+         months. When Finished Goods assembly consumption exists for this
+         component, the chart uses that ground-truth movement instead of
+         kit sale-lines × BOM ratio to avoid double-counting.
       4. Recent activity feed — last 10 sale lines across the whole family
          so the buyer can spot which child is actually driving demand.
       5. Parents — what this SKU is built FROM (when applicable). Useful
@@ -3791,7 +3794,38 @@ def render_demand_breakdown(
     sl["Quantity"] = pd.to_numeric(
         sl.get("Quantity", pd.Series(dtype="float64")),
         errors="coerce").fillna(0)
-    today = _analysis_today_from_dates(sl["InvoiceDate"])
+    if "Status" in sl.columns:
+        _bad_sale_statuses = ("CREDITED", "VOIDED", "CANCELLED", "CANCELED")
+        sl = sl[~sl["Status"].astype(str).str.upper().isin(
+            _bad_sale_statuses)]
+
+    asm = (assemblies_df.copy()
+           if assemblies_df is not None else pd.DataFrame())
+    if not asm.empty:
+        for _col in ("ComponentSKU", "CompletionDate", "Date",
+                     "Quantity", "Status"):
+            if _col not in asm.columns:
+                asm[_col] = pd.NA
+        _completed = pd.to_datetime(
+            asm["CompletionDate"], errors="coerce")
+        _fallback = pd.to_datetime(asm["Date"], errors="coerce")
+        asm["_movement_date"] = _completed.fillna(_fallback)
+        asm["Quantity"] = pd.to_numeric(
+            asm["Quantity"], errors="coerce").fillna(0)
+        if "Status" in asm.columns:
+            _bad_asm_statuses = ("VOIDED", "CANCELLED", "CANCELED", "DRAFT")
+            asm = asm[~asm["Status"].astype(str).str.upper().isin(
+                _bad_asm_statuses)]
+        asm = asm.dropna(subset=["_movement_date", "ComponentSKU"])
+    else:
+        asm = pd.DataFrame(columns=[
+            "ComponentSKU", "_movement_date", "Quantity", "Status"])
+
+    today = _analysis_today_from_dates(
+        sl["InvoiceDate"],
+        asm["_movement_date"] if "_movement_date" in asm.columns
+        else None,
+    )
     cutoff_45 = today - pd.Timedelta(days=45)
     cutoff_90 = today - pd.Timedelta(days=90)
     cutoff_365 = today - pd.Timedelta(days=365)
@@ -3806,6 +3840,17 @@ def render_demand_breakdown(
         sl_master[sl_master["InvoiceDate"] >= cutoff_45]["Quantity"].sum())
     last_sale_date = (sl_master["InvoiceDate"].max()
                       if not sl_master.empty else None)
+    asm_master = asm[asm["ComponentSKU"].astype(str) == str(sku)].copy()
+    asm_12mo = float(
+        asm_master[asm_master["_movement_date"] >= cutoff_365][
+            "Quantity"].sum()) if not asm_master.empty else 0.0
+    asm_90d = float(
+        asm_master[asm_master["_movement_date"] >= cutoff_90][
+            "Quantity"].sum()) if not asm_master.empty else 0.0
+    asm_45d = float(
+        asm_master[asm_master["_movement_date"] >= cutoff_45][
+            "Quantity"].sum()) if not asm_master.empty else 0.0
+    has_fg_consumption = asm_12mo > 0 or asm_90d > 0 or asm_45d > 0
 
     children = bom_children.get(sku, [])
     parents = bom_parents.get(sku, [])
@@ -4041,6 +4086,20 @@ def render_demand_breakdown(
                     )
 
     # === Section 2: Demand sources (children rolling up) ===================
+    if has_fg_consumption:
+        st.info(
+            "🏗️ **FG assembly consumption found for this component.** "
+            "The monthly demand chart below uses direct sales plus CIN7 "
+            "Finished Goods component consumption as the engine-equivalent "
+            "view. Kit sale-lines are still shown for audit, but are not "
+            "added to the chart when FG consumption exists because that "
+            "would double-count the same component movement."
+        )
+        _fg_cols = st.columns(3)
+        _fg_cols[0].metric("FG consumption 12mo", f"{asm_12mo:.0f}")
+        _fg_cols[1].metric("FG consumption 90d", f"{asm_90d:.0f}")
+        _fg_cols[2].metric("FG consumption 45d", f"{asm_45d:.0f}")
+
     if children:
         st.markdown(
             f"#### :bar_chart: Demand sources — {len(children)} child SKU(s) "
@@ -4092,13 +4151,25 @@ def render_demand_breakdown(
             )
             total_contrib_12 = sum(r["Contrib 12mo"] for r in rows)
             total_contrib_90 = sum(r["Contrib 90d"] for r in rows)
-            st.caption(
-                f"Total rollup contribution: "
-                f"**{total_contrib_12:.2f} master units / 12mo** · "
-                f"**{total_contrib_90:.2f} master units / 90d**. "
-                f"Plus direct sales of master "
-                f"({int(own_12mo)} / 12mo, {int(own_90d)} / 90d). "
-                f"Effective demand = direct + rollup.")
+            if has_fg_consumption:
+                st.caption(
+                    f"Kit-sale BOM estimate: "
+                    f"**{total_contrib_12:.2f} master units / 12mo** · "
+                    f"**{total_contrib_90:.2f} master units / 90d**. "
+                    f"FG assembly ground truth: "
+                    f"**{asm_12mo:.2f} / 12mo** · "
+                    f"**{asm_90d:.2f} / 90d**. "
+                    f"Effective demand for this chart = direct master "
+                    f"sales ({int(own_12mo)} / 12mo, {int(own_90d)} / "
+                    f"90d) + FG assembly consumption.")
+            else:
+                st.caption(
+                    f"Total rollup contribution: "
+                    f"**{total_contrib_12:.2f} master units / 12mo** · "
+                    f"**{total_contrib_90:.2f} master units / 90d**. "
+                    f"Plus direct sales of master "
+                    f"({int(own_12mo)} / 12mo, {int(own_90d)} / 90d). "
+                    f"Effective demand = direct + rollup.")
     else:
         st.info(
             ":information_source: No children roll up into this SKU. "
@@ -4155,12 +4226,24 @@ def render_demand_breakdown(
     family_skus = list(dict.fromkeys(
         [str(s) for s in family_skus + _predecessor_skus]))
 
-    family_sl = sl[sl["SKU"].astype(str).isin(
+    # Activity feed still shows the full family including kit sale-lines.
+    # The chart itself switches to FG assembly ground truth when present
+    # so kit sale-lines are not double-counted against the component
+    # consumption rows.
+    family_activity_sl = sl[sl["SKU"].astype(str).isin(
         [str(s) for s in family_skus])].copy()
+    family_activity_sl = family_activity_sl.dropna(subset=["InvoiceDate"])
+    chart_skus = (
+        list(dict.fromkeys([str(sku)] + [str(p) for p in _predecessor_skus]))
+        if has_fg_consumption
+        else family_skus
+    )
+    family_sl = sl[sl["SKU"].astype(str).isin(
+        [str(s) for s in chart_skus])].copy()
     family_sl = family_sl.dropna(subset=["InvoiceDate"])
-    if not family_sl.empty:
+    if not family_sl.empty or has_fg_consumption:
         _n_preds_with_data = len(set(_predecessor_skus) & set(
-            family_sl["SKU"].astype(str)))
+            family_activity_sl["SKU"].astype(str)))
         _pred_suffix = (
             f" — incl. {_n_preds_with_data} predecessor"
             f"{'s' if _n_preds_with_data != 1 else ''} with sales history"
@@ -4168,26 +4251,49 @@ def render_demand_breakdown(
         st.markdown(
             f"#### 📈 Family monthly demand — "
             f"master-roll equivalents (last 12 months){_pred_suffix}")
-        st.caption(
-            "Each SKU's units are multiplied by its BOM ratio (and "
-            "migration share for predecessors) to this master, so the "
-            "chart is in a single unit (master rolls) regardless of how "
-            "the family sells or what predecessors it replaced. "
-            f"Master = `{sku}` = 1 unit per row.")
+        if has_fg_consumption:
+            st.caption(
+                "This chart uses direct sales of the selected SKU plus "
+                "CIN7 Finished Goods component consumption. Kit sale-lines "
+                "are shown in the activity feed below, but are not added "
+                "to the chart when FG consumption exists because the "
+                "assembly rows are the actual component movement. "
+                f"Master = `{sku}` = 1 unit per row.")
+        else:
+            st.caption(
+                "Each SKU's units are multiplied by its BOM ratio (and "
+                "migration share for predecessors) to this master, so the "
+                "chart is in a single unit (master rolls) regardless of how "
+                "the family sells or what predecessors it replaced. "
+                f"Master = `{sku}` = 1 unit per row.")
         cutoff_12mo = today - pd.Timedelta(days=365)
         recent_sl = family_sl[family_sl["InvoiceDate"] >= cutoff_12mo].copy()
-        if not recent_sl.empty:
-            recent_sl["master_units"] = recent_sl.apply(
-                lambda r: (float(r["Quantity"] or 0)
-                            * sku_to_master_ratio.get(str(r["SKU"]), 1.0)),
-                axis=1,
-            )
-            recent_sl["month"] = (recent_sl["InvoiceDate"]
-                                   .dt.to_period("M").astype(str))
-            monthly = recent_sl.groupby("month")["master_units"].sum()
+        if not recent_sl.empty or has_fg_consumption:
             all_months = (pd.period_range(end=today, periods=12, freq="M")
                           .astype(str))
-            monthly = monthly.reindex(all_months, fill_value=0)
+            monthly = pd.Series(0.0, index=all_months)
+            if not recent_sl.empty:
+                recent_sl["master_units"] = recent_sl.apply(
+                    lambda r: (float(r["Quantity"] or 0)
+                                * sku_to_master_ratio.get(
+                                    str(r["SKU"]), 1.0)),
+                    axis=1,
+                )
+                recent_sl["month"] = (recent_sl["InvoiceDate"]
+                                       .dt.to_period("M").astype(str))
+                monthly = monthly.add(
+                    recent_sl.groupby("month")["master_units"].sum(),
+                    fill_value=0).reindex(all_months, fill_value=0)
+            if has_fg_consumption:
+                asm_recent = asm_master[
+                    asm_master["_movement_date"] >= cutoff_12mo].copy()
+                if not asm_recent.empty:
+                    asm_recent["month"] = (
+                        asm_recent["_movement_date"].dt.to_period("M")
+                        .astype(str))
+                    monthly = monthly.add(
+                        asm_recent.groupby("month")["Quantity"].sum(),
+                        fill_value=0).reindex(all_months, fill_value=0)
             st.bar_chart(monthly)
         else:
             st.caption(
@@ -4195,20 +4301,21 @@ def render_demand_breakdown(
                 "dormant family.")
 
     # === Section 4: Recent activity feed ===================================
-    # family_sl now includes predecessor sales (added above), so this
+    # family_activity_sl now includes kit + predecessor sales, so this
     # naturally shows recent CASCADE/SMOKIES sales alongside SIERRA's,
     # giving the buyer the full lineage view.
-    if not family_sl.empty:
+    if not family_activity_sl.empty:
         _pred_set = set(_predecessor_skus)
-        _has_pred_sales = bool(_pred_set & set(family_sl["SKU"].astype(str)))
+        _has_pred_sales = bool(
+            _pred_set & set(family_activity_sl["SKU"].astype(str)))
         _recent_label = (
             "across the family (incl. predecessors)"
             if _has_pred_sales else "across the family")
         st.markdown(
             f"#### :clipboard: Recent activity — last 10 sales "
             f"{_recent_label}")
-        recent_10 = (family_sl.sort_values("InvoiceDate", ascending=False)
-                     .head(10)).copy()
+        recent_10 = (family_activity_sl.sort_values(
+            "InvoiceDate", ascending=False).head(10)).copy()
         cols_to_show = [c for c in
                         ["InvoiceDate", "SKU", "Customer",
                           "Quantity", "Total"]
@@ -4223,6 +4330,26 @@ def render_demand_breakdown(
                 display["Total"] = pd.to_numeric(
                     display["Total"], errors="coerce")
             st.dataframe(display, hide_index=True, width="stretch")
+
+    if has_fg_consumption:
+        st.markdown(
+            "#### 🏗️ Recent FG assembly consumption — last 10 component "
+            "moves")
+        asm_recent_10 = (asm_master.sort_values(
+            "_movement_date", ascending=False).head(10)).copy()
+        asm_cols = [c for c in [
+            "_movement_date", "AssemblyNumber", "ParentSKU", "ParentName",
+            "Quantity", "Status",
+        ] if c in asm_recent_10.columns]
+        if asm_cols:
+            asm_display = asm_recent_10[asm_cols].copy()
+            asm_display = asm_display.rename(
+                columns={"_movement_date": "CompletionDate"})
+            if "CompletionDate" in asm_display.columns:
+                asm_display["CompletionDate"] = pd.to_datetime(
+                    asm_display["CompletionDate"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+            st.dataframe(asm_display, hide_index=True, width="stretch")
 
     # === Section 5: Parents (where this SKU is built from) =================
     if parents:
@@ -15235,6 +15362,7 @@ elif page == "Ordering":
                 products_df=products,
                 bom_children=BOM_CHILDREN,
                 bom_parents=BOM_PARENTS,
+                assemblies_df=assemblies,
                 engine_row=_engine_row,
                 engine_df_full=engine_df,
             )
@@ -18827,6 +18955,7 @@ elif page == "Product Detail":
                 products_df=products,
                 bom_children=BOM_CHILDREN,
                 bom_parents=BOM_PARENTS,
+                assemblies_df=assemblies,
                 engine_row=None,
                 stock_df=stock,
             )

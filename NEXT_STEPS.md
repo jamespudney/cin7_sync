@@ -196,6 +196,15 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   date. AI velocity answers now receive the assemblies dataframe and
   report Current month as direct invoice lines + FG assembly
   consumption instead of direct sales only.
+- **Demand drill-in assembly parity** — Ordering and Product Detail
+  demand breakdowns now receive the same Finished Goods assembly data as
+  the engine. When a selected component has FG component consumption,
+  the monthly family chart uses direct sales + FG consumption as the
+  ground-truth demand view, while kit-sale BOM rollup stays visible only
+  as an audit estimate to avoid double-counting. This is important for
+  assembly-heavy components such as `LED-NEON-FLEX-NICHO-3000K-2`,
+  where Inventory Planner's current-month demand can be far ahead of
+  direct sale-lines alone.
 - **Slow-stock stale-warning guard** — the Overview slow-stock holding
   KPI no longer lets an old active dormancy warning contribute value
   when the current engine row shows positive 45d/90d movement. Warnings
