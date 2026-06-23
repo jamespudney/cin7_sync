@@ -255,6 +255,18 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_current_month_engine_units", script)
         self.assertIn("finished-goods assembly", script)
         self.assertIn("consumption when those sources are ahead", script)
+        self.assertIn("ai_tools.set_assemblies(assemblies)", script)
+
+    def test_assembly_sync_filters_by_detail_completion_date(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "cin7_sync.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("CIN7_ASSEMBLY_LIST_BUFFER_DAYS", script)
+        self.assertIn("candidate_cutoff", script)
+        self.assertIn("completion_dt is not None and completion_dt < cutoff",
+                      script)
+        self.assertIn("assemblies_{days}d_v2_completion", script)
 
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (
@@ -637,6 +649,46 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertEqual(movement["direct_invoice_qty"], 5)
         self.assertEqual(movement["assembly_qty"], 30)
         self.assertEqual(movement["total_qty"], 35)
+
+    def test_ai_velocity_reports_current_month_assembly_movement(self) -> None:
+        today = pd.Timestamp(datetime.now().date())
+        sku = "LED-NEON-FLEX-NICHO-3000K-2"
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": sku,
+                "InvoiceDate": today.strftime("%Y-%m-%d"),
+                "Quantity": 5,
+                "Total": 100,
+                "Status": "AUTHORISED",
+                "SaleID": "S1",
+            }
+        ])
+        assemblies = pd.DataFrame([
+            {
+                "ComponentSKU": sku,
+                "CompletionDate": today.strftime("%Y-%m-%d"),
+                "Date": today.strftime("%Y-%m-%d"),
+                "Quantity": 44,
+                "Status": "COMPLETED",
+            }
+        ])
+
+        try:
+            ai_tools.set_assemblies(assemblies)
+            result = ai_tools.get_velocity(
+                pd.DataFrame(),
+                sale_lines,
+                {"sku": sku, "days": 30},
+            )
+        finally:
+            ai_tools.set_assemblies(pd.DataFrame())
+
+        movement = result["current_month_movement"]
+        self.assertEqual(movement["direct_invoice_qty"], 5)
+        self.assertEqual(movement["assembly_qty"], 44)
+        self.assertEqual(movement["total_qty"], 49)
+        self.assertIn("Finished Goods assembly consumption",
+                      result["assistant_guidance"])
 
     def test_calendar_month_periods_end_on_current_calendar_month(self) -> None:
         self.assertEqual(

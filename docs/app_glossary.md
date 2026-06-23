@@ -68,6 +68,10 @@ If that assembly file is stale, components such as
 `LED-NEON-FLEX-NICHO-3000K-2` can appear under-demanded and falsely
 slow.
 
+For "how many sold this month?" questions on components, use direct
+invoice movement plus FG assembly consumption. Direct sale-lines alone
+are not the total when assembly rows exist.
+
 #### FixedCost / AverageCost / PO cost
 - **FixedCost** — the agreed supplier price on the SKU's supplier record
   in CIN7. What you'll actually pay on the PO.

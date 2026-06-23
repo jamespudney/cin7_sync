@@ -149,6 +149,10 @@ The daily worker must keep that 30-day assembly file fresh; otherwise
 assembly-heavy components (for example `LED-NEON-FLEX-NICHO-3000K-2`)
 can appear under-demanded and falsely slow.
 
+For "how many sold this month?" questions on components, answer using
+direct invoice movement plus FG assembly consumption. Do not report
+direct sale-lines alone as the total if assembly rows are available.
+
 #### FixedCost / AverageCost / PO cost
 - **FixedCost** — the agreed supplier price on the SKU's supplier record
   in CIN7. What you'll actually pay on the PO.

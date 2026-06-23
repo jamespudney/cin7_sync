@@ -1410,6 +1410,14 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
             if sl_path else pd.DataFrame())
         if sl_path:
             log.info("Listener loaded sale lines from %s", Path(sl_path).name)
+        asm_files = _glob.glob(str(OUTPUT_DIR / "assemblies_last_*d_*.csv"))
+        asm_path = _widest_window_file(asm_files, "assemblies_last")
+        assemblies = (
+            pd.read_csv(asm_path, low_memory=False)
+            if asm_path else pd.DataFrame())
+        if asm_path:
+            log.info("Listener loaded assemblies from %s",
+                     Path(asm_path).name)
 
         # v2.67.69 — full engine intelligence on the worker.
         # Earlier versions merged products+stock for a slim engine_df
@@ -1501,6 +1509,7 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
                     ai_tools.set_shopify_orders(
                         pd.read_csv(so_full, low_memory=False))
             ai_tools.set_sale_lines_longest(sale_lines)
+            ai_tools.set_assemblies(assemblies)
             gc.collect()  # free any transient pandas allocations
         except Exception as exc:  # noqa: BLE001
             log.warning("listener data wiring partial: %s", exc)

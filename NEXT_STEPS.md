@@ -189,6 +189,13 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   ahead of the cached ABC bucket. This fixes
   assembly-heavy components such as `LED-NEON-FLEX-NICHO-3000K-2`
   lagging Inventory Planner MTD demand.
+- **Assembly MTD completion-date fix** — 30-day Finished Goods sync now
+  keeps a wider candidate buffer from `finishedGoodsList`, fetches task
+  detail, and filters by detail `CompletionDate`. This covers CIN7
+  tasks whose list-level `Date` is not the actual component-consumption
+  date. AI velocity answers now receive the assemblies dataframe and
+  report Current month as direct invoice lines + FG assembly
+  consumption instead of direct sales only.
 - **Slow-stock stale-warning guard** — the Overview slow-stock holding
   KPI no longer lets an old active dormancy warning contribute value
   when the current engine row shows positive 45d/90d movement. Warnings

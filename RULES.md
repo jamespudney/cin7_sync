@@ -68,6 +68,8 @@ Anything else is a child / phantom / cut / assembly.
 
 **3.4.1 Assembly-heavy MTD demand.** Components consumed through CIN7 finished-goods assemblies (FG-XXXX tasks) must use `assemblies_last_30d_*.csv` for month-to-date demand. `sale_lines_last_30d_*.csv` alone is insufficient for SKUs that mostly leave stock via kit builds, e.g. `LED-NEON-FLEX-NICHO-3000K-2`. If the 30-day assembly file is stale or missing, the engine can understate current-month demand and falsely mark active components as slow/dormant.
 
+The assembly sync must filter final rows by `finishedGoods` detail `CompletionDate`, not only by `finishedGoodsList.Date`. CIN7's list-level `Date` can be the task/start/list date, while the component consumption belongs to the completion month. AI velocity answers must use direct sale-lines + assembly consumption for MTD component movement.
+
 **Signals computed**:
 - `units_45d` / `units_prior_45d` → `momentum` ratio (prior = days 45-90 ago).
 - `customers_45d` — distinct customer count in last 45d.

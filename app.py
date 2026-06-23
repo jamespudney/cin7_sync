@@ -20198,6 +20198,12 @@ elif page == "AI Assistant":
     except Exception:
         pass
     try:
+        # Finished Goods component-consumption rows let SKU velocity
+        # answers include kit-build demand, not just direct invoices.
+        ai_tools.set_assemblies(assemblies)
+    except Exception:
+        pass
+    try:
         ai_tools.set_stock_adjustments(stock_adjustments)
     except Exception:
         pass

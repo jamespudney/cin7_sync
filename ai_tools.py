@@ -36,6 +36,7 @@ from typing import Any, Optional
 import pandas as pd
 
 import db
+from engine.sku_movement_audit import build_sku_current_month_movement
 from storage_dimensions import ensure_storage_dim_column, extract_storage_dim
 
 
@@ -172,10 +173,13 @@ TOOL_SCHEMAS: list[dict] = [
         "name": "get_velocity",
         "description": (
             "Sales velocity / units sold / revenue for a SKU over the "
-            "last N days. Returns totals AND optionally a daily/weekly/"
-            "monthly breakdown that the UI will render as an inline "
-            "chart. Use when user asks 'how fast does X sell', 'sales "
-            "history for X', or 'show me the last 90 days of Y'."
+            "last N days. For assembly-heavy components, also returns "
+            "current-calendar-month movement from direct invoice lines "
+            "PLUS CIN7 FG assembly consumption. Returns totals AND "
+            "optionally a daily/weekly/monthly breakdown that the UI "
+            "will render as an inline chart. Use when user asks 'how "
+            "fast does X sell', 'sales history for X', 'show me the "
+            "last 90 days of Y', or 'how many sold this month'."
         ),
         "input_schema": {
             "type": "object",
@@ -2343,6 +2347,20 @@ def get_velocity(engine_df: pd.DataFrame,
         "last_sale": (in_window["InvoiceDate"].max().strftime("%Y-%m-%d")
                       if not in_window.empty else None),
     }
+    assemblies_df = _ASSEMBLIES_HOLDER.get("df")
+    current_month_movement = build_sku_current_month_movement(
+        sku,
+        sale_lines_df,
+        assemblies_df,
+    )
+    result["current_month_movement"] = current_month_movement
+    result["assistant_guidance"] = (
+        "For 'sold this month' / MTD questions, use "
+        "current_month_movement.total_qty as the headline when it is "
+        "available. It includes direct invoiced sale-lines plus CIN7 "
+        "Finished Goods assembly consumption. units_sold is only the "
+        f"direct invoice-line total for the last {days} days."
+    )
 
     # v2.67.308 — surface the engine's canonical demand signals so the
     # assistant can never report a raw invoice-line sum without seeing
@@ -2373,6 +2391,10 @@ def get_velocity(engine_df: pd.DataFrame,
                 "effective_units_12mo": _eng_eff,
                 "units_45d": float(eng.get("units_45d") or 0),
                 "units_prior_45d": float(eng.get("units_prior_45d") or 0),
+                "assembly_units_12mo": float(
+                    eng.get("assembly_units_12mo") or 0),
+                "assembly_units_45d": float(
+                    eng.get("assembly_units_45d") or 0),
                 "excess_units": float(eng.get("excess_units") or 0),
                 "migrated_in": float(eng.get("migrated_in") or 0),
                 "migrated_out": float(eng.get("migrated_out") or 0),
@@ -2670,6 +2692,7 @@ _PURCHASE_LINES_HOLDER: dict = {"df": None}
 # get_stock_adjustment.
 _PURCHASE_HEADERS_HOLDER: dict = {"df": None}
 _SALE_LINES_LONGEST_HOLDER: dict = {"df": None}
+_ASSEMBLIES_HOLDER: dict = {"df": None}
 _STOCK_ADJUSTMENTS_HOLDER: dict = {"df": None}
 # v2.67.54 — ShipStation shipments holder.
 _SHIPMENTS_HOLDER: dict = {"df": None}
@@ -2901,6 +2924,16 @@ def set_sale_lines_longest(sale_lines_df: pd.DataFrame) -> None:
     so get_sale_order can return full line detail per sale without
     each tool call having to merge windows itself."""
     _SALE_LINES_LONGEST_HOLDER["df"] = sale_lines_df
+
+
+def set_assemblies(assemblies_df: pd.DataFrame) -> None:
+    """Stash CIN7 Finished Goods component-consumption rows.
+
+    These rows are required for assembly-heavy SKUs where "sold this
+    month" really means direct sale_lines plus components consumed by
+    FG-XXXX kit builds.
+    """
+    _ASSEMBLIES_HOLDER["df"] = assemblies_df
 
 
 def set_stock_adjustments(stock_adjustments_df: pd.DataFrame) -> None:

@@ -1386,13 +1386,18 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
         ComponentProductID, ComponentSKU, ComponentName, Quantity,
         Unit, Cost, BinID, Bin
 
-    The finishedGoodsList endpoint has no date/UpdatedSince filter and
-    sorts roughly newest-first; we paginate completed tasks and break
-    once we see a Date older than the cutoff. Then for each kept task
-    we fetch /finishedGoods?TaskID=... once for its PickLines."""
+    The finishedGoodsList endpoint has no date/UpdatedSince filter.
+    Its list-level Date is not always the completion date the engine
+    needs, so short-window syncs keep a wider candidate buffer and
+    filter again after fetching detail.CompletionDate."""
     log.info("Pulling Finished Goods (assembly tasks) for last %d days...",
              days)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    buffer_days = int(os.environ.get(
+        "CIN7_ASSEMBLY_LIST_BUFFER_DAYS", "180") or "180")
+    candidate_cutoff = (
+        cutoff - timedelta(days=buffer_days)
+        if days <= 45 and buffer_days > 0 else cutoff)
 
     def _parse_dt(s):
         if not s:
@@ -1405,13 +1410,29 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
         except (ValueError, TypeError):
             return None
 
+    def _row_dates(row: Dict[str, Any]) -> List[datetime]:
+        out: List[datetime] = []
+        for key in (
+            "CompletionDate", "Date", "Updated", "LastUpdated",
+            "Created", "CreatedDate", "ModifiedDate",
+        ):
+            dt = _parse_dt(row.get(key))
+            if dt is not None:
+                out.append(dt)
+        return out
+
     # v2.67.336 — paginate FULLY and filter client-side. The earlier
     # streak-break optimisation assumed CIN7 returns the list newest-
     # first, but the v2.67.335 backfill log showed "Found 0 in window"
     # in 0.7s — i.e. page 1 had 25 consecutive OLD rows and we aborted.
     # Empirically CIN7 sorts finishedGoodsList oldest-first (or by some
     # field unrelated to Date), so the only safe strategy is to walk
-    # every page and keep rows where Date is in-window OR unparseable.
+    # every page.
+    #
+    # v2.67.371 — for short 30d pulls, keep a wider candidate buffer
+    # because list-level Date can be task creation date while detail
+    # CompletionDate is the actual movement date. We filter again after
+    # the detail call before writing pick lines.
     tasks: List[Dict[str, Any]] = []
     total_scanned = 0
     for row in client.paginate(
@@ -1419,15 +1440,18 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
         params={"Status": "COMPLETED"},
     ):
         total_scanned += 1
-        dt = _parse_dt(row.get("Date"))
-        if dt is None or dt >= cutoff:
+        dates = _row_dates(row)
+        if not dates or any(dt >= candidate_cutoff for dt in dates):
             tasks.append(row)
         if total_scanned % 500 == 0:
             log.info("  Scanned %d list rows (%d in window so far)...",
                      total_scanned, len(tasks))
 
-    log.info("  Scanned %d total rows; %d in window.",
-             total_scanned, len(tasks))
+    log.info("  Scanned %d total rows; %d candidate tasks "
+             "(candidate cutoff %s; final cutoff %s).",
+             total_scanned, len(tasks),
+             candidate_cutoff.date().isoformat(),
+             cutoff.date().isoformat())
 
     # v2.67.337 — process NEWEST tasks first. CIN7's list sorts oldest-
     # first, but recent assemblies are far more demand-relevant — they
@@ -1441,7 +1465,7 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
     # progressively. Without this the CSV is written ONLY at the very
     # end, so any restart loses hours of work and the engine sees
     # nothing until completion.
-    ckpt_name = f"assemblies_{days}d"
+    ckpt_name = f"assemblies_{days}d_v2_completion"
     state = _load_checkpoint(ckpt_name)
     processed_ids: set = set(state.get("processed_ids") or [])
     rows: List[Dict[str, Any]] = []
@@ -1500,6 +1524,10 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
         parent_name = task.get("ProductName")
         parent_qty = task.get("Quantity")
         completion = detail.get("CompletionDate") or task.get("Date")
+        completion_dt = _parse_dt(completion)
+        if completion_dt is not None and completion_dt < cutoff:
+            processed_ids.add(tid_s)
+            continue
         status = detail.get("Status") or task.get("Status")
         for pl in pick_lines:
             if not isinstance(pl, dict):
