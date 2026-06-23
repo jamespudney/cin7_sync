@@ -180,6 +180,11 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   Inventory Planner. SKU detail now surfaces Current month, 90d,
   Customers 45d and Momentum directly, plus a warning when exact
   sale-lines are ahead of the ABC monthly bucket.
+- **Slow-stock jump explainability** — Overview's slow-stock value tile
+  now carries a "Why did slow-stock value move?" expander showing top
+  value contributors and SKUs touched by the latest dormancy run. This
+  makes engine/sync-driven jumps auditable instead of just showing a
+  scary headline total.
 - **ABC foreground OOM guard** — the Streamlit web process no longer
   rebuilds the full ABC engine when `engine_output.csv` is missing.
   It starts `warm_engine.py` in the background and keeps the UI on the

@@ -221,6 +221,17 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("snapshot is likely stale or missing recent", script)
         self.assertIn("sale-line files; run/await", script)
 
+    def test_slow_stock_overview_explains_value_changes(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"detail_df": detail_df', script)
+        self.assertIn("Why did slow-stock value move?", script)
+        self.assertIn("Top 20 slow-stock value", script)
+        self.assertIn("Flagged by latest run", script)
+        self.assertIn("Largest SKUs touched by the latest run", script)
+
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (
             Path(__file__).resolve().parents[1] / "warm_engine_helpers.py"

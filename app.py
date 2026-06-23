@@ -1297,10 +1297,32 @@ def _compute_slow_stock_holding(engine_df: pd.DataFrame,
                    if "OnHand" in df.columns else 0.0)
     value_held = (float(_to_num(df["OnHandValue"]).fillna(0).sum())
                    if "OnHandValue" in df.columns else 0.0)
+    detail_cols = [c for c in [
+        "SKU", "Name", "ABC", "trend_flag", "OnHand", "Available",
+        "OnOrder", "OnHandValue", "effective_units_12mo",
+        "effective_units_90d", "units_45d", "last_6mo_series",
+        "is_dormant", "is_non_master_tube",
+    ] if c in df.columns]
+    detail_df = (
+        df[detail_cols].copy()
+        if detail_cols else pd.DataFrame()
+    )
+    if not detail_df.empty:
+        detail_df["Dormancy first seen"] = (
+            detail_df["SKU"].astype(str).map(
+                lambda s: (dormancy_warnings.get(s) or {}).get(
+                    "first_seen_dormant_at", "")))
+        detail_df["Dormancy last seen"] = (
+            detail_df["SKU"].astype(str).map(
+                lambda s: (dormancy_warnings.get(s) or {}).get(
+                    "last_seen_dormant_at", "")))
+        detail_df = detail_df.sort_values(
+            "OnHandValue", ascending=False, na_position="last")
     return {
         "sku_count": int(len(df)),
         "units_held": units_held,
         "value_held": value_held,
+        "detail_df": detail_df,
         "filter_summary": "parents/standalones + children with "
                             "direct OnHand>0; engine OnHandValue "
                             "cost chain",
@@ -7463,6 +7485,74 @@ if page == "Overview":
         "Movers** page for the full SKU-level breakdown and "
         "manual dismiss controls."
     )
+    _slow_detail_df = _slow_holding.get("detail_df")
+    if isinstance(_slow_detail_df, pd.DataFrame) and not _slow_detail_df.empty:
+        with st.expander("Why did slow-stock value move?", expanded=False):
+            st.caption(
+                "This tile is the active dormancy-warning set intersected "
+                "with SKUs that still have stock on hand, valued by the "
+                "engine OnHandValue cost chain. New engine runs can add "
+                "SKUs to the warning set; recovery/dismissal removes them.")
+            _today_str = pd.Timestamp(datetime.now().date()).strftime(
+                "%Y-%m-%d")
+            _recently_flagged = _slow_detail_df[
+                _slow_detail_df["Dormancy last seen"]
+                .astype(str).str.startswith(_today_str, na=False)
+            ].copy()
+            _bd1, _bd2 = st.columns(2)
+            _bd1.metric(
+                "Top 20 slow-stock value",
+                _fmt_money(float(pd.to_numeric(
+                    _slow_detail_df.head(20).get(
+                        "OnHandValue", pd.Series(dtype=float)),
+                    errors="coerce").fillna(0).sum())),
+            )
+            _bd2.metric(
+                "Flagged by latest run",
+                _fmt_number(len(_recently_flagged)),
+            )
+            _show_cols = [c for c in [
+                "SKU", "Name", "ABC", "trend_flag", "OnHand",
+                "Available", "OnHandValue", "effective_units_90d",
+                "units_45d", "last_6mo_series", "Dormancy last seen",
+            ] if c in _slow_detail_df.columns]
+            st.dataframe(
+                _slow_detail_df[_show_cols].head(25),
+                hide_index=True,
+                use_container_width=True,
+                height=360,
+                column_config={
+                    "OnHandValue": st.column_config.NumberColumn(
+                        "Value", format="$%.0f"),
+                    "OnHand": st.column_config.NumberColumn(format="%.2f"),
+                    "Available": st.column_config.NumberColumn(format="%.2f"),
+                    "effective_units_90d": st.column_config.NumberColumn(
+                        "90d units", format="%.2f"),
+                    "units_45d": st.column_config.NumberColumn(
+                        "45d units", format="%.2f"),
+                },
+            )
+            if not _recently_flagged.empty:
+                st.markdown("**Largest SKUs touched by the latest run**")
+                st.dataframe(
+                    _recently_flagged[_show_cols].head(15),
+                    hide_index=True,
+                    use_container_width=True,
+                    height=260,
+                    column_config={
+                        "OnHandValue": st.column_config.NumberColumn(
+                            "Value", format="$%.0f"),
+                        "OnHand": st.column_config.NumberColumn(
+                            format="%.2f"),
+                        "Available": st.column_config.NumberColumn(
+                            format="%.2f"),
+                        "effective_units_90d":
+                            st.column_config.NumberColumn(
+                                "90d units", format="%.2f"),
+                        "units_45d": st.column_config.NumberColumn(
+                            "45d units", format="%.2f"),
+                    },
+                )
 
     # Stock positions
     if not stock.empty:
