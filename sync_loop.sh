@@ -45,6 +45,13 @@ _start_warm_engine() {
     local status="${DATA_DIR}/output/engine_refresh_status.json"
     local engine_log="${DATA_DIR}/output/engine_refresh.log"
 
+    if [ "${WARM_ENGINE_ALLOW_STALE_INPUTS:-0}" != "1" ] && \
+       ! _engine_inputs_ready; then
+        echo "[$(stamp)] warm_engine skipped: core sync inputs missing/stale (${reason})" \
+          | tee -a "$LOG"
+        return 0
+    fi
+
     if _engine_refresh_running; then
         echo "[$(stamp)] warm_engine already running; skipped (${reason})" \
           | tee -a "$LOG"
@@ -132,6 +139,38 @@ _check_daily_output_fresh \
     "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV"
 _check_daily_output_fresh \
     "assemblies_last_30d_*.csv" "assemblies_last_30d CSV"
+
+_engine_input_fresh() {
+    local pattern="$1"
+    local label="$2"
+    local max_age_h="${3:-$CATCHUP_STALE_HOURS}"
+    local freshest
+    freshest=$(ls -t "${DATA_DIR}"/output/${pattern} \
+        2>/dev/null | head -1)
+    if [ -z "$freshest" ]; then
+        echo "[$(stamp)] engine input missing: ${label}" \
+          | tee -a "$LOG"
+        return 1
+    fi
+    local age_s
+    local age_h
+    age_s=$(( $(date -u +%s) \
+        - $(date -u -r "$freshest" +%s 2>/dev/null || echo 0) ))
+    age_h=$(( age_s / 3600 ))
+    if [ "$age_h" -ge "$max_age_h" ]; then
+        echo "[$(stamp)] engine input stale: ${label} is ${age_h}h old" \
+          | tee -a "$LOG"
+        return 1
+    fi
+    return 0
+}
+
+_engine_inputs_ready() {
+    _engine_input_fresh "sales_last_30d_*.csv" "sales_last_30d CSV" || return 1
+    _engine_input_fresh "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV" || return 1
+    _engine_input_fresh "assemblies_last_30d_*.csv" "assemblies_last_30d CSV" || return 1
+    return 0
+}
 
 if [ "$_catchup_needed" = "1" ]; then
     echo "[$(stamp)] catch-up: running daily_sync.sh now" \

@@ -11,17 +11,45 @@
 # Logs go to /data/output/daily_sync.log (on the persistent disk so
 # you can review past runs from inside the app or via the Render shell).
 #
-# Failure policy: every step uses `|| true` so a single failure doesn't
-# block the rest of the chain. The next day's run will retry. Render
-# will also email you the cron job's exit code.
+# Failure policy: individual sync steps keep going so one failure does
+# not block the rest of the chain. At the end, the script exits non-zero
+# if a critical engine feed is still missing/stale, because warming ABC
+# from partial sales or assembly data creates bad buying signals.
 
 set -uo pipefail
 
 DATA_DIR="${DATA_DIR:-/data}"
 LOG="${DATA_DIR}/output/daily_sync.log"
 mkdir -p "${DATA_DIR}/output"
+CRITICAL_SYNC_FAILURE=0
+DAILY_SYNC_CRITICAL_MAX_AGE_HOURS="${DAILY_SYNC_CRITICAL_MAX_AGE_HOURS:-30}"
 
 stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+verify_critical_csv() {
+    local pattern="$1"
+    local label="$2"
+    local freshest
+    freshest=$(ls -t "${DATA_DIR}"/output/${pattern} \
+        2>/dev/null | head -1)
+    if [ -z "$freshest" ]; then
+        echo "[$(stamp)] CRITICAL missing ${label}; ABC cache must not be warmed" \
+            >> "$LOG"
+        CRITICAL_SYNC_FAILURE=1
+        return
+    fi
+
+    local age_s
+    local age_h
+    age_s=$(( $(date -u +%s) \
+        - $(date -u -r "$freshest" +%s 2>/dev/null || echo 0) ))
+    age_h=$(( age_s / 3600 ))
+    if [ "$age_h" -ge "$DAILY_SYNC_CRITICAL_MAX_AGE_HOURS" ]; then
+        echo "[$(stamp)] CRITICAL stale ${label}: ${age_h}h old (${freshest})" \
+            >> "$LOG"
+        CRITICAL_SYNC_FAILURE=1
+    fi
+}
 
 echo "" >> "$LOG"
 echo "============================================================" >> "$LOG"
@@ -179,6 +207,16 @@ echo "[$(stamp)] housekeeping_audit" >> "$LOG"
 python housekeeping_audit.py --verbose \
   --log "${DATA_DIR}/output/housekeeping.log" >> "$LOG" 2>&1 || \
   echo "[$(stamp)] housekeeping_audit FAILED (continuing)" >> "$LOG"
+
+verify_critical_csv "sales_last_30d_*.csv" "sales_last_30d CSV"
+verify_critical_csv "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV"
+verify_critical_csv "assemblies_last_30d_*.csv" "assemblies_last_30d CSV"
+
+if [ "$CRITICAL_SYNC_FAILURE" = "1" ]; then
+    echo "[$(stamp)] daily_sync.sh finished with critical feed failures" >> "$LOG"
+    echo "" >> "$LOG"
+    exit 1
+fi
 
 echo "[$(stamp)] daily_sync.sh done" >> "$LOG"
 echo "" >> "$LOG"

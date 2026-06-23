@@ -148,6 +148,10 @@ MTD/current-month demand for these SKUs depends on
 The daily worker must keep that 30-day assembly file fresh; otherwise
 assembly-heavy components (for example `LED-NEON-FLEX-NICHO-3000K-2`)
 can appear under-demanded and falsely slow.
+Data Health and housekeeping must check the explicit
+`assemblies_last_30d_*.csv` feed. A fresh `assemblies_last_3d_*.csv`
+file is not enough to validate ABC, Ordering, slow-stock, or current
+month demand calculations.
 
 For "how many sold this month?" questions on components, answer using
 direct invoice movement plus FG assembly consumption. Do not report

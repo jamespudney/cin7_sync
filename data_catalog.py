@@ -34,7 +34,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
     DatasetSpec("Sale lines (rolling)", "sale_lines_last", "CIN7 sales", 24, "python cin7_sync.py salelines --days 30"),
     DatasetSpec("Purchase lines (rolling)", "purchase_lines_last", "CIN7 purchasing", 24, "python cin7_sync.py purchaselines --days 30"),
     DatasetSpec("BOMs", "boms", "CIN7 production", 168, "python cin7_sync.py boms"),
-    DatasetSpec("Assemblies (rolling)", "assemblies_last", "CIN7 production", 168, "python cin7_sync.py assemblies --days 3"),
+    DatasetSpec("Assemblies (30d)", "assemblies_last_30d", "CIN7 production", 30, "python cin7_sync.py assemblies --days 30"),
     DatasetSpec("Stock adjustments (30d)", "stock_adjustments_last_30d", "CIN7 movements", 24, "python cin7_sync.py stockadjustments --days 30"),
     DatasetSpec("Stock transfers (30d)", "stock_transfers_last_30d", "CIN7 movements", 24, "python cin7_sync.py stocktransfers --days 30"),
     DatasetSpec("Shipments", "shipments_last_30d", "ShipStation", 24, "python shipstation_sync.py daily --days 30"),

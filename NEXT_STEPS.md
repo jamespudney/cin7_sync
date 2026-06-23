@@ -189,6 +189,13 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   ahead of the cached ABC bucket. This fixes
   assembly-heavy components such as `LED-NEON-FLEX-NICHO-3000K-2`
   lagging Inventory Planner MTD demand.
+- **ABC engine input guard** — Data Health and housekeeping now track
+  the explicit `assemblies_last_30d_*.csv` feed, not the generic
+  `assemblies_last_*` pattern. A fresh 3-day assembly file can no
+  longer hide a missing 30-day engine window. `daily_sync.sh` exits
+  non-zero if sales 30d, sale-lines 30d, or assemblies 30d is still
+  missing/stale, and `sync_loop.sh` skips ABC cache warming until those
+  three core inputs are fresh.
 - **Assembly MTD completion-date fix** — 30-day Finished Goods sync now
   keeps a wider candidate buffer from `finishedGoodsList`, fetches task
   detail, and filters by detail `CompletionDate`. This covers CIN7

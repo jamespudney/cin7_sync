@@ -110,6 +110,12 @@ CSV_FEEDS: List[FeedSpec] = [
         max_hours=30.0,
         consumed_by="ABC engine, AI bot"),
     FeedSpec(
+        "CIN7 assemblies 30d window",
+        "assemblies_last_30d_*.csv",
+        max_hours=30.0,
+        consumed_by="ABC engine, Ordering, AI assembly-heavy demand",
+        severity="critical"),
+    FeedSpec(
         "CIN7 purchase-lines 30d window",
         "purchase_lines_last_30d_*.csv",
         max_hours=30.0,

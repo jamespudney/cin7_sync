@@ -240,11 +240,21 @@ class AppMemoryStructureTests(unittest.TestCase):
         daily = (root / "daily_sync.sh").read_text(encoding="utf-8")
         loop = (root / "sync_loop.sh").read_text(encoding="utf-8")
         cin7_sync = (root / "cin7_sync.py").read_text(encoding="utf-8")
+        catalog = (root / "data_catalog.py").read_text(encoding="utf-8")
+        housekeeping = (root / "housekeeping_audit.py").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("cin7_sync assemblies --days 30", daily)
         self.assertIn("CIN7_QUICK_SKIP_ASSEMBLIES=1", daily)
+        self.assertIn("CRITICAL_SYNC_FAILURE", daily)
         self.assertIn("CIN7_QUICK_SKIP_ASSEMBLIES", cin7_sync)
         self.assertIn("assemblies_last_30d_*.csv", loop)
+        self.assertIn("_engine_inputs_ready", loop)
+        self.assertIn("Assemblies (30d)", catalog)
+        self.assertIn("assemblies_last_30d", catalog)
+        self.assertIn("CIN7 assemblies 30d window", housekeeping)
+        self.assertIn("assemblies_last_30d_*.csv", housekeeping)
 
     def test_sku_detail_uses_live_current_month_movement(self) -> None:
         script = (
