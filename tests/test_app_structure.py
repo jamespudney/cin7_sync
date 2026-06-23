@@ -297,6 +297,8 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("Delta live minus local", script)
         self.assertIn("Live CIN7 Movement demand MTD", script)
         self.assertIn("Live FG/Assembly demand", script)
+        self.assertIn("def _read_app_window_csv", script)
+        self.assertIn("1d/3d nearsync files", script)
 
     def test_warm_engine_reuses_app_sale_line_union(self) -> None:
         helper_script = (

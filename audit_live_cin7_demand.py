@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import re
 import sys
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -80,6 +81,62 @@ def _read_csv(path: Optional[Path]) -> List[Dict[str, Any]]:
         return list(csv.DictReader(fh))
 
 
+def _dedupe_keep_last(rows: List[Dict[str, Any]],
+                      cols: List[str]) -> List[Dict[str, Any]]:
+    if not cols:
+        return rows
+    keyed: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+    order: List[Tuple[str, ...]] = []
+    for row in rows:
+        key = tuple(str(row.get(col) or "") for col in cols)
+        if key not in keyed:
+            order.append(key)
+        keyed[key] = row
+    return [keyed[key] for key in order]
+
+
+def _read_app_window_csv(kind: str) -> Tuple[List[Dict[str, Any]], str]:
+    """Mirror the dashboard's rolling-window loader for local audit.
+
+    The app starts with the largest available window, then unions newer
+    smaller windows written after that base file. A naive "latest file"
+    lookup picks the 1d/3d nearsync files and dramatically understates
+    month-to-date demand.
+    """
+    files: List[Tuple[int, float, Path]] = []
+    pattern = f"{kind}_last_*d_*.csv"
+    rx = re.compile(rf"{re.escape(kind)}_last_(\d+)d_")
+    for path in OUTPUT_DIR.glob(pattern):
+        match = rx.match(path.name)
+        if match:
+            files.append((int(match.group(1)), path.stat().st_mtime, path))
+    if not files:
+        return [], "(missing)"
+
+    files.sort(key=lambda item: (-item[0], -item[1]))
+    base_days, base_mtime, base_path = files[0]
+    selected = [(base_days, base_mtime, base_path)]
+    rows = _read_csv(base_path)
+
+    for days, mtime, path in files[1:]:
+        if mtime <= base_mtime:
+            continue
+        selected.append((days, mtime, path))
+        rows.extend(_read_csv(path))
+
+    if kind == "sale_lines":
+        rows = _dedupe_keep_last(rows, [
+            "SaleID", "SKU", "Quantity", "InvoiceNumber", "OrderNumber"])
+        rows = _dedupe_keep_last(rows, [
+            "SaleID", "SKU", "Quantity", "OrderNumber"])
+    elif kind == "assemblies":
+        rows = _dedupe_keep_last(rows, [
+            "TaskID", "ComponentSKU", "Quantity", "BinID"])
+
+    source = ", ".join(path.name for _days, _mtime, path in selected)
+    return rows, source
+
+
 def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: List[str] = []
@@ -123,18 +180,11 @@ def local_direct_sales(
     sku: str,
     start: date,
     end: date,
-) -> Tuple[float, List[Dict[str, Any]], Optional[Path]]:
-    path = _latest([
-        "sale_lines_last_30d",
-        "sale_lines_last_45d",
-        "sale_lines_last_90d",
-        "sale_lines_last_365d",
-        "sale_lines_last_730d",
-        "sale_lines",
-    ])
+) -> Tuple[float, List[Dict[str, Any]], str]:
+    source_rows, source = _read_app_window_csv("sale_lines")
     rows = []
     total = 0.0
-    for row in _read_csv(path):
+    for row in source_rows:
         if str(row.get("SKU") or "") != sku:
             continue
         if _status(row) in BAD_SALE_STATUSES:
@@ -145,25 +195,17 @@ def local_direct_sales(
         qty = _qty(row.get("Quantity"))
         total += qty
         rows.append(row)
-    return total, rows, path
+    return total, rows, source
 
 
 def local_bom_rollup_estimate(
     sku: str,
     start: date,
     end: date,
-) -> Tuple[float, List[Dict[str, Any]], Optional[Path], Optional[Path]]:
+) -> Tuple[float, List[Dict[str, Any]], Optional[Path], str]:
     bom_path = _latest(["boms"])
-    sl_path = _latest([
-        "sale_lines_last_30d",
-        "sale_lines_last_45d",
-        "sale_lines_last_90d",
-        "sale_lines_last_365d",
-        "sale_lines_last_730d",
-        "sale_lines",
-    ])
+    sale_lines, sl_source = _read_app_window_csv("sale_lines")
     boms = _read_csv(bom_path)
-    sale_lines = _read_csv(sl_path)
     children = []
     ratios: Dict[str, float] = {}
     for row in boms:
@@ -175,7 +217,7 @@ def local_bom_rollup_estimate(
         ratios[child] = _qty(row.get("Quantity"))
         children.append(row)
     if not ratios:
-        return 0.0, [], bom_path, sl_path
+        return 0.0, [], bom_path, sl_source
 
     total = 0.0
     audit_rows: List[Dict[str, Any]] = []
@@ -197,24 +239,18 @@ def local_bom_rollup_estimate(
         out["SourceLineQty"] = qty
         out["BOMRatio"] = ratios[child]
         audit_rows.append(out)
-    return total, audit_rows, bom_path, sl_path
+    return total, audit_rows, bom_path, sl_source
 
 
 def local_assembly_consumption(
     sku: str,
     start: date,
     end: date,
-) -> Tuple[float, List[Dict[str, Any]], Optional[Path]]:
-    path = _latest([
-        "assemblies_last_30d",
-        "assemblies_last_45d",
-        "assemblies_last_90d",
-        "assemblies_last_365d",
-        "assemblies",
-    ])
+) -> Tuple[float, List[Dict[str, Any]], str]:
+    source_rows, source = _read_app_window_csv("assemblies")
     rows = []
     total = 0.0
-    for row in _read_csv(path):
+    for row in source_rows:
         if str(row.get("ComponentSKU") or "") != sku:
             continue
         if _status(row) in BAD_ASSEMBLY_STATUSES:
@@ -227,32 +263,19 @@ def local_assembly_consumption(
             continue
         total += qty
         rows.append(row)
-    return total, rows, path
+    return total, rows, source
 
 
 def local_mtd_maps(
     start: date,
     end: date,
-) -> Tuple[Dict[str, float], Dict[str, float], Optional[Path], Optional[Path]]:
-    sale_path = _latest([
-        "sale_lines_last_30d",
-        "sale_lines_last_45d",
-        "sale_lines_last_90d",
-        "sale_lines_last_365d",
-        "sale_lines_last_730d",
-        "sale_lines",
-    ])
-    asm_path = _latest([
-        "assemblies_last_30d",
-        "assemblies_last_45d",
-        "assemblies_last_90d",
-        "assemblies_last_365d",
-        "assemblies",
-    ])
+) -> Tuple[Dict[str, float], Dict[str, float], str, str]:
+    sale_rows, sale_source = _read_app_window_csv("sale_lines")
+    asm_rows, asm_source = _read_app_window_csv("assemblies")
     direct: Dict[str, float] = defaultdict(float)
     assemblies: Dict[str, float] = defaultdict(float)
 
-    for row in _read_csv(sale_path):
+    for row in sale_rows:
         if _status(row) in BAD_SALE_STATUSES:
             continue
         day = _parse_day(row.get("InvoiceDate"))
@@ -262,7 +285,7 @@ def local_mtd_maps(
         if sku:
             direct[sku] += _qty(row.get("Quantity"))
 
-    for row in _read_csv(asm_path):
+    for row in asm_rows:
         if _status(row) in BAD_ASSEMBLY_STATUSES:
             continue
         day = _parse_day(row.get("CompletionDate")) or _parse_day(
@@ -274,7 +297,7 @@ def local_mtd_maps(
         if sku and qty > 0:
             assemblies[sku] += qty
 
-    return dict(direct), dict(assemblies), sale_path, asm_path
+    return dict(direct), dict(assemblies), sale_source, asm_source
 
 
 def _cin7_client(rate: float) -> Cin7Client:
