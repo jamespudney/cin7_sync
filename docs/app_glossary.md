@@ -147,10 +147,12 @@ four signals combined to avoid false-positives:
   customers**, top customer **under 40%**, and non-top customers averaging
   **at least 2 units each**. Real broad-based demand; engine switches to
   last-45d velocity to keep up.
-- **🎯 Project** — ANY of these triggers: top customer **≥50%** of 45d
-  volume, top **2 customers combined ≥70%**, or fewer than 3 distinct
-  customers. Looks concentrated / one-off; engine subtracts top
-  customer's 12mo contribution before forecasting to avoid over-ordering.
+- **🎯 Project** — concentrated / one-off demand: a 45d spike with too
+  few real buyers, visible historical lineage demand that should not
+  drive auto-reorder, or a full-year pattern where only one or two
+  customers account for the demand and recent activity is low. Engine
+  subtracts the top customer's 12mo contribution before forecasting to
+  avoid over-ordering.
 - **🔀 Mixed** — spike exists but fails both sets of rules. Watch
   signal, no velocity override.
 - **📉 Decline** — units down 50%+ vs prior 45 days. Worth review.
@@ -582,6 +584,11 @@ For Neonica 100m master rolls, the Order qty is allowed to be a
 decimal of the roll: 40m required becomes `0.40`, not a full `1.00`
 roll. The engine skips MOQ/full-roll rounding on those fractional
 bulk rows.
+
+Project/manual rows also skip supplier MOQ auto-rounding. If the math
+says a few-buyer Project needs 1-2 units, the engine must not inflate
+that to a 10-unit MOQ automatically; the buyer can manually override
+when a live project really needs more.
 
 #### LED strip family rollup
 LED strip cut variants roll up to the bulk-roll master by shared SKU

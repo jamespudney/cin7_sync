@@ -457,6 +457,34 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertNotIn("\"Revenue\": float(chunk[\"Total\"].sum())",
                          script)
 
+    def test_project_reorder_uses_final_label_and_skips_moq(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("top_cust_pct_12mo", script)
+        self.assertIn(
+            "if visible_12mo > 0 and u45 < 3 and 0 < cust_12mo <= 2",
+            script,
+        )
+        project_reason_pos = script.index(
+            'df["project_reason"] = df.apply(_project_reason, axis=1)'
+        )
+        velocity_pos = script.index(
+            'df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)',
+            project_reason_pos,
+        )
+        doc_pos = script.index('df["DoC_days"] = df.apply(', velocity_pos)
+        self.assertLess(velocity_pos, doc_pos)
+        self.assertIn(
+            "and not use_fractional and not is_project_row",
+            script,
+        )
+        self.assertIn(
+            "MOQ {moq:g} not auto-applied to Project rows",
+            script,
+        )
+
 
 class ReorderMathTests(unittest.TestCase):
     def test_bulk_roll_residue_is_ignored_for_planning(self) -> None:

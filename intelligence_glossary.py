@@ -309,6 +309,14 @@ The promotion path (`_promote_dormant_flag`) uses the SAME diversity
 rule: a 12mo customer count ≥ 3 means a SKU is never promoted to
 Project regardless of low volume.
 
+For non-spike rows, Project promotion also looks at the whole 12-month
+customer picture. If a SKU has visible 12mo demand, little recent
+activity (`units_45d < 3`), and only one or two customers in that full
+year, treat it as a few-buyer Project even if the big order happened
+outside the last-45-day window. The top-customer share fields used for
+this (`top_cust_pct_12mo`, `top_cust_units_12mo`) must come from the
+full year, not only from recent customers.
+
 Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
 skip classification entirely — the signal is too noisy at that scale.
 
@@ -721,6 +729,11 @@ For Neonica 100m master rolls, the Order qty is allowed to be a
 decimal of the roll: 40m required becomes `0.40`, not a full `1.00`
 roll. The engine skips MOQ/full-roll rounding on those fractional
 bulk rows.
+
+Project/manual rows also skip supplier MOQ auto-rounding. If the math
+says a few-buyer Project needs 1-2 units, the engine must not inflate
+that to a 10-unit MOQ automatically; the buyer can manually override
+when a live project really needs more.
 
 #### LED strip family rollup
 LED strip cut variants roll up to the bulk-roll master by shared SKU

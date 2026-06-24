@@ -5385,46 +5385,75 @@ def _abc_engine(products: pd.DataFrame,
     #   top_cust_units_12mo — top buyer's full 12mo contribution on
     #                        this SKU (for project baseline correction)
     top_info = []
-    for sku, g in sl_recent.groupby("SKU"):
-        if g.empty:
-            continue
-        cust_tot = g.groupby("CustomerID").agg(
+    sl_recent_by_sku = {
+        str(sku): g for sku, g in sl_recent.groupby(
+            sl_recent["SKU"].astype(str), sort=False)
+    }
+    sl_by_sku = {
+        str(sku): g for sku, g in sl.groupby(
+            sl["SKU"].astype(str), sort=False)
+    }
+    for sku, g12 in sl_by_sku.items():
+        g = sl_recent_by_sku.get(sku)
+        share1 = 0.0
+        share2 = 0.0
+        non_top_avg = 0.0
+        top_name = ""
+        if g is not None and not g.empty:
+            cust_tot = g.groupby("CustomerID").agg(
+                qty=("Quantity", "sum"),
+                name=("Customer", "first"),
+            ).sort_values("qty", ascending=False)
+            total = float(g["Quantity"].sum())
+            if not cust_tot.empty and total > 0:
+                top_qty = float(cust_tot.iloc[0]["qty"])
+                top_name = cust_tot.iloc[0]["name"]
+                share1 = top_qty / total
+                share2 = share1
+                if len(cust_tot) >= 2:
+                    share2 = (
+                        top_qty + float(cust_tot.iloc[1]["qty"])) / total
+                # Non-top: average units per customer excluding the biggest
+                non_top_qty = total - top_qty
+                non_top_n = max(len(cust_tot) - 1, 0)
+                non_top_avg = (
+                    non_top_qty / non_top_n) if non_top_n > 0 else 0.0
+
+        # Full-year concentration is independent of 45d activity.
+        # Project / MOQ suppression relies on this for SKUs whose big
+        # project sale was earlier than the recent window.
+        cust_tot_12 = g12.groupby("CustomerID").agg(
             qty=("Quantity", "sum"),
             name=("Customer", "first"),
         ).sort_values("qty", ascending=False)
-        if cust_tot.empty:
-            continue
-        total = float(g["Quantity"].sum())
-        if total <= 0:
-            continue
-        top_qty = float(cust_tot.iloc[0]["qty"])
-        top_name = cust_tot.iloc[0]["name"]
-        top_cid = cust_tot.index[0]
-        share1 = top_qty / total
-        share2 = share1
-        if len(cust_tot) >= 2:
-            share2 = (top_qty + float(cust_tot.iloc[1]["qty"])) / total
-        # Non-top: average units per customer excluding the biggest
-        non_top_qty = total - top_qty
-        non_top_n = max(len(cust_tot) - 1, 0)
-        non_top_avg = (non_top_qty / non_top_n) if non_top_n > 0 else 0.0
-        cust_12mo = float(
-            sl[(sl["SKU"] == sku) & (sl["CustomerID"] == top_cid)
-                ]["Quantity"].sum())
+        cust_12mo = 0.0
+        share_12mo = 0.0
+        top_name_12mo = ""
+        total_12mo = float(g12["Quantity"].sum()) if not g12.empty else 0.0
+        if not cust_tot_12.empty and total_12mo > 0:
+            cust_12mo = float(cust_tot_12.iloc[0]["qty"])
+            share_12mo = cust_12mo / total_12mo
+            top_name_12mo = str(cust_tot_12.iloc[0]["name"] or "")
         top_info.append({
             "SKU": sku,
             "top_cust_pct": share1,
             "top_2_cust_pct": share2,
             "non_top_avg_units": non_top_avg,
-            "top_cust_name": str(top_name)[:50] if top_name else "",
+            "top_cust_name": (
+                str(top_name)[:50] if top_name
+                else str(top_name_12mo)[:50]),
             "top_cust_units_12mo": cust_12mo,
+            "top_cust_pct_12mo": share_12mo,
+            "top_cust_name_12mo": str(top_name_12mo)[:50],
         })
     top_df = (pd.DataFrame(top_info)
                 if top_info else pd.DataFrame(
                   columns=["SKU", "top_cust_pct", "top_2_cust_pct",
                             "non_top_avg_units",
                             "top_cust_name",
-                            "top_cust_units_12mo"]))
+                            "top_cust_units_12mo",
+                            "top_cust_pct_12mo",
+                            "top_cust_name_12mo"]))
 
     vel = vel.merge(u45, on="SKU", how="left")
     vel = vel.merge(uprior, on="SKU", how="left")
@@ -5439,7 +5468,9 @@ def _abc_engine(products: pd.DataFrame,
     vel["customers_12mo"] = vel["customers_12mo"].fillna(0).astype(int)
     vel["top_cust_pct"] = vel["top_cust_pct"].fillna(0)
     vel["top_cust_units_12mo"] = vel["top_cust_units_12mo"].fillna(0)
+    vel["top_cust_pct_12mo"] = vel["top_cust_pct_12mo"].fillna(0)
     vel["top_cust_name"] = vel["top_cust_name"].fillna("")
+    vel["top_cust_name_12mo"] = vel["top_cust_name_12mo"].fillna("")
     # momentum (avoid div-by-zero)
     vel["momentum"] = vel.apply(
         lambda r: (r["units_45d"] / max(r["units_prior_45d"], 1.0)
@@ -5648,7 +5679,7 @@ def _abc_engine(products: pd.DataFrame,
               "units_45d", "units_prior_45d", "units_90d",
               "customers_45d", "customers_12mo",
               "top_cust_pct", "top_2_cust_pct", "non_top_avg_units",
-              "top_cust_units_12mo", "momentum"]:
+              "top_cust_units_12mo", "top_cust_pct_12mo", "momentum"]:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
@@ -5659,6 +5690,9 @@ def _abc_engine(products: pd.DataFrame,
     if "top_cust_name" not in df.columns:
         df["top_cust_name"] = ""
     df["top_cust_name"] = df["top_cust_name"].fillna("")
+    if "top_cust_name_12mo" not in df.columns:
+        df["top_cust_name_12mo"] = ""
+    df["top_cust_name_12mo"] = df["top_cust_name_12mo"].fillna("")
 
     # Backorder per SKU — use CIN7's OWN stock snapshot, not a sale-line
     # derivation.
@@ -6639,6 +6673,8 @@ def _abc_engine(products: pd.DataFrame,
     _new_non_top_avg: dict = {}
     _new_top_name: dict = {}
     _new_top_12mo: dict = {}
+    _new_top_pct_12mo: dict = {}
+    _new_top_name_12mo: dict = {}
     for _s in df["SKU"].astype(str):
         _45 = _cust_qty_45d.get(_s, {})
         _12 = _cust_qty_12mo.get(_s, {})
@@ -6662,8 +6698,15 @@ def _abc_engine(products: pd.DataFrame,
                     _non_top_qty / _non_top_n
                     if _non_top_n > 0 else 0.0)
                 _new_top_name[_s] = _names.get(_top_cid, "")
-                # Top customer's 12mo total (from 12mo map for SAME cid)
-                _new_top_12mo[_s] = float(_12.get(_top_cid, 0))
+        if _12:
+            _sorted12 = sorted(_12.items(), key=lambda x: -x[1])
+            _total12 = sum(_12.values())
+            if _sorted12 and _total12 > 0:
+                _top12_cid, _top12_qty = _sorted12[0]
+                _new_top_12mo[_s] = float(_top12_qty)
+                _new_top_pct_12mo[_s] = float(_top12_qty) / _total12
+                _new_top_name_12mo[_s] = _names.get(_top12_cid, "")
+                _new_top_name.setdefault(_s, _new_top_name_12mo[_s])
 
     # Write back — overwrite the raw values with rolled-up versions
     df["customers_45d"] = (
@@ -6678,6 +6721,10 @@ def _abc_engine(products: pd.DataFrame,
         df["SKU"].astype(str).map(_new_top_name).fillna(""))
     df["top_cust_units_12mo"] = (
         df["SKU"].astype(str).map(_new_top_12mo).fillna(0))
+    df["top_cust_pct_12mo"] = (
+        df["SKU"].astype(str).map(_new_top_pct_12mo).fillna(0))
+    df["top_cust_name_12mo"] = (
+        df["SKU"].astype(str).map(_new_top_name_12mo).fillna(""))
 
     df["trend_12m"] = df["SKU"].apply(
         lambda s: list(monthly_12.get(s, [0.0] * 12)))
@@ -6871,14 +6918,6 @@ def _abc_engine(products: pd.DataFrame,
         return base
 
     df["avg_daily_base"] = df["avg_daily"]
-    df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)
-    # v2.67.358 — buyer-friendly monthly view. Daily is the right
-    # input for the reorder math (LT × avg_daily) but buyers think
-    # and reason in months ("about 60 a month"). Surface both — the
-    # Ordering table and Upcoming Reorders display avg/month while
-    # the math trace keeps both. 30.4 = average days per calendar
-    # month (365.25 / 12).
-    df["avg_month"] = df["avg_daily"] * 30.4
 
     # Promote is_dormant into trend_flag display so the buyer sees
     # 💤 Dormant in the PO editor's Trend column. We override Stable
@@ -6915,12 +6954,15 @@ def _abc_engine(products: pd.DataFrame,
             u45 = float(r.get("units_45d") or 0)
             u90 = float(r.get("units_90d") or 0)
             cust_12mo = int(r.get("customers_12mo") or 0)
+            top_share_12mo = float(r.get("top_cust_pct_12mo") or 0)
             # If visible monthly demand exists but the effective reorder
             # demand is zero, this SKU's demand has been rolled away,
             # migrated, or otherwise suppressed from auto-buying. Calling it
             # Stable is misleading for buyers because there is no sustaining
             # baseline on THIS row; treat it as project/manual demand.
             if eff_12mo <= 0 and visible_12mo > 0:
+                return "🎯 Project"
+            if visible_12mo > 0 and u45 < 3 and 0 < cust_12mo <= 2:
                 return "🎯 Project"
             # v2.67.320 — CUSTOMER-DIVERSITY GUARD (highest priority
             # after dormancy). A "project" is concentrated demand from
@@ -6964,8 +7006,7 @@ def _abc_engine(products: pd.DataFrame,
             # from one customer across two sales. That's project-
             # driven by definition, regardless of total units.
             if visible_12mo > 0:
-                top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
-                if top_u_12mo / visible_12mo >= 0.5:
+                if top_share_12mo >= 0.5:
                     return "🎯 Project"
             # v2.67.315 — pure "no recent activity" case. Catches
             # SKUs with diversified buyers historically but zero
@@ -6999,6 +7040,8 @@ def _abc_engine(products: pd.DataFrame,
         u45 = float(r.get("units_45d") or 0)
         u90 = float(r.get("units_90d") or 0)
         top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
+        cust_12mo = int(r.get("customers_12mo") or 0)
+        top_share_12mo = float(r.get("top_cust_pct_12mo") or 0)
         # Reasons checked in priority order. Promotion (Stable → Project)
         # only runs when units_45d < 3, so the promotion-set reasons
         # don't overlap with concentrated.
@@ -7006,8 +7049,10 @@ def _abc_engine(products: pd.DataFrame,
             return "rolled-up-history"
         if 0 < visible_12mo < 12 and u45 < 3:
             return "low-volume"
+        if visible_12mo > 0 and u45 < 3 and 0 < cust_12mo <= 2:
+            return "sporadic-few-buyers"
         if (visible_12mo > 0 and u45 < 3
-                and top_u_12mo / max(visible_12mo, 1) >= 0.5):
+                and top_share_12mo >= 0.5):
             return "sporadic-single-buyer"
         # v2.67.315 — no-recent-activity fallback (last 90d empty
         # but 12mo has sales). Distinct from low-volume / sporadic
@@ -7017,6 +7062,18 @@ def _abc_engine(products: pd.DataFrame,
         return "concentrated"
 
     df["project_reason"] = df.apply(_project_reason, axis=1)
+    # Apply trend-aware velocity only after the final trend flag is known.
+    # Without this, rows promoted from Stable -> Project show the right
+    # label but keep the old Stable avg_daily, which can inflate suggested
+    # orders.
+    df["avg_daily"] = df.apply(_adjust_avg_daily, axis=1)
+    # v2.67.358 — buyer-friendly monthly view. Daily is the right
+    # input for the reorder math (LT × avg_daily) but buyers think
+    # and reason in months ("about 60 a month"). Surface both — the
+    # Ordering table and Upcoming Reorders display avg/month while
+    # the math trace keeps both. 30.4 = average days per calendar
+    # month (365.25 / 12).
+    df["avg_month"] = df["avg_daily"] * 30.4
     df["DoC_days"] = df.apply(
         lambda r: (r["OnHand"] / r["avg_daily"])
         if r["avg_daily"] > 0 else None, axis=1)
@@ -11276,8 +11333,9 @@ elif page == "Ordering":
         _eff12_for_clamp = float(row.get("effective_units_12mo") or 0)
         _u12 = float(row.get("units_12mo") or 0)
         _mom = float(row.get("momentum") or 1.0)
-        _top12_share = (
-            (_top12 / _u12) if _u12 > 0 else 0.0)
+        _top12_share = float(row.get("top_cust_pct_12mo") or 0)
+        if _top12_share <= 0 and _u12 > 0:
+            _top12_share = _top12 / _u12
         clamp_active = False
         clamp_note = ""
 
@@ -11332,7 +11390,8 @@ elif page == "Ordering":
                 "the historic 12mo (dominated by ended project work) "
                 "doesn't justify any reorder. Manually override the "
                 "Order qty if a new project lands.")
-        elif _top12_share > 0.50 and _mom < 0.5 and _u12 > 0:
+        elif (_top12_share > 0.50 and _mom < 0.5
+                and _eff12_for_clamp > 0):
             # Baseline = everything except this one customer's
             # contribution, expressed against the original 12mo
             # window. Apply the same RATIO to effective_units_12mo so
@@ -11348,7 +11407,10 @@ elif page == "Ordering":
             # for the 12mo bucket anyway).
             avg_daily = _baseline_eff / 365.0
             clamp_active = True
-            _top_name = str(row.get("top_cust_name") or "—")[:40]
+            _top_name = str(
+                row.get("top_cust_name_12mo")
+                or row.get("top_cust_name")
+                or "—")[:40]
             clamp_note = (
                 f" — clamped: top customer **{_top_name}** took "
                 f"**{_top12_share:.0%}** of 12mo and momentum is "
@@ -11501,7 +11563,8 @@ elif page == "Ordering":
         # doesn't apply to "0.4 of a 100m roll" — fractional ordering
         # is the whole point of the feature, MOQ would defeat it).
         moq = cfg.get("moq_units") or 0
-        if reorder > 0 and moq and reorder < moq and not use_fractional:
+        if (reorder > 0 and moq and reorder < moq
+                and not use_fractional and not is_project_row):
             reorder = int(moq)
 
         # Excess = OnHand beyond target. For bulk masters, ignore
@@ -11730,13 +11793,17 @@ elif page == "Ordering":
                     )
             elif _tf == "🎯 Project":
                 _topu = float(row.get("top_cust_units_12mo") or 0)
-                _topname = str(row.get("top_cust_name") or "—")[:40]
+                _topname = str(
+                    row.get("top_cust_name_12mo")
+                    or row.get("top_cust_name")
+                    or "—")[:40]
                 _preason = str(row.get("project_reason") or "concentrated")
                 _eff_lv = float(row.get("effective_units_12mo") or 0)
                 _raw_lv = float(row.get("units_12mo") or 0)
                 _lineage_lv = float(row.get("lineage_units_12mo") or 0)
                 _visible_lv = max(_eff_lv, _raw_lv, _lineage_lv)
                 _share = (_topu / _visible_lv * 100) if _visible_lv > 0 else 0
+                _cust12_lv = int(row.get("customers_12mo") or 0)
                 if _preason == "rolled-up-history":
                     demand_lines.append(
                         f"- **Project / rolled-up history** — visible "
@@ -11761,6 +11828,17 @@ elif page == "Ordering":
                         f"effective demand) before annualising — the "
                         f"rest is sporadic one-offs that shouldn't "
                         f"drive reorder.\n"
+                    )
+                elif _preason == "sporadic-few-buyers":
+                    demand_lines.append(
+                        f"- **Few-buyer Project** — "
+                        f"**{_visible_lv:.0f} units in 12mo** across "
+                        f"only **{_cust12_lv} customers**. That is not "
+                        "broad replenishment demand. Velocity override: "
+                        f"subtracting the top customer's 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of visible "
+                        "demand) before annualising, so the engine doesn't "
+                        "auto-restock for an already-served project.\n"
                     )
                 elif _preason == "stale-12mo":
                     demand_lines.append(
@@ -11927,7 +12005,12 @@ elif page == "Ordering":
                if use_fractional
                else f"{reorder} units")
             + (f" (rounded up to MOQ {moq:g})"
-               if moq and not use_fractional and reorder == int(moq)
+               if (moq and not use_fractional and not is_project_row
+                   and reorder == int(moq))
+               else "")
+            + (f" (MOQ {moq:g} not auto-applied to Project rows)"
+               if (moq and not use_fractional and is_project_row
+                   and 0 < reorder < float(moq))
                else "")
             + f"\n\n"
             f"**Excess stock** (over target): {excess_units:.0f} units × "
@@ -13863,7 +13946,10 @@ elif page == "Ordering":
             effective_pos = available + on_order
             new_reorder = int(round(max(0, new_target - effective_pos)))
             moq = cfg_sel.get("moq_units") or 0
-            if new_reorder > 0 and moq and new_reorder < moq:
+            is_project_override = (
+                str(row.get("trend_flag") or "") == "🎯 Project")
+            if (new_reorder > 0 and moq and new_reorder < moq
+                    and not is_project_override):
                 new_reorder = int(moq)
             row = row.copy()
             row["lead_time_days"] = new_lt

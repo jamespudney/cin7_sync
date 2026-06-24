@@ -82,10 +82,13 @@ For an exact-SKU month-to-date dispute, CIN7's product **Movements** ledger (`/p
 - `top_cust_pct` — share taken by the single biggest 45d buyer.
 - `top_2_cust_pct` — share taken by the top-2 combined.
 - `non_top_avg_units` — avg units per customer excluding the top buyer.
+- `top_cust_pct_12mo` / `top_cust_units_12mo` — full-year customer
+  concentration. These must be computed from the whole 12mo window,
+  not only from customers active in the last 45 days.
 
 **Classification** (tightened April 2026 after real-world feedback — original thresholds were too permissive):
 - **📈 Trend** — ALL of: momentum >1.5, **customers_45d ≥ 3**, **top_cust_pct < 40%**, **non_top_avg_units ≥ 2**. Real broad-based acceleration. Engine overrides `avg_daily` to use last-45d rate.
-- **🎯 Project** — when the spike is concentrated to **1-2 distinct customers**, or when visible 12mo lineage demand exists but effective reorder demand is zero. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting where applicable; visible-only project rows stay at zero auto-reorder unless the buyer manually overrides.
+- **🎯 Project** — when the spike is concentrated to **1-2 distinct customers**, when last-12mo demand is concentrated into only **1-2 customers** with little recent activity, or when visible 12mo lineage demand exists but effective reorder demand is zero. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting where applicable; visible-only project rows stay at zero auto-reorder unless the buyer manually overrides. Project rows do **not** auto-round up to supplier MOQ; the buyer can still override the order qty manually when a known project exists.
 - **🔀 Mixed** — spike (momentum >1.5) with 3+ customers involved, but the spread is not broad enough for Trend. Watch signal; no velocity override.
 - **📉 Decline** — momentum < 0.5. Manual review.
 - **Stable** — everything else.

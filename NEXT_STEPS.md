@@ -168,6 +168,13 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   `effective_units_12mo`. They should explain when a SKU moved
   historically/project-wise but is not being auto-reordered from that
   history.
+- **Few-buyer Project reorder guard** — SKUs whose 12mo demand is
+  concentrated into only one or two customers are now promoted from
+  Stable to 🎯 Project even when that project demand happened outside
+  the last-45-day window. The Project velocity override is applied
+  after the final label is set, and supplier MOQ is no longer
+  auto-applied to Project rows, so a small manual/project buy does not
+  become a 10-roll reorder by default.
 
 ### 2026-06-23
 
