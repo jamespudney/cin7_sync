@@ -286,6 +286,8 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("FG assembly consumption found", script)
         self.assertIn("Kit-sale BOM estimate", script)
         self.assertIn("Recent FG assembly consumption", script)
+        self.assertIn("NON_MOVEMENT_COMPONENT_SALE_STATUSES", script)
+        self.assertIn("Suppressed", script)
         self.assertIn("assembly rows are the actual component movement",
                       script)
 
@@ -699,6 +701,51 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertEqual(movement["direct_invoice_qty"], 5)
         self.assertEqual(movement["assembly_qty"], 30)
         self.assertEqual(movement["total_qty"], 35)
+
+    def test_current_month_movement_suppresses_nonfinal_component_sale_lines(
+            self) -> None:
+        sku = "LED-AB-SL-M3"
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": sku,
+                "InvoiceDate": "2026-06-19",
+                "OrderDate": "2026-06-19",
+                "Quantity": 33,
+                "Total": 100,
+                "Status": "PICKING",
+                "SaleID": "SO-57961",
+            },
+        ])
+        assemblies = pd.DataFrame([
+            {
+                "ComponentSKU": sku,
+                "CompletionDate": "2026-06-19",
+                "Date": "2026-06-19",
+                "Quantity": 31,
+                "Status": "COMPLETED",
+                "TaskID": "FG-49275",
+            },
+            {
+                "ComponentSKU": sku,
+                "CompletionDate": "2026-06-18",
+                "Date": "2026-06-18",
+                "Quantity": 4,
+                "Status": "COMPLETED",
+                "TaskID": "FG-49231",
+            },
+        ])
+
+        movement = build_sku_current_month_movement(
+            sku,
+            sale_lines,
+            assemblies,
+            today=pd.Timestamp("2026-06-24"),
+        )
+
+        self.assertEqual(movement["direct_invoice_qty"], 0)
+        self.assertEqual(movement["assembly_qty"], 35)
+        self.assertEqual(movement["total_qty"], 35)
+        self.assertEqual(movement["ignored_nonmovement_direct_qty"], 33)
 
     def test_ai_velocity_reports_current_month_assembly_movement(self) -> None:
         today = pd.Timestamp(datetime.now().date())

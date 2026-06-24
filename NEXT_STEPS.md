@@ -205,6 +205,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   exposed to Finished Goods assembly demand against live CIN7 Product
   Movements. Use this after assembly-sync fixes to prove other
   component SKUs now tie out.
+- **Assembly component double-count guard** — for component SKUs with
+  Finished Goods consumption, non-final sale-line statuses (`ORDERED`,
+  `PICKING`, `PICKED`, `PACKING`, `BACKORDERED`, `DRAFT`) are no longer
+  added on top of FG movement. This prevents cases such as
+  `LED-AB-SL-M3` from counting the same kit/build demand once from the
+  pending sale line and again from the actual FG component movement.
 - **Assembly MTD completion-date fix** — 30-day Finished Goods sync now
   keeps a wider candidate buffer from `finishedGoodsList`, fetches task
   detail, and filters by detail `CompletionDate`. This covers CIN7

@@ -67,6 +67,7 @@ from engine.sku_movement_audit import (
     build_sku_sales_audit,
     build_strip_movement_audit,
     calendar_month_periods,
+    NON_MOVEMENT_COMPONENT_SALE_STATUSES,
 )
 from storage_dimensions import (
     ensure_storage_dim_column,
@@ -5261,6 +5262,25 @@ def _abc_engine(products: pd.DataFrame,
                     len(a))
             except Exception:  # noqa: BLE001
                 pass
+
+    if assembly_components and "Status" in sl.columns:
+        _status_u = sl["Status"].astype(str).str.upper()
+        _component_nonmovement = (
+            sl["SKU"].astype(str).isin(assembly_components)
+            & _status_u.isin(NON_MOVEMENT_COMPONENT_SALE_STATUSES)
+        )
+        if _component_nonmovement.any():
+            try:
+                import logging as _lg
+                _lg.getLogger("app").info(
+                    "Suppressed %.0f non-final direct sale-line units "
+                    "for %d assembly-driven component SKUs.",
+                    float(sl.loc[_component_nonmovement, "Quantity"].sum()),
+                    sl.loc[_component_nonmovement, "SKU"].nunique(),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            sl = sl.loc[~_component_nonmovement].copy()
 
     vel = (sl.groupby("SKU")
              .agg(units_12mo=("Quantity", "sum"),
@@ -21099,7 +21119,10 @@ elif page == "AI Assistant":
                 "questions, answer from `current_month_demand.total_qty`, "
                 "not `units_sold`. If `current_month_demand.fg_assembly_qty` "
                 "is non-zero, explicitly say the total is direct invoice "
-                "sales plus Finished Goods assembly consumption.\n"
+                "sales plus Finished Goods assembly consumption. If "
+                "`ignored_nonmovement_direct_qty` is non-zero, explain "
+                "that non-final component sale-lines were not added again "
+                "because the FG task already records the stock movement.\n"
                 "- search_products_by_text — substring search across "
                 "title/description/tags/product_type/collections. Use "
                 "when an alias rule of type='text_search' fires (see "

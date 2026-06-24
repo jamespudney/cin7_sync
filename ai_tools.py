@@ -2511,6 +2511,8 @@ def get_velocity(engine_df: pd.DataFrame,
     synced_assembly_month = float(
         current_month_movement.get("assembly_qty") or 0)
     synced_total_month = float(current_month_movement.get("total_qty") or 0)
+    ignored_nonmovement_direct = float(
+        current_month_movement.get("ignored_nonmovement_direct_qty") or 0)
 
     def _live_outbound_qty(*labels: str) -> float:
         by_type = live_movements.get("by_type") or {}
@@ -2537,6 +2539,7 @@ def get_velocity(engine_df: pd.DataFrame,
             "synced_direct_invoice_qty": synced_direct_month,
             "synced_fg_assembly_qty": synced_assembly_month,
             "synced_total_qty": synced_total_month,
+            "ignored_nonmovement_direct_qty": ignored_nonmovement_direct,
             "is_live": True,
             "answer_rule": (
                 "Use total_qty as the headline for current-month demand. "
@@ -2552,6 +2555,7 @@ def get_velocity(engine_df: pd.DataFrame,
             "total_qty": synced_total_month,
             "direct_invoice_qty": synced_direct_month,
             "fg_assembly_qty": synced_assembly_month,
+            "ignored_nonmovement_direct_qty": ignored_nonmovement_direct,
             "is_live": False,
             "live_unavailable_reason": live_movements.get("reason"),
             "answer_rule": (
@@ -2575,7 +2579,9 @@ def get_velocity(engine_df: pd.DataFrame,
         "When false, it comes from synced sale-lines plus synced CIN7 "
         "Finished Goods assemblies. Do not answer current-month demand "
         f"from units_sold; units_sold is only direct invoice lines for "
-        f"the last {days} days."
+        f"the last {days} days. If ignored_nonmovement_direct_qty is "
+        "non-zero, explain that non-final component sale-lines were not "
+        "added because FG movement already records the stock demand."
     )
 
     # v2.67.308 — surface the engine's canonical demand signals so the

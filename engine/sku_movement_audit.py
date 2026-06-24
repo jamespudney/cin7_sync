@@ -14,7 +14,15 @@ import pandas as pd
 from engine.sku_rules import _is_strip_sku, _parse_strip_base
 
 
-EXCLUDED_SALE_STATUSES = {"CREDITED", "VOIDED", "CANCELLED"}
+EXCLUDED_SALE_STATUSES = {"CREDITED", "VOIDED", "CANCELLED", "CANCELED"}
+NON_MOVEMENT_COMPONENT_SALE_STATUSES = {
+    "BACKORDERED",
+    "DRAFT",
+    "ORDERED",
+    "PACKING",
+    "PICKED",
+    "PICKING",
+}
 
 
 def _empty_audit(reason: str) -> dict[str, Any]:
@@ -182,13 +190,6 @@ def build_sku_current_month_movement(
     period = calendar_month_periods(today=today, periods=1)[-1]
 
     sl = _clean_sale_lines(sale_lines_df)
-    sku_lines = sl[sl["SKU"].astype(str) == sku_s].copy()
-    direct_qty = 0.0
-    if not sku_lines.empty:
-        inv_period = sku_lines["InvoiceDate"].dt.to_period("M")
-        direct_qty = float(
-            sku_lines.loc[inv_period == period, "Quantity"].sum())
-
     assembly_qty = 0.0
     a = assemblies_df.copy() if assemblies_df is not None else pd.DataFrame()
     if not a.empty:
@@ -211,12 +212,32 @@ def build_sku_current_month_movement(
             assembly_qty = float(
                 comp.loc[comp_period == period, "Quantity"].sum())
 
+    sku_lines = sl[sl["SKU"].astype(str) == sku_s].copy()
+    direct_qty = 0.0
+    ignored_nonmovement_qty = 0.0
+    if not sku_lines.empty:
+        inv_period = sku_lines["InvoiceDate"].dt.to_period("M")
+        month_lines = sku_lines.loc[inv_period == period].copy()
+        if assembly_qty > 0 and "Status" in month_lines.columns:
+            status = month_lines["Status"].astype(str).str.upper()
+            nonmovement = status.isin(NON_MOVEMENT_COMPONENT_SALE_STATUSES)
+            ignored_nonmovement_qty = float(
+                month_lines.loc[nonmovement, "Quantity"].sum())
+            month_lines = month_lines.loc[~nonmovement]
+        direct_qty = float(month_lines["Quantity"].sum())
+
     return {
         "ok": True,
         "period": str(period),
         "direct_invoice_qty": direct_qty,
         "assembly_qty": assembly_qty,
         "total_qty": direct_qty + assembly_qty,
+        "ignored_nonmovement_direct_qty": ignored_nonmovement_qty,
+        "direct_qty_rule": (
+            "If FG assembly consumption exists for this component, "
+            "non-final sale-line statuses are not added on top because "
+            "the stock movement is already represented by the FG task."
+        ),
     }
 
 

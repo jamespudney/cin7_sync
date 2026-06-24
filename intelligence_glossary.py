@@ -162,6 +162,12 @@ direct invoice movement plus FG assembly consumption. Do not report
 direct sale-lines alone as the total if assembly rows are available.
 AI tools expose this as `current_month_demand.total_qty`, with
 `direct_invoice_qty` and `fg_assembly_qty` split out for the explanation.
+When a component has FG assembly consumption, non-final sale-line
+statuses such as ORDERED, PICKING, PICKED, PACKING, BACKORDERED, and
+DRAFT are not added on top of the FG quantity. Those lines can represent
+the same kit/build demand before the stock ledger posts; adding them
+again double-counts the component. Completed/authorised direct sales
+still count.
 
 For exact-SKU month-to-date disputes, CIN7's live product Movements
 ledger (`/product?Sku=...&IncludeMovements=true`) is the reconciliation

@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dotenv import load_dotenv
 
 from cin7_sync import Cin7Client, OUTPUT_DIR, _extract_sale_lines
+from engine.sku_movement_audit import NON_MOVEMENT_COMPONENT_SALE_STATUSES
 
 
 BAD_SALE_STATUSES = {"CREDITED", "VOIDED", "CANCELLED", "CANCELED"}
@@ -181,6 +182,8 @@ def local_direct_sales(
     sku: str,
     start: date,
     end: date,
+    *,
+    suppress_nonmovement_component_lines: bool = False,
 ) -> Tuple[float, List[Dict[str, Any]], str]:
     source_rows, source = _read_app_window_csv("sale_lines")
     rows = []
@@ -189,6 +192,9 @@ def local_direct_sales(
         if str(row.get("SKU") or "") != sku:
             continue
         if _status(row) in BAD_SALE_STATUSES:
+            continue
+        if (suppress_nonmovement_component_lines
+                and _status(row) in NON_MOVEMENT_COMPONENT_SALE_STATUSES):
             continue
         day = _parse_day(row.get("InvoiceDate"))
         if not _in_period(day, start, end):
@@ -276,16 +282,6 @@ def local_mtd_maps(
     direct: Dict[str, float] = defaultdict(float)
     assemblies: Dict[str, float] = defaultdict(float)
 
-    for row in sale_rows:
-        if _status(row) in BAD_SALE_STATUSES:
-            continue
-        day = _parse_day(row.get("InvoiceDate"))
-        if not _in_period(day, start, end):
-            continue
-        sku = str(row.get("SKU") or "").strip()
-        if sku:
-            direct[sku] += _qty(row.get("Quantity"))
-
     for row in asm_rows:
         if _status(row) in BAD_ASSEMBLY_STATUSES:
             continue
@@ -297,6 +293,20 @@ def local_mtd_maps(
         qty = _qty(row.get("Quantity"))
         if sku and qty > 0:
             assemblies[sku] += qty
+
+    assembly_skus = set(assemblies)
+    for row in sale_rows:
+        if _status(row) in BAD_SALE_STATUSES:
+            continue
+        sku = str(row.get("SKU") or "").strip()
+        if (sku in assembly_skus
+                and _status(row) in NON_MOVEMENT_COMPONENT_SALE_STATUSES):
+            continue
+        day = _parse_day(row.get("InvoiceDate"))
+        if not _in_period(day, start, end):
+            continue
+        if sku:
+            direct[sku] += _qty(row.get("Quantity"))
 
     return dict(direct), dict(assemblies), sale_source, asm_source
 
@@ -785,14 +795,22 @@ def main() -> int:
     print(f"Output dir: {OUTPUT_DIR}")
     print("=" * 78)
 
-    direct_qty, direct_rows, direct_path = local_direct_sales(sku, start, end)
+    asm_qty, asm_rows, asm_path = local_assembly_consumption(sku, start, end)
+    direct_qty, direct_rows, direct_path = local_direct_sales(
+        sku,
+        start,
+        end,
+        suppress_nonmovement_component_lines=asm_qty > 0,
+    )
     bom_qty, bom_rows, bom_path, bom_sl_path = local_bom_rollup_estimate(
         sku, start, end)
-    asm_qty, asm_rows, asm_path = local_assembly_consumption(sku, start, end)
 
     print("\n[Local synced data]")
     print(f"  Direct invoice sales      : {direct_qty:g}")
     print(f"    sale-line file          : {direct_path or '(missing)'}")
+    if asm_qty > 0:
+        print("    note                    : non-final direct sale-line statuses "
+              "for this assembly component are suppressed")
     print(f"  BOM kit-sale estimate     : {bom_qty:g}")
     print(f"    BOM file                : {bom_path or '(missing)'}")
     print(f"    sale-line file          : {bom_sl_path or '(missing)'}")
