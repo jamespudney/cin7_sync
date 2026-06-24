@@ -6686,6 +6686,12 @@ def _abc_engine(products: pd.DataFrame,
     # Last 6 months total (sum of most recent 6 monthly buckets)
     df["last_6mo"] = df["trend_12m"].apply(
         lambda buckets: float(sum(buckets[-6:])) if buckets else 0.0)
+    # Buyer-visible demand total from the same 12 monthly buckets shown in
+    # the Ordering grid. This is deliberately separate from
+    # `effective_units_12mo`, which remains the reorder-math source of
+    # truth and may be zero for child/rolled-up SKUs.
+    df["lineage_units_12mo"] = df["trend_12m"].apply(
+        lambda buckets: float(sum(buckets)) if buckets else 0.0)
     # Last 6 months as a readable "oldest … newest" sequence.
     # Show 1 decimal place when values include rolled-up fractional
     # contributions (e.g. master rolls absorbing per-foot demand —
@@ -6902,10 +6908,20 @@ def _abc_engine(products: pd.DataFrame,
             return "💤 Dormant"
         if cur == "Stable":
             eff_12mo = float(r.get("effective_units_12mo") or 0)
+            lineage_12mo = float(r.get("lineage_units_12mo") or 0)
+            raw_12mo = float(r.get("units_12mo") or 0)
+            visible_12mo = max(eff_12mo, lineage_12mo, raw_12mo)
             abc = str(r.get("ABC") or "C").strip().upper()
             u45 = float(r.get("units_45d") or 0)
             u90 = float(r.get("units_90d") or 0)
             cust_12mo = int(r.get("customers_12mo") or 0)
+            # If visible monthly demand exists but the effective reorder
+            # demand is zero, this SKU's demand has been rolled away,
+            # migrated, or otherwise suppressed from auto-buying. Calling it
+            # Stable is misleading for buyers because there is no sustaining
+            # baseline on THIS row; treat it as project/manual demand.
+            if eff_12mo <= 0 and visible_12mo > 0:
+                return "🎯 Project"
             # v2.67.320 — CUSTOMER-DIVERSITY GUARD (highest priority
             # after dormancy). A "project" is concentrated demand from
             # 1-2 buyers. A SKU sold to 3+ DISTINCT customers over the
@@ -6930,7 +6946,7 @@ def _abc_engine(products: pd.DataFrame,
             # Example: LEDWFLEX180R-24v-5m had 5 units in 12mo, ABC=A,
             # and was staying Stable because v2.67.315 A-grace fired
             # before the low-volume check.
-            if 0 < eff_12mo < 12:
+            if 0 < visible_12mo < 12:
                 return "🎯 Project"
             # v2.67.316 — A-class grace tightened from u90>0 to u45>0.
             # The 45-day window is the real "recently active" signal;
@@ -6947,16 +6963,16 @@ def _abc_engine(products: pd.DataFrame,
             # like LEDWFLEX120R-24v-5m: 54 units in 12mo, but ALL 54
             # from one customer across two sales. That's project-
             # driven by definition, regardless of total units.
-            if eff_12mo > 0:
+            if visible_12mo > 0:
                 top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
-                if top_u_12mo / eff_12mo >= 0.5:
+                if top_u_12mo / visible_12mo >= 0.5:
                     return "🎯 Project"
             # v2.67.315 — pure "no recent activity" case. Catches
             # SKUs with diversified buyers historically but zero
             # sales in the last 90 days. eff_12mo > 0 but u90 == 0
             # means the last quarter has been silent — too sparse
             # for "Stable" regardless of unit count or buyer mix.
-            if eff_12mo > 0 and u90 == 0:
+            if visible_12mo > 0 and u90 == 0:
                 return "🎯 Project"
         return cur
 
@@ -6977,21 +6993,26 @@ def _abc_engine(products: pd.DataFrame,
         if r.get("trend_flag") != "🎯 Project":
             return ""
         eff_12mo = float(r.get("effective_units_12mo") or 0)
+        lineage_12mo = float(r.get("lineage_units_12mo") or 0)
+        raw_12mo = float(r.get("units_12mo") or 0)
+        visible_12mo = max(eff_12mo, lineage_12mo, raw_12mo)
         u45 = float(r.get("units_45d") or 0)
         u90 = float(r.get("units_90d") or 0)
         top_u_12mo = float(r.get("top_cust_units_12mo") or 0)
         # Reasons checked in priority order. Promotion (Stable → Project)
         # only runs when units_45d < 3, so the promotion-set reasons
         # don't overlap with concentrated.
-        if 0 < eff_12mo < 12 and u45 < 3:
+        if eff_12mo <= 0 and visible_12mo > 0:
+            return "rolled-up-history"
+        if 0 < visible_12mo < 12 and u45 < 3:
             return "low-volume"
-        if (eff_12mo > 0 and u45 < 3
-                and top_u_12mo / max(eff_12mo, 1) >= 0.5):
+        if (visible_12mo > 0 and u45 < 3
+                and top_u_12mo / max(visible_12mo, 1) >= 0.5):
             return "sporadic-single-buyer"
         # v2.67.315 — no-recent-activity fallback (last 90d empty
         # but 12mo has sales). Distinct from low-volume / sporadic
         # because the buyer mix may have been diversified historically.
-        if eff_12mo > 0 and u90 == 0 and u45 < 3:
+        if visible_12mo > 0 and u90 == 0 and u45 < 3:
             return "stale-12mo"
         return "concentrated"
 
@@ -11712,11 +11733,26 @@ elif page == "Ordering":
                 _topname = str(row.get("top_cust_name") or "—")[:40]
                 _preason = str(row.get("project_reason") or "concentrated")
                 _eff_lv = float(row.get("effective_units_12mo") or 0)
-                _share = (_topu / _eff_lv * 100) if _eff_lv > 0 else 0
-                if _preason == "low-volume":
+                _raw_lv = float(row.get("units_12mo") or 0)
+                _lineage_lv = float(row.get("lineage_units_12mo") or 0)
+                _visible_lv = max(_eff_lv, _raw_lv, _lineage_lv)
+                _share = (_topu / _visible_lv * 100) if _visible_lv > 0 else 0
+                if _preason == "rolled-up-history":
+                    demand_lines.append(
+                        f"- **Project / rolled-up history** — visible "
+                        f"12mo demand is **{_visible_lv:.0f} units** "
+                        "from the trend lineage, but reorder-math "
+                        f"demand is **{_eff_lv:.0f}** for this row. "
+                        "That means the movement has been rolled to a "
+                        "master/successor or suppressed from automatic "
+                        "buying. Do not treat this as a steady baseline "
+                        "for this SKU; manually order only when there is "
+                        "a known project or direct buyer need.\n"
+                    )
+                elif _preason == "low-volume":
                     demand_lines.append(
                         f"- **Low-volume Project** — only "
-                        f"**{_eff_lv:.0f} units in 12mo** total (<1/mo "
+                        f"**{_visible_lv:.0f} units in 12mo** total (<1/mo "
                         f"avg). Not dormant (a sale landed inside the "
                         f"90d window) but too sparse to call Stable. "
                         f"Treated as project demand: subtracting top "
@@ -11729,7 +11765,7 @@ elif page == "Ordering":
                 elif _preason == "stale-12mo":
                     demand_lines.append(
                         f"- **Stale 12mo Project** — "
-                        f"**{_eff_lv:.0f} units in 12mo** total but "
+                        f"**{_visible_lv:.0f} units in 12mo** total but "
                         f"**zero sales in the last 90 days**. The "
                         f"historic activity isn't a baseline you "
                         f"can plan against — it was project work "
@@ -11746,7 +11782,7 @@ elif page == "Ordering":
                 elif _preason == "sporadic-single-buyer":
                     demand_lines.append(
                         f"- **Sporadic single-buyer Project** — "
-                        f"**{_eff_lv:.0f} units in 12mo** total, but "
+                        f"**{_visible_lv:.0f} units in 12mo** total, but "
                         f"top customer **{_topname}** took "
                         f"**{_topu:.0f} units ({_share:.0f}%)** of "
                         f"that. Few transactions clustered to one "
@@ -12168,8 +12204,20 @@ elif page == "Ordering":
         _s[2].metric("Available", f"{float(_r.get('Available') or 0):.0f}")
         _s[3].metric("OnOrder", f"{float(_r.get('OnOrder') or 0):.0f}")
         _d = st.columns(4)
-        _d[0].metric("12mo units",
-                     f"{float(_r.get('effective_units_12mo') or 0):.0f}")
+        _raw_u12 = float(_r.get("units_12mo") or 0)
+        _eff_u12 = float(_r.get("effective_units_12mo") or 0)
+        _lineage_u12 = float(_r.get("lineage_units_12mo") or 0)
+        _display_u12 = max(_raw_u12, _eff_u12, _lineage_u12)
+        _d[0].metric(
+            "12mo demand",
+            f"{_display_u12:.0f}",
+            help=(
+                "Buyer-visible demand from the 12-month trend lineage. "
+                "The reorder math still uses effective_units_12mo, which "
+                "may be lower/zero for child, migrated, or project-style "
+                "rows to prevent accidental auto-buying."
+            ),
+        )
         _d[1].metric("45d units", f"{float(_r.get('units_45d') or 0):.0f}")
         _d[2].metric("Customers 12mo",
                      f"{int(_r.get('customers_12mo') or 0)}")
@@ -12193,6 +12241,8 @@ elif page == "Ordering":
         st.markdown(
             f"**Supplier:** {_r.get('Supplier') or '—'}  \n"
             f"**Last 6 months:** {_r.get('last_6mo_series') or '—'}  \n"
+            f"**Reorder-math 12mo:** {_eff_u12:.0f}"
+            f"  ·  **Raw direct+FG 12mo:** {_raw_u12:.0f}  \n"
             f"**Target stock:** {float(_r.get('target_stock') or 0):.0f}"
             f"  ·  **Lead time:** "
             f"{float(_r.get('lead_time_days') or 0):.0f}d "
@@ -14568,6 +14618,21 @@ elif page == "Ordering":
                 axis=1)
     _work["Line value"] = (_work["Order qty"] * _work["POCost"]).round(2)
     _work["Include?"] = _work["Order qty"] > 0
+    # In the buyer grid, "12mo units" should agree with the visible trend
+    # buckets. Keep the engine row's effective_units_12mo untouched for
+    # reorder math; this is only a display copy used by the editor.
+    if "units_12mo" in _work.columns:
+        _u12_raw = pd.to_numeric(
+            _work.get("units_12mo", pd.Series(0, index=_work.index)),
+            errors="coerce").fillna(0)
+        _u12_eff = pd.to_numeric(
+            _work.get("effective_units_12mo", pd.Series(0, index=_work.index)),
+            errors="coerce").fillna(0)
+        _u12_lineage = pd.to_numeric(
+            _work.get("lineage_units_12mo", pd.Series(0, index=_work.index)),
+            errors="coerce").fillna(0)
+        _work["units_12mo"] = pd.concat(
+            [_u12_raw, _u12_eff, _u12_lineage], axis=1).max(axis=1)
     # 🔍 Inspect — tick to open the demand-breakdown expander below the
     # table. Lets the buyer drill into any row's reasoning without
     # leaving the PO editor. The breakdown reads the FIRST ticked SKU,
@@ -14760,6 +14825,7 @@ elif page == "Ordering":
                     "freight_mode", "lead_time_days",
                     "excess_units", "excess_value",
                     "last_6mo", "last_6mo_series",
+                    "lineage_units_12mo",
                     "Category", "Name",
                     # Trend-detection fields
                     "trend_flag", "units_45d", "units_prior_45d",
@@ -14859,7 +14925,14 @@ elif page == "Ordering":
                 width="medium",
             ),
             "units_12mo": st.column_config.NumberColumn(
-                "12mo units", disabled=True, format="%.0f"),
+                "12mo demand",
+                disabled=True,
+                format="%.0f",
+                help="Buyer-visible 12-month demand. This is the max of "
+                     "raw direct/FG usage, effective reorder demand, and "
+                     "the 12-month trend lineage, so it agrees with the "
+                     "visible monthly buckets. The reorder calculation "
+                     "still uses effective_units_12mo internally."),
             "avg_daily": st.column_config.NumberColumn(
                 "Daily", disabled=True, format="%.2f"),
             "avg_month": st.column_config.NumberColumn(
@@ -21704,6 +21777,10 @@ elif page == "AI Assistant":
                 "`⚠️ SLOW —`\n"
                 "  - If `OnHand`>0 AND `effective_units_12mo`==0 "
                 "→ prefix with `🔴 DEAD —`\n"
+                "    Exception: if `lineage_units_12mo` or "
+                "`display_units_12mo` is >0, say visible historical/"
+                "project demand exists but the engine is not using it "
+                "as a steady reorder baseline.\n"
                 "  - If `excess_units`>0 → prefix with "
                 "`📦 EXCESS —`\n"
                 # v2.67.31 — remnant signal. The engine's slow/dead/
@@ -21785,7 +21862,10 @@ elif page == "AI Assistant":
                 "answers.\n"
                 "  - `effective_units_12mo` — 12-month demand "
                 "with rollups. Zero (with OnHand>0) means dead "
-                "stock per RULES.md §4.3.\n"
+                "stock per RULES.md §4.3, unless "
+                "`lineage_units_12mo`/`display_units_12mo` shows "
+                "historical project movement that was deliberately "
+                "excluded from reorder math.\n"
                 "  - `excess_units` — units over target stock. "
                 ">0 means over-stocked per RULES.md §4.1.\n"
                 "Format every product row as `<SKU> — <Name> — "

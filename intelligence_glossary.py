@@ -119,6 +119,25 @@ consumption below) + sales rolled up from child variants (MP variants,
 cuts) + sales migrated from retiring SKUs. Used for the reorder math,
 NOT the raw "units_12mo" figure on its own.
 
+#### Lineage units / visible 12mo demand
+`lineage_units_12mo` is the buyer-visible 12-month demand total from
+the same monthly buckets used for the 12-month sparkline and "Last 6
+months" column. The Ordering grid labels this as **12mo demand** so the
+number agrees with the trend chart the buyer can see.
+
+This is deliberately separate from `effective_units_12mo`:
+- **`lineage_units_12mo` / `display_units_12mo`** — explains what moved
+  historically across this SKU's visible demand lineage.
+- **`effective_units_12mo`** — drives target stock, suggested reorder,
+  Status, and slow/dead/excess math.
+
+If visible demand exists but `effective_units_12mo` is zero, the SKU is
+not a sustaining reorder baseline. The movement has been rolled to a
+master/successor or represents project/manual demand. The engine labels
+that row **🎯 Project**, not Stable, and AI answers should say: "it moved
+historically/project-wise, but the engine is not auto-reordering from
+that history."
+
 #### Assembly consumption (FG-XXXX tasks) — v2.67.334-339
 Many components — LED strips, profile parts, mounting clips — sell
 mostly via kits, not as standalone items. When a kit ships, CIN7 fires

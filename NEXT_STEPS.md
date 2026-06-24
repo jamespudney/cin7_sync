@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-06-23
+Last updated: 2026-06-24
 
 ---
 
@@ -152,6 +152,22 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 ---
 
 ## Shipped (since 2026-04-30)
+
+### 2026-06-24
+
+- **Ordering lineage-demand display** — Ordering now separates
+  buyer-visible `lineage_units_12mo` from reorder-math
+  `effective_units_12mo`. The grid's "12mo demand" column agrees with
+  the visible 12-month/last-6-month trend buckets, while auto-reorder
+  math still uses effective demand so child, migrated, and project-style
+  rows do not trigger accidental buying. SKUs with visible historical
+  demand but zero effective reorder demand are labelled 🎯 Project
+  instead of Stable.
+- **AI demand-field parity** — app assistant and Slack PO commentary now
+  receive `lineage_units_12mo` and `display_units_12mo` alongside
+  `effective_units_12mo`. They should explain when a SKU moved
+  historically/project-wise but is not being auto-reordered from that
+  history.
 
 ### 2026-06-23
 

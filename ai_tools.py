@@ -2018,8 +2018,17 @@ def get_sku_details(engine_df: pd.DataFrame,
     # effective_units_12mo OR walk to the master via migration_chain.
     _dir = float(detail.get("units_12mo") or 0)
     _eff = float(detail.get("effective_units_12mo") or 0)
+    _lineage = float(detail.get("lineage_units_12mo") or 0)
+    detail["display_units_12mo"] = max(_dir, _eff, _lineage)
     _is_nmt = bool(detail.get("is_non_master_tube") or False)
     _notes = []
+    if _lineage > 0 and _eff <= 0:
+        _notes.append(
+            f"lineage_units_12mo ({_lineage:.0f}) shows visible "
+            "12-month movement, but effective_units_12mo is 0 because "
+            "the row is not a sustaining reorder baseline. Report the "
+            "visible demand for history, and the effective demand for "
+            "auto-reorder math.")
     if _is_nmt:
         _notes.append(
             "is_non_master_tube=True — direct units_12mo is near-zero by "
@@ -2603,6 +2612,7 @@ def get_velocity(engine_df: pd.DataFrame,
             eng = eng_row.iloc[0]
             _eng_eff = float(eng.get("effective_units_12mo") or 0)
             _eng_dir = float(eng.get("units_12mo") or 0)
+            _eng_lineage = float(eng.get("lineage_units_12mo") or 0)
             result["engine_signals"] = {
                 "ABC": str(eng.get("ABC") or ""),
                 "trend_flag": str(eng.get("trend_flag") or ""),
@@ -2611,6 +2621,9 @@ def get_velocity(engine_df: pd.DataFrame,
                     eng.get("is_non_master_tube", False)),
                 "units_12mo_direct": _eng_dir,
                 "effective_units_12mo": _eng_eff,
+                "lineage_units_12mo": _eng_lineage,
+                "display_units_12mo": max(
+                    _eng_dir, _eng_eff, _eng_lineage),
                 "units_45d": float(eng.get("units_45d") or 0),
                 "units_prior_45d": float(eng.get("units_prior_45d") or 0),
                 "assembly_units_12mo": float(
@@ -4792,6 +4805,12 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 "is_dormant": bool(_epо(_lsku, "is_dormant", False)),
                 "units_12mo": _epо(_lsku, "units_12mo", 0),
                 "effective_units_12mo": _epо(_lsku, "effective_units_12mo", 0),
+                "lineage_units_12mo": _epо(_lsku, "lineage_units_12mo", 0),
+                "display_units_12mo": max(
+                    float(_epо(_lsku, "units_12mo", 0) or 0),
+                    float(_epо(_lsku, "effective_units_12mo", 0) or 0),
+                    float(_epо(_lsku, "lineage_units_12mo", 0) or 0),
+                ),
                 "units_45d": _epо(_lsku, "units_45d", 0),
                 "available": _epо(_lsku, "Available"),
                 "on_order": _epо(_lsku, "OnOrder"),
@@ -5533,6 +5552,12 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "is_dormant": bool(_eng(sku, "is_dormant", False)),
             "units_12mo": _eng(sku, "units_12mo", 0),
             "effective_units_12mo": _eng(sku, "effective_units_12mo", 0),
+            "lineage_units_12mo": _eng(sku, "lineage_units_12mo", 0),
+            "display_units_12mo": max(
+                float(_eng(sku, "units_12mo", 0) or 0),
+                float(_eng(sku, "effective_units_12mo", 0) or 0),
+                float(_eng(sku, "lineage_units_12mo", 0) or 0),
+            ),
             "units_45d": _eng(sku, "units_45d", 0),
             "available": _eng(sku, "Available", None),
             "on_order": _eng(sku, "OnOrder", None),
@@ -5597,7 +5622,8 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "v2.67.367 — ENGINE SIGNALS + IP NOTES ON EVERY LINE. "
             "Each line carries real engine data: `abc_class`, "
             "`trend_flag`, `is_dormant`, `units_12mo`, "
-            "`effective_units_12mo`, `units_45d`, `available`, "
+            "`effective_units_12mo`, `lineage_units_12mo`, "
+            "`display_units_12mo`, `units_45d`, `available`, "
             "`on_order`, `allocated`, `excess_units`, "
             "`suggested_reorder`, `reorder_status`, and "
             "`stock_locator`. "
@@ -5609,6 +5635,10 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "warehouse Location. "
             "If `units_12mo` is 0 but `effective_units_12mo` > 0, "
             "report the effective figure. "
+            "If `display_units_12mo` or `lineage_units_12mo` is >0 while "
+            "`effective_units_12mo` is 0, report visible 12mo demand as "
+            "historical/project movement and make clear the engine is not "
+            "auto-reordering from it. "
             "If engine data is missing for a SKU (fields null/0), "
             "say 'not in engine — verify manually' rather than "
             "calling it dead or dormant. "

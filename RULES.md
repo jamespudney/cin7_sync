@@ -38,6 +38,8 @@ Anything else is a child / phantom / cut / assembly.
 
 **2.3 Sales demand must roll up from child to master.** A sale of a child SKU consumes master stock. The ABC engine computes `effective_units_12mo` as `direct + migrated_in + tube_rollup_in + kit_rollup_in`. That effective number — not the raw direct sales — is what drives Status (Dead Stock, Slow Mover, etc.), ABC classification, and reorder targets.
 
+**2.3.1 Visible demand vs reorder demand.** `lineage_units_12mo` / `display_units_12mo` are buyer-visible history fields from the same monthly buckets shown in the Ordering trend columns. They explain what moved historically. `effective_units_12mo` remains the reorder-math field. If visible demand is >0 but effective demand is 0, label the row 🎯 Project/manual history, not Stable, and do not auto-reorder from that history.
+
 **2.4 Rollup methods, in priority order:**
 - **Method A — BOM components.** If a non-master SKU is an assembly (has components in CIN7's BOM table), distribute its sales to EACH component × BOM quantity. A single kit with three components rolls to all three, not just the first.
 - **Method B — Tube master lookup.** For LED tube family SKUs, find the tube of the same family + color + length that's marked master.
@@ -83,7 +85,7 @@ For an exact-SKU month-to-date dispute, CIN7's product **Movements** ledger (`/p
 
 **Classification** (tightened April 2026 after real-world feedback — original thresholds were too permissive):
 - **📈 Trend** — ALL of: momentum >1.5, **customers_45d ≥ 3**, **top_cust_pct < 40%**, **non_top_avg_units ≥ 2**. Real broad-based acceleration. Engine overrides `avg_daily` to use last-45d rate.
-- **🎯 Project** — only when the spike is concentrated to **1-2 distinct customers**. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting.
+- **🎯 Project** — when the spike is concentrated to **1-2 distinct customers**, or when visible 12mo lineage demand exists but effective reorder demand is zero. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting where applicable; visible-only project rows stay at zero auto-reorder unless the buyer manually overrides.
 - **🔀 Mixed** — spike (momentum >1.5) with 3+ customers involved, but the spread is not broad enough for Trend. Watch signal; no velocity override.
 - **📉 Decline** — momentum < 0.5. Manual review.
 - **Stable** — everything else.
@@ -102,7 +104,7 @@ The `calc_trace` transparency panel always shows the full breakdown when the fla
 
 **4.2 Excess for non-masters.** Only flag as excess if **zero direct sales**. A variant with sales is fulfilling real demand even if it's above "target" — the target doesn't apply to it the same way.
 
-**4.3 Dead stock** = holding stock AND zero `effective_units_12mo`. Must use effective units (with rollup) not direct — a master tube that only sells via its variants isn't dead.
+**4.3 Dead stock** = holding stock AND zero `effective_units_12mo`. Must use effective units (with rollup) not direct — a master tube that only sells via its variants isn't dead. If `lineage_units_12mo` / `display_units_12mo` is >0 while `effective_units_12mo` is zero, report it as historical/project movement excluded from auto-reorder, not as steady demand.
 
 ---
 

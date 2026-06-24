@@ -62,6 +62,18 @@ pick-lines + sales rolled up from child variants (MP variants, cuts,
 kit components) + sales migrated from retiring SKUs. Used for the
 reorder math, NOT the raw "units_12mo" figure.
 
+#### Lineage units / visible 12mo demand
+`lineage_units_12mo` is the buyer-visible 12-month demand total from
+the same buckets used for the sparkline and "Last 6 months" column.
+The Ordering grid labels this as **12mo demand** so the number agrees
+with the visible trend.
+
+This is separate from `effective_units_12mo`, which still drives
+target stock, suggested reorder, Status, and slow/dead/excess math.
+If visible demand exists but effective reorder demand is zero, the SKU
+is treated as **🎯 Project**: it moved historically/project-wise, but
+the engine is not auto-reordering from that history.
+
 MTD/current-month demand for assembly-heavy components depends on
 `assemblies_last_30d_*.csv`, not just `sale_lines_last_30d_*.csv`.
 If that assembly file is stale, components such as
