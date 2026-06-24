@@ -11,6 +11,7 @@ Examples:
     python audit_live_cin7_demand.py LED-NEON-FLEX-NICHO-3000K-2 --from 2026-06-01 --to 2026-06-23 --live-product-movements
     python audit_live_cin7_demand.py LED-NEON-FLEX-NICHO-3000K-2 --live-assemblies --live-sales
     python audit_live_cin7_demand.py --batch-engine --from 2026-06-01 --to 2026-06-23 --limit 250
+    python audit_live_cin7_demand.py --batch-engine --assembly-heavy --limit 50 --live-product-movements
 """
 
 from __future__ import annotations
@@ -524,12 +525,29 @@ def _engine_row_score(row: Dict[str, Any]) -> float:
     )
 
 
+def _engine_row_assembly_score(row: Dict[str, Any]) -> float:
+    """Rank rows most exposed to stale/missing Finished Goods assembly data."""
+    asm_12m = _qty(row.get("assembly_units_12mo"))
+    asm_45d = _qty(row.get("assembly_units_45d"))
+    eff = _qty(row.get("effective_units_12mo"))
+    reorder = _qty(row.get("reorder_qty") or row.get("Suggested reorder"))
+    excess_value = abs(_qty(row.get("excess_value")))
+    return (
+        (asm_45d * 1000.0)
+        + (asm_12m * 20.0)
+        + (eff * 2.0)
+        + (reorder * 25.0)
+        + (excess_value / 50.0)
+    )
+
+
 def _batch_candidate_skus(
         *,
         sku_list: Optional[str],
         sku_file: Optional[str],
         batch_engine: bool,
         all_engine: bool,
+        assembly_heavy: bool,
         limit: int) -> Tuple[List[str], Dict[str, Dict[str, Any]], Optional[Path]]:
     candidates: List[str] = []
     meta: Dict[str, Dict[str, Any]] = {}
@@ -555,14 +573,22 @@ def _batch_candidate_skus(
             sku = str(row.get("SKU") or "").strip()
             if not sku:
                 continue
-            score = _engine_row_score(row)
+            score = (
+                _engine_row_assembly_score(row)
+                if assembly_heavy else _engine_row_score(row)
+            )
             has_attention = (
                 all_engine
                 or score > 0
-                or _qty(row.get("effective_units_12mo")) > 0
-                or _qty(row.get("units_45d")) > 0
-                or _qty(row.get("reorder_qty")) > 0
-                or _qty(row.get("excess_value")) > 0
+                or (
+                    not assembly_heavy
+                    and (
+                        _qty(row.get("effective_units_12mo")) > 0
+                        or _qty(row.get("units_45d")) > 0
+                        or _qty(row.get("reorder_qty")) > 0
+                        or _qty(row.get("excess_value")) > 0
+                    )
+                )
             )
             if has_attention:
                 scored.append((score, sku, row))
@@ -600,6 +626,7 @@ def run_batch_product_movement_audit(args: argparse.Namespace,
         sku_file=args.sku_file,
         batch_engine=args.batch_engine,
         all_engine=args.all_engine,
+        assembly_heavy=args.assembly_heavy,
         limit=args.limit,
     )
     if not skus:
@@ -618,6 +645,8 @@ def run_batch_product_movement_audit(args: argparse.Namespace,
     print(f"Period: {start.isoformat()} to {end.isoformat()} inclusive")
     print(f"SKUs selected: {len(skus)}")
     print(f"Engine source: {engine_path or '(not used)'}")
+    print("Selection mode: "
+          f"{'assembly-heavy engine rows' if args.assembly_heavy else 'engine attention score'}")
     print(f"Sale-line source: {sale_path or '(missing)'}")
     print(f"Assembly source: {asm_path or '(missing)'}")
     print("=" * 78)
@@ -705,6 +734,11 @@ def main() -> int:
     parser.add_argument("--all-engine", action="store_true",
                         help=("With --batch-engine, include all engine SKUs "
                               "before applying --limit."))
+    parser.add_argument("--assembly-heavy", action="store_true",
+                        help=("With --batch-engine, rank/select SKUs by "
+                              "assembly_units_45d / assembly_units_12mo so "
+                              "component SKUs most exposed to stale Finished "
+                              "Goods data are audited first."))
     parser.add_argument("--limit", type=int, default=100,
                         help=("Max SKUs for --batch-engine. Use 0 for no "
                               "limit, but this may take hours."))

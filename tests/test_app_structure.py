@@ -211,6 +211,11 @@ class AppMemoryStructureTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "app.py"
         ).read_text(encoding="utf-8")
 
+        self.assertIn("def _render_ordering_engine_input_freshness", script)
+        self.assertIn("Engine inputs ·", script)
+        self.assertIn("Sale lines 30d", script)
+        self.assertIn("FG assemblies 30d", script)
+        self.assertIn("Ordering, slow-stock, and AI demand answers", script)
         self.assertIn("_d2[0].metric(", script)
         self.assertIn('"Current month"', script)
         self.assertIn("_current_month_live_units", script)
@@ -303,6 +308,9 @@ class AppMemoryStructureTests(unittest.TestCase):
 
         self.assertIn("--batch-engine", script)
         self.assertIn("--all-engine", script)
+        self.assertIn("--assembly-heavy", script)
+        self.assertIn("_engine_row_assembly_score", script)
+        self.assertIn("assembly_units_45d", script)
         self.assertIn("cin7_product_movement_audit_", script)
         self.assertIn("Delta live minus local", script)
         self.assertIn("Live CIN7 Movement demand MTD", script)
@@ -717,11 +725,16 @@ class StripRollupParsingTests(unittest.TestCase):
 
         try:
             ai_tools.set_assemblies(assemblies)
-            result = ai_tools.get_velocity(
-                pd.DataFrame(),
-                sale_lines,
-                {"sku": sku, "days": 30},
-            )
+            with patch.object(
+                ai_tools,
+                "_get_live_product_movements",
+                return_value={"ok": False, "reason": "test"},
+            ):
+                result = ai_tools.get_velocity(
+                    pd.DataFrame(),
+                    sale_lines,
+                    {"sku": sku, "days": 30},
+                )
         finally:
             ai_tools.set_assemblies(pd.DataFrame())
 
@@ -729,6 +742,14 @@ class StripRollupParsingTests(unittest.TestCase):
         self.assertEqual(movement["direct_invoice_qty"], 5)
         self.assertEqual(movement["assembly_qty"], 44)
         self.assertEqual(movement["total_qty"], 49)
+        demand = result["current_month_demand"]
+        self.assertEqual(demand["source"], "synced_sale_lines_plus_fg_assemblies")
+        self.assertEqual(demand["direct_invoice_qty"], 5)
+        self.assertEqual(demand["fg_assembly_qty"], 44)
+        self.assertEqual(demand["total_qty"], 49)
+        self.assertIn("current_month_demand.total_qty",
+                      result["assistant_guidance"])
+        self.assertIn("units_sold_note", result)
         self.assertIn("Finished Goods assembly consumption",
                       result["assistant_guidance"])
         self.assertIn("current_month_live_product_movements", result)

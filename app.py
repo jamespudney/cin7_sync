@@ -1629,6 +1629,75 @@ def _freshness_from_output_dir() -> tuple:
         return (None, None, None)
 
 
+def _ordering_engine_input_freshness() -> list[dict]:
+    """Freshness for the source files that make Ordering trustworthy."""
+    specs = [
+        ("Sale lines 30d", "sale_lines_last_30d", 30.0),
+        ("FG assemblies 30d", "assemblies_last_30d", 30.0),
+        ("ABC cache", "engine_output", 24.0),
+    ]
+    rows = []
+    now = datetime.now()
+    for label, prefix, cadence_h in specs:
+        try:
+            path = catalog_latest_file(prefix, OUTPUT_DIR)
+            if path is None:
+                rows.append({
+                    "label": label,
+                    "status": "missing",
+                    "icon": "🔴",
+                    "age": "missing",
+                    "file": "",
+                })
+                continue
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            age_h = (now - mtime).total_seconds() / 3600.0
+            if age_h > cadence_h * 2:
+                status, icon = "stale", "🔴"
+            elif age_h > cadence_h:
+                status, icon = "aging", "🟡"
+            else:
+                status, icon = "fresh", "🟢"
+            rows.append({
+                "label": label,
+                "status": status,
+                "icon": icon,
+                "age": _sidebar_age_label(mtime),
+                "file": path.name,
+            })
+        except Exception:  # noqa: BLE001
+            rows.append({
+                "label": label,
+                "status": "unavailable",
+                "icon": "🟡",
+                "age": "unavailable",
+                "file": "",
+            })
+    return rows
+
+
+def _render_ordering_engine_input_freshness() -> None:
+    rows = _ordering_engine_input_freshness()
+    bits = [
+        f"{r['icon']} {r['label']}: {r['age']}"
+        for r in rows
+    ]
+    message = "Engine inputs · " + " · ".join(bits)
+    bad = [
+        r for r in rows
+        if r.get("status") in {"missing", "stale", "unavailable"}
+    ]
+    if bad:
+        st.warning(
+            message
+            + " — Ordering, slow-stock, and AI demand answers depend on "
+              "fresh sale-lines plus 30-day Finished Goods assemblies.",
+            icon="⚠️",
+        )
+    else:
+        st.caption(message)
+
+
 # The sidebar's demand-capture form needs `products` loaded so it can
 # build the SKU/name autocomplete. Streamlit runs the script top-to-
 # bottom — if we delay loading products until below the sidebar
@@ -10735,6 +10804,8 @@ elif page == "Ordering":
                     "ABC refresh is already running, or could not be "
                     "started. The dashboard will keep using the last "
                     "good engine output.")
+
+    _render_ordering_engine_input_freshness()
 
     # ------------------------------------------------------------------
     # Glossary — click-to-reveal definitions for every buyer-facing term.
@@ -21023,6 +21094,12 @@ elif page == "AI Assistant":
                 "the stock like for X?', 'how are we looking on X?', "
                 "'do we have enough X?', or 'stock position for X'. "
                 "Do not answer those questions with OnHand alone.\n"
+                "- get_velocity — SKU-level sales/usage. For 'how many "
+                "sold this month?', 'month to date', or 'current month' "
+                "questions, answer from `current_month_demand.total_qty`, "
+                "not `units_sold`. If `current_month_demand.fg_assembly_qty` "
+                "is non-zero, explicitly say the total is direct invoice "
+                "sales plus Finished Goods assembly consumption.\n"
                 "- search_products_by_text — substring search across "
                 "title/description/tags/product_type/collections. Use "
                 "when an alias rule of type='text_search' fires (see "

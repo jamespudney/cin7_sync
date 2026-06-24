@@ -152,10 +152,16 @@ Data Health and housekeeping must check the explicit
 `assemblies_last_30d_*.csv` feed. A fresh `assemblies_last_3d_*.csv`
 file is not enough to validate ABC, Ordering, slow-stock, or current
 month demand calculations.
+The Ordering page surfaces the freshness of sale-lines 30d, Finished
+Goods assemblies 30d, and the ABC cache together. If any of those are
+stale, buyer recommendations should be treated as provisional until
+the sync and warm-engine pass complete.
 
 For "how many sold this month?" questions on components, answer using
 direct invoice movement plus FG assembly consumption. Do not report
 direct sale-lines alone as the total if assembly rows are available.
+AI tools expose this as `current_month_demand.total_qty`, with
+`direct_invoice_qty` and `fg_assembly_qty` split out for the explanation.
 
 For exact-SKU month-to-date disputes, CIN7's live product Movements
 ledger (`/product?Sku=...&IncludeMovements=true`) is the reconciliation

@@ -180,7 +180,9 @@ TOOL_SCHEMAS: list[dict] = [
             "are present, it also checks the live CIN7 product movement "
             "ledger (IncludeMovements=true), which mirrors the product "
             "Movements screen and is the preferred answer for current-"
-            "month 'sold/used' questions. Returns totals AND "
+            "month 'sold/used' questions. Returns current_month_demand "
+            "as the answer-ready total, split into direct invoice demand "
+            "and Finished Goods assembly consumption. Returns totals AND "
             "optionally a daily/weekly/monthly breakdown that the UI "
             "will render as an inline chart. Use when user asks 'how "
             "fast does X sell', 'sales history for X', 'show me the "
@@ -2504,17 +2506,76 @@ def get_velocity(engine_df: pd.DataFrame,
     result["current_month_movement"] = current_month_movement
     live_movements = _get_live_product_movements(sku)
     result["current_month_live_product_movements"] = live_movements
+    synced_direct_month = float(
+        current_month_movement.get("direct_invoice_qty") or 0)
+    synced_assembly_month = float(
+        current_month_movement.get("assembly_qty") or 0)
+    synced_total_month = float(current_month_movement.get("total_qty") or 0)
+
+    def _live_outbound_qty(*labels: str) -> float:
+        by_type = live_movements.get("by_type") or {}
+        wanted = {str(label).strip().upper() for label in labels}
+        total = 0.0
+        for typ, vals in by_type.items():
+            if str(typ or "").strip().upper() not in wanted:
+                continue
+            if isinstance(vals, dict):
+                total += float(vals.get("outbound_qty") or 0)
+        return total
+
+    if live_movements.get("ok"):
+        live_direct_month = _live_outbound_qty("Sale")
+        live_assembly_month = _live_outbound_qty(
+            "Finished Goods", "Assembly")
+        result["current_month_demand"] = {
+            "source": "cin7_live_product_movements",
+            "source_label": "Live CIN7 product Movements",
+            "period": live_movements.get("period"),
+            "total_qty": float(live_movements.get("demand_qty") or 0),
+            "direct_invoice_qty": live_direct_month,
+            "fg_assembly_qty": live_assembly_month,
+            "synced_direct_invoice_qty": synced_direct_month,
+            "synced_fg_assembly_qty": synced_assembly_month,
+            "synced_total_qty": synced_total_month,
+            "is_live": True,
+            "answer_rule": (
+                "Use total_qty as the headline for current-month demand. "
+                "If fg_assembly_qty is non-zero, say this is direct sales "
+                "plus Finished Goods assembly consumption."
+            ),
+        }
+    else:
+        result["current_month_demand"] = {
+            "source": "synced_sale_lines_plus_fg_assemblies",
+            "source_label": "Synced sale-lines + FG assemblies",
+            "period": current_month_movement.get("period"),
+            "total_qty": synced_total_month,
+            "direct_invoice_qty": synced_direct_month,
+            "fg_assembly_qty": synced_assembly_month,
+            "is_live": False,
+            "live_unavailable_reason": live_movements.get("reason"),
+            "answer_rule": (
+                "Use total_qty as the headline for current-month demand. "
+                "If fg_assembly_qty is non-zero, say this is direct sales "
+                "plus Finished Goods assembly consumption."
+            ),
+        }
+    result["units_sold_note"] = (
+        "units_sold is direct invoice-line quantity for the requested "
+        f"{days}-day window only. For current-month component/kit demand, "
+        "answer from current_month_demand.total_qty instead."
+    )
     result["assistant_guidance"] = (
         "For 'sold this month' / MTD questions, first use "
-        "current_month_live_product_movements.demand_qty when "
-        "current_month_live_product_movements.ok is true. That value "
-        "comes from CIN7's live product Movements ledger and counts "
-        "outbound Sale + Finished Goods / Assembly movements. If live "
-        "product movements "
-        "are unavailable, use current_month_movement.total_qty; it "
-        "includes direct invoiced sale-lines plus synced CIN7 Finished "
-        "Goods assembly consumption. units_sold is only the direct "
-        f"invoice-line total for the last {days} days."
+        "current_month_demand.total_qty. That field is intentionally "
+        "split into direct_invoice_qty and fg_assembly_qty, so say "
+        "'direct sales + Finished Goods assembly consumption' whenever "
+        "fg_assembly_qty is non-zero. When current_month_demand.is_live "
+        "is true, it comes from CIN7's live product Movements ledger. "
+        "When false, it comes from synced sale-lines plus synced CIN7 "
+        "Finished Goods assemblies. Do not answer current-month demand "
+        f"from units_sold; units_sold is only direct invoice lines for "
+        f"the last {days} days."
     )
 
     # v2.67.308 — surface the engine's canonical demand signals so the

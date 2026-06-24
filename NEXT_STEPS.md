@@ -196,6 +196,15 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   non-zero if sales 30d, sale-lines 30d, or assemblies 30d is still
   missing/stale, and `sync_loop.sh` skips ABC cache warming until those
   three core inputs are fresh.
+- **Ordering engine-input visibility** — the Ordering page now shows
+  a compact freshness strip for sale-lines 30d, Finished Goods
+  assemblies 30d, and the ABC cache. Buyers can see immediately when
+  reorder / slow-stock / AI demand answers are based on stale inputs.
+- **Assembly-heavy SKU audit** — `audit_live_cin7_demand.py` supports
+  `--batch-engine --assembly-heavy` to audit the engine rows most
+  exposed to Finished Goods assembly demand against live CIN7 Product
+  Movements. Use this after assembly-sync fixes to prove other
+  component SKUs now tie out.
 - **Assembly MTD completion-date fix** — 30-day Finished Goods sync now
   keeps a wider candidate buffer from `finishedGoodsList`, fetches task
   detail, and filters by detail `CompletionDate`. This covers CIN7
