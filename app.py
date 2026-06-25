@@ -6120,6 +6120,15 @@ def _abc_engine(products: pd.DataFrame,
             master_sku, qty_per = target
             if not master_sku or not qty_per:
                 continue
+            if has_bom and master_sku in assembly_components:
+                # A completed FG task is the ground-truth component
+                # movement. Adding the parent sale-line × BOM ratio
+                # as well would count the same kit twice for the
+                # component's reorder demand.
+                master_rollup_notes.setdefault(master_sku, []).append(
+                    f"{sku}: skipped BOM sale estimate; FG assembly "
+                    "movement already counted")
+                continue
             consumption = own_units * qty_per
             consumption_90d = own_units_90d * qty_per
             master_rollup_inflow[master_sku] = (

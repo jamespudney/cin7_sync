@@ -153,6 +153,17 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ## Shipped (since 2026-04-30)
 
+### 2026-06-25
+
+- **Assembly/BOM double-count guard** — 12-month effective reorder
+  demand now matches the existing monthly/45d/90d rule: if a component
+  has CIN7 FG assembly consumption, that FG movement is the ground
+  truth and the engine does not also add parent kit sale-lines × BOM
+  ratio into `tube_rollup_in`. This fixes cases like
+  `LED-BCF-RGB-IP20-5`, where direct sales + FG consumption were being
+  counted correctly but an extra BOM estimate could inflate suggested
+  reorder.
+
 ### 2026-06-24
 
 - **Ordering lineage-demand display** — Ordering now separates

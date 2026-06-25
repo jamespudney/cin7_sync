@@ -485,6 +485,35 @@ class AppMemoryStructureTests(unittest.TestCase):
             script,
         )
 
+    def test_assembly_components_do_not_add_bom_estimate_to_12mo_rollup(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        effective_rollup_pos = script.index(
+            "# Now compute rollup across ALL non-master products."
+        )
+        monthly_rollup_pos = script.index(
+            "# --- Roll up children's monthly buckets onto master SKUs",
+            effective_rollup_pos,
+        )
+        effective_rollup_block = script[
+            effective_rollup_pos:monthly_rollup_pos
+        ]
+
+        self.assertIn(
+            "if has_bom and master_sku in assembly_components:",
+            effective_rollup_block,
+        )
+        self.assertIn(
+            "skipped BOM sale estimate; FG assembly",
+            effective_rollup_block,
+        )
+        self.assertIn(
+            "master_rollup_inflow[master_sku]",
+            effective_rollup_block,
+        )
+
 
 class ReorderMathTests(unittest.TestCase):
     def test_bulk_roll_residue_is_ignored_for_planning(self) -> None:

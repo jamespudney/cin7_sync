@@ -150,6 +150,7 @@ demand math:
   the SKU's velocity reflects ALL the ways it left the shelf — not
   just direct invoices.
 - Suppresses the BOM-rollup-from-kit-sales path for those components
+  in every reorder window, including 12mo `effective_units_12mo`
   (assembly consumption IS the kit-sale-times-ratio, just observed
   rather than derived — counting both would double).
 - Surfaced in the Inspect-a-SKU panel under "🏗️ Assembly consumption"
