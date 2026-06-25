@@ -237,17 +237,28 @@ line, e.g. `Lead time: 35 days (sea (category rule: Profiles -
 Channels at ~3m → sea))`.
 
 #### Ordering PO editor row focus
-The Ordering page's PO editor preserves the saved per-user column
-layout and width settings. A browser-side enhancer supports sideways
-movement across wide column sets with horizontal wheel/trackpad input
-or modified left/right arrow keys. Buyers can also click-hold inside
-the grid and drag left/right to pan horizontally. The clicked-row cue
-stays visible while moving sideways and clears when the buyer leaves
-the grid, clicks elsewhere, or moves vertically. The cue is positioned
-against the full editor frame so frozen/scrolling canvas layers do not
-make it jump to the first visible row. This is a UI aid only:
-it does not change the underlying reorder calculations, saved layout
-keys, draft qtys, or CIN7 write logic.
+The Ordering page's main PO editor and optional pull-forward editor
+preserve the saved per-user column layout and width settings. A
+browser-side enhancer supports sideways movement across wide column
+sets with horizontal wheel/trackpad input or modified left/right arrow
+keys. Buyers can also click-hold inside the grid and drag left/right to
+pan horizontally. The clicked-row cue stays visible while moving
+sideways and clears when the buyer leaves the grid, clicks elsewhere,
+or moves vertically. The cue is positioned against the full editor
+frame so frozen/scrolling canvas layers do not make it jump to the
+first visible row. This is a UI aid only: it does not change the
+underlying reorder calculations, saved layout keys, draft qtys, or
+CIN7 write logic.
+
+#### Optional pull-forward
+The section below the main PO editor is not a second reorder list. It
+only shows SKUs where `Suggested reorder = 0` today, but the engine
+expects the item to fall below target inside the selected pull-forward
+window. Use it only to consolidate freight or hit MOV. The default
+window follows supplier cadence where configured, falling back to a
+short 21-day horizon instead of always starting at 45 days. Moving the
+slider reruns the table and recomputes the optional qty
+(`avg_daily × selected window`).
 
 #### Status badges (Ordering page)
 Computed in `_status()` using **Available** (not OnHand) so a SKU that's

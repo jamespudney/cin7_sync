@@ -6,7 +6,7 @@
 
 **Versioning.** When you add or change a rule, bump the top-of-file date and mark which page / function it affects. When a rule becomes obsolete, strike it through — don't delete — so the reasoning stays visible.
 
-Last updated: 2026-04-24
+Last updated: 2026-06-25
 
 ---
 
@@ -155,6 +155,16 @@ dropship_skus = CIN7_always_ds
 **Baseline coverage (as of Apr 2026):** 130 SKUs with CIN7 `Always Drop Ship` + 132 with `Dropship` tag — primarily Gyford Décor (108 of 113 items) but also scattered across other suppliers. No supplier-level or per-SKU overrides needed to start — CIN7's data does the work.
 
 **5.4 Minimum Order Value (MOV)** — configured per supplier in `supplier_config`. The PO editor flags when the current draft is below MOV so the buyer can consolidate lines.
+
+**5.5 Optional pull-forward is not a reorder-now signal.** The
+secondary supplier table below the main PO editor only shows SKUs where
+`Suggested reorder = 0` today, but the item may fall below target
+inside the selected pull-forward window. Use it only to hit MOV or
+deliberately consolidate freight. The default window follows supplier
+cadence where configured, otherwise 21 days. Moving the slider reruns
+the table and recomputes the optional qty as
+`avg_daily × selected window`; it must not change the main reorder
+calculation unless the buyer ticks a row and adds it to the draft PO.
 
 ---
 

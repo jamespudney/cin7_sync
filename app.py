@@ -14244,7 +14244,7 @@ elif page == "Ordering":
             f":warning: **{sel_sup} MOV not met** — current PO is "
             f"{_fmt_money(_live_total_check)} vs minimum "
             f"{_fmt_money(mov_amt)}. **Need {_fmt_money(gap)} more.** "
-            f"Use the Upcoming reorders expander below to consolidate "
+            f"Use the optional pull-forward section below to consolidate "
             f"future-needed SKUs into this PO, or pad qtys on lines "
             f"approaching their next price tier (see Tier Opportunities)."
         )
@@ -16194,18 +16194,35 @@ elif page == "Ordering":
                     delta_color=("normal" if po_value >= mov_amt
                                   else "inverse"))
 
+    def _pull_forward_window_default_days() -> int:
+        """Default optional pull-forward horizon for this supplier."""
+        _cfg = supp_configs.get(sel_sup, {})
+        raw_days = (
+            _cfg.get("order_cadence_days")
+            or _cfg.get("review_days_A")
+            or 21
+        )
+        try:
+            days = int(raw_days)
+        except (TypeError, ValueError):
+            days = 21
+        days = max(7, min(180, days))
+        return max(7, min(180, int(round(days / 7.0)) * 7))
+
+    _pull_forward_default_window = _pull_forward_window_default_days()
+    _pull_forward_window_key = f"pull_forward_window_{sel_sup}"
+
     # --- MOV auto-fill — inline with demand --------------------------
     # If the current draft is under MOV, compute the N most-urgent
-    # upcoming items and show a one-click "Auto-fill to MOV" button.
-    # Uses the same upcoming-reorder logic as the section below, but
+    # optional pull-forward items and show a one-click "Auto-fill to MOV"
+    # button. Uses the same pull-forward logic as the section below, but
     # prioritised by urgency (days_to_reorder ascending) and capped
     # at the amount needed to cross MOV.
     if mov_amt and po_value < mov_amt and not all_supplier_df.empty:
         shortfall = mov_amt - po_value
-        # Pick the user's chosen lookahead window from session state
-        # (falls back to 45 if they haven't moved the slider)
+        # Pick the user's chosen pull-forward window from session state.
         _af_window = int(st.session_state.get(
-            f"upcoming_window_{sel_sup}", 45))
+            _pull_forward_window_key, _pull_forward_default_window))
 
         cand = all_supplier_df.copy()
         # v2.67.319 — Available already nets the backorder; don't
@@ -16231,7 +16248,8 @@ elif page == "Ordering":
             & (~cand["SKU"].astype(str).isin(_extras_skus))
         ].sort_values("days_to_reorder")
 
-        # Suggest qty = avg_daily × window, use same logic as upcoming table
+        # Optional qty = avg_daily × window, same logic as the
+        # pull-forward table below.
         cand["suggest_qty"] = (
             cand["avg_daily"] * _af_window
         ).round().clip(lower=1).astype(int)
@@ -16254,7 +16272,7 @@ elif page == "Ordering":
             st.warning(
                 f":warning: **MOV shortfall** "
                 f"{mov_ccy}${shortfall:,.0f}. "
-                f"The **{len(picks)} most-urgent upcoming item(s)** "
+                f"The **{len(picks)} closest optional pull-forward item(s)** "
                 f"(soonest to hit target, within {_af_window}d window) "
                 f"would bring this PO to "
                 f"**{mov_ccy}${running:,.0f}** — "
@@ -16279,7 +16297,7 @@ elif page == "Ordering":
                         "days_to_reorder": st.column_config.NumberColumn(
                             "Days to target", format="%.0fd"),
                         "suggest_qty": st.column_config.NumberColumn(
-                            "Suggest qty", format="%.0f"),
+                            "Optional qty", format="%.0f"),
                         "POCost": st.column_config.NumberColumn(
                             "Unit $", format="$%.2f"),
                         "line_value": st.column_config.NumberColumn(
@@ -16312,23 +16330,24 @@ elif page == "Ordering":
                     })
                     added += 1
                 st.success(
-                    f"Added **{added}** upcoming item(s) to the draft. "
+                    f"Added **{added}** optional pull-forward item(s) "
+                    "to the draft. "
                     "Scroll up to fine-tune any quantity before "
                     "exporting the PO."
                 )
                 st.rerun()
             af_c2.caption(
-                ":bulb: Each line defaults to its *upcoming* suggested "
-                f"qty ( avg_daily × {_af_window}d ). Adjust the slider "
-                "below the PO editor to change window; that also "
-                "changes this auto-fill suggestion."
+                ":bulb: Each line defaults to its *optional pull-forward* "
+                f"qty (avg_daily × {_af_window}d). These are not due "
+                "today; adjust the slider below the PO editor to change "
+                "the pull-forward window."
             )
         elif cand.empty:
             st.info(
                 f":information_source: MOV shortfall "
-                f"${shortfall:,.0f}, but no upcoming items from this "
-                "supplier qualify for auto-fill. "
-                "Check the Upcoming section below, or add a manual line."
+                f"${shortfall:,.0f}, but no optional pull-forward items "
+                "from this supplier qualify for auto-fill. Check the "
+                "pull-forward section below, or add a manual line."
             )
 
     # Draft PO action
@@ -16878,45 +16897,45 @@ elif page == "Ordering":
                     "have items in the current draft — when they do, "
                     "tier comparisons will surface here.")
 
-    # --- Upcoming reorders — lookahead consolidation ------------------
+    # --- Optional pull-forward — lookahead consolidation ---------------
     # Show SKUs from the current supplier that AREN'T in the main
-    # reorder list today but will be within the next N days. Lets the
-    # buyer consolidate future orders into this PO rather than placing
-    # a second one soon.
-    # v2.67.363 — collapse the upcoming reorders header into a visual
-    # separator so it's clearly a secondary section. The content stays
-    # fully visible but the section is visually de-emphasised vs Draft PO.
+    # reorder list today but may be needed within the next N days. This
+    # is not a second reorder recommendation list; it is for deliberate
+    # pull-forward when consolidating freight or hitting MOV.
     st.markdown("---")
     _up_hdr1, _up_hdr2 = st.columns([4, 1])
-    _up_hdr1.markdown("### 📅 Upcoming reorders — consolidate into this PO")
-    _up_hdr2.caption("ℹ️ Only needed when consolidating shipments or hitting MOV.")
+    _up_hdr1.markdown("### 📅 Optional pull-forward — not due today")
+    _up_hdr2.caption("ℹ️ Use only for MOV or freight consolidation.")
     st.caption(
-        "Items from this supplier that the engine doesn't need yet but "
-        "will need within the window below. Tick to add to the main PO "
-        "above. Useful for hitting MOV or batching shipping to one run."
+        "These rows have **Suggested reorder = 0 today**. They are shown "
+        "only because the item may fall below target inside the selected "
+        "window. Tick them only if you deliberately want to pull future "
+        "demand into this PO."
     )
     uw_col1, uw_col2 = st.columns([1, 3])
     upcoming_window = uw_col1.slider(
-        "Window (days)",
-        min_value=7, max_value=180, value=45, step=7,
-        key=f"upcoming_window_{sel_sup}",
-        help="How far ahead to look. 45 days matches the default review "
-             "cycle for C-class items — tweak to your supplier's cadence.",
+        "Pull-forward window (days)",
+        min_value=7, max_value=180,
+        value=_pull_forward_default_window, step=7,
+        key=_pull_forward_window_key,
+        help="How far ahead to look for optional pull-forward lines. "
+             "Default follows supplier cadence where configured; increase "
+             "only when deliberately consolidating freight or MOV.",
     )
     uw_col2.caption(
-        "**How this works:** an item shows up here if its current stock "
-        "(Available + OnOrder − backorders) is still above the reorder "
-        "target today, but at its 12-month sales rate it will drop "
-        "below target within the window. The Suggest column is how many "
-        "to order now to cover that window."
+        "**How this works:** an item shows up here only when current "
+        "effective position is still above target today, so it is not in "
+        "the main reorder table. The optional qty is how much you would "
+        "pull forward if you choose to consolidate now. Moving the slider "
+        "reruns the table and recomputes the optional qty."
     )
 
-    # Build the upcoming-reorder table from all_supplier_df (which has
+    # Build the optional pull-forward table from all_supplier_df (which has
     # engine-computed target_stock, reorder_qty, effective_pos ingredients)
     # but filter to items NOT already in the main reorder list.
     upc = all_supplier_df.copy()
     if upc.empty:
-        st.info("No upcoming items for this supplier.")
+        st.info("No optional pull-forward candidates for this supplier.")
     else:
         # Effective position = what we'll have for future demand.
         # v2.67.319 — Available already nets the backorder (negative when
@@ -16949,11 +16968,11 @@ elif page == "Ordering":
 
         if upc.empty:
             st.success(
-                f":white_check_mark: Nothing else expected in the next "
-                f"{upcoming_window} days from this supplier."
+                f":white_check_mark: No optional pull-forward candidates "
+                f"in the next {upcoming_window} days from this supplier."
             )
         else:
-            # Suggested qty = enough to cover the window at avg_daily.
+            # Optional qty = enough to cover the window at avg_daily.
             # Honest, simple. The buyer can edit Order qty in the main
             # editor after adding if they want to stock deeper.
             upc["Suggest"] = (
@@ -16979,6 +16998,13 @@ elif page == "Ordering":
 
             # Use a unique key so editing here doesn't clash with the
             # main PO editor's state.
+            _pull_forward_anchor = (
+                f"w4s-pull-forward-editor-{_supplier_anchor_slug}"
+            )
+            st.markdown(
+                f'<div id="{_pull_forward_anchor}"></div>',
+                unsafe_allow_html=True,
+            )
             upc_edited = st.data_editor(
                 upc_view,
                 width="stretch", hide_index=True, height=350,
@@ -16988,7 +17014,7 @@ elif page == "Ordering":
                         "✓ Add to PO",
                         help="Tick + click 'Add ticked items' below. "
                              "The SKU drops into the main PO editor "
-                             "above with the Suggest qty as the starting "
+                             "above with the optional qty as the starting "
                              "Order qty — you can fine-tune it there.",
                         width="small",
                     ),
@@ -17014,14 +17040,15 @@ elif page == "Ordering":
                         disabled=True, format="%.0f"),
                     "eff_pos": st.column_config.NumberColumn(
                         "Eff. pos", disabled=True, format="%.0f",
-                        help="Available + OnOrder − backorders"),
+                        help="Available + OnOrder. Available already "
+                             "nets allocated/backorders."),
                     "target_stock": st.column_config.NumberColumn(
                         "Target", disabled=True, format="%.0f"),
                     "days_to_reorder": st.column_config.NumberColumn(
                         "Days to target",
                         disabled=True, format="%.0fd",
                         help="Days until effective position drops below "
-                             "target at current 12mo sales rate."),
+                             "target at the engine's current velocity."),
                     "avg_daily": st.column_config.NumberColumn(
                         "Daily", disabled=True, format="%.2f"),
                     "avg_month": st.column_config.NumberColumn(
@@ -17029,16 +17056,18 @@ elif page == "Ordering":
                         help="avg_daily × 30.4. Buyer-friendly "
                              "view for cadence reasoning."),
                     "Suggest": st.column_config.NumberColumn(
-                        "Suggest qty", disabled=True, format="%.0f",
+                        "Optional qty", disabled=True, format="%.0f",
                         help="avg_daily × window — enough to fill the "
-                             "upcoming window. Adjust in the main "
-                             "editor after adding."),
+                             "pull-forward window if you choose to "
+                             "consolidate now. Adjust in the main editor "
+                             "after adding."),
                     "POCost": st.column_config.NumberColumn(
                         "PO cost", disabled=True, format="$%.2f"),
                     "Line $": st.column_config.NumberColumn(
                         disabled=True, format="$%.0f"),
                 },
             )
+            _render_ordering_editor_enhancer(_pull_forward_anchor)
 
             tick_mask = upc_edited["Add?"].fillna(False).astype(bool)
             n_ticked = int(tick_mask.sum())
@@ -17074,14 +17103,15 @@ elif page == "Ordering":
                     })
                     added_count += 1
                 st.success(
-                    f"Added **{added_count}** item(s) from upcoming "
-                    f"to the main PO. Scroll up to review / tweak."
+                    f"Added **{added_count}** optional pull-forward "
+                    f"item(s) to the main PO. Scroll up to review / tweak."
                 )
                 st.rerun()
             ub2.caption(
                 ":bulb: Tip: watch the *Days to target* column — items "
-                "sorted by that number are the most urgent additions. "
-                "A quick way to hit MOV is to tick the top few."
+                "sorted by that number are the closest optional "
+                "pull-forwards. A quick way to hit MOV is to tick the "
+                "top few, but they are not due today."
             )
 
     # --- Sales-history migration manager (retiring -> successor) -------

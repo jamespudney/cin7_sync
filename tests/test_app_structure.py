@@ -181,6 +181,21 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("w4s-ordering-editor-", script)
         self.assertIn("_render_ordering_editor_enhancer(_ordering_grid_anchor)",
                       script)
+        self.assertIn("w4s-pull-forward-editor-", script)
+        self.assertIn("_render_ordering_editor_enhancer(_pull_forward_anchor)",
+                      script)
+
+    def test_pull_forward_window_is_not_hardcoded_to_45_days(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _pull_forward_window_default_days", script)
+        self.assertIn("_pull_forward_window_key", script)
+        self.assertIn("Pull-forward window (days)", script)
+        self.assertIn("Suggested reorder = 0 today", script)
+        self.assertIn("recomputes the optional qty", script)
+        self.assertNotIn('f"upcoming_window_{sel_sup}", 45', script)
 
     def test_ordering_recent_demand_anchors_to_snapshot_date(self) -> None:
         script = (

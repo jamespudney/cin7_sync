@@ -155,6 +155,15 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ### 2026-06-25
 
+- **Ordering optional pull-forward UX** — the secondary supplier table
+  below the main PO editor is now labelled as optional pull-forward,
+  not a second reorder list. It only shows rows with
+  `Suggested reorder = 0` today, for deliberate MOV or freight
+  consolidation. The default
+  window follows supplier cadence where configured, otherwise 21 days,
+  and moving the slider reruns the table and recomputes the optional
+  qty. The same row-focus / click-drag horizontal scrolling aid used in
+  the main PO editor now applies here too.
 - **Ordering Trend/Status freshness** — the existing Trend column is
   now recomputed after migration, BOM, strip-family, and customer
   rollups, so rolled customer counts cannot sit beside stale direct-only
