@@ -184,6 +184,17 @@ Topmet UPS caps at 2200mm). Override per row in the grid; the reorder
 qty recalculates with the new lead time on next refresh.
 
 #### Status badges
+Status is the buyer action label and uses **Available** (OnHand -
+Allocated), not just OnHand:
+
+- 🔴 **Reorder now** — Available < 0 (oversold), Available = 0 while
+  target/reorder is positive, or Available < lead-time demand.
+- 🟠 **Reorder soon** — below target but not urgent.
+- 🔵 **Overstocked** — Available > target × 1.5.
+- 🟢 **On target** — no buying action needed.
+- 💀 **Dead stock** — no visible/effective 12mo demand and stock held.
+- ⚪ **No demand, no stock** — no visible/effective 12mo demand and no
+  stock.
 - 📦 **Dropship** — order-on-demand, we don't stock it.
 - Active, Deprecated, Discontinued — from CIN7's product status.
 
@@ -197,10 +208,10 @@ available in the current snapshot, capped at today. This keeps 45d
 units, customers_45d, momentum, and 90d dormancy meaningful while the
 background ABC warmer is rebuilding.
 
-- **📈 Trend** — ALL of these must be true: momentum >1.5, **3+ distinct
-  customers**, top customer **under 40%**, and non-top customers averaging
-  **at least 2 units each**. Real broad-based demand; engine switches to
-  last-45d velocity to keep up.
+- **📈 Trend** — 45d momentum >1.5 plus broad customer spread, OR a
+  sustained lift in the 12-month sparkline where the latest 3 calendar
+  buckets materially exceed the previous 3 with enough customers. Real
+  broad-based demand; engine switches to recent velocity to keep up.
 - **🎯 Project** — only when the spike is concentrated to **1-2 distinct
   customers**. Looks like a genuine one-off; engine subtracts top
   customer's 12mo contribution before forecasting to avoid over-ordering.
@@ -219,7 +230,14 @@ that's noise. The ≥2 units average rule makes sure there's substance
 beyond the big buyer.
 
 Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
-skip classification entirely — the signal is too noisy at that scale.
+skip classification unless there are 10+ distinct recent customers.
+For bulk rolls and cut families, customer spread can be a stronger
+signal than fractional roll-equivalent units.
+
+The Trend column is recomputed after migration, BOM, strip-family, and
+customer rollups. The final rolled values are the authority, so the
+grid should never show rolled customer counts beside a stale direct-only
+Trend label.
 
 The trend breakdown (who's buying, what %) shows in the transparency
 panel at the bottom when you drill into any flagged SKU.
@@ -5480,12 +5498,15 @@ def _abc_engine(products: pd.DataFrame,
         axis=1,
     )
 
-    # Classify — tightened rules per buyer feedback:
+    # Classify — tightened rules per buyer feedback. This first pass is
+    # intentionally recomputed later after migration/BOM/strip customer
+    # rollups. The final rolled metrics are the source of truth for the
+    # buyer-facing Trend column.
     #   📈 Trend  requires ALL of:
     #     - momentum > 1.5
-    #     - 4+ distinct customers in 45d
-    #     - top customer < 40%  (was 60%)
-    #     - non-top customers avg ≥ 2 units each (real spread, not noise)
+    #     - broad recent customer spread. Either 10+ buyers, or
+    #       3+ buyers with top customer < 40% and non-top customers
+    #       avg ≥ 2 units each (real spread, not noise)
     #   🎯 Project triggers ONLY when demand is concentrated to 1-2
     #     distinct buyers in the 45d window (a true one-off project).
     #     With 3+ distinct buyers it's diversified demand → Trend
@@ -5505,20 +5526,29 @@ def _abc_engine(products: pd.DataFrame,
         u45v = float(r["units_45d"])
         uprv = float(r["units_prior_45d"])
         mom = r["momentum"]
-        # Low-volume guard — not enough signal to classify at 45d
-        if u45v < 3:
+        n_cust = int(r["customers_45d"])
+        # Low-volume guard — not enough signal to classify at 45d.
+        # For bulk/strip families, though, units can be fractional roll
+        # equivalents; 10+ recent buyers is a real signal even if the
+        # roll-equivalent units are below 3.
+        if u45v < 3 and n_cust < 10:
             return "Stable"
         # Decline
         if uprv > 0 and mom < 0.5:
             return "📉 Decline"
         # Spike — decompose
         if mom > 1.5:
-            n_cust = int(r["customers_45d"])
             top_share = float(r["top_cust_pct"])
             non_top_avg = float(r.get("non_top_avg_units", 0))
             # Concentrated to 1-2 buyers → genuine one-off project.
             if n_cust <= 2:
                 return "🎯 Project"
+            # Very broad recent customer spread is a real market signal.
+            # For strip families and bulk-roll equivalents, units per
+            # non-top customer can be fractional, so the generic
+            # non_top_avg >= 2 rule is too harsh.
+            if n_cust >= 10:
+                return "📈 Trend"
             # 3+ distinct buyers = diversified demand, never Project.
             # Broad spread + meaningful non-top volume = real Trend;
             # otherwise the sizes are uneven → Mixed (uses normal
@@ -6682,6 +6712,7 @@ def _abc_engine(products: pd.DataFrame,
     _new_non_top_avg: dict = {}
     _new_top_name: dict = {}
     _new_top_12mo: dict = {}
+    _new_cust_count_12mo: dict = {}
     _new_top_pct_12mo: dict = {}
     _new_top_name_12mo: dict = {}
     for _s in df["SKU"].astype(str):
@@ -6708,6 +6739,7 @@ def _abc_engine(products: pd.DataFrame,
                     if _non_top_n > 0 else 0.0)
                 _new_top_name[_s] = _names.get(_top_cid, "")
         if _12:
+            _new_cust_count_12mo[_s] = len(_12)
             _sorted12 = sorted(_12.items(), key=lambda x: -x[1])
             _total12 = sum(_12.values())
             if _sorted12 and _total12 > 0:
@@ -6730,10 +6762,19 @@ def _abc_engine(products: pd.DataFrame,
         df["SKU"].astype(str).map(_new_top_name).fillna(""))
     df["top_cust_units_12mo"] = (
         df["SKU"].astype(str).map(_new_top_12mo).fillna(0))
+    df["customers_12mo"] = (
+        df["SKU"].astype(str).map(_new_cust_count_12mo)
+        .fillna(0).astype(int))
     df["top_cust_pct_12mo"] = (
         df["SKU"].astype(str).map(_new_top_pct_12mo).fillna(0))
     df["top_cust_name_12mo"] = (
         df["SKU"].astype(str).map(_new_top_name_12mo).fillna(""))
+    # The first trend pass ran on direct sale-line customer metrics.
+    # After migration/BOM/strip rollups, customer spread may be much
+    # broader (e.g. 22 customers in 45d across the family). Recompute
+    # the base Trend/Project/Mixed/Decline label from the final rolled
+    # metrics so the displayed customer count and label agree.
+    df["trend_flag"] = df.apply(_trend_flag, axis=1)
 
     df["trend_12m"] = df["SKU"].apply(
         lambda s: list(monthly_12.get(s, [0.0] * 12)))
@@ -6762,6 +6803,44 @@ def _abc_engine(products: pd.DataFrame,
             return "  ".join(f"{v:.1f}" for v in last6)
         return "  ".join(f"{int(round(v))}" for v in last6)
     df["last_6mo_series"] = df["trend_12m"].apply(_fmt_6mo_series)
+
+    def _upgrade_trend_from_monthly(r):
+        cur = r.get("trend_flag", "Stable")
+        if pd.isna(cur):
+            cur = "Stable"
+        if cur != "Stable":
+            return cur
+        buckets = r.get("trend_12m")
+        if not isinstance(buckets, list) or len(buckets) < 6:
+            return cur
+        last6 = []
+        for v in buckets[-6:]:
+            try:
+                fv = float(v or 0)
+            except (TypeError, ValueError):
+                fv = 0.0
+            last6.append(fv)
+        prior3 = sum(last6[:3])
+        recent3 = sum(last6[3:])
+        if recent3 <= 0:
+            return cur
+        cust_45d = int(r.get("customers_45d") or 0)
+        top_share = float(r.get("top_cust_pct") or 0)
+        if cust_45d < 3:
+            return cur
+        ratio = recent3 / max(prior3, 1.0)
+        lift = recent3 - prior3
+        # Sustained monthly lift catches products whose 12-month
+        # sparkline is plainly rising even when the 45d/prior-45d
+        # window alone is too narrow or lumpy. Example shape:
+        # 16 19 11 -> 31 17 25.
+        if cust_45d >= 10 and ratio >= 1.20 and lift >= 3:
+            return "📈 Trend"
+        if top_share < 0.60 and ratio >= 1.35 and lift >= 6:
+            return "📈 Trend"
+        return cur
+
+    df["trend_flag"] = df.apply(_upgrade_trend_from_monthly, axis=1)
 
     # 8. Hybrid ABC uses EFFECTIVE units (post-migration, post-rollup) so
     # Sierra masters with migrated Smokies demand get proper A/B/C class.
@@ -6962,6 +7041,7 @@ def _abc_engine(products: pd.DataFrame,
             abc = str(r.get("ABC") or "C").strip().upper()
             u45 = float(r.get("units_45d") or 0)
             u90 = float(r.get("units_90d") or 0)
+            cust_45d = int(r.get("customers_45d") or 0)
             cust_12mo = int(r.get("customers_12mo") or 0)
             top_share_12mo = float(r.get("top_cust_pct_12mo") or 0)
             # If visible monthly demand exists but the effective reorder
@@ -6971,6 +7051,13 @@ def _abc_engine(products: pd.DataFrame,
             # baseline on THIS row; treat it as project/manual demand.
             if eff_12mo <= 0 and visible_12mo > 0:
                 return "🎯 Project"
+            # If the final rolled-up recent window already has broad
+            # customer diversity, do not promote it to Project via the
+            # low-volume / few-buyer fallback below. This matters for
+            # strip families where units can be fractional rolls while
+            # the customer count is clearly repeatable demand.
+            if cust_45d >= 3 and u45 > 0:
+                return cur
             if visible_12mo > 0 and u45 < 3 and 0 < cust_12mo <= 2:
                 return "🎯 Project"
             # v2.67.320 — CUSTOMER-DIVERSITY GUARD (highest priority
@@ -12069,17 +12156,21 @@ elif page == "Ordering":
     if "calc_trace" in engine_df.columns:
         engine_df = engine_df.drop(columns=["calc_trace"])
 
+    _product_status = engine_df.get(
+        "Status", pd.Series("", index=engine_df.index)
+    ).astype(str)
+
     # Dropship override: these SKUs are order-on-demand. Zero the target
-    # and reorder, override Status badge, leave everything else (sales
-    # history, OnHand etc.) intact so buyer can watch volume and decide
-    # when to promote to stocked via the Dropship expander below.
+    # and reorder, leave everything else (sales history, OnHand etc.)
+    # intact so buyer can watch volume and decide when to promote to
+    # stocked via the Dropship expander below. Final Status badge is
+    # applied after the computed status pass.
     if dropship_skus:
         _ds_mask = engine_df["SKU"].astype(str).isin(dropship_skus)
         engine_df.loc[_ds_mask, "target_stock"] = 0
         engine_df.loc[_ds_mask, "reorder_qty"] = 0
         engine_df.loc[_ds_mask, "excess_units"] = 0
         engine_df.loc[_ds_mask, "excess_value"] = 0
-        engine_df.loc[_ds_mask, "Status"] = "📦 Dropship"
 
     # Discontinued override: any SKU with "[Discontinued]" in its Name
     # (case-insensitive) OR Status="Discontinued" in CIN7 — force
@@ -12091,8 +12182,7 @@ elif page == "Ordering":
     _disc_name_mask = (engine_df["Name"].astype(str)
                        .str.contains(r"\[Discontinued\]", case=False,
                                       regex=True, na=False))
-    _disc_status_mask = (engine_df.get("Status", pd.Series(dtype=str))
-                          .astype(str).str.lower() == "discontinued")
+    _disc_status_mask = (_product_status.str.lower() == "discontinued")
     _disc_mask = _disc_name_mask | _disc_status_mask
     if _disc_mask.any():
         engine_df.loc[_disc_mask, "target_stock"] = 0
@@ -12183,12 +12273,14 @@ elif page == "Ordering":
         # (and so the filter) lagged. Now they agree.
         #
         # Tiers, in order:
-        #   ⚪ No demand, no stock        (eff=0, onhand=0)
-        #   💀 Dead stock                 (eff=0, onhand>0)
         #   🔴 Reorder now if any of:
-        #        – Available ≤ 0          (oversold or no free stock)
+        #        – Available < 0          (oversold)
         #        – Available < lead-time demand
         #        – reorder_qty > 0 AND Available < target
+        #   ⚪ No demand, no stock        (no visible/effective demand,
+        #                                  no stock)
+        #   💀 Dead stock                 (no visible/effective demand,
+        #                                  holding stock)
         #   🟠 Reorder soon                (Available < target)
         #   🔵 Overstocked                 (Available > target × 1.5)
         #   🟢 On target                   (everything else)
@@ -12208,11 +12300,21 @@ elif page == "Ordering":
         avg_daily = float(r.get("avg_daily") or 0)
         lead_time = float(r.get("lead_time_days") or 0)
         reorder_qty = float(r.get("reorder_qty") or 0)
+        lineage_12mo = float(r.get("lineage_units_12mo") or 0)
+        display_12mo = float(r.get("display_units_12mo") or 0)
+        raw_units_12mo = float(r.get("units_12mo") or 0)
+        visible_12mo = max(eff, lineage_12mo, display_12mo, raw_units_12mo)
         sku_str = str(r.get("SKU") or "")
         once_slow = sku_str in dormancy_warnings_map
-        if eff == 0 and onhand == 0:
+        if available < 0:
+            # Oversold always wins. A customer shortage should never be
+            # hidden behind Dead Stock / Project / Overstocked wording.
+            base = "🔴 Reorder now"
+        elif available == 0 and (target > 0 or reorder_qty > 0):
+            base = "🔴 Reorder now"
+        elif visible_12mo <= 0 and onhand == 0:
             base = "⚪ No demand, no stock"
-        elif eff == 0 and onhand > 0:
+        elif visible_12mo <= 0 and onhand > 0:
             base = "💀 Dead stock"
         elif target == 0 and reorder_qty <= 0 and available == 0:
             # Dormant/project SKUs can correctly have target=0 and
@@ -12220,12 +12322,6 @@ elif page == "Ordering":
             # is not "Reorder now" and not "Overstocked"; it is simply at
             # the engine's current target.
             base = "🟢 On target"
-        elif available <= 0:
-            # Oversold or no free stock at all — the engine wants you
-            # to reorder regardless of the steady-state target. Same
-            # spirit as the v2.67.318 OnHand≤0 rule, extended to
-            # negative-Available SKUs that pre-.333 fell through.
-            base = "🔴 Reorder now"
         elif available < avg_daily * lead_time:
             base = "🔴 Reorder now"
         elif reorder_qty > 0 and available < target:
@@ -12240,6 +12336,13 @@ elif page == "Ordering":
             base = "🟢 On target"
         return f"❗ {base}" if once_slow else base
     engine_df["Status"] = engine_df.apply(_status, axis=1)
+    # Final Status overrides happen after the computed status pass so
+    # the displayed buyer action cannot be overwritten by cached or
+    # earlier labels.
+    if dropship_skus:
+        engine_df.loc[_ds_mask, "Status"] = "📦 Dropship"
+    if _disc_mask.any():
+        engine_df.loc[_disc_mask, "Status"] = "🚫 Discontinued"
 
     # --- SKU detail panel (v2.67.326) ---------------------------------
     # James 2026-05-28: see a SKU's full detail without leaving the
@@ -15127,9 +15230,10 @@ elif page == "Ordering":
             "trend_flag": st.column_config.TextColumn(
                 "📈 Trend",
                 help="Signal comparing last 45d vs prior 45d, checking "
-                     "multi-customer vs single-customer concentration. "
+                     "multi-customer vs single-customer concentration, "
+                     "plus sustained lift in the 12mo sparkline. "
                      "📈 Trend = real broad growth (engine boosts "
-                     "velocity). 🎯 Project = one-off concentrated to "
+                     "recent velocity). 🎯 Project = one-off concentrated to "
                      "1 customer (engine discounts the spike). "
                      "🔀 Mixed = watch. 📉 Decline = down 50%+. "
                      "💤 Dormant = had history but no activity in 90d "

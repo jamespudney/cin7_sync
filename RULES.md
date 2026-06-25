@@ -86,14 +86,19 @@ For an exact-SKU month-to-date dispute, CIN7's product **Movements** ledger (`/p
   concentration. These must be computed from the whole 12mo window,
   not only from customers active in the last 45 days.
 
+The buyer-facing `trend_flag` / Trend column must always be recomputed
+after migration, BOM, strip-family, and customer rollups. The final
+rolled values are the authority. A row must never show `customers_45d`
+from rolled family demand while keeping an older direct-only Trend label.
+
 **Classification** (tightened April 2026 after real-world feedback — original thresholds were too permissive):
-- **📈 Trend** — ALL of: momentum >1.5, **customers_45d ≥ 3**, **top_cust_pct < 40%**, **non_top_avg_units ≥ 2**. Real broad-based acceleration. Engine overrides `avg_daily` to use last-45d rate.
+- **📈 Trend** — momentum >1.5 plus broad customer spread, or sustained monthly lift in the existing 12-month sparkline. The 45d version is either **customers_45d ≥ 10** (very broad recent market signal, including fractional bulk-roll demand) OR **customers_45d ≥ 3**, **top_cust_pct < 40%**, and **non_top_avg_units ≥ 2**. The monthly version upgrades Stable to Trend when the most recent 3 calendar buckets materially exceed the previous 3 buckets with at least 3 recent customers. Real broad-based acceleration. Engine overrides `avg_daily` to use last-45d rate.
 - **🎯 Project** — when the spike is concentrated to **1-2 distinct customers**, when last-12mo demand is concentrated into only **1-2 customers** with little recent activity, or when visible 12mo lineage demand exists but effective reorder demand is zero. Engine subtracts the top customer's 12mo contribution from effective demand before forecasting where applicable; visible-only project rows stay at zero auto-reorder unless the buyer manually overrides. Project rows do **not** auto-round up to supplier MOQ; the buyer can still override the order qty manually when a known project exists.
 - **🔀 Mixed** — spike (momentum >1.5) with 3+ customers involved, but the spread is not broad enough for Trend. Watch signal; no velocity override.
 - **📉 Decline** — momentum < 0.5. Manual review.
 - **Stable** — everything else.
 
-**Low-volume guard**: SKUs with <3 units in last 45d bypass classification — signal is noise at that scale.
+**Low-volume guard**: SKUs with <3 units in last 45d bypass classification unless there are **10+ distinct recent customers**. For bulk rolls and cut families, units may be fractional roll-equivalents while customer spread is the stronger signal.
 
 **Why the refinement**: original rules allowed top_cust_pct up to 60% and called it a Trend. Real example: 8 customers, 50% to one — the other 7 averaged 1.6 units each. Not a trend, closer to a project. The top-2 share + non-top-avg checks catch this pattern explicitly.
 
@@ -107,7 +112,7 @@ The `calc_trace` transparency panel always shows the full breakdown when the fla
 
 **4.2 Excess for non-masters.** Only flag as excess if **zero direct sales**. A variant with sales is fulfilling real demand even if it's above "target" — the target doesn't apply to it the same way.
 
-**4.3 Dead stock** = holding stock AND zero `effective_units_12mo`. Must use effective units (with rollup) not direct — a master tube that only sells via its variants isn't dead. If `lineage_units_12mo` / `display_units_12mo` is >0 while `effective_units_12mo` is zero, report it as historical/project movement excluded from auto-reorder, not as steady demand.
+**4.3 Dead stock** = holding stock AND zero visible/effective demand. Must use effective units plus visible lineage/display demand, not direct-only sales — a master tube that only sells via its variants isn't dead. If `lineage_units_12mo` / `display_units_12mo` is >0 while `effective_units_12mo` is zero, report it as historical/project movement excluded from auto-reorder, not as steady demand. Oversold SKUs (`Available < 0`) always show Reorder now before any dead/no-demand label.
 
 ---
 

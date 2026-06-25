@@ -485,6 +485,69 @@ class AppMemoryStructureTests(unittest.TestCase):
             script,
         )
 
+    def test_trend_column_uses_final_rolled_metrics(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        customer_rollup_pos = script.index('df["customers_45d"] = (')
+        full_year_customer_pos = script.index(
+            'df["customers_12mo"] = (',
+            customer_rollup_pos,
+        )
+        final_trend_pos = script.index(
+            'df["trend_flag"] = df.apply(_trend_flag, axis=1)',
+            customer_rollup_pos,
+        )
+        monthly_trend_pos = script.index(
+            'df["trend_flag"] = df.apply(_upgrade_trend_from_monthly, axis=1)',
+            final_trend_pos,
+        )
+        promote_pos = script.index(
+            'df["trend_flag"] = df.apply(_promote_dormant_flag, axis=1)',
+            monthly_trend_pos,
+        )
+        self.assertLess(customer_rollup_pos, final_trend_pos)
+        self.assertLess(full_year_customer_pos, final_trend_pos)
+        self.assertLess(final_trend_pos, monthly_trend_pos)
+        self.assertLess(monthly_trend_pos, promote_pos)
+        self.assertIn("if u45v < 3 and n_cust < 10:", script)
+        self.assertIn("if n_cust >= 10:", script)
+        self.assertIn("Sustained monthly lift catches products", script)
+        self.assertIn(
+            "final rolled metrics are the source of truth",
+            script,
+        )
+
+    def test_status_uses_visible_demand_and_shortage_wins(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        status_pos = script.index("def _status(r):")
+        visible_pos = script.index("visible_12mo = max(", status_pos)
+        shortage_pos = script.index("if available < 0:", visible_pos)
+        no_demand_pos = script.index(
+            "elif visible_12mo <= 0 and onhand == 0:",
+            shortage_pos,
+        )
+        dead_pos = script.index(
+            "elif visible_12mo <= 0 and onhand > 0:",
+            no_demand_pos,
+        )
+        status_apply_pos = script.index(
+            'engine_df["Status"] = engine_df.apply(_status, axis=1)',
+            dead_pos,
+        )
+        dropship_final_pos = script.index(
+            'engine_df.loc[_ds_mask, "Status"] = "📦 Dropship"',
+            status_apply_pos,
+        )
+        self.assertLess(shortage_pos, no_demand_pos)
+        self.assertLess(no_demand_pos, dead_pos)
+        self.assertLess(status_apply_pos, dropship_final_pos)
+        self.assertIn("display_units_12mo", script[status_pos:dead_pos])
+
     def test_assembly_components_do_not_add_bom_estimate_to_12mo_rollup(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"

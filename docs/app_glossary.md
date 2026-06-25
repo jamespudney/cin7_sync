@@ -126,6 +126,17 @@ it does not change the underlying reorder calculations, saved layout
 keys, draft qtys, or CIN7 write logic.
 
 #### Status badges
+Status is the buyer action label and uses **Available** (OnHand -
+Allocated), not just OnHand:
+
+- 🔴 **Reorder now** — Available < 0 (oversold), Available = 0 while
+  target/reorder is positive, or Available < lead-time demand.
+- 🟠 **Reorder soon** — below target but not urgent.
+- 🔵 **Overstocked** — Available > target × 1.5.
+- 🟢 **On target** — no buying action needed.
+- 💀 **Dead stock** — no visible/effective 12mo demand and stock held.
+- ⚪ **No demand, no stock** — no visible/effective 12mo demand and no
+  stock.
 - 📦 **Dropship** — order-on-demand, we don't stock it.
 - Active, Deprecated, Discontinued — from CIN7's product status.
 
@@ -143,10 +154,10 @@ A secondary check the engine runs to detect when the last-45-day sales
 pattern has diverged from the prior 45 days (days 45-90 ago). Uses
 four signals combined to avoid false-positives:
 
-- **📈 Trend** — ALL of these must be true: momentum >1.5, **4+ distinct
-  customers**, top customer **under 40%**, and non-top customers averaging
-  **at least 2 units each**. Real broad-based demand; engine switches to
-  last-45d velocity to keep up.
+- **📈 Trend** — 45d momentum >1.5 plus broad customer spread, OR a
+  sustained lift in the 12-month sparkline where the latest 3 calendar
+  buckets materially exceed the previous 3 with enough customers. Real
+  broad-based demand; engine switches to recent velocity to keep up.
 - **🎯 Project** — concentrated / one-off demand: a 45d spike with too
   few real buyers, visible historical lineage demand that should not
   drive auto-reorder, or a full-year pattern where only one or two
@@ -168,7 +179,14 @@ that's noise. The ≥2 units average rule makes sure there's substance
 beyond the big buyer.
 
 Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
-skip classification entirely — the signal is too noisy at that scale.
+skip classification unless there are 10+ distinct recent customers.
+For bulk rolls and cut families, customer spread can be a stronger
+signal than fractional roll-equivalent units.
+
+The Trend column is recomputed after migration, BOM, strip-family, and
+customer rollups. The final rolled values are the authority, so the
+grid should never show rolled customer counts beside a stale direct-only
+Trend label.
 
 The trend breakdown (who's buying, what %) shows in the transparency
 panel at the bottom when you drill into any flagged SKU.

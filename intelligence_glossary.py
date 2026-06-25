@@ -254,16 +254,19 @@ Computed in `_status()` using **Available** (not OnHand) so a SKU that's
 oversold (Allocated > OnHand) reads as urgent, not as Overstocked
 (v2.67.333). Ladder:
 
-- 🔴 **Reorder now** — Available ≤ 0 (oversold or no free stock), OR
-  Available < lead-time demand. The engine wants stock immediately.
+- 🔴 **Reorder now** — Available < 0 (oversold), OR Available = 0
+  while target/reorder is positive, OR Available < lead-time demand.
+  The engine wants stock immediately.
 - 🟠 **Reorder soon** — engine's `reorder_qty > 0` AND Available <
   target, OR Available < target without an urgent shortfall.
 - 🔵 **Overstocked** — Available > target × 1.5. **Uses Available, not
   OnHand** — a SKU with 100 on hand but 90 committed isn't overstocked.
 - 🟢 **On target** — everything else (well-stocked, no reorder needed).
-- 💀 **Dead stock** — eff_units_12mo = 0 AND OnHand > 0. Sitting
-  inventory with no demand.
-- ⚪ **No demand, no stock** — eff_units_12mo = 0 AND OnHand = 0.
+- 💀 **Dead stock** — no visible/effective 12mo demand AND OnHand > 0.
+  Sitting inventory with no demand. Visible lineage/display demand
+  prevents this label even if effective auto-reorder demand is zero.
+- ⚪ **No demand, no stock** — no visible/effective 12mo demand AND
+  OnHand = 0.
 - ❗ prefix — "once-slow" warning on a SKU that's currently recovering
   (the engine saw it as dormant in the past). Auto-lifts after 90 days
   of sustained recovery.
@@ -295,9 +298,14 @@ Rules now (when momentum > 1.5, i.e. a spike is present):
   window. Genuine one-off concentration. Engine subtracts the top
   customer's 12mo contribution before forecasting to avoid over-
   ordering future stock against a one-time order.
-- **📈 Trend** — **3+ distinct customers** AND top customer < 40% AND
-  non-top customers averaging ≥ 2 units each. Real broad-based
-  acceleration; engine switches to last-45d velocity to keep up.
+- **📈 Trend** — either **10+ distinct customers** (very broad recent
+  demand, including fractional bulk-roll demand) OR **3+ distinct
+  customers** AND top customer < 40% AND non-top customers averaging
+  ≥ 2 units each. Stable rows can also upgrade to Trend when the
+  12-month sparkline shows sustained monthly lift: latest 3 calendar
+  buckets materially exceed the previous 3 with at least 3 recent
+  customers. Real broad-based acceleration; engine switches to recent
+  velocity to keep up.
 - **🔀 Mixed** — **3+ distinct customers** but the spread isn't broad
   enough for Trend (one or two buyers leading but multiple
   participants). Engine uses normal 12mo velocity (NOT suppressed) —
@@ -319,7 +327,14 @@ this (`top_cust_pct_12mo`, `top_cust_units_12mo`) must come from the
 full year, not only from recent customers.
 
 Low-volume guard: SKUs selling fewer than 3 units in the last 45 days
-skip classification entirely — the signal is too noisy at that scale.
+skip classification entirely unless there are 10+ distinct recent
+customers. For bulk rolls and cut families, units may be fractional
+roll-equivalents while customer spread is the stronger signal.
+
+The buyer-facing Trend column is recomputed after migration, BOM,
+strip-family, and customer rollups. The final rolled customer/demand
+values are the authority; the grid must never show rolled customer
+counts beside an older direct-only Trend label.
 
 The trend breakdown (who's buying, what %) shows in the transparency
 panel at the bottom when you drill into any flagged SKU.

@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-06-24
+Last updated: 2026-06-25
 
 ---
 
@@ -155,6 +155,15 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ### 2026-06-25
 
+- **Ordering Trend/Status freshness** — the existing Trend column is
+  now recomputed after migration, BOM, strip-family, and customer
+  rollups, so rolled customer counts cannot sit beside stale direct-only
+  labels. Stable rows also upgrade to 📈 Trend when the 12-month
+  sparkline shows sustained monthly lift (latest 3 months materially
+  above the previous 3) with enough recent customers. The existing
+  Status column is recalculated from final stock/reorder values, with
+  oversold shortages winning before dead/no-demand labels and final
+  dropship/discontinued overrides applied last.
 - **Assembly/BOM double-count guard** — 12-month effective reorder
   demand now matches the existing monthly/45d/90d rule: if a component
   has CIN7 FG assembly consumption, that FG movement is the ground
