@@ -826,7 +826,8 @@ def _latest_file(prefix: str) -> Optional[Path]:
     return catalog_latest_file(prefix, OUTPUT_DIR)
 
 
-@st.cache_data(persist="disk", show_spinner="Loading data…")
+@st.cache_data(persist="disk", show_spinner="Loading data…",
+               max_entries=32)
 def _read_csv_cached(path_str: str, mtime: float) -> pd.DataFrame:
     """Disk-persisted CSV reader. Cache key = (path, mtime), so a new
     CSV with a different mtime invalidates automatically — even though
@@ -1855,7 +1856,7 @@ with st.sidebar:
     # when the latest two products_*.csv files differ on any SKU AND the
     # old SKU still has live references in our DB tables. Click-through
     # tells the buyer exactly what to do.
-    @st.cache_data(ttl=300, show_spinner=False)
+    @st.cache_data(ttl=300, show_spinner=False, max_entries=1)
     def _detect_pending_renames() -> list:
         """Compares two latest products CSVs by ProductID, returns list
         of (old_sku, new_sku, name, has_db_refs) for renames that still
@@ -2733,7 +2734,7 @@ _STOCK_LOCATOR_COLUMNS = (
 )
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=128)
 def _cached_live_product_movements_for_sku(sku: str) -> dict:
     """Return CIN7 product Movements for one SKU when live creds exist.
 
@@ -2885,6 +2886,33 @@ def _read_engine_refresh_status() -> dict:
         return {}
 
 
+def _mem_available_mb() -> Optional[int]:
+    """Linux MemAvailable in MB, when available.
+
+    Render reports OOM at the container limit, not Python's heap limit.
+    MemAvailable is the cheapest in-process signal before we launch a
+    second Python process for the ABC warm job.
+    """
+    try:
+        for line in Path("/proc/meminfo").read_text(
+                encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(int(parts[1]) / 1024)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _warm_engine_min_available_mb() -> int:
+    raw = os.environ.get("WARM_ENGINE_MIN_AVAILABLE_MB", "2500").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 2500
+
+
 def _format_engine_age(dt: datetime) -> str:
     age_min = (datetime.now() - dt).total_seconds() / 60.0
     if age_min < 1:
@@ -2912,6 +2940,17 @@ def _start_background_engine_refresh(reason: str,
     if os.environ.get("WARM_ENGINE_RUNNING") == "1":
         return False
     if _engine_refresh_running():
+        return False
+    threshold = _warm_engine_min_available_mb()
+    available = _mem_available_mb()
+    if threshold > 0 and available is not None and available < threshold:
+        _write_engine_refresh_status({
+            "state": "skipped",
+            "reason": reason,
+            "skip_reason": (
+                f"only {available}MB available, threshold is "
+                f"{threshold}MB"),
+        })
         return False
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -3011,7 +3050,8 @@ _PURCHASE_LINES_NUMERIC_COLS = (
 # 2. Union any more-recent shorter-window files (they contain today's data
 #    that the overnight long-window sync missed)
 # 3. Dedupe on line identity (SaleID+SKU+Qty), keeping the most-recent version
-@st.cache_data(persist="disk", show_spinner="Loading sales history…")
+@st.cache_data(persist="disk", show_spinner="Loading sales history…",
+               max_entries=1)
 def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     import re as _re
     files = []
@@ -3116,7 +3156,7 @@ if sale_lines.empty:
 # rollup is derived and usually incomplete. James 2026-06-01 example:
 # LED-NEON-FLEX-NICHO-3000K-2 had ~90 FG- consumptions vs ~5 direct
 # sales per month; the engine was seeing ~half of true demand.
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False, max_entries=1)
 def _load_longest_assemblies_cached(fingerprint: tuple) -> pd.DataFrame:
     import re as _re
     files = []
@@ -3171,7 +3211,8 @@ assemblies = _load_longest_assemblies()
 # loader block.
 
 
-@st.cache_data(persist="disk", show_spinner="Loading sales headers…")
+@st.cache_data(persist="disk", show_spinner="Loading sales headers…",
+               max_entries=1)
 def _load_longest_sales_cached(fingerprint: tuple) -> pd.DataFrame:
     """Headers version. fingerprint key: see _dir_fingerprint()."""
     import re as _re
@@ -3208,7 +3249,8 @@ def _load_longest_sales() -> pd.DataFrame:
         _dir_fingerprint("sales_last_*d_*.csv"))
 
 
-@st.cache_data(persist="disk", show_spinner="Loading purchase history…")
+@st.cache_data(persist="disk", show_spinner="Loading purchase history…",
+               max_entries=1)
 def _load_longest_purchase_lines_cached(fingerprint: tuple) -> pd.DataFrame:
     import re as _re
     files = []
@@ -3319,7 +3361,8 @@ _SHIPMENTS_DTYPE = {
 
 
 @st.cache_data(persist="disk",
-                show_spinner="Loading shipping history…")
+                show_spinner="Loading shipping history…",
+                max_entries=1)
 def _load_longest_shipments_cached(fingerprint: tuple) -> pd.DataFrame:
     files = []
     full_path = OUTPUT_DIR / "shipments_full.csv"
@@ -3433,7 +3476,8 @@ def _load_longest_shipments() -> pd.DataFrame:
 # ShopifyOrderID, last-write wins (Shopify's `updated_at` filter
 # means an updated order shows up again with newer data).
 @st.cache_data(persist="disk",
-                show_spinner="Loading Shopify orders…")
+                show_spinner="Loading Shopify orders…",
+                max_entries=1)
 def _load_longest_shopify_orders_cached(fingerprint: tuple) -> pd.DataFrame:
     files = []
     full_path = OUTPUT_DIR / "shopify_orders_full.csv"
@@ -3522,7 +3566,7 @@ boms = load("boms")  # AssemblySKU, ComponentSKU, Quantity, BOMType, ...
 # BOM helpers — parent/child lookups
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False, max_entries=1)
 def _build_bom_indexes(boms_df: pd.DataFrame) -> dict:
     """Pre-compute lookups:
       parents_of[sku]   = list of dicts {ComponentSKU, ComponentName, Qty}
@@ -5116,7 +5160,8 @@ if stock_only and _filtered_count > 0:
 
 @st.cache_data(
     persist="disk",
-    show_spinner="Computing ABC engine…")
+    show_spinner="Computing ABC engine…",
+    max_entries=1)
 def _abc_engine(products: pd.DataFrame,
                 stock: pd.DataFrame,
                 sale_lines: pd.DataFrame,
@@ -7374,7 +7419,7 @@ def _abc_engine(products: pd.DataFrame,
 # semantically identical to a fresh compute. The wrapper makes the
 # pattern explicit: read here, mutate downstream, expect to see
 # mutations on subsequent reads in the same process.
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
     """Process-cached accessor for the full ABC engine output.
 
@@ -17325,7 +17370,7 @@ elif page == "Ad-Umpire":
         with _col_dr3:
             st.metric("To", _ad_end.isoformat())
 
-    @st.cache_data(ttl=300)
+    @st.cache_data(ttl=300, max_entries=8)
     def _load_ad_campaigns(start_iso: str, end_iso: str
                               ) -> pd.DataFrame:
         # v2.67.171 — Route through db.connect() so this reads
@@ -17348,7 +17393,7 @@ elif page == "Ad-Umpire":
         except Exception:
             return pd.DataFrame()
 
-    @st.cache_data(ttl=300)
+    @st.cache_data(ttl=300, max_entries=8)
     def _load_ad_skus(start_iso: str, end_iso: str) -> pd.DataFrame:
         # v2.67.171 — see _load_ad_campaigns rationale.
         import db as _db_ad
@@ -19216,7 +19261,7 @@ elif page == "Product Detail":
         # --- SKU selector: one searchable dropdown, type to filter ----------
         # Build an index of "SKU — Name" labels once and let Streamlit handle
         # typeahead. Works smoothly up to tens of thousands of options.
-        @st.cache_data(ttl=300, show_spinner=False)
+        @st.cache_data(ttl=300, show_spinner=False, max_entries=1)
         def _build_sku_options(products_df: pd.DataFrame) -> tuple:
             df = products_df[["SKU", "Name"]].copy()
             df["label"] = (
@@ -20456,7 +20501,8 @@ elif page == "Kits & Fixtures":
             key=f"excl_kit_{group_size}",
         )
 
-        @st.cache_data(ttl=900, show_spinner="Computing product affinity…")
+        @st.cache_data(ttl=900, show_spinner="Computing product affinity…",
+                       max_entries=3)
         def _compute_affinity_groups(sl_df: pd.DataFrame,
                                      prod_df: pd.DataFrame,
                                      k: int):

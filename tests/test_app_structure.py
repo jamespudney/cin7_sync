@@ -446,7 +446,40 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("WARM_ENGINE_MIN_AVAILABLE_MB", warm_engine)
         self.assertIn("MemAvailable:", warm_engine)
         self.assertIn("skipping cache warm", warm_engine)
+        self.assertIn('"WARM_ENGINE_MIN_AVAILABLE_MB", "2500"', warm_engine)
+        self.assertIn(
+            'WARM_ENGINE_MIN_AVAILABLE_MB="${WARM_ENGINE_MIN_AVAILABLE_MB:-2500}"',
+            sync_loop,
+        )
         self.assertIn("WARM_ENGINE_MIN_AVAILABLE_MB", render_config)
+        self.assertIn('value: "2500"', render_config)
+
+    def test_large_streamlit_caches_are_bounded(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            '@st.cache_data(persist="disk", show_spinner="Loading data…",\n'
+            '               max_entries=32)',
+            script,
+        )
+        self.assertIn(
+            '@st.cache_data(persist="disk", show_spinner="Loading sales history…",\n'
+            '               max_entries=1)',
+            script,
+        )
+        self.assertIn('show_spinner="Computing ABC engine…",', script)
+        self.assertIn("max_entries=1)\ndef _abc_engine", script)
+        self.assertIn(
+            "@st.cache_resource(show_spinner=False, max_entries=1)\n"
+            "def _get_engine_df_cached",
+            script,
+        )
+        self.assertIn("def _mem_available_mb", script)
+        self.assertIn("available < threshold", script)
+        self.assertIn('"state": "skipped"', script)
+        self.assertIn('"skip_reason"', script)
 
     def test_app_deploys_are_staged_not_auto_deployed(self) -> None:
         render_config = (

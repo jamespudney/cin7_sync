@@ -73,11 +73,11 @@ def _mem_available_mb() -> int | None:
 def _memory_guard_allows_warm() -> bool:
     global _WARM_SKIP_REASON
     raw_threshold = os.environ.get(
-        "WARM_ENGINE_MIN_AVAILABLE_MB", "1200").strip()
+        "WARM_ENGINE_MIN_AVAILABLE_MB", "2500").strip()
     try:
         threshold = int(raw_threshold)
     except ValueError:
-        threshold = 1200
+        threshold = 2500
     if threshold <= 0:
         return True
     available = _mem_available_mb()

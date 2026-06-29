@@ -466,6 +466,12 @@ copies of the same CIN7 exports in memory. If Render still reports
 OOM, inspect live memory metrics before increasing the instance size
 or moving more computations into the background worker.
 
+Large Streamlit caches must be bounded. Snapshot-keyed CSV readers use
+small `max_entries` limits, and the biggest merged source/ABC caches
+keep one current entry. NearSync creates new CSV filenames and mtimes
+throughout the day; without those bounds, the web process can keep old
+snapshots resident until Render kills the service.
+
 Ordering-page reorder calculations are also split into two layers:
 numeric fields (`target_stock`, `reorder_qty`, `lead_time_days`,
 `excess_units`, etc.) are computed table-wide, but the long markdown
@@ -876,4 +882,4 @@ ABC cache warming is opportunistic. `sync_loop.sh` starts
 shows in the sidebar. Deploy catch-up warms are delayed by
 `WARM_ENGINE_BOOT_DELAY_MIN` (default 30 minutes), and the warmer
 skips if available memory is below `WARM_ENGINE_MIN_AVAILABLE_MB`
-(default 1200 MB).
+(default 2500 MB on the shared 4 GB Render web instance).

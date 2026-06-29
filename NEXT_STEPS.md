@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-06-25
+Last updated: 2026-06-29
 
 ---
 
@@ -152,6 +152,16 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 ---
 
 ## Shipped (since 2026-04-30)
+
+### 2026-06-29
+
+- **Render memory stability guard** — large Streamlit CSV/source/ABC
+  caches are now bounded with `max_entries` so near-sync snapshots do
+  not accumulate in the web process all day. The app also checks
+  Linux `MemAvailable` before spawning background ABC warms, and the
+  Render warmer guard now defaults to 2500 MB free on the shared 4 GB
+  web instance. If memory is tight, the warm is skipped and the app
+  stays available instead of competing with a second Python process.
 
 ### 2026-06-25
 
