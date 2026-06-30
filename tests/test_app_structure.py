@@ -244,6 +244,37 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("snapshot is likely stale or missing recent", script)
         self.assertIn("sale-line files; run/await", script)
 
+    def test_ordering_has_sku_buying_policy_columns(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "app.py").read_text(encoding="utf-8")
+        db_script = (root / "db.py").read_text(encoding="utf-8")
+
+        self.assertIn("lead_time_days INTEGER", db_script)
+        self.assertIn("eoq_qty REAL", db_script)
+        self.assertIn("def set_sku_buying_settings", db_script)
+        self.assertIn("_migrate_sku_pack_buying_settings", db_script)
+        self.assertIn("sku_buying_settings = {", script)
+        self.assertIn('"sku_buying": sku_buying_settings', script)
+        self.assertIn('lead_time_basis = "sku"', script)
+        self.assertIn('"sku_lead_time_days"', script)
+        self.assertIn('"sku_moq"', script)
+        self.assertIn('"sku_eoq_qty"', script)
+        self.assertIn("SKU buying policy", script)
+        self.assertIn("db.set_sku_buying_settings", script)
+        self.assertIn("_sku_buying_edits", script)
+        self.assertIn("Ordering and Product Detail use this", script)
+
+    def test_ordering_and_product_detail_show_12mo_series(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('df["last_12mo_series"]', script)
+        self.assertIn('"last_12mo_series"', script)
+        self.assertIn("Last 12 months", script)
+        self.assertIn("_pd_engine_row = _pd_hit.iloc[0]", script)
+        self.assertIn("engine_row=_pd_engine_row", script)
+
     def test_slow_stock_overview_explains_value_changes(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"

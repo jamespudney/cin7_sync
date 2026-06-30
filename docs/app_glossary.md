@@ -14,7 +14,9 @@ rank + 40% of 12-month quantity rank):
 How long from placing the PO to receiving the goods. Set per supplier
 in the Supplier configuration expander below. Air vs sea toggles use
 different LTs; the engine picks the faster one when the supplier offers
-air AND the item qualifies.
+air AND the item qualifies. A SKU-level **Sku Leadtime** can be set in
+Ordering or Product Detail; when present, that duration overrides IP and
+supplier default lead-time days for that SKU.
 
 #### Safety %
 A buffer added on top of lead-time demand to absorb variance (a big
@@ -106,11 +108,40 @@ same component movement.
 Set per supplier (e.g. Blebox $250). The PO summary flags when the
 current draft is below MOV so you can consolidate.
 
+#### SKU buying settings (Sku Leadtime / MOQ / EOQ)
+These are per-SKU overrides stored in `sku_pack_settings` and editable
+from both Ordering and Product Detail:
+
+- **Sku Leadtime** — manual lead-time duration in days. Blank/0 means use
+  IP observed/configured lead time, then supplier defaults.
+- **SKU MOQ** — minimum order quantity for that SKU. It can lift the
+  target stock and floor the suggested reorder when a positive reorder
+  exists.
+- **SKU EOQ / batch qty** — economic/order batch multiple. It rounds
+  target stock and suggested reorder up to the next useful batch.
+
+SKU MOQ/EOQ win over supplier MOQ. Project rows are not auto-inflated by
+MOQ/EOQ; the buyer can still manually set an order qty for a known
+project. Because these settings change target stock, they also affect
+optimum stock, excess/slow-stock tied-up value, and reorder suggestions
+after the next Ordering/ABC recalculation.
+
 #### Freight mode
-Air or Sea. The engine defaults to air when the supplier offers it
-**and** the SKU's length fits in the supplier's air cutoff (e.g.
-Topmet UPS caps at 2200mm). Override per row in the grid; the reorder
-qty recalculates with the new lead time on next refresh.
+Air or Sea. Decision order:
+
+1. **Category rule**: SKUs in `Profiles - Channels`,
+   `Accessories - Profiles - Inner profiles`, or `Diffusers` at ~3m
+   length ship sea regardless of supplier air-eligibility.
+2. **Supplier default**: otherwise air when the supplier offers it and
+   the SKU's length fits in the supplier's air cutoff. Sea is fallback.
+3. **SKU lead-time override**: when `Sku Leadtime` is set for the SKU,
+   that duration wins. The freight METHOD is still from rules 1-2 or the
+   manual override; this is a duration override.
+4. **IP lead time**: when IP has an observed or configured lead time for
+   the SKU, that duration wins over supplier default duration.
+5. **Per-row override**: the buyer can flip any row's mode via the
+   Freight column dropdown. The reorder qty recalculates with the new
+   lead time on next refresh.
 
 #### Ordering PO editor row focus
 The Ordering page's main PO editor and optional pull-forward editor
@@ -221,6 +252,12 @@ voided, and cancelled lines excluded. The Inspect panel's **SKU sales
 audit** shows the same calendar-month invoice totals beside `OrderDate`
 totals, so buyers can spot open/current orders that are not yet counted
 as invoiced demand.
+
+#### Last 12 months column
+The Ordering page and Product Detail also show **Last 12 months** from
+the exact same monthly buckets as Last 6 months and the 12mo sparkline.
+It is there so buyers can see the full-year shape while preserving the
+existing saved column layouts.
 
 #### Slow movers / dormancy (v2.67.36+)
 A SKU is **dormant** when its 90-day demand has dropped sharply

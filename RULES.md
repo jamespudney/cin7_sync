@@ -6,7 +6,7 @@
 
 **Versioning.** When you add or change a rule, bump the top-of-file date and mark which page / function it affects. When a rule becomes obsolete, strike it through — don't delete — so the reasoning stays visible.
 
-Last updated: 2026-06-29
+Last updated: 2026-06-30
 
 ---
 
@@ -165,6 +165,31 @@ cadence where configured, otherwise 21 days. Moving the slider reruns
 the table and recomputes the optional qty as
 `avg_daily × selected window`; it must not change the main reorder
 calculation unless the buyer ticks a row and adds it to the draft PO.
+
+**5.6 SKU-level buying policy overrides supplier defaults.** The
+`sku_pack_settings` table now stores per-SKU `lead_time_days`, `moq`,
+and `eoq_qty` (plus legacy `pack_qty`). Product Detail and the Ordering
+grid edit the same row, so buyer changes must stay in sync across both
+places.
+
+- **Sku Leadtime** is a duration override. Freight method is still chosen
+  by category/supplier/manual freight rules, but if a SKU lead time is
+  set, that duration overrides IP observed/configured and supplier
+  default lead-time days.
+- **SKU MOQ** lifts `target_stock` when the computed target is lower, and
+  floors suggested reorder quantity when a positive reorder exists. It
+  wins over supplier MOQ.
+- **SKU EOQ / batch qty** rounds `target_stock` and suggested reorder up
+  to a clean economic/order batch multiple. Legacy `pack_qty` is used as
+  the batch multiple only when `eoq_qty` is empty.
+- **Project rows are not auto-inflated** by MOQ/EOQ. They stay visible
+  for buyer review, but a known project must be manually ordered.
+- Because target stock changes, optimum stock value, excess/slow-stock
+  tied-up value, and reorder suggestions must all reflect these SKU
+  settings after the next Ordering/ABC recalculation.
+- Ordering and Product Detail must show both `last_6mo_series` and
+  `last_12mo_series` from the same monthly demand buckets, so buyers can
+  see the full year without opening a CSV.
 
 ---
 

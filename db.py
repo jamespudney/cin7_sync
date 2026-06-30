@@ -427,13 +427,16 @@ CREATE TABLE IF NOT EXISTS family_pricing_rules (
     PRIMARY KEY (family, supplier)
 );
 
--- Per-SKU pack quantity (e.g., MMA-M155-25A-M comes in packs of 10).
--- Reorder qty rounds UP to nearest multiple. Independent of family
--- pricing — a SKU may have a pack qty without being in any tier scheme.
+-- Per-SKU buying policy. Originally just pack quantity, now the shared
+-- SKU-level override table for lead time, MOQ, and EOQ / batch qty.
+-- Reorder/target qty rounds UP to nearest EOQ multiple when set.
+-- Independent of supplier defaults and family pricing.
 CREATE TABLE IF NOT EXISTS sku_pack_settings (
     sku             TEXT    PRIMARY KEY,
-    pack_qty        REAL    NOT NULL,
+    pack_qty        REAL    NOT NULL DEFAULT 0, -- legacy pack multiple
     moq             REAL,                 -- minimum order qty (overrides supplier default)
+    lead_time_days  INTEGER,              -- manual SKU lead-time override
+    eoq_qty         REAL,                 -- economic/batch order multiple
     note            TEXT,
     set_by          TEXT    NOT NULL,
     set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
@@ -1478,6 +1481,23 @@ def _migrate_supplier_cadence(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE supplier_config ADD COLUMN "
                 "order_cadence_days INTEGER")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_sku_pack_buying_settings(conn: sqlite3.Connection) -> None:
+    """Add SKU lead-time / EOQ fields to older sku_pack_settings tables."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('sku_pack_settings')").fetchall()}
+        if "lead_time_days" not in cols:
+            conn.execute(
+                "ALTER TABLE sku_pack_settings ADD COLUMN "
+                "lead_time_days INTEGER")
+        if "eoq_qty" not in cols:
+            conn.execute(
+                "ALTER TABLE sku_pack_settings ADD COLUMN "
+                "eoq_qty REAL")
     except sqlite3.Error:
         pass
 
@@ -3720,6 +3740,12 @@ _PG_POST_CUTOVER_TABLES = [
     ("supplier_config_add_order_cadence_days",
       "ALTER TABLE supplier_config "
       "ADD COLUMN IF NOT EXISTS order_cadence_days INTEGER;"),
+    ("sku_pack_settings_add_lead_time_days",
+      "ALTER TABLE sku_pack_settings "
+      "ADD COLUMN IF NOT EXISTS lead_time_days INTEGER;"),
+    ("sku_pack_settings_add_eoq_qty",
+      "ALTER TABLE sku_pack_settings "
+      "ADD COLUMN IF NOT EXISTS eoq_qty DOUBLE PRECISION;"),
     # v2.67.284 — supplier holiday / shutdown periods. Multiple
     # rows per supplier; the reorder engine adds the overlap with
     # the upcoming lead-time + cadence window to the target cover.
@@ -4047,6 +4073,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_supplier_dropship(conn)
         _migrate_supplier_stockout_recovery(conn)
         _migrate_supplier_cadence(conn)
+        _migrate_sku_pack_buying_settings(conn)
         _migrate_demand_signal_match_columns(conn)
         _migrate_product_aliases_multi_target(conn)
         _migrate_ad_campaign_skus_spend(conn)  # v2.67.105
@@ -5513,31 +5540,72 @@ def delete_family_pricing_rule(family: str, supplier: str,
         )
 
 
-# ----- Per-SKU pack settings ------------------------------------------
+# ----- Per-SKU buying settings ----------------------------------------
 
-def set_sku_pack(sku: str, pack_qty: float, actor: str,
-                  moq: Optional[float] = None, note: str = "") -> None:
+def _positive_or_none(value) -> Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def set_sku_buying_settings(
+    sku: str,
+    actor: str,
+    *,
+    pack_qty: Optional[float] = None,
+    moq: Optional[float] = None,
+    lead_time_days: Optional[int] = None,
+    eoq_qty: Optional[float] = None,
+    note: str = "",
+) -> None:
+    """Save per-SKU buying policy.
+
+    `pack_qty` is retained as the legacy batch-multiple field. New code
+    should use `eoq_qty`; the engine treats `eoq_qty` first, then falls
+    back to legacy `pack_qty`.
+    """
+    _pack = _positive_or_none(pack_qty) or 0.0
+    _moq = _positive_or_none(moq)
+    _eoq = _positive_or_none(eoq_qty)
+    try:
+        _lt = int(lead_time_days) if lead_time_days else None
+    except (TypeError, ValueError):
+        _lt = None
+    if _lt is not None and _lt <= 0:
+        _lt = None
     with connect() as c:
         c.execute(
             """
             INSERT INTO sku_pack_settings
-                (sku, pack_qty, moq, note, set_by)
-            VALUES (?, ?, ?, ?, ?)
+                (sku, pack_qty, moq, lead_time_days, eoq_qty, note, set_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(sku) DO UPDATE SET
                 pack_qty = excluded.pack_qty,
                 moq = excluded.moq,
+                lead_time_days = excluded.lead_time_days,
+                eoq_qty = excluded.eoq_qty,
                 note = excluded.note,
                 set_by = excluded.set_by,
                 set_at = datetime('now')
             """,
-            (sku, pack_qty, moq, note, actor),
+            (sku, _pack, _moq, _lt, _eoq, note, actor),
         )
         c.execute(
             "INSERT INTO audit_log (event, actor, target, detail) "
             "VALUES (?, ?, ?, ?)",
-            ("sku_pack.set", actor, sku,
-             f"pack={pack_qty} moq={moq}"),
+            ("sku_buying.set", actor, sku,
+             f"lt={_lt} moq={_moq} eoq={_eoq} pack={_pack}"),
         )
+
+
+def set_sku_pack(sku: str, pack_qty: float, actor: str,
+                  moq: Optional[float] = None, note: str = "") -> None:
+    """Backward-compatible helper for the older pack-quantity editor."""
+    set_sku_buying_settings(
+        sku, actor, pack_qty=pack_qty, moq=moq,
+        eoq_qty=pack_qty, note=note)
 
 
 def get_sku_pack(sku: str) -> Optional[sqlite3.Row]:
@@ -5559,7 +5627,7 @@ def clear_sku_pack(sku: str, actor: str) -> None:
         c.execute(
             "INSERT INTO audit_log (event, actor, target, detail) "
             "VALUES (?, ?, ?, ?)",
-            ("sku_pack.clear", actor, sku, ""),
+            ("sku_buying.clear", actor, sku, ""),
         )
 
 

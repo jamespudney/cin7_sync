@@ -326,6 +326,14 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   `wired4signs-app` on Render's Pro web instance type (4 GB RAM),
   matching the live upgrade and avoiding Blueprint downgrades to
   Standard/2 GB.
+- **SKU buying policy overrides** — Ordering and Product Detail now share
+  per-SKU buying settings for `Sku Leadtime`, `SKU MOQ`, and `SKU EOQ /
+  batch qty` from `sku_pack_settings`. SKU lead time overrides IP and
+  supplier lead-time duration, SKU MOQ/EOQ shape target stock and
+  suggested reorder, and both pages show Last 12 months beside the
+  existing Last 6 months demand series. Existing saved Ordering column
+  layouts are preserved and the new fields are inserted beside their
+  related lead-time/demand columns.
 
 ### 2026-06-22
 

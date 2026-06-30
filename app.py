@@ -6834,20 +6834,28 @@ def _abc_engine(products: pd.DataFrame,
     # truth and may be zero for child/rolled-up SKUs.
     df["lineage_units_12mo"] = df["trend_12m"].apply(
         lambda buckets: float(sum(buckets)) if buckets else 0.0)
-    # Last 6 months as a readable "oldest … newest" sequence.
+    # Monthly buckets as readable "oldest … newest" sequences.
     # Show 1 decimal place when values include rolled-up fractional
     # contributions (e.g. master rolls absorbing per-foot demand —
     # 100 cuts × 0.0035 ratio = 0.35 rolls). For SKUs whose values
     # are all whole numbers (typical leaf products), keep the
     # cleaner integer format the buyer is used to.
-    def _fmt_6mo_series(buckets):
+    def _fmt_month_series(buckets, count: int):
         if not buckets:
             return ""
-        last6 = buckets[-6:]
-        if any(abs(v - round(v)) > 0.05 for v in last6):
-            return "  ".join(f"{v:.1f}" for v in last6)
-        return "  ".join(f"{int(round(v))}" for v in last6)
+        vals = buckets[-count:]
+        if any(abs(v - round(v)) > 0.05 for v in vals):
+            return "  ".join(f"{v:.1f}" for v in vals)
+        return "  ".join(f"{int(round(v))}" for v in vals)
+
+    def _fmt_6mo_series(buckets):
+        return _fmt_month_series(buckets, 6)
+
+    def _fmt_12mo_series(buckets):
+        return _fmt_month_series(buckets, 12)
+
     df["last_6mo_series"] = df["trend_12m"].apply(_fmt_6mo_series)
+    df["last_12mo_series"] = df["trend_12m"].apply(_fmt_12mo_series)
 
     def _upgrade_trend_from_monthly(r):
         cur = r.get("trend_flag", "Stable")
@@ -10449,15 +10457,15 @@ elif page == "Supplier Pricing":
                 st.success(f"Saved {r_family}/{r_supplier} rule = {r_rule}")
                 st.rerun()
 
-    # ===== Tab 4: Pack Quantities =====
+    # ===== Tab 4: SKU Buying Settings =====
     with packs_tab:
-        st.subheader("Per-SKU pack quantities")
+        st.subheader("Per-SKU buying settings")
         st.caption(
-            "When a SKU comes in fixed pack sizes (e.g., MMA-M155-"
-            "25A-M is sold in packs of 10), the engine rounds reorder "
-            "qty UP to the nearest multiple. MOQ override is optional "
-            "— useful when this SKU's MOQ differs from the supplier "
-            "default in supplier_config.")
+            "SKU-level Lead time, MOQ, and EOQ override the supplier "
+            "defaults when present. Ordering and Product Detail use this "
+            "same table, so quick row edits and deeper SKU edits stay in "
+            "sync. Legacy Pack qty is kept as a batch multiple for older "
+            "rules; EOQ is the current economic/order batch multiple.")
 
         existing_packs = db.all_sku_pack()
         if existing_packs:
@@ -10469,46 +10477,64 @@ elif page == "Supplier Pricing":
                 df_packs["Name"] = df_packs["sku"].map(names).fillna("")
             st.dataframe(df_packs, hide_index=True, width="stretch",
                           column_config={
-                              "pack_qty": st.column_config.NumberColumn(format="%g"),
-                              "moq": st.column_config.NumberColumn(format="%g"),
+                              "lead_time_days": st.column_config.NumberColumn(
+                                  "Sku Leadtime", format="%d"),
+                              "moq": st.column_config.NumberColumn(
+                                  "SKU MOQ", format="%g"),
+                              "eoq_qty": st.column_config.NumberColumn(
+                                  "SKU EOQ", format="%g"),
+                              "pack_qty": st.column_config.NumberColumn(
+                                  "Legacy pack qty", format="%g"),
                           })
         else:
-            st.info("No pack quantities configured.")
+            st.info("No SKU buying settings configured.")
 
-        with st.expander(":heavy_plus_sign: Add / update pack qty"):
+        with st.expander(":heavy_plus_sign: Add / update SKU buying settings"):
             sk_options = (sorted(set(products["SKU"].astype(str)))
                            if not products.empty else [])
-            pq1, pq2, pq3 = st.columns([3, 1, 1])
+            pq1, pq2, pq3, pq4, pq5 = st.columns([3, 1, 1, 1, 1])
             with pq1:
                 pq_sku = st.selectbox(
                     "SKU", options=[""] + sk_options,
                     key="pq_sku")
             with pq2:
-                pq_pack = st.number_input(
-                    "Pack qty",
-                    min_value=0.0, value=10.0, step=1.0,
-                    key="pq_pack")
+                pq_lt = st.number_input(
+                    "Sku Leadtime (0=default)",
+                    min_value=0, max_value=365, value=0, step=1,
+                    key="pq_lt")
             with pq3:
                 pq_moq = st.number_input(
-                    "MOQ override (0=none)",
+                    "SKU MOQ (0=none)",
                     min_value=0.0, value=0.0, step=1.0,
                     key="pq_moq")
+            with pq4:
+                pq_eoq = st.number_input(
+                    "SKU EOQ / batch (0=none)",
+                    min_value=0.0, value=0.0, step=1.0,
+                    key="pq_eoq")
+            with pq5:
+                pq_pack = st.number_input(
+                    "Legacy pack",
+                    min_value=0.0, value=0.0, step=1.0,
+                    key="pq_pack")
             pq_note = st.text_input("Note", key="pq_note")
-            if st.button("💾 Save pack",
+            if st.button("💾 Save SKU buying settings",
                           key="pq_save", type="primary",
                           disabled=not pq_sku):
-                db.set_sku_pack(
+                db.set_sku_buying_settings(
                     sku=pq_sku,
-                    pack_qty=float(pq_pack),
                     actor=actor,
+                    pack_qty=(float(pq_pack) if pq_pack > 0 else None),
                     moq=(float(pq_moq) if pq_moq > 0 else None),
+                    lead_time_days=(int(pq_lt) if pq_lt > 0 else None),
+                    eoq_qty=(float(pq_eoq) if pq_eoq > 0 else None),
                     note=pq_note,
                 )
-                st.success(f"Saved {pq_sku}: pack of {pq_pack:g}")
+                st.success(f"Saved SKU buying settings for {pq_sku}")
                 st.rerun()
 
         if existing_packs:
-            with st.expander(":wastebasket: Clear pack qty"):
+            with st.expander(":wastebasket: Clear SKU buying settings"):
                 pick = st.selectbox(
                     "Pick SKU",
                     options=[""] + [r["sku"] for r in existing_packs],
@@ -11271,7 +11297,40 @@ elif page == "Ordering":
         ip_lead_times_by_sku = db.get_ip_lead_times()
     except Exception:  # noqa: BLE001
         ip_lead_times_by_sku = {}
+    try:
+        sku_buying_settings = {
+            str(r["sku"]): dict(r) for r in db.all_sku_pack()
+        }
+    except Exception:  # noqa: BLE001
+        sku_buying_settings = {}
     _today_for_engine = date.today()
+
+    def _sku_policy_float(sku: str, key: str) -> float:
+        try:
+            val = float((sku_buying_settings.get(str(sku) or "", {})
+                         or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return val if val > 0 else 0.0
+
+    def _ceil_to_multiple(value: float, multiple: float) -> float:
+        if value <= 0 or multiple <= 0:
+            return value
+        import math as _math
+        return _math.ceil((value - 1e-9) / multiple) * multiple
+
+    def _sku_buying_values(sku: str) -> tuple[int, float, float]:
+        sku_policy = sku_buying_settings.get(str(sku) or "", {}) or {}
+        try:
+            lead_time = int(sku_policy.get("lead_time_days") or 0)
+        except (TypeError, ValueError):
+            lead_time = 0
+        if not 1 <= lead_time <= 365:
+            lead_time = 0
+        sku_moq = _sku_policy_float(str(sku), "moq")
+        sku_eoq = (_sku_policy_float(str(sku), "eoq_qty")
+                   or _sku_policy_float(str(sku), "pack_qty"))
+        return lead_time, sku_moq, sku_eoq
 
     def _format_iso_weeks_range(start, end):
         """'Wk 32' for a same-week span, 'Wk 32-34' otherwise."""
@@ -11355,6 +11414,8 @@ elif page == "Ordering":
         air_eligible_default = bool(cfg.get("air_eligible_default") or 0)
         air_max_len = cfg.get("air_max_length_mm")
         length_mm = row.get("LengthMM")
+        sku_key = str(row.get("SKU") or "")
+        _sku_lt_int, sku_moq, sku_eoq = _sku_buying_values(sku_key)
 
         # Per-SKU air-eligibility: default from supplier cfg, BUT disqualify
         # if length exceeds supplier's air_max_length_mm
@@ -11416,17 +11477,19 @@ elif page == "Ordering":
         # blanked the cell for every IP-tracked SKU (most of them).
         # The basis ("observed" / "configured") is still surfaced in
         # the calc trace below.
-        _sku_for_lt = str(row.get("SKU") or "")
-        _ip_row = ip_lead_times_by_sku.get(_sku_for_lt) or {}
+        _ip_row = ip_lead_times_by_sku.get(sku_key) or {}
         _obs_lt = _ip_row.get("observed_lead_time_days")
         _conf_lt_ip = _ip_row.get("configured_lead_time_days")
-        lead_time_basis_from_ip = None
-        if _obs_lt and 3 <= int(_obs_lt) <= 120:
+        lead_time_basis = "supplier"
+        if _sku_lt_int and 1 <= _sku_lt_int <= 365:
+            lead_time_days = _sku_lt_int
+            lead_time_basis = "sku"
+        elif _obs_lt and 3 <= int(_obs_lt) <= 120:
             lead_time_days = int(_obs_lt)
-            lead_time_basis_from_ip = "observed"
+            lead_time_basis = "ip_observed"
         elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
             lead_time_days = int(_conf_lt_ip)
-            lead_time_basis_from_ip = "configured"
+            lead_time_basis = "ip_configured"
 
         # Safety factor by class
         abc = row.get("ABC") or "C"
@@ -11573,6 +11636,22 @@ elif page == "Ordering":
             _today_for_engine, window_end)
         holiday_cover = avg_daily * closure_days
         target = lt_demand + safety + review_demand + holiday_cover
+        raw_target = target
+        is_project_row = (str(row.get("trend_flag") or "")
+                          == "🎯 Project")
+        target_policy_notes = []
+        if not is_project_row:
+            if sku_moq > 0 and target < sku_moq:
+                target = sku_moq
+                target_policy_notes.append(
+                    f"SKU MOQ lifts target to {sku_moq:g}")
+            if sku_eoq > 0:
+                rounded_target = _ceil_to_multiple(target, sku_eoq)
+                if rounded_target > target + 1e-9:
+                    target_policy_notes.append(
+                        f"SKU EOQ rounds target to {rounded_target:g} "
+                        f"(multiple of {sku_eoq:g})")
+                    target = rounded_target
         onhand = row["OnHand"]
         allocated = float(row.get("Allocated") or 0)
         available = float(row.get("Available") or 0)
@@ -11677,8 +11756,6 @@ elif page == "Ordering":
         # policy).
         stockout_boost_applied = False
         is_dormant_row = bool(row.get("is_dormant", False))
-        is_project_row = (str(row.get("trend_flag") or "")
-                          == "🎯 Project")
         if (effective_pos <= 0
                 and not is_dormant_row
                 and not is_project_row):
@@ -11700,13 +11777,20 @@ elif page == "Ordering":
                 stockout_boost_applied = True
                 reorder = stockout_qty
 
-        # MOQ — skipped for fractional bulk SKUs (a "1 unit minimum"
-        # doesn't apply to "0.4 of a 100m roll" — fractional ordering
-        # is the whole point of the feature, MOQ would defeat it).
-        moq = cfg.get("moq_units") or 0
+        # SKU MOQ / EOQ beats supplier MOQ. Supplier MOQ remains a
+        # reorder-qty floor only; SKU MOQ/EOQ also lifted target above
+        # so optimum/excess reflect the SKU's true buying constraint.
+        moq = sku_moq or cfg.get("moq_units") or 0
         if (reorder > 0 and moq and reorder < moq
-                and not use_fractional and not is_project_row):
-            reorder = int(moq)
+                and not is_project_row
+                and (sku_moq > 0 or not use_fractional)):
+            reorder = float(moq)
+        if reorder > 0 and sku_eoq > 0 and not is_project_row:
+            reorder = _ceil_to_multiple(float(reorder), sku_eoq)
+        if not use_fractional:
+            reorder = int(round(float(reorder)))
+        elif reorder:
+            reorder = round(float(reorder), 2)
 
         # Excess = OnHand beyond target. For bulk masters, ignore
         # non-actionable residue below 5m so 0.002 rolls left on a 100m
@@ -11721,6 +11805,10 @@ elif page == "Ordering":
             "target_stock": target,
             "reorder_qty": reorder,
             "lead_time_days": lead_time_days,
+            "sku_lead_time_days": (
+                _sku_lt_int if _sku_lt_int and _sku_lt_int > 0 else 0),
+            "sku_moq": sku_moq,
+            "sku_eoq_qty": sku_eoq,
             "freight_mode": freight_mode_used,
             "excess_units": excess_units,
             "excess_value": excess_value,
@@ -12076,27 +12164,52 @@ elif page == "Ordering":
                 f"effective = {_eff90:.1f}\n"
             )
 
+        if lead_time_basis == "sku":
+            lead_time_basis_note = (
+                " — SKU-level lead-time override from buying settings; "
+                "overrides IP and supplier defaults.\n\n")
+        elif lead_time_basis == "ip_observed":
+            lead_time_basis_note = (
+                " — IP's measured average PO-to-receipt time for "
+                "this SKU; overrides the supplier-config default "
+                "with the real number.\n\n")
+        elif lead_time_basis == "ip_configured":
+            lead_time_basis_note = (
+                " — IP's configured lead-time setting for "
+                "this SKU; overrides the supplier-config default.\n\n")
+        elif (air_eligible_default and air_max_len
+                and length_mm is not None
+                and length_mm > air_max_len):
+            lead_time_basis_note = (
+                f" — SKU length {length_mm}mm > {air_max_len}mm "
+                f"air max, forced sea\n\n")
+        else:
+            lead_time_basis_note = "\n\n"
+
+        if target_policy_notes:
+            target_policy_text = (
+                f"\n\n**SKU buying policy**: raw target "
+                f"{raw_target:.1f} → **{target:.1f}** units ("
+                + "; ".join(target_policy_notes)
+                + ")")
+        else:
+            target_policy_text = ""
+
+        reorder_policy_bits = []
+        if sku_moq > 0:
+            reorder_policy_bits.append(f"SKU MOQ {sku_moq:g}")
+        elif moq:
+            reorder_policy_bits.append(f"supplier MOQ {float(moq):g}")
+        if sku_eoq > 0:
+            reorder_policy_bits.append(f"SKU EOQ {sku_eoq:g}")
+        reorder_policy_text = (
+            " (" + ", ".join(reorder_policy_bits) + " applied)"
+            if reorder_policy_bits and not is_project_row else "")
+
         trace = "".join(demand_lines) + (
             f"**Lead time**: {lead_time_days} days "
             f"({freight_mode_used}{_freight_rule_note})"
-            + (
-                " — IP's measured average PO-to-receipt time for "
-                "this SKU; overrides the supplier-config default "
-                "with the real number.\n\n"
-                if lead_time_basis_from_ip == "observed"
-                else " — IP's configured lead-time setting for "
-                      "this SKU; overrides the supplier-config "
-                      "default.\n\n"
-                if lead_time_basis_from_ip == "configured"
-                else (
-                    f" — SKU length {length_mm}mm > {air_max_len}mm "
-                    f"air max, forced sea\n\n"
-                    if (air_eligible_default and air_max_len
-                        and length_mm is not None
-                        and length_mm > air_max_len)
-                    else "\n\n"
-                )
-            )
+            + lead_time_basis_note
             + f"**ABC class**: {abc} → safety {safety_pct:.0f}%\n\n"
             f"**Review period**: {review_days}d — {review_basis}\n\n"
             f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "
@@ -12123,7 +12236,9 @@ elif page == "Ordering":
             + f"**Target stock**: {lt_demand:.1f} + {safety:.1f} + "
             f"{review_demand:.1f}"
             + (f" + {holiday_cover:.1f}" if closure_days > 0 else "")
-            + f" = **{target:.1f} units**\n\n"
+            + f" = **{raw_target:.1f} units**"
+            + target_policy_text
+            + "\n\n"
             f"**Current position**:\n"
             f"- OnHand: {onhand:.0f} physical units\n"
             f"- Allocated (reserved for open orders): {allocated:.0f}\n"
@@ -12145,6 +12260,7 @@ elif page == "Ordering":
                f"bulk master is {row.get('bulk_length_m', 0):g}m)"
                if use_fractional
                else f"{reorder} units")
+            + reorder_policy_text
             + (f" (rounded up to MOQ {moq:g})"
                if (moq and not use_fractional and not is_project_row
                    and reorder == int(moq))
@@ -12170,12 +12286,14 @@ elif page == "Ordering":
     # rebuild that was spiking memory and crashing Render on every
     # navigation, holiday save, and cadence save.
     _reorder_cols = ("target_stock", "reorder_qty", "lead_time_days",
+                       "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
                        "freight_mode", "excess_units", "excess_value")
     try:
         _cache_sig = json.dumps({
             "supp": supp_configs,
             "clos": closures_by_supplier,
             "ip_lt": ip_lead_times_by_sku,
+            "sku_buying": sku_buying_settings,
             "today": _today_for_engine.isoformat(),
         }, sort_keys=True, default=str)
     except (TypeError, ValueError):
@@ -12191,6 +12309,10 @@ elif page == "Ordering":
         engine_df["target_stock"] = applied.apply(lambda x: x["target_stock"])
         engine_df["reorder_qty"] = applied.apply(lambda x: x["reorder_qty"])
         engine_df["lead_time_days"] = applied.apply(lambda x: x["lead_time_days"])
+        engine_df["sku_lead_time_days"] = applied.apply(
+            lambda x: x["sku_lead_time_days"])
+        engine_df["sku_moq"] = applied.apply(lambda x: x["sku_moq"])
+        engine_df["sku_eoq_qty"] = applied.apply(lambda x: x["sku_eoq_qty"])
         engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
         engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
         engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
@@ -12481,12 +12603,17 @@ elif page == "Ordering":
         st.markdown(
             f"**Supplier:** {_r.get('Supplier') or '—'}  \n"
             f"**Last 6 months:** {_r.get('last_6mo_series') or '—'}  \n"
+            f"**Last 12 months:** {_r.get('last_12mo_series') or '—'}  \n"
             f"**Reorder-math 12mo:** {_eff_u12:.0f}"
             f"  ·  **Raw direct+FG 12mo:** {_raw_u12:.0f}  \n"
             f"**Target stock:** {float(_r.get('target_stock') or 0):.0f}"
             f"  ·  **Lead time:** "
             f"{float(_r.get('lead_time_days') or 0):.0f}d "
             f"({_r.get('freight_mode') or '—'})"
+            f"  ·  **SKU LT/MOQ/EOQ:** "
+            f"{float(_r.get('sku_lead_time_days') or 0):.0f}d / "
+            f"{float(_r.get('sku_moq') or 0):g} / "
+            f"{float(_r.get('sku_eoq_qty') or 0):g}"
         )
         if _current_month_product_units > max(
                 _current_month_engine_units, _current_month_live_units) + 1:
@@ -14079,6 +14206,10 @@ elif page == "Ordering":
                 new_mode = "sea (manual)"
             else:
                 return row
+            sku_lt_override, sku_moq_override, sku_eoq_override = (
+                _sku_buying_values(sku_here))
+            if sku_lt_override:
+                new_lt = sku_lt_override
             abc = row.get("ABC") or "C"
             safety_pct = {
                 "A": cfg_sel.get("safety_pct_A") or 30.0,
@@ -14090,29 +14221,68 @@ elif page == "Ordering":
                 "B": cfg_sel.get("review_days_B") or 30,
                 "C": cfg_sel.get("review_days_C") or 45,
             }.get(abc, 30)
+            _cadence = cfg_sel.get("order_cadence_days")
+            if _cadence and int(_cadence) > 0:
+                review_days = int(_cadence)
             avg_daily = float(row.get("avg_daily") or 0)
             lt_demand = avg_daily * new_lt
             safety = lt_demand * (safety_pct / 100.0)
             review_demand = avg_daily * review_days
             new_target = lt_demand + safety + review_demand
+            is_project_override = (
+                str(row.get("trend_flag") or "") == "🎯 Project")
+            if not is_project_override:
+                if sku_moq_override > 0 and new_target < sku_moq_override:
+                    new_target = sku_moq_override
+                if sku_eoq_override > 0:
+                    new_target = _ceil_to_multiple(
+                        float(new_target), sku_eoq_override)
             onhand = float(row.get("OnHand") or 0)
             available = float(row.get("Available") or 0)
             on_order = float(row.get("OnOrder") or 0)
             # v2.67.319 — Available already nets the backorder (negative
             # when over-committed); do NOT subtract `unfulfilled` again.
-            effective_pos = available + on_order
-            new_reorder = int(round(max(0, new_target - effective_pos)))
-            moq = cfg_sel.get("moq_units") or 0
-            is_project_override = (
-                str(row.get("trend_flag") or "") == "🎯 Project")
+            is_bulk = bool(row.get("is_bulk_master", False))
+            bulk_len_m = float(row.get("bulk_length_m") or 0)
+            use_fractional = fractional_bulk_order_allowed(
+                sel_sup, is_bulk, bulk_len_m, cfg_sel)
+            planning_available = normalise_planning_quantity(
+                available, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+            planning_on_order = normalise_planning_quantity(
+                on_order, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+            target_for_position = normalise_planning_quantity(
+                new_target, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+            effective_pos = planning_available + planning_on_order
+            new_reorder = max(0, target_for_position - effective_pos)
+            moq = sku_moq_override or cfg_sel.get("moq_units") or 0
             if (new_reorder > 0 and moq and new_reorder < moq
+                    and not is_project_override
+                    and (sku_moq_override > 0 or not use_fractional)):
+                new_reorder = float(moq)
+            if (new_reorder > 0 and sku_eoq_override > 0
                     and not is_project_override):
-                new_reorder = int(moq)
+                new_reorder = _ceil_to_multiple(
+                    float(new_reorder), sku_eoq_override)
+            new_reorder = (
+                round(float(new_reorder), 2) if use_fractional
+                else int(round(float(new_reorder)))
+            )
+            new_excess_units = excess_units_over_target(
+                onhand, new_target,
+                is_bulk_master=is_bulk,
+                bulk_length_m=bulk_len_m,
+            )
             row = row.copy()
             row["lead_time_days"] = new_lt
+            row["sku_lead_time_days"] = sku_lt_override
+            row["sku_moq"] = sku_moq_override
+            row["sku_eoq_qty"] = sku_eoq_override
             row["freight_mode"] = new_mode
             row["target_stock"] = new_target
             row["reorder_qty"] = new_reorder
+            row["excess_units"] = new_excess_units
+            row["excess_value"] = (
+                new_excess_units * float(row.get("AverageCost") or 0))
             return row
 
         all_supplier_df = all_supplier_df.apply(_apply_override, axis=1)
@@ -14323,7 +14493,7 @@ elif page == "Ordering":
     default_editor_cols = [
         "Include?", "🔍", "SKU", "Name", "ABC", "Status", "Category",
         "trend_flag",
-        "trend_12m", "last_6mo_series", "units_12mo",
+        "trend_12m", "last_6mo_series", "last_12mo_series", "units_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
         "avg_daily", "avg_month", "LengthMM",
         "OnHand", "Allocated", "Available", "OnOrder",
@@ -14331,6 +14501,7 @@ elif page == "Ordering":
         "target_stock", "reorder_qty",
         "Order qty", "Line value",
         "freight_mode", "lead_time_days",
+        "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
         "POCost", "POCostBasis", "excess_units", "excess_value",
         "Note", "Exclude?", "Dropship?",
         "Source",
@@ -14368,12 +14539,18 @@ elif page == "Ordering":
     # column added in a recent release. The user can still reorder
     # / hide via the layout editor afterwards. Add new column names
     # to this set as they ship.
-    _NEWLY_INTRODUCED_COLS = {"avg_month"}
-    for _new in _NEWLY_INTRODUCED_COLS:
+    _NEWLY_INTRODUCED_COLS = [
+        ("avg_month", "avg_daily"),
+        ("last_12mo_series", "last_6mo_series"),
+        ("sku_lead_time_days", "lead_time_days"),
+        ("sku_moq", "sku_lead_time_days"),
+        ("sku_eoq_qty", "sku_moq"),
+    ]
+    for _new, _after in _NEWLY_INTRODUCED_COLS:
         if _new not in editor_cols and _new in default_editor_cols:
-            # Insert just after avg_daily if it's there, else append.
-            if "avg_daily" in editor_cols:
-                _idx = editor_cols.index("avg_daily") + 1
+            # Insert beside the column it explains if present, else append.
+            if _after in editor_cols:
+                _idx = editor_cols.index(_after) + 1
                 editor_cols.insert(_idx, _new)
             else:
                 editor_cols.append(_new)
@@ -14390,6 +14567,7 @@ elif page == "Ordering":
         "Category": "Category",
         "trend_12m": "📈 12mo trend (sparkline)",
         "last_6mo_series": "Last 6 months (trend numbers)",
+        "last_12mo_series": "Last 12 months (trend numbers)",
         "units_12mo": "12mo units sold",
         "avg_daily": "Avg daily units",
         "avg_month": "Avg/month",
@@ -14406,6 +14584,9 @@ elif page == "Ordering":
         "Line value": "Line $ value",
         "freight_mode": "Freight (air/sea)",
         "lead_time_days": "Lead time (days)",
+        "sku_lead_time_days": "Sku Leadtime",
+        "sku_moq": "SKU MOQ",
+        "sku_eoq_qty": "SKU EOQ / batch qty",
         "POCost": "PO cost (FixedCost)",
         "POCostBasis": "Cost basis",
         "excess_units": "Excess units",
@@ -14428,15 +14609,19 @@ elif page == "Ordering":
     PRESETS = {
         "Buyer essentials (default)": [
             "Include?", "SKU", "Name", "ABC", "Status",
-            "trend_flag", "last_6mo_series", "avg_month",
+            "trend_flag", "last_6mo_series", "last_12mo_series",
+            "avg_month",
             "OnHand", "Available", "OnOrder", "unfulfilled",
             "target_stock", "reorder_qty", "freight_mode",
+            "lead_time_days", "sku_lead_time_days", "sku_moq",
+            "sku_eoq_qty",
             "POCost", "Order qty", "Line value",
             "Note", "Exclude?", "Dropship?",
         ],
         "Detailed view (everything)": list(default_editor_cols),
         "Minimal — just decide to buy": [
-            "Include?", "SKU", "Name", "ABC", "last_6mo_series",
+            "Include?", "SKU", "Name", "ABC",
+            "last_6mo_series", "last_12mo_series",
             "OnHand", "reorder_qty", "POCost",
             "Order qty", "Line value",
         ],
@@ -14449,7 +14634,7 @@ elif page == "Ordering":
         ],
         "Excess / cleanup view": [
             "SKU", "Name", "ABC", "Status", "Category",
-            "OnHand", "last_6mo_series", "DoC_days",
+            "OnHand", "last_6mo_series", "last_12mo_series", "DoC_days",
             "excess_units", "excess_value",
         ],
     }
@@ -15066,8 +15251,9 @@ elif page == "Ordering":
                     "OnOrder", "unfulfilled", "DoC_days",
                     "target_stock", "reorder_qty",
                     "freight_mode", "lead_time_days",
+                    "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
                     "excess_units", "excess_value",
-                    "last_6mo", "last_6mo_series",
+                    "last_6mo", "last_6mo_series", "last_12mo_series",
                     "lineage_units_12mo",
                     "Category", "Name",
                     # Trend-detection fields
@@ -15167,6 +15353,15 @@ elif page == "Ordering":
                 disabled=True,
                 width="medium",
             ),
+            "last_12mo_series": st.column_config.TextColumn(
+                "Last 12 months",
+                help="Units sold in each of the last 12 calendar months — "
+                     "oldest on the left, current month on the right. "
+                     "Uses the same demand buckets as the 6-month numbers "
+                     "and Product Detail.",
+                disabled=True,
+                width="large",
+            ),
             "units_12mo": st.column_config.NumberColumn(
                 "12mo demand",
                 disabled=True,
@@ -15230,6 +15425,30 @@ elif page == "Ordering":
             ),
             "lead_time_days": st.column_config.NumberColumn(
                 "LT (d)", disabled=True),
+            "sku_lead_time_days": st.column_config.NumberColumn(
+                "Sku Leadtime",
+                min_value=0,
+                max_value=365,
+                step=1,
+                format="%d",
+                help="Manual SKU lead-time override in days. 0 or blank "
+                     "uses IP observed/configured lead time, then supplier "
+                     "default. Save edits to apply."),
+            "sku_moq": st.column_config.NumberColumn(
+                "SKU MOQ",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Manual SKU minimum order quantity. 0 or blank uses "
+                     "supplier defaults only. Save edits to apply."),
+            "sku_eoq_qty": st.column_config.NumberColumn(
+                "SKU EOQ",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Economic/order batch quantity for this SKU. When set, "
+                     "target and suggested reorder round to this multiple "
+                     "except for Project rows. Save edits to apply."),
             "excess_units": st.column_config.NumberColumn(
                 "Excess u", disabled=True, format="%.0f"),
             "excess_value": st.column_config.NumberColumn(
@@ -15839,6 +16058,21 @@ elif page == "Ordering":
     _changed_notes = []
     _ds_add = []   # SKUs to flag dropship
     _ds_remove = []  # SKUs to un-flag dropship
+    _sku_buying_edits = []
+
+    def _numeric_policy_cell(value) -> float:
+        try:
+            if value is None or pd.isna(value):
+                return 0.0
+            val = float(pd.to_numeric(value, errors="coerce"))
+        except (TypeError, ValueError):
+            return 0.0
+        return val if val > 0 else 0.0
+
+    def _int_policy_cell(value) -> int:
+        val = _numeric_policy_cell(value)
+        return int(round(val)) if val > 0 else 0
+
     if "Exclude?" in edited.columns:
         excl_mask = edited["Exclude?"].fillna(False).astype(bool)
         _new_exclusions = edited.loc[excl_mask, "SKU"].astype(
@@ -15883,6 +16117,35 @@ elif page == "Ordering":
             old_note = (latest_notes_map.get(sku_e) or "").strip()
             if new_note and new_note != old_note:
                 _changed_notes.append((sku_e, new_note))
+    _policy_cols = {"SKU", "sku_lead_time_days", "sku_moq", "sku_eoq_qty"}
+    if _policy_cols.issubset(set(edited.columns)):
+        _loaded_policy = {}
+        if _policy_cols.issubset(set(editable.columns)):
+            for _, _r in editable.iterrows():
+                _sk = str(_r.get("SKU") or "")
+                if not _sk:
+                    continue
+                _loaded_policy[_sk] = (
+                    _int_policy_cell(_r.get("sku_lead_time_days")),
+                    _numeric_policy_cell(_r.get("sku_moq")),
+                    _numeric_policy_cell(_r.get("sku_eoq_qty")),
+                )
+        for _, _r in edited.iterrows():
+            _sk = str(_r.get("SKU") or "")
+            if not _sk:
+                continue
+            _new_policy = (
+                _int_policy_cell(_r.get("sku_lead_time_days")),
+                _numeric_policy_cell(_r.get("sku_moq")),
+                _numeric_policy_cell(_r.get("sku_eoq_qty")),
+            )
+            _old_policy = _loaded_policy.get(_sk, _new_policy)
+            if (
+                _new_policy[0] != _old_policy[0]
+                or abs(_new_policy[1] - _old_policy[1]) > 0.001
+                or abs(_new_policy[2] - _old_policy[2]) > 0.001
+            ):
+                _sku_buying_edits.append((_sk, *_new_policy))
 
     # --- Persistent qty-edit detection + save/clear UI ---------------
     # Detect Order qty edits by comparing edited["Order qty"] to the
@@ -15978,13 +16241,14 @@ elif page == "Ordering":
 
     sec1, sec2 = st.columns([1, 3])
     save_disabled = (not _new_exclusions) and (not _changed_notes) \
-        and (not _ds_add) and (not _ds_remove)
+        and (not _ds_add) and (not _ds_remove) and (not _sku_buying_edits)
     if sec1.button("💾 Save edits",
                     key=f"save_po_edits_{sel_sup}",
                     type="primary",
                     disabled=save_disabled,
-                    help="Commits any Exclude?, Dropship? and Note edits "
-                         "above to the team database.",
+                    help="Commits any Exclude?, Dropship?, Note, Sku "
+                         "Leadtime, MOQ, and EOQ edits above to the team "
+                         "database.",
                     use_container_width=True):
         actor = st.session_state.get("current_user", "").strip()
         if not actor:
@@ -16022,12 +16286,37 @@ elif page == "Ordering":
                 for sku_e, body in _changed_notes:
                     db.add_note(sku_e, actor, body)
                 msgs.append(f"Saved {len(_changed_notes)} note edit(s)")
+            if _sku_buying_edits:
+                for sku_e, lt_days, sku_moq, sku_eoq in _sku_buying_edits:
+                    existing_policy = sku_buying_settings.get(sku_e, {}) or {}
+                    note = str(existing_policy.get("note") or "")
+                    pack_qty = _numeric_policy_cell(
+                        existing_policy.get("pack_qty"))
+                    if (lt_days <= 0 and sku_moq <= 0 and sku_eoq <= 0
+                            and pack_qty <= 0 and not note.strip()):
+                        db.clear_sku_pack(sku_e, actor)
+                    else:
+                        db.set_sku_buying_settings(
+                            sku=sku_e,
+                            actor=actor,
+                            pack_qty=(pack_qty if pack_qty > 0 else None),
+                            moq=(sku_moq if sku_moq > 0 else None),
+                            lead_time_days=(
+                                int(lt_days) if lt_days > 0 else None),
+                            eoq_qty=(sku_eoq if sku_eoq > 0 else None),
+                            note=note,
+                        )
+                st.session_state.pop("_reorder_apply_sig", None)
+                msgs.append(
+                    f"Saved SKU buying settings for "
+                    f"{len(_sku_buying_edits)} SKU(s)")
             st.success(" • ".join(msgs) + ". Refreshing…")
             st.rerun()
     if save_disabled:
         sec2.caption(
             ":information_source: No pending edits — tick *Exclude?*, "
-            "*Dropship?* or type into *Note* to enable Save."
+            "*Dropship?*, type into *Note*, or edit SKU buying settings "
+            "to enable Save."
         )
     else:
         pending = []
@@ -16039,6 +16328,9 @@ elif page == "Ordering":
             pending.append(f"{len(_ds_remove)} promote-to-stocked")
         if _changed_notes:
             pending.append(f"{len(_changed_notes)} note edit(s)")
+        if _sku_buying_edits:
+            pending.append(
+                f"{len(_sku_buying_edits)} SKU buying setting edit(s)")
         sec2.caption(
             ":pencil2: Pending: " + ", ".join(pending)
             + " — click Save to commit."
@@ -17033,7 +17325,7 @@ elif page == "Ordering":
             if "avg_daily" in upc.columns and "avg_month" not in upc.columns:
                 upc["avg_month"] = upc["avg_daily"] * 30.4
             show_cols = ["SKU", "Name", "ABC", "trend_flag",
-                         "last_6mo_series", "avg_month",
+                         "last_6mo_series", "last_12mo_series", "avg_month",
                          "OnHand", "OnOrder", "eff_pos",
                          "target_stock", "days_to_reorder",
                          "avg_daily", "Suggest", "POCost", "Line $",
@@ -17079,6 +17371,11 @@ elif page == "Ordering":
                              "months — oldest on the left, current month "
                              "on the right. Same column as the main "
                              "reorder table."),
+                    "last_12mo_series": st.column_config.TextColumn(
+                        "Last 12 months", disabled=True, width="large",
+                        help="Units sold in each of the last 12 calendar "
+                             "months — same demand buckets as Ordering "
+                             "and Product Detail."),
                     "OnHand": st.column_config.NumberColumn(
                         disabled=True, format="%.0f"),
                     "OnOrder": st.column_config.NumberColumn(
@@ -19302,6 +19599,19 @@ elif page == "Product Detail":
         st.session_state["selected_sku"] = sku
 
         prod_row = products[products["SKU"] == sku].iloc[0]
+        _pd_engine_df = pd.DataFrame()
+        _pd_engine_row = None
+        try:
+            _pd_engine_df = _load_engine_output_snapshot()
+            if (not _pd_engine_df.empty
+                    and "SKU" in _pd_engine_df.columns):
+                _pd_hit = _pd_engine_df[
+                    _pd_engine_df["SKU"].astype(str) == str(sku)]
+                if not _pd_hit.empty:
+                    _pd_engine_row = _pd_hit.iloc[0]
+        except Exception:  # noqa: BLE001
+            _pd_engine_df = pd.DataFrame()
+            _pd_engine_row = None
 
         # --- "This SKU has been replaced" banner --------------------------
         # If this SKU is recorded as a predecessor in the migration DB,
@@ -19445,7 +19755,9 @@ elif page == "Product Detail":
                 bom_children=BOM_CHILDREN,
                 bom_parents=BOM_PARENTS,
                 assemblies_df=assemblies,
-                engine_row=None,
+                engine_row=_pd_engine_row,
+                engine_df_full=(
+                    _pd_engine_df if not _pd_engine_df.empty else None),
                 stock_df=stock,
             )
 
@@ -19458,6 +19770,153 @@ elif page == "Product Detail":
         c4.metric("Status", str(prod_row.get("Status") or "—"))
         c5.metric("Avg cost",
                   _fmt_money(float(prod_row.get("AverageCost") or 0)))
+
+        # --- SKU buying settings ---------------------------------------------
+        def _pd_primary_supplier_name(row) -> str:
+            sups_raw = row.get("Suppliers")
+            if not sups_raw or sups_raw in ("[]", "None", None):
+                return ""
+            sups = sups_raw
+            if isinstance(sups, str):
+                try:
+                    sups = json.loads(sups)
+                except (ValueError, TypeError):
+                    return ""
+            if not isinstance(sups, list) or not sups:
+                return ""
+            primary = next(
+                (s for s in sups
+                 if isinstance(s, dict) and s.get("SupplierName")),
+                None,
+            )
+            return str(primary.get("SupplierName") or "") if primary else ""
+
+        _pd_policy_row = db.get_sku_pack(sku)
+        _pd_policy = dict(_pd_policy_row) if _pd_policy_row is not None else {}
+        _pd_supplier = ""
+        if _pd_engine_row is not None:
+            _pd_supplier = str(_pd_engine_row.get("Supplier") or "").strip()
+        if not _pd_supplier:
+            _pd_supplier = _pd_primary_supplier_name(prod_row)
+        _pd_cfgs = db.all_supplier_configs()
+        _pd_supplier_norm = " ".join(_pd_supplier.split()).strip()
+        _pd_cfg = _pd_cfgs.get(
+            _pd_supplier_norm, _pd_cfgs.get(_pd_supplier, {}))
+        try:
+            _pd_ip_lt = db.get_ip_lead_times().get(sku, {})
+        except Exception:  # noqa: BLE001
+            _pd_ip_lt = {}
+
+        def _pd_pos_float(value) -> float:
+            try:
+                val = float(value or 0)
+            except (TypeError, ValueError):
+                return 0.0
+            return val if val > 0 else 0.0
+
+        _pd_sku_lt = int(_pd_policy.get("lead_time_days") or 0)
+        _pd_sku_moq = _pd_pos_float(_pd_policy.get("moq"))
+        _pd_sku_eoq = (
+            _pd_pos_float(_pd_policy.get("eoq_qty"))
+            or _pd_pos_float(_pd_policy.get("pack_qty")))
+        _pd_effective_lt = (
+            float(_pd_engine_row.get("lead_time_days") or 0)
+            if _pd_engine_row is not None else 0)
+        _pd_supplier_lt_bits = []
+        if _pd_cfg.get("lead_time_air_days"):
+            _pd_supplier_lt_bits.append(
+                f"air {int(_pd_cfg.get('lead_time_air_days'))}d")
+        if _pd_cfg.get("lead_time_sea_days"):
+            _pd_supplier_lt_bits.append(
+                f"sea {int(_pd_cfg.get('lead_time_sea_days'))}d")
+        _pd_ip_bits = []
+        if _pd_ip_lt.get("observed_lead_time_days"):
+            _pd_ip_bits.append(
+                f"observed "
+                f"{int(float(_pd_ip_lt['observed_lead_time_days']))}d")
+        if _pd_ip_lt.get("configured_lead_time_days"):
+            _pd_ip_bits.append(
+                f"configured "
+                f"{int(float(_pd_ip_lt['configured_lead_time_days']))}d")
+        _pd_last6 = (
+            str(_pd_engine_row.get("last_6mo_series") or "")
+            if _pd_engine_row is not None else "")
+        _pd_last12 = (
+            str(_pd_engine_row.get("last_12mo_series") or "")
+            if _pd_engine_row is not None else "")
+
+        st.markdown("### Buying settings")
+        bs1, bs2, bs3, bs4 = st.columns(4)
+        bs1.metric("Supplier", _pd_supplier or "—")
+        bs2.metric(
+            "Effective lead time",
+            f"{_pd_effective_lt:.0f}d" if _pd_effective_lt else "—",
+            help="Lead time currently shown by the cached engine row.")
+        bs3.metric("SKU MOQ", f"{_pd_sku_moq:g}" if _pd_sku_moq else "—")
+        bs4.metric("SKU EOQ", f"{_pd_sku_eoq:g}" if _pd_sku_eoq else "—")
+        st.caption(
+            "Supplier defaults: "
+            f"{', '.join(_pd_supplier_lt_bits) or '—'} · "
+            "IP lead times: "
+            f"{', '.join(_pd_ip_bits) or '—'} · "
+            f"Last 6 months: `{_pd_last6 or '—'}` · "
+            f"Last 12 months: `{_pd_last12 or '—'}`")
+        with st.form(f"pd_buying_settings_{sku}"):
+            b1, b2, b3 = st.columns(3)
+            pd_lt = b1.number_input(
+                "Sku Leadtime (days, 0=default)",
+                min_value=0, max_value=365,
+                value=int(_pd_sku_lt or 0),
+                step=1,
+                help="When set, this SKU lead time overrides IP and "
+                     "supplier lead-time defaults in reorder math.")
+            pd_moq = b2.number_input(
+                "SKU MOQ (0=none)",
+                min_value=0.0,
+                value=float(_pd_sku_moq or 0),
+                step=1.0,
+                format="%.2f")
+            pd_eoq = b3.number_input(
+                "SKU EOQ / batch qty (0=none)",
+                min_value=0.0,
+                value=float(_pd_sku_eoq or 0),
+                step=1.0,
+                format="%.2f",
+                help="Rounds target and suggested reorder to this multiple "
+                     "except for Project rows.")
+            pd_note = st.text_input(
+                "Buying note",
+                value=str(_pd_policy.get("note") or ""))
+            pd_save = st.form_submit_button(
+                "💾 Save SKU buying settings", type="primary")
+            if pd_save:
+                actor = st.session_state.get("current_user", "").strip()
+                if not actor:
+                    st.error(
+                        "Enter your name in the sidebar first — edits need "
+                        "an author for audit logging.")
+                else:
+                    legacy_pack = _pd_pos_float(_pd_policy.get("pack_qty"))
+                    if (pd_lt <= 0 and pd_moq <= 0 and pd_eoq <= 0
+                            and legacy_pack <= 0 and not pd_note.strip()):
+                        db.clear_sku_pack(sku, actor)
+                        st.success(f"Cleared SKU buying settings for {sku}.")
+                    else:
+                        db.set_sku_buying_settings(
+                            sku=sku,
+                            actor=actor,
+                            pack_qty=(
+                                legacy_pack if legacy_pack > 0 else None),
+                            moq=(float(pd_moq) if pd_moq > 0 else None),
+                            lead_time_days=(
+                                int(pd_lt) if pd_lt > 0 else None),
+                            eoq_qty=(float(pd_eoq) if pd_eoq > 0 else None),
+                            note=pd_note.strip(),
+                        )
+                        st.success(
+                            f"Saved SKU buying settings for {sku}.")
+                    st.session_state.pop("_reorder_apply_sig", None)
+                    st.rerun()
 
         # BOM banner
         is_bom = str(prod_row.get("BillOfMaterial")).lower() == "true"
