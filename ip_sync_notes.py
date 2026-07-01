@@ -130,6 +130,28 @@ def _note_text(warehouse: Dict[str, Any]) -> str:
     return ""
 
 
+def _note_entries_for_variant(variant: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return every note entry exposed by IP for one variant.
+
+    IP's UI labels these as replenishment notes. In practice the public API
+    can expose the note at variant top-level (`replenishment_notes`) even
+    when the warehouse blocks omit it, so check both places.
+    """
+    entries: List[Dict[str, str]] = []
+    top_note = _note_text(variant)
+    if top_note:
+        entries.append({"warehouse_id": "", "note": top_note})
+    for warehouse in _collect_warehouse_blocks(variant):
+        note = _note_text(warehouse)
+        if not note:
+            continue
+        entries.append({
+            "warehouse_id": _warehouse_id(warehouse),
+            "note": note,
+        })
+    return entries
+
+
 def _safe_filename_token(value: str) -> str:
     token = "".join(
         ch if ch.isalnum() or ch in {"-", "_", "."} else "_"
@@ -282,11 +304,9 @@ def main() -> int:
                 continue
             variant_id = variant.get("id") or ""
             tags = _tags_string(variant)
-            for warehouse in _collect_warehouse_blocks(variant):
-                note = _note_text(warehouse)
-                if not note:
-                    continue
-                warehouse_id = _warehouse_id(warehouse)
+            for note_entry in _note_entries_for_variant(variant):
+                note = note_entry["note"]
+                warehouse_id = note_entry["warehouse_id"]
                 dedupe_key = (sku, variant_id, warehouse_id, note)
                 if dedupe_key in seen:
                     continue

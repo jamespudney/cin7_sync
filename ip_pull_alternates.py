@@ -129,6 +129,23 @@ def _master_sku(variant: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _note_text(block: Dict[str, Any]) -> str:
+    for key in (
+        "replenishment_notes",
+        "replenishment_note",
+        "buyer_notes",
+        "notes",
+        "note",
+    ):
+        value = block.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 def fetch_all_variants(headers: Dict[str, str],
                         rate: float,
                         log: logging.Logger,
@@ -359,11 +376,22 @@ def main() -> int:
             # --- Per-warehouse notes + curated settings + velocities ----
             note_count = 0
             had_override = False
+            top_note = _note_text(v)
+            if top_note:
+                notes_w.writerow([
+                    master_sku or "",
+                    master_id or "",
+                    "",
+                    top_note[:500],
+                    tags_str,
+                ])
+                n_note_rows += 1
+                note_count += 1
             for wh in warehouses:
                 if not isinstance(wh, dict):
                     continue
                 wh_id = wh.get("warehouse") or ""
-                note = (wh.get("replenishment_notes") or "").strip()
+                note = _note_text(wh)
 
                 # Settings dimensions
                 lead_time = wh.get("lead_time")
@@ -387,7 +415,7 @@ def main() -> int:
                     fdesc.get("method") if isinstance(fdesc, dict) else "")
 
                 # Notes CSV — only emit rows that actually have a note
-                if note:
+                if note and note != top_note:
                     notes_w.writerow([
                         master_sku or "",
                         master_id or "",
