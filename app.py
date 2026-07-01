@@ -18170,14 +18170,14 @@ elif page == "Ordering":
     if show_pull_forward:
         with st.expander("Optional pull-forward notes", expanded=False):
             st.caption(
-                "These rows have Suggested reorder = 0 today. They appear "
-                "only because the item may fall below target inside the "
-                "selected window."
+                "These rows are not in the main PO table today. They appear "
+                "only when the item would become a suggested reorder inside "
+                "the selected window."
             )
             st.caption(
-                "The optional qty is what you would pull forward if you "
-                "choose to consolidate now. Moving the slider recomputes "
-                "that optional qty."
+                "Suggested reorder is recalculated as current target plus "
+                "selected-window demand minus effective position. Moving "
+                "the slider recomputes the optional qty."
             )
         uw_col1, _ = st.columns([1, 3])
         upcoming_window = uw_col1.slider(
@@ -18196,12 +18196,37 @@ elif page == "Ordering":
         if upc.empty:
             st.info("No optional pull-forward candidates for this supplier.")
         else:
-            upc["eff_pos"] = (
-                upc["Available"].fillna(0)
-                + upc["OnOrder"].fillna(0)
+            upc["today_reorder_qty"] = _ordering_numeric_col(
+                upc, "reorder_qty", 0.0)
+            upc["avg_daily"] = _ordering_numeric_col(
+                upc, "avg_daily", 0.0)
+            upc["target_stock"] = _ordering_numeric_col(
+                upc, "target_stock", 0.0)
+            upc["Available"] = _ordering_numeric_col(
+                upc, "Available", 0.0)
+            upc["OnOrder"] = _ordering_numeric_col(
+                upc, "OnOrder", 0.0)
+
+            def _planning_qty_for_row(row, col: str) -> float:
+                return normalise_planning_quantity(
+                    row.get(col, 0),
+                    is_bulk_master=bool(row.get("is_bulk_master", False)),
+                    bulk_length_m=float(row.get("bulk_length_m") or 0),
+                )
+
+            upc["eff_pos"] = upc.apply(
+                lambda r: (
+                    _planning_qty_for_row(r, "Available")
+                    + _planning_qty_for_row(r, "OnOrder")
+                ),
+                axis=1,
+            )
+            upc["planning_target_stock"] = upc.apply(
+                lambda r: _planning_qty_for_row(r, "target_stock"),
+                axis=1,
             )
             upc["surplus_above_target"] = (
-                upc["eff_pos"] - upc["target_stock"].fillna(0)
+                upc["eff_pos"] - upc["planning_target_stock"]
             )
             upc["days_to_reorder"] = upc.apply(
                 lambda r: (
@@ -18211,11 +18236,66 @@ elif page == "Ordering":
                 ),
                 axis=1,
             )
+            upc["window_demand"] = upc["avg_daily"] * float(upcoming_window)
+            upc["window_target_stock"] = (
+                upc["planning_target_stock"] + upc["window_demand"]
+            )
+            upc["pull_forward_reorder_qty"] = (
+                upc["window_target_stock"] - upc["eff_pos"]
+            ).clip(lower=0)
+
+            _main_po_skus = set()
+            if "SKU" in editable.columns:
+                _main_po_skus = set(editable["SKU"].astype(str).tolist())
+            _extra_po_skus = {
+                str(e.get("SKU") or "") for e in st.session_state.get(
+                    extra_key, [])
+            }
+
+            def _pull_forward_order_qty(row) -> float:
+                qty = float(row.get("pull_forward_reorder_qty") or 0)
+                if qty <= 0:
+                    return 0
+                sku_here = str(row.get("SKU") or "")
+                _sku_lt, sku_moq_override, sku_eoq_override = (
+                    _sku_buying_values(sku_here))
+                is_project = (
+                    str(row.get("trend_flag") or row.get("Trend") or "")
+                    == "🎯 Project"
+                )
+                is_bulk = bool(row.get("is_bulk_master", False))
+                try:
+                    bulk_len_m = float(row.get("bulk_length_m") or 0)
+                except (TypeError, ValueError):
+                    bulk_len_m = 0.0
+                use_fractional = fractional_bulk_order_allowed(
+                    sel_sup, is_bulk, bulk_len_m, cfg)
+                moq = sku_moq_override or cfg.get("moq_units") or 0
+                if (not is_project
+                        and moq
+                        and qty < float(moq)
+                        and (sku_moq_override > 0 or not use_fractional)):
+                    qty = float(moq)
+                if (not is_project
+                        and sku_eoq_override > 0
+                        and qty > 0):
+                    qty = _ceil_to_multiple(float(qty), sku_eoq_override)
+                if use_fractional:
+                    return round(float(qty), 2)
+                return int(max(1, _ceil_to_multiple(float(qty), 1.0)))
+
+            upc["reorder_qty"] = upc.apply(
+                _pull_forward_order_qty, axis=1)
+            upc["Order qty"] = upc["reorder_qty"]
+
             upc = upc[
-                (upc["reorder_qty"].fillna(0) == 0)
-                & (upc["avg_daily"].fillna(0) > 0)
+                (upc["today_reorder_qty"] <= 0)
+                & (upc["avg_daily"] > 0)
                 & (upc["surplus_above_target"] > 0)
-                & (upc["days_to_reorder"] < upcoming_window)
+                & (upc["days_to_reorder"] <= upcoming_window)
+                & (upc["reorder_qty"] > 0)
+                & (~upc["SKU"].astype(str).isin(_main_po_skus))
+                & (~upc["SKU"].astype(str).isin(_extra_po_skus))
             ].copy()
 
             if upc.empty:
@@ -18225,10 +18305,6 @@ elif page == "Ordering":
                     f"this supplier."
                 )
             else:
-                upc["Suggest"] = (
-                    upc["avg_daily"] * upcoming_window
-                ).round().astype(int)
-                upc["Order qty"] = upc["Suggest"]
                 if "avg_daily" in upc.columns and "avg_month" not in upc.columns:
                     upc["avg_month"] = upc["avg_daily"] * 30.4
                 upc_view = _ordering_add_to_po_view(

@@ -312,9 +312,11 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _pull_forward_window_default_days", script)
         self.assertIn("_pull_forward_window_key", script)
         self.assertIn("Pull-forward window (days)", script)
-        self.assertIn("Suggested reorder = 0 today", script)
-        self.assertIn("Moving the slider recomputes", script)
-        self.assertIn("that optional qty", script)
+        self.assertIn("would become a suggested reorder inside", script)
+        self.assertIn("the slider recomputes the optional qty", script)
+        self.assertIn("pull_forward_reorder_qty", script)
+        self.assertIn("_main_po_skus", script)
+        self.assertIn("window_target_stock", script)
         self.assertNotIn('f"upcoming_window_{sel_sup}", 45', script)
 
     def test_ordering_recent_demand_anchors_to_snapshot_date(self) -> None:
