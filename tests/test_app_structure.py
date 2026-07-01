@@ -400,6 +400,8 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn('"reorder_qty": 0.0', script)
         self.assertIn("_supplier_reorder_qty = pd.to_numeric", script)
         self.assertIn('s_df.get("reorder_qty"', script)
+        self.assertIn("_product_names_by_sku", script)
+        self.assertIn("missing_name", script)
         self.assertNotIn('(s_df["reorder_qty"] > 0)', script)
 
     def test_ordering_supplier_catalog_search_is_committed_and_bounded(self) -> None:
@@ -408,8 +410,10 @@ class AppMemoryStructureTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("def _filter_supplier_catalog", script)
-        self.assertIn("catalog_search_form_", script)
-        self.assertIn("form_submit_button", script)
+        self.assertIn("Searches SKU and product name", script)
+        self.assertIn("roma endcap", script)
+        self.assertIn("catalog_clear_", script)
+        self.assertNotIn("catalog_search_form_", script)
         self.assertIn("max_catalog_rows = 80 if", script)
         self.assertIn("Click the main Save edits button after adding", script)
 

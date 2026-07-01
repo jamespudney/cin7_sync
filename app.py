@@ -14526,6 +14526,12 @@ elif page == "Ordering":
         all_supplier_df = orderable_df[orderable_df["Supplier"] == sel_sup]
 
     _product_images_by_sku = _product_image_lookup(products, product_images)
+    _product_names_by_sku = {}
+    if (not products.empty
+            and {"SKU", "Name"}.issubset(set(products.columns))):
+        _product_names_by_sku = dict(
+            zip(products["SKU"].astype(str), products["Name"].astype(str))
+        )
     if "SKU" in all_supplier_df.columns:
         all_supplier_df = all_supplier_df.copy()
         all_supplier_df["Image"] = (
@@ -14607,6 +14613,15 @@ elif page == "Ordering":
             out.loc[missing_img, "Image"] = (
                 out.loc[missing_img, "SKU"].astype(str)
                 .map(_product_images_by_sku)
+                .fillna("")
+            )
+        if "Name" in out.columns and "SKU" in out.columns:
+            missing_name = (
+                out["Name"].fillna("").astype(str).str.strip().str.len().eq(0)
+            )
+            out.loc[missing_name, "Name"] = (
+                out.loc[missing_name, "SKU"].astype(str)
+                .map(_product_names_by_sku)
                 .fillna("")
             )
         return out
@@ -18251,49 +18266,35 @@ elif page == "Ordering":
         if all_supplier_df.empty:
             st.info("No supplier SKUs found for this supplier.")
         else:
-            _catalog_query_key = f"catalog_search_committed_{sel_sup}"
-            _catalog_hide_key = f"catalog_hide_visible_committed_{sel_sup}"
-            with st.form(f"catalog_search_form_{sel_sup}"):
-                cat_controls = st.columns([3, 1])
-                catalog_query_input = cat_controls[0].text_input(
-                    "Search supplier SKUs",
-                    value=st.session_state.get(_catalog_query_key, ""),
-                    key=f"catalog_search_input_{sel_sup}",
-                    placeholder="SKU, name, category, status, or trend...",
-                    help=(
-                        "Search accepts partial SKUs with or without "
-                        "hyphens/spaces, and multiple words narrow the "
-                        "result."
-                    ),
-                )
-                hide_visible_input = cat_controls[1].checkbox(
-                    "Hide rows already above",
-                    value=bool(st.session_state.get(_catalog_hide_key, False)),
-                    key=f"catalog_hide_visible_input_{sel_sup}",
-                    help="Useful when you only want SKUs that are not "
-                         "already in the reorder or pull-forward sections.",
-                )
-                fs1, fs2, fs3 = st.columns([1, 1, 4])
-                search_submitted = fs1.form_submit_button(
-                    "Search",
-                    type="primary",
-                    use_container_width=True,
-                )
-                search_cleared = fs2.form_submit_button(
-                    "Clear",
-                    use_container_width=True,
-                )
-            if search_submitted:
-                st.session_state[_catalog_query_key] = catalog_query_input
-                st.session_state[_catalog_hide_key] = hide_visible_input
-                st.rerun()
-            if search_cleared:
+            _catalog_query_key = f"catalog_search_input_{sel_sup}"
+            _catalog_hide_key = f"catalog_hide_visible_input_{sel_sup}"
+
+            def _clear_supplier_catalog_search():
                 st.session_state[_catalog_query_key] = ""
                 st.session_state[_catalog_hide_key] = False
-                st.rerun()
-            catalog_query = st.session_state.get(_catalog_query_key, "")
-            hide_visible_catalog = bool(
-                st.session_state.get(_catalog_hide_key, False))
+
+            cat_controls = st.columns([4, 1.4, 1])
+            catalog_query = cat_controls[0].text_input(
+                "Search supplier SKUs",
+                key=_catalog_query_key,
+                placeholder="SKU, product name, category, status, or trend...",
+                help=(
+                    "Searches SKU and product name. Use spaces to narrow "
+                    "results, e.g. `roma endcap`."
+                ),
+            )
+            hide_visible_catalog = cat_controls[1].checkbox(
+                "Hide rows already above",
+                key=_catalog_hide_key,
+                help="Useful when you only want SKUs that are not already in "
+                     "the reorder or pull-forward sections.",
+            )
+            cat_controls[2].button(
+                "Clear",
+                key=f"catalog_clear_{sel_sup}",
+                use_container_width=True,
+                on_click=_clear_supplier_catalog_search,
+            )
 
             catalog_df = _filter_supplier_catalog(
                 all_supplier_df, catalog_query)
