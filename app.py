@@ -14745,6 +14745,47 @@ elif page == "Ordering":
             )
         return _normalise_ordering_supplier_df(live_df)
 
+    def _positive_reorder_count(df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        qty = pd.to_numeric(
+            df.get("reorder_qty", pd.Series(0, index=df.index)),
+            errors="coerce",
+        ).fillna(0)
+        return int((qty > 0).sum())
+
+    _buyer_status_values = {
+        "🔴 Reorder now",
+        "🟠 Reorder soon",
+        "🟢 On target",
+        "🔵 Overstocked",
+        "💀 Dead stock",
+        "⚪ No demand, no stock",
+        "📦 Dropship",
+        "🚫 Discontinued",
+    }
+
+    def _has_buyer_status(df: pd.DataFrame) -> bool:
+        if df.empty or "Status" not in df.columns:
+            return False
+        statuses = set(df["Status"].dropna().astype(str).unique().tolist())
+        return bool(statuses & _buyer_status_values)
+
+    if ordering_supplier_snapshot_used:
+        # Materialized supplier snapshots are an acceleration layer only.
+        # Older snapshots can contain raw CIN7 product Status="Active" and
+        # default reorder_qty=0, which blanks or pollutes the buyer's PO grid.
+        # If the snapshot lacks real Ordering recommendations, fall back to the
+        # live engine_df slice for this supplier.
+        _snapshot_has_reorder = _positive_reorder_count(all_supplier_df) > 0
+        _snapshot_has_buyer_status = _has_buyer_status(all_supplier_df)
+        if not _snapshot_has_reorder or not _snapshot_has_buyer_status:
+            _live_candidate = _prepared_live_supplier_df()
+            if (_positive_reorder_count(_live_candidate) > 0
+                    or _has_buyer_status(_live_candidate)):
+                all_supplier_df = _live_candidate
+                ordering_supplier_snapshot_used = False
+
     def _apply_ordering_view_filters(source_df: pd.DataFrame,
                                      *,
                                      relax_status_if_empty: bool = False
@@ -14775,48 +14816,14 @@ elif page == "Ordering":
                     or out.empty):
                 out = status_out
         if only_reorder_positive:
-            # Keep two kinds of rows:
-            #   (a) Normal items with a positive reorder suggestion (engine
-            #       thinks we should buy them).
-            #   (b) Dropship items with ANY active 12-month demand — these
-            #       are "candidates the buyer might want to decide on":
-            #       either add to this PO (tick Include?) or promote to
-            #       stocked (untick Dropship?). Pure-zero-demand dropship
-            #       items stay hidden to avoid clutter; they're still in
-            #       the "📦 Dropship products" expander with full list.
-            _is_dropship = out["SKU"].astype(str).isin(dropship_skus)
+            # Main PO grid should mean "engine recommends ordering these".
+            # Zero-suggestion SKUs live in Optional pull-forward and All
+            # supplier SKUs, where the buyer can add them deliberately.
             _supplier_reorder_qty = pd.to_numeric(
                 out.get("reorder_qty", pd.Series(0, index=out.index)),
                 errors="coerce",
             ).fillna(0)
-            _has_any_demand = pd.to_numeric(
-                out.get(
-                    "effective_units_12mo",
-                    pd.Series(0, index=out.index),
-                ),
-                errors="coerce",
-            ).fillna(0) > 0
-            # v2.67.318 — also keep OUT-OF-STOCK items that sold this year
-            # even when the engine suggests 0. These are almost all 🎯 Project
-            # / 💤 Dormant SKUs whose reorder was (correctly) suppressed —
-            # but the buyer still needs to SEE them to decide whether to
-            # manually order (e.g. 1 roll of a project neon for shelf
-            # presence). Without this, the methodology fixes (v2.67.310-317)
-            # made every project SKU vanish from its supplier's view, which
-            # is what James hit with Neonica's neon/profile products.
-            _out_of_stock = out.apply(
-                lambda r: normalise_planning_quantity(
-                    r.get("OnHand", 0),
-                    is_bulk_master=bool(r.get("is_bulk_master", False)),
-                    bulk_length_m=float(r.get("bulk_length_m") or 0),
-                ) <= 0,
-                axis=1,
-            )
-            keep_mask = (
-                (_supplier_reorder_qty > 0)
-                | (_is_dropship & _has_any_demand)
-                | (_out_of_stock & _has_any_demand)
-            )
+            keep_mask = _supplier_reorder_qty > 0
             out = out[keep_mask]
         _supplier_sort_reorder = pd.to_numeric(
             out.get("reorder_qty", pd.Series(0, index=out.index)),
@@ -20707,32 +20714,6 @@ elif page == "Product Detail":
                                              "Quantity": "Qty per unit"}),
                             width="stretch", hide_index=True)
 
-        # --- Demand breakdown -----------------------------------------------
-        # Same component used in PO editor — shows where demand for this
-        # SKU comes from (direct sales + rolled-up children), with monthly
-        # trend chart and recent activity feed. Engine-computed columns
-        # (Suggest, daily rates, dormancy) aren't available on this page
-        # without re-running the engine, so the header strip falls back
-        # to direct-sales counters; everything else (rollup table,
-        # monthly chart, activity feed) renders identically.
-        with st.expander(
-            ":mag: Demand breakdown — where does demand for this SKU "
-            "come from?",
-            expanded=True,
-        ):
-            render_demand_breakdown(
-                sku=sku,
-                sale_lines_df=sale_lines,
-                products_df=products,
-                bom_children=BOM_CHILDREN,
-                bom_parents=BOM_PARENTS,
-                assemblies_df=assemblies,
-                engine_row=_pd_engine_row,
-                engine_df_full=(
-                    _pd_engine_df if not _pd_engine_df.empty else None),
-                stock_df=stock,
-            )
-
         # --- Product master header ------------------------------------------
         st.subheader(str(prod_row.get("Name") or sku))
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -20889,6 +20870,29 @@ elif page == "Product Detail":
                             f"Saved SKU buying settings for {sku}.")
                     st.session_state.pop("_reorder_apply_sig", None)
                     st.rerun()
+
+        # --- Demand breakdown -----------------------------------------------
+        # Same component used in PO editor — shows where demand for this
+        # SKU comes from (direct sales + rolled-up children), with monthly
+        # trend chart and recent activity feed. Placed after Buying settings
+        # so high-use SKU-level controls stay near the top of Product Detail.
+        with st.expander(
+            ":mag: Demand breakdown — where does demand for this SKU "
+            "come from?",
+            expanded=True,
+        ):
+            render_demand_breakdown(
+                sku=sku,
+                sale_lines_df=sale_lines,
+                products_df=products,
+                bom_children=BOM_CHILDREN,
+                bom_parents=BOM_PARENTS,
+                assemblies_df=assemblies,
+                engine_row=_pd_engine_row,
+                engine_df_full=(
+                    _pd_engine_df if not _pd_engine_df.empty else None),
+                stock_df=stock,
+            )
 
         # BOM banner
         is_bom = str(prod_row.get("BillOfMaterial")).lower() == "true"

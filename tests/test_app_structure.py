@@ -405,6 +405,10 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _apply_ordering_view_filters", script)
         self.assertIn("relax_status_if_empty=True", script)
         self.assertIn("live_supplier_df = _prepared_live_supplier_df()", script)
+        self.assertIn("def _positive_reorder_count", script)
+        self.assertIn("_snapshot_has_reorder", script)
+        self.assertIn("Main PO grid should mean", script)
+        self.assertIn("keep_mask = _supplier_reorder_qty > 0", script)
         self.assertNotIn('(s_df["reorder_qty"] > 0)', script)
 
     def test_ordering_supplier_catalog_search_is_committed_and_bounded(self) -> None:
@@ -419,6 +423,17 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertNotIn("catalog_search_form_", script)
         self.assertIn("max_catalog_rows = 80 if", script)
         self.assertIn("Click the main Save edits button after adding", script)
+
+    def test_product_detail_buying_settings_are_above_demand_breakdown(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertLess(
+            script.index('st.markdown("### Buying settings")'),
+            script.index(":mag: Demand breakdown — where does demand"),
+        )
+        self.assertIn("high-use SKU-level controls stay near the top", script)
 
     def test_ordering_and_product_detail_show_12mo_series(self) -> None:
         script = (
