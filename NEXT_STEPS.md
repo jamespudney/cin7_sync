@@ -169,6 +169,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   supplier's precomputed rows instead of reshaping the full engine table
   on every rerun. This is only a serving cache: if it is stale, missing,
   or unreadable, the page falls back to the existing engine dataframe.
+- **Ordering declutter + lazy optional tools** — explanatory text that
+  cluttered the PO workspace is now tucked behind help/notes controls.
+  Manual extra-line entry, optional pull-forward, all-supplier catalogue,
+  sales-history migrations, and per-SKU calculation inspection are lazy
+  toggles, so normal qty/filter edits do not build those secondary grids
+  unless the buyer opens them.
 
 ### 2026-06-29
 

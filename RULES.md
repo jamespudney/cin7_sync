@@ -287,6 +287,15 @@ back to `engine_output.csv` / `engine_df` without changing numbers.
 
 **9.9 Data freshness indicator.** Sidebar shows 🟢 🟡 🔴 based on age of the latest `stock_on_hand_*.csv` (15-min nearsync heartbeat): green <20min, amber 20-60min, red >60min. Manual `🔄 Refresh data now` button clears Streamlit's 5-min cache.
 
+**9.10 Ordering optional tools stay closed and lazy by default.** The
+main PO editor is the primary buyer workspace. Secondary tools — manual
+extra line, optional pull-forward, all supplier catalogue, sales-history
+migrations, and calculation inspector — must be behind toggles or another
+true lazy gate, not merely a closed `st.expander`. Streamlit expanders
+still execute their body on every rerun, so heavy helper tables should
+not be built until the buyer opens them. Explanatory copy belongs in
+help text or a small closed notes expander inside the opened tool.
+
 ---
 
 ## 10. Data Backup & Recovery Rules

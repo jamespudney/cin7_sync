@@ -536,6 +536,12 @@ widget rerun. It is not a calculation source: if the snapshot mtime does
 not match the current `engine_output.csv`, or the DB read fails, the
 page falls back to the normal engine dataframe.
 
+Optional Ordering tools are lazy by design. Manual extra-line entry,
+optional pull-forward, all-supplier catalogue search, sales-history
+migration tools, and the per-SKU calculation inspector are hidden behind
+toggles. This keeps the buyer screen quiet and prevents Streamlit from
+building secondary data editors/charts on every normal PO edit.
+
 #### Cost basis chain — how the engine values stock (v2.67.180)
 The engine values inventory at `OnHand × EffectiveUnitCost`.
 EffectiveUnitCost is resolved per SKU via a fall-back chain — the

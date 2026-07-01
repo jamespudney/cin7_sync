@@ -236,6 +236,25 @@ class AppMemoryStructureTests(unittest.TestCase):
             script,
         )
 
+    def test_ordering_optional_tools_are_lazy_toggled(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("show_manual_add = st.toggle", script)
+        self.assertIn("if show_manual_add:", script)
+        self.assertIn("show_pull_forward = st.toggle", script)
+        self.assertIn("if show_pull_forward:", script)
+        self.assertIn("show_supplier_catalog = st.toggle", script)
+        self.assertIn("if show_supplier_catalog:", script)
+        self.assertIn("show_migration_tools = st.toggle", script)
+        self.assertIn("if show_migration_tools:", script)
+        self.assertIn("show_calc_inspector = st.toggle", script)
+        self.assertIn("if show_calc_inspector:", script)
+        self.assertNotIn("PO actions — save your edits", script)
+        self.assertNotIn("No MOV configured for {sel_sup}. To enable",
+                         script)
+
     def test_pull_forward_window_is_not_hardcoded_to_45_days(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"
@@ -245,7 +264,8 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_pull_forward_window_key", script)
         self.assertIn("Pull-forward window (days)", script)
         self.assertIn("Suggested reorder = 0 today", script)
-        self.assertIn("recomputes the optional qty", script)
+        self.assertIn("Moving the slider recomputes", script)
+        self.assertIn("that optional qty", script)
         self.assertNotIn('f"upcoming_window_{sel_sup}", 45', script)
 
     def test_ordering_recent_demand_anchors_to_snapshot_date(self) -> None:

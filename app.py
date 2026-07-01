@@ -11058,11 +11058,12 @@ elif page == "Sales Recent":
 
 elif page == "Ordering":
     st.header("🛒 Ordering — ABC-driven reorder workbench")
-    st.caption(
-        "Unified buying workspace. ABC classification on 12-month velocity. "
-        "Supplier-first workflow with freight-mode-aware lead times, "
-        "transparent calculations, and draft-PO staging."
-    )
+    with st.expander("Page notes", expanded=False):
+        st.caption(
+            "Unified buying workspace. ABC classification on 12-month "
+            "velocity. Supplier-first workflow with freight-mode-aware "
+            "lead times, transparent calculations, and draft-PO staging."
+        )
 
     # v2.67.346 — explicit recompute button. The engine snapshot is
     # shared across sessions, and supplier/config changes can leave
@@ -14590,11 +14591,7 @@ elif page == "Ordering":
             f"value is now {_fmt_money(_live_total_check)} vs minimum "
             f"{_fmt_money(mov_amt)}.")
     elif not mov_amt:
-        st.caption(
-            f":bulb: No MOV configured for {sel_sup}. To enable "
-            "MOV-gap visibility, expand 'Configure lead times, MOQ/MOV, "
-            "freight per supplier' above and set `mov_amount`."
-        )
+        pass
 
     # Editable PO table
     # NOTE: PO lines use FixedCost (CIN7 supplier price) — NOT AverageCost.
@@ -16552,8 +16549,6 @@ elif page == "Ordering":
     # session-state key (_quick_push_) to trigger the same confirm flow.
     st.divider()
     _qp_col1, _qp_col2, _qp_col3 = st.columns([2, 2, 2])
-    _qp_col1.caption(
-        "📋 **PO actions** — save your edits above, then push to CIN7.")
     with _qp_col2:
         _qp_actor = st.session_state.get("current_user", "").strip()
         _qpush_disabled = (
@@ -16583,77 +16578,79 @@ elif page == "Ordering":
     st.divider()
 
     # --- Add extra lines manually --------------------------------------
-    st.markdown("#### :heavy_plus_sign: Add extra line to this PO")
-    st.caption(
-        "Add any SKU to this PO — appears at the bottom of the table "
-        "above. Useful for items the reorder engine didn't auto-flag "
-        "(stock-up for a project, one-off purchase, item currently at "
-        "target but you want more)."
+    show_manual_add = st.toggle(
+        "Add extra line to this PO",
+        value=False,
+        key=f"show_manual_add_{sel_sup}",
+        help=(
+            "Open only when you need to add a SKU the engine did not "
+            "auto-flag, such as a project stock-up or one-off purchase."
+        ),
     )
+    if show_manual_add:
+        # Build SKU options only when the buyer opens this tool.
+        supplier_skus = sorted(
+            all_supplier_df["SKU"].astype(str).tolist()
+        )
+        all_skus = sorted(engine_df["SKU"].astype(str).tolist())
 
-    # Build SKU options: this supplier's SKUs first, optionally all
-    supplier_skus = sorted(
-        all_supplier_df["SKU"].tolist()
-    )
-    all_skus = sorted(engine_df["SKU"].tolist())
+        xc1, xc2, xc3, xc4, xc5 = st.columns([3, 1, 1, 2, 1])
+        show_all_skus = xc1.checkbox(
+            "Allow adding SKUs not from this supplier",
+            value=False, key=f"show_all_skus_{sel_sup}",
+            help="If checked, you can add any SKU in the catalog (not just "
+                 "those CIN7 associates with this supplier). Useful if you "
+                 "know an item can be sourced from this supplier but CIN7 "
+                 "doesn't have the relationship on record yet.",
+        )
+        available_skus = all_skus if show_all_skus else supplier_skus
 
-    xc1, xc2, xc3, xc4, xc5 = st.columns([3, 1, 1, 2, 1])
-    show_all_skus = xc1.checkbox(
-        "Allow adding SKUs not from this supplier",
-        value=False, key=f"show_all_skus_{sel_sup}",
-        help="If checked, you can add any SKU in the catalog (not just "
-             "those CIN7 associates with this supplier). Useful if you "
-             "know an item can be sourced from this supplier but CIN7 "
-             "doesn't have the relationship on record yet.",
-    )
-    available_skus = all_skus if show_all_skus else supplier_skus
-
-    xe1, xe2, xe3, xe4 = st.columns([3, 1, 1, 1])
-    extra_sku = xe1.selectbox(
-        "SKU to add",
-        options=available_skus,
-        key=f"extra_sku_{sel_sup}",
-        placeholder="Start typing…",
-    )
-    extra_qty = xe2.number_input(
-        "Qty", min_value=1, value=1, step=1,
-        key=f"extra_qty_{sel_sup}",
-    )
-    # Auto-suggest unit cost from engine_df
-    default_cost = 0.0
-    if extra_sku:
-        match = engine_df[engine_df["SKU"] == extra_sku]
-        if not match.empty:
-            default_cost = float(match["EffectiveUnitCost"].iloc[0] or 0)
-    extra_cost = xe3.number_input(
-        "Unit cost", min_value=0.0, value=default_cost,
-        step=0.01, format="%.2f",
-        key=f"extra_cost_{sel_sup}",
-    )
-    xe4.write(" ")
-    xe4.write(" ")
-    if xe4.button("Add line", key=f"add_extra_{sel_sup}",
-                   use_container_width=True,
-                   disabled=not extra_sku):
-        # Build a complete extra-line record
-        name = ""
-        abc = "—"
+        xe1, xe2, xe3, xe4 = st.columns([3, 1, 1, 1])
+        extra_sku = xe1.selectbox(
+            "SKU to add",
+            options=available_skus,
+            key=f"extra_sku_{sel_sup}",
+            placeholder="Start typing…",
+        )
+        extra_qty = xe2.number_input(
+            "Qty", min_value=1, value=1, step=1,
+            key=f"extra_qty_{sel_sup}",
+        )
+        # Auto-suggest unit cost from engine_df
+        default_cost = 0.0
         if extra_sku:
-            row_m = engine_df[engine_df["SKU"] == extra_sku]
-            if not row_m.empty:
-                name = str(row_m["Name"].iloc[0] or "")[:80]
-                abc = str(row_m["ABC"].iloc[0] or "—")
-        st.session_state[extra_key].append({
-            "SKU": extra_sku,
-            "Name": name,
-            "ABC": abc,
-            "Order qty": int(extra_qty),
-            "Unit cost": float(extra_cost),
-            "Line value": round(int(extra_qty) * float(extra_cost), 2),
-            "From supplier?":
-                "✓" if extra_sku in supplier_skus else "⚠ off-supplier",
-        })
-        st.rerun()
+            match = engine_df[engine_df["SKU"] == extra_sku]
+            if not match.empty:
+                default_cost = float(match["EffectiveUnitCost"].iloc[0] or 0)
+        extra_cost = xe3.number_input(
+            "Unit cost", min_value=0.0, value=default_cost,
+            step=0.01, format="%.2f",
+            key=f"extra_cost_{sel_sup}",
+        )
+        xe4.write(" ")
+        xe4.write(" ")
+        if xe4.button("Add line", key=f"add_extra_{sel_sup}",
+                       use_container_width=True,
+                       disabled=not extra_sku):
+            # Build a complete extra-line record
+            name = ""
+            abc = "—"
+            if extra_sku:
+                row_m = engine_df[engine_df["SKU"] == extra_sku]
+                if not row_m.empty:
+                    name = str(row_m["Name"].iloc[0] or "")[:80]
+                    abc = str(row_m["ABC"].iloc[0] or "—")
+            st.session_state[extra_key].append({
+                "SKU": extra_sku,
+                "Name": name,
+                "ABC": abc,
+                "Order qty": int(extra_qty),
+                "Unit cost": float(extra_cost),
+                "Line value": round(int(extra_qty) * float(extra_cost), 2),
+                "From supplier?":
+                    "✓" if extra_sku in supplier_skus else "⚠ off-supplier",
+            })
+            st.rerun()
 
     # Quick action: clear ALL extras for this supplier
     extras = st.session_state[extra_key]
@@ -17614,168 +17611,156 @@ elif page == "Ordering":
                     "tier comparisons will surface here.")
 
     # --- Optional pull-forward — lookahead consolidation ---------------
-    # Show SKUs from the current supplier that AREN'T in the main
-    # reorder list today but may be needed within the next N days. This
-    # is not a second reorder recommendation list; it is for deliberate
-    # pull-forward when consolidating freight or hitting MOV.
+    # Kept behind a toggle for both UX and speed. Streamlit expanders still
+    # execute their body on every rerun; a toggle lets us skip the table
+    # build entirely until the buyer asks for it.
     st.markdown("---")
-    _up_hdr1, _up_hdr2 = st.columns([4, 1])
-    _up_hdr1.markdown("### 📅 Optional pull-forward — not due today")
-    with _up_hdr2.expander("Notes", expanded=False):
-        st.caption("Use only for MOV or freight consolidation.")
-        st.caption(
-            "These rows have Suggested reorder = 0 today. They are shown "
-            "only because the item may fall below target inside the "
-            "selected window. Tick them only if you deliberately want to "
-            "pull future demand into this PO."
-        )
-    uw_col1, uw_col2 = st.columns([1, 3])
-    upcoming_window = uw_col1.slider(
-        "Pull-forward window (days)",
-        min_value=7, max_value=180,
-        value=_pull_forward_default_window, step=7,
-        key=_pull_forward_window_key,
-        help="How far ahead to look for optional pull-forward lines. "
-             "Default follows supplier cadence where configured; increase "
-             "only when deliberately consolidating freight or MOV.",
+    show_pull_forward = st.toggle(
+        "Optional pull-forward — not due today",
+        value=False,
+        key=f"show_pull_forward_{sel_sup}",
+        help=(
+            "Open when you want to deliberately pull future demand into "
+            "this PO for MOV or freight consolidation. Closed by default "
+            "so normal buyer actions do not rebuild this table."
+        ),
     )
-    with uw_col2.expander("How this works", expanded=False):
-        st.caption(
-            "An item shows up here only when current effective position is "
-            "still above target today, so it is not in the main reorder "
-            "table. The optional qty is how much you would pull forward if "
-            "you choose to consolidate now. Moving the slider reruns the "
-            "table and recomputes the optional qty."
+    if show_pull_forward:
+        with st.expander("Optional pull-forward notes", expanded=False):
+            st.caption(
+                "These rows have Suggested reorder = 0 today. They appear "
+                "only because the item may fall below target inside the "
+                "selected window."
+            )
+            st.caption(
+                "The optional qty is what you would pull forward if you "
+                "choose to consolidate now. Moving the slider recomputes "
+                "that optional qty."
+            )
+        uw_col1, _ = st.columns([1, 3])
+        upcoming_window = uw_col1.slider(
+            "Pull-forward window (days)",
+            min_value=7, max_value=180,
+            value=_pull_forward_default_window, step=7,
+            key=_pull_forward_window_key,
+            help="How far ahead to look for optional pull-forward lines.",
         )
 
-    # Build the optional pull-forward table from all_supplier_df (which has
-    # engine-computed target_stock, reorder_qty, effective_pos ingredients)
-    # but filter to items NOT already in the main reorder list.
-    upc = all_supplier_df.copy()
-    if upc.empty:
-        st.info("No optional pull-forward candidates for this supplier.")
-    else:
-        # Effective position = what we'll have for future demand.
-        # v2.67.319 — Available already nets the backorder (negative when
-        # over-committed); don't subtract unfulfilled again.
-        upc["eff_pos"] = (
-            upc["Available"].fillna(0)
-            + upc["OnOrder"].fillna(0)
-        )
-        upc["surplus_above_target"] = (
-            upc["eff_pos"] - upc["target_stock"].fillna(0)
-        )
-        # Days until we cross below target at current sales rate
-        upc["days_to_reorder"] = upc.apply(
-            lambda r: (r["surplus_above_target"] / max(r["avg_daily"], 0.001)
-                       if r["avg_daily"] and r["avg_daily"] > 0
-                       else 999),
-            axis=1,
-        )
-        # Filter:
-        #   - not already in main reorder (reorder_qty == 0)
-        #   - has meaningful velocity (avg_daily > 0, else no basis to forecast)
-        #   - currently above target (surplus > 0)
-        #   - will drop below target inside window
-        upc = upc[
-            (upc["reorder_qty"].fillna(0) == 0)
-            & (upc["avg_daily"].fillna(0) > 0)
-            & (upc["surplus_above_target"] > 0)
-            & (upc["days_to_reorder"] < upcoming_window)
-        ].copy()
-
+        # Build the optional pull-forward table from all_supplier_df (which
+        # has engine-computed target_stock, reorder_qty, effective_pos
+        # ingredients) but filter to items NOT already in the main reorder
+        # list.
+        upc = all_supplier_df.copy()
         if upc.empty:
-            st.success(
-                f":white_check_mark: No optional pull-forward candidates "
-                f"in the next {upcoming_window} days from this supplier."
-            )
+            st.info("No optional pull-forward candidates for this supplier.")
         else:
-            # Optional qty = enough to cover the window at avg_daily.
-            # Honest, simple. The buyer can edit Order qty in the main
-            # editor after adding if they want to stock deeper.
-            upc["Suggest"] = (
-                upc["avg_daily"] * upcoming_window
-            ).round().astype(int)
-            upc["Order qty"] = upc["Suggest"]
-
-            # v2.67.358 — avg_month for buyer-friendly cadence view.
-            # Computed inline (the engine_df one is on the master
-            # engine frame, this upc frame may be a per-supplier
-            # slice/copy so we derive locally).
-            if "avg_daily" in upc.columns and "avg_month" not in upc.columns:
-                upc["avg_month"] = upc["avg_daily"] * 30.4
-            upc_view = _ordering_add_to_po_view(
-                upc,
-                source_label="Pull-forward",
-                qty_col="Order qty",
-                sort_by="days_to_reorder",
+            upc["eff_pos"] = (
+                upc["Available"].fillna(0)
+                + upc["OnOrder"].fillna(0)
             )
-
-            # Use a unique key so editing here doesn't clash with the
-            # main PO editor's state.
-            _pull_forward_anchor = (
-                f"w4s-pull-forward-editor-{_supplier_anchor_slug}"
+            upc["surplus_above_target"] = (
+                upc["eff_pos"] - upc["target_stock"].fillna(0)
             )
-            st.markdown(
-                f'<div id="{_pull_forward_anchor}"></div>',
-                unsafe_allow_html=True,
+            upc["days_to_reorder"] = upc.apply(
+                lambda r: (
+                    r["surplus_above_target"] / max(r["avg_daily"], 0.001)
+                    if r["avg_daily"] and r["avg_daily"] > 0
+                    else 999
+                ),
+                axis=1,
             )
-            upc_edited = st.data_editor(
-                upc_view,
-                width="stretch", hide_index=True, height=350,
-                key=f"upcoming_editor_{sel_sup}_{upcoming_window}",
-                column_config=_ordering_add_to_po_column_config(),
-            )
-            _render_ordering_editor_enhancer(_pull_forward_anchor)
+            upc = upc[
+                (upc["reorder_qty"].fillna(0) == 0)
+                & (upc["avg_daily"].fillna(0) > 0)
+                & (upc["surplus_above_target"] > 0)
+                & (upc["days_to_reorder"] < upcoming_window)
+            ].copy()
 
-            tick_mask = upc_edited["Add?"].fillna(False).astype(bool)
-            n_ticked = int(tick_mask.sum())
-            add_disabled = (n_ticked == 0)
-
-            ub1, ub2 = st.columns([1, 3])
-            if ub1.button(
-                f":heavy_plus_sign: Add {n_ticked} ticked item(s) to PO",
-                key=f"upcoming_add_{sel_sup}",
-                type="primary" if n_ticked else "secondary",
-                disabled=add_disabled,
-                use_container_width=True,
-            ):
-                added_count, skipped_count = _ordering_add_selected_rows_to_po(
-                    upc_edited[tick_mask],
-                    upc,
-                    source_marker="✓ pull-forward",
-                )
-                skip_msg = (
-                    f" {skipped_count} already appeared in the main PO "
-                    "editor and were skipped."
-                    if skipped_count else ""
-                )
+            if upc.empty:
                 st.success(
-                    f"Added **{added_count}** optional pull-forward "
-                    f"item(s) to the main PO. Scroll up to review / tweak."
-                    f"{skip_msg}"
+                    f":white_check_mark: No optional pull-forward "
+                    f"candidates in the next {upcoming_window} days from "
+                    f"this supplier."
                 )
-                st.rerun()
-            with ub2.expander("Pull-forward tip", expanded=False):
-                st.caption(
-                    "Watch the Days to target column. Items sorted by that "
-                    "number are the closest optional pull-forwards. A quick "
-                    "way to hit MOV is to tick the top few, but they are "
-                    "not due today."
+            else:
+                upc["Suggest"] = (
+                    upc["avg_daily"] * upcoming_window
+                ).round().astype(int)
+                upc["Order qty"] = upc["Suggest"]
+                if "avg_daily" in upc.columns and "avg_month" not in upc.columns:
+                    upc["avg_month"] = upc["avg_daily"] * 30.4
+                upc_view = _ordering_add_to_po_view(
+                    upc,
+                    source_label="Pull-forward",
+                    qty_col="Order qty",
+                    sort_by="days_to_reorder",
                 )
+
+                _pull_forward_anchor = (
+                    f"w4s-pull-forward-editor-{_supplier_anchor_slug}"
+                )
+                st.markdown(
+                    f'<div id="{_pull_forward_anchor}"></div>',
+                    unsafe_allow_html=True,
+                )
+                upc_edited = st.data_editor(
+                    upc_view,
+                    width="stretch", hide_index=True, height=350,
+                    key=f"upcoming_editor_{sel_sup}_{upcoming_window}",
+                    column_config=_ordering_add_to_po_column_config(),
+                )
+                _render_ordering_editor_enhancer(_pull_forward_anchor)
+
+                tick_mask = upc_edited["Add?"].fillna(False).astype(bool)
+                n_ticked = int(tick_mask.sum())
+                add_disabled = (n_ticked == 0)
+
+                ub1, _ = st.columns([1, 3])
+                if ub1.button(
+                    f":heavy_plus_sign: Add {n_ticked} ticked item(s) to PO",
+                    key=f"upcoming_add_{sel_sup}",
+                    type="primary" if n_ticked else "secondary",
+                    disabled=add_disabled,
+                    use_container_width=True,
+                ):
+                    added_count, skipped_count = (
+                        _ordering_add_selected_rows_to_po(
+                            upc_edited[tick_mask],
+                            upc,
+                            source_marker="✓ pull-forward",
+                        )
+                    )
+                    skip_msg = (
+                        f" {skipped_count} already appeared in the main PO "
+                        "editor and were skipped."
+                        if skipped_count else ""
+                    )
+                    st.success(
+                        f"Added **{added_count}** optional pull-forward "
+                        f"item(s) to the main PO. Scroll up to review / "
+                        f"tweak.{skip_msg}"
+                    )
+                    st.rerun()
 
     # --- All supplier SKUs — full catalogue add-to-PO picker ----------
     st.markdown("---")
-    with st.expander(
-        f"📚 All supplier SKUs — search and add to PO "
-        f"({len(all_supplier_df):,})",
-        expanded=False,
-    ):
-        st.caption(
-            "This uses the **same saved column layout** as the main PO "
-            "editor. Nothing here rewrites your column configuration. "
-            "Tick rows to add them to the main PO editor above."
-        )
+    show_supplier_catalog = st.toggle(
+        f"All supplier SKUs — search and add to PO ({len(all_supplier_df):,})",
+        value=False,
+        key=f"show_supplier_catalog_{sel_sup}",
+        help=(
+            "Open only when you need to search the full supplier catalogue "
+            "and add extra SKUs. Closed by default so normal buyer actions "
+            "do not build this large grid."
+        ),
+    )
+    if show_supplier_catalog:
+        with st.expander("Supplier catalogue notes", expanded=False):
+            st.caption(
+                "This uses the same saved column layout as the main PO "
+                "editor. Nothing here rewrites your column configuration. "
+                "Tick rows to add them to the main PO editor above."
+            )
         if all_supplier_df.empty:
             st.info("No supplier SKUs found for this supplier.")
         else:
@@ -17907,10 +17892,17 @@ elif page == "Ordering":
     # successor's demand for reorder purposes. All migration rules are
     # applied inside the ABC engine via FAMILY_MIGRATION_RULES + this
     # per-SKU override table.
-    with st.expander(
-        "🔗 Sales-history migrations (retiring → successor)",
-        expanded=False,
-    ):
+    show_migration_tools = st.toggle(
+        "Sales-history migrations",
+        value=False,
+        key=f"show_migration_tools_{sel_sup}",
+        help=(
+            "Open only when managing retiring/successor SKU demand rules. "
+            "Closed by default so the Ordering page does not build the "
+            "migration editor on normal PO work."
+        ),
+    )
+    if show_migration_tools:
         st.caption(
             "When a SKU is superseded, attach its historical demand to "
             "its successor so the reorder engine plans for the combined "
@@ -17985,68 +17977,80 @@ elif page == "Ordering":
                 st.rerun()
 
     # --- Transparency: pick a SKU and see the calculation ----------------
-    st.markdown("### :mag: How was each number calculated?")
-    st.caption(
-        "Pick any SKU from the list above to see the full step-by-step "
-        "math behind its suggested reorder quantity. Buyer-friendly — no "
-        "black boxes."
+    show_calc_inspector = st.toggle(
+        "Inspect calculation for a SKU",
+        value=False,
+        key=f"show_calc_inspector_{sel_sup}",
+        help=(
+            "Open only when you want the chart and step-by-step reorder "
+            "math for one SKU. Closed by default to keep the PO screen "
+            "clean and avoid building charts on every rerun."
+        ),
     )
+    if show_calc_inspector:
+        detail_options = s_df["SKU"].tolist()
+        if detail_options:
+            pick_sku = st.selectbox(
+                "SKU to explain",
+                options=detail_options,
+                key="ord_detail_sku")
+            row_detail = s_df[s_df["SKU"] == pick_sku].iloc[0]
 
-    detail_options = s_df["SKU"].tolist()
-    if detail_options:
-        pick_sku = st.selectbox("SKU to explain",
-                                   options=detail_options,
-                                   key="ord_detail_sku")
-        row_detail = s_df[s_df["SKU"] == pick_sku].iloc[0]
-
-        # --- Monthly sales chart for this SKU ---
-        st.markdown(f"#### 📈 {pick_sku} — sales history")
-        chart_cols = st.columns([1, 5])
-        chart_window = chart_cols[0].radio(
-            "Window", ["12 months", "24 months"],
-            key=f"chart_window_{pick_sku}",
-            horizontal=False,
-        )
-        trend_key = "trend_12m" if chart_window == "12 months" else "trend_24m"
-        trend_values = row_detail[trend_key]
-        # Label each bucket with its month (oldest → newest)
-        bucket_count = len(trend_values)
-        today_ts = pd.Timestamp(datetime.now().date())
-        month_labels = []
-        for i in range(bucket_count):
-            months_back = bucket_count - 1 - i
-            month_date = (today_ts - pd.Timedelta(days=int(30.437 * months_back)))
-            month_labels.append(month_date.strftime("%Y-%m"))
-
-        chart_df = pd.DataFrame({
-            "Month": month_labels,
-            "Units sold": trend_values,
-        })
-        if chart_df["Units sold"].sum() == 0:
-            chart_cols[1].info(
-                f"No sales in the last {chart_window}. "
-                "Either this SKU has no demand or the sync window doesn't "
-                "cover that far back. "
-                + ("Once the 2-year pull finishes, 24m data will populate."
-                   if chart_window == "24 months" else "")
+            st.markdown(f"#### 📈 {pick_sku} — sales history")
+            chart_cols = st.columns([1, 5])
+            chart_window = chart_cols[0].radio(
+                "Window", ["12 months", "24 months"],
+                key=f"chart_window_{pick_sku}",
+                horizontal=False,
             )
-        else:
-            fig_sku = px.bar(
-                chart_df, x="Month", y="Units sold",
-                title=f"{pick_sku} — monthly units sold "
-                       f"({chart_window})",
-                labels={"Units sold": "Units"},
+            trend_key = (
+                "trend_12m" if chart_window == "12 months"
+                else "trend_24m"
             )
-            fig_sku.update_layout(height=320,
-                                    margin=dict(l=0, r=0, t=40, b=0),
-                                    xaxis_title=None)
-            chart_cols[1].plotly_chart(fig_sku, width="stretch")
+            trend_values = row_detail[trend_key]
+            bucket_count = len(trend_values)
+            today_ts = pd.Timestamp(datetime.now().date())
+            month_labels = []
+            for i in range(bucket_count):
+                months_back = bucket_count - 1 - i
+                month_date = (
+                    today_ts
+                    - pd.Timedelta(days=int(30.437 * months_back))
+                )
+                month_labels.append(month_date.strftime("%Y-%m"))
 
-        # --- Calculation trace below chart ---
-        st.markdown("#### :gear: Reorder calculation")
-        row_trace = _compute_target_and_reorder(
-            row_detail, include_trace=True).get("calc_trace", "")
-        st.markdown(row_trace)
+            chart_df = pd.DataFrame({
+                "Month": month_labels,
+                "Units sold": trend_values,
+            })
+            if chart_df["Units sold"].sum() == 0:
+                chart_cols[1].info(
+                    f"No sales in the last {chart_window}. "
+                    "Either this SKU has no demand or the sync window "
+                    "doesn't cover that far back. "
+                    + (
+                        "Once the 2-year pull finishes, 24m data will "
+                        "populate."
+                        if chart_window == "24 months" else ""
+                    )
+                )
+            else:
+                fig_sku = px.bar(
+                    chart_df, x="Month", y="Units sold",
+                    title=f"{pick_sku} — monthly units sold "
+                          f"({chart_window})",
+                    labels={"Units sold": "Units"},
+                )
+                fig_sku.update_layout(
+                    height=320,
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    xaxis_title=None)
+                chart_cols[1].plotly_chart(fig_sku, width="stretch")
+
+            st.markdown("#### :gear: Reorder calculation")
+            row_trace = _compute_target_and_reorder(
+                row_detail, include_trace=True).get("calc_trace", "")
+            st.markdown(row_trace)
 
 
 # ---------------------------------------------------------------------------
