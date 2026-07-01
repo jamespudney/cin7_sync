@@ -79,11 +79,12 @@ import os
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 from dotenv import load_dotenv
+
+from data_paths import OUTPUT_DIR
 
 BASE_URL = "https://app.inventory-planner.com/api/v1"
 PAGE_SIZE = 1000  # IP allows up to 1000 per docs
@@ -102,7 +103,6 @@ USER_AGENT = (
 #   tags         — variant-level tags (operational labels)
 FIELDS = "id,connections,merged,warehouse,tags"
 
-OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 

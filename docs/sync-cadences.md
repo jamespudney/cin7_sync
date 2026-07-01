@@ -35,6 +35,14 @@ Runs `daily_sync.sh`. Calls:
 4. `sync_sku_renames.py --apply` — propagates any SKU renames CIN7
    has made into our local DB.
 5. `sync_supplier_names.py --apply` — same for supplier names.
+6. `ip_sync_notes.py` — fast Inventory Planner replenishment-notes
+   refresh into `/data/output/ip_notes_*.csv`. These are the buyer
+   notes surfaced in Product Detail, Ordering drill-ins, PO commentary,
+   and the Slack bot. Example: `LED-SMOKIES38-B-3` can carry a note
+   like `BWF - MOQ 1000m/profile`.
+7. `ip_pull_alternates.py` — heavier Inventory Planner knowledge export
+   for combine-sales/stock links, settings, velocities, vendors,
+   forecasts, and a second notes capture.
 
 Heavier than nearsync (~10-15 minutes total). Done overnight so
 the workday runs unaffected. After the sync completes, `sync_loop.sh`

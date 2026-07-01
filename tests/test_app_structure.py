@@ -274,6 +274,26 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("st.column_config.ImageColumn", script)
         self.assertIn("Hover over the thumbnail", script)
 
+    def test_inventory_planner_notes_sync_writes_to_shared_output(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        notes_sync = (root / "ip_sync_notes.py").read_text(encoding="utf-8")
+        ip_pull = (root / "ip_pull_alternates.py").read_text(encoding="utf-8")
+        daily = (root / "daily_sync.sh").read_text(encoding="utf-8")
+        catalog = (root / "data_catalog.py").read_text(encoding="utf-8")
+        docs = (root / "docs" / "sync-cadences.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("from data_paths import OUTPUT_DIR", notes_sync)
+        self.assertIn("warehouse.replenishment_notes", notes_sync)
+        self.assertIn('"SKU", "VariantID", "WarehouseID", "Note", "Tags"',
+                      notes_sync)
+        self.assertIn("from data_paths import OUTPUT_DIR", ip_pull)
+        self.assertNotIn('OUTPUT_DIR = Path("output")', ip_pull)
+        self.assertIn("python ip_sync_notes.py", daily)
+        self.assertIn("python ip_sync_notes.py", catalog)
+        self.assertIn("LED-SMOKIES38-B-3", docs)
+
     def test_overview_surfaces_inventory_cost_vs_retail_value(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"

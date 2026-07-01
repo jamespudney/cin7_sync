@@ -39,7 +39,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
     DatasetSpec("Stock transfers (30d)", "stock_transfers_last_30d", "CIN7 movements", 24, "python cin7_sync.py stocktransfers --days 30"),
     DatasetSpec("Shipments", "shipments_last_30d", "ShipStation", 24, "python shipstation_sync.py daily --days 30"),
     DatasetSpec("Shopify orders", "shopify_orders", "Shopify", 24, "python shopify_sync.py --orders-recent 7"),
-    DatasetSpec("Inventory Planner notes", "ip_notes", "Inventory Planner", 24, "python ip_pull_alternates.py"),
+    DatasetSpec("Inventory Planner notes", "ip_notes", "Inventory Planner", 24, "python ip_sync_notes.py"),
     DatasetSpec("Engine output", "engine_output", "Derived", 1, "python warm_engine.py"),
 )
 

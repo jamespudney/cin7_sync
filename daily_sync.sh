@@ -178,6 +178,10 @@ fi
 # Inventory Planner buyer notes and alternates are curated team knowledge
 # used by PO commentary and migration/compatibility workflows.
 if [ -n "${IP_API_KEY:-}" ] && [ -n "${IP_ACCOUNT:-}" ]; then
+    echo "[$(stamp)] ip_sync_notes" >> "$LOG"
+    python ip_sync_notes.py >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] ip_sync_notes FAILED (continuing)" >> "$LOG"
+
     echo "[$(stamp)] ip_pull_alternates" >> "$LOG"
     python ip_pull_alternates.py >> "$LOG" 2>&1 || \
       echo "[$(stamp)] ip_pull_alternates FAILED (continuing)" >> "$LOG"
