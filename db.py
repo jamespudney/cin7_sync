@@ -5396,13 +5396,21 @@ def clear_critical_component(cid: int, actor: str) -> None:
 # UI preferences — per-user, per-view column layout
 # ---------------------------------------------------------------------------
 
+TEAM_DEFAULT_UI_USER = "__team_default__"
+JAMES_LAYOUT_FALLBACK_USERS = ("james", "james pudney", "jamespudney")
+
+
+def _normalise_ui_user(user: str) -> str:
+    return (user or "").strip().lower() or "default"
+
+
 def get_column_layout(user: str, view: str) -> Optional[List[str]]:
     """Return the saved column order for (user, view), or None if unset.
 
     Result is a list of column-key strings in the order the user wants them
     rendered. Columns not present in the list should be hidden by the caller.
     """
-    user = (user or "").strip().lower() or "default"
+    user = _normalise_ui_user(user)
     with connect() as c:
         row = c.execute(
             # v2.67.313 — `user` and `view` are reserved in Postgres;
@@ -5417,10 +5425,31 @@ def get_column_layout(user: str, view: str) -> Optional[List[str]]:
     return cols or None
 
 
+def get_column_layout_with_default(user: str, view: str) -> Optional[List[str]]:
+    """Return a personal layout, then the team/James fallback if present.
+
+    Existing saved user views always win. The reserved team row lets James
+    publish a preferred Ordering layout for new users without overwriting
+    anyone's own column configuration.
+    """
+    user_norm = _normalise_ui_user(user)
+    personal = get_column_layout(user_norm, view)
+    if personal:
+        return personal
+    for fallback_user in (TEAM_DEFAULT_UI_USER, *JAMES_LAYOUT_FALLBACK_USERS):
+        fallback_norm = _normalise_ui_user(fallback_user)
+        if fallback_norm == user_norm:
+            continue
+        layout = get_column_layout(fallback_norm, view)
+        if layout:
+            return layout
+    return None
+
+
 def save_column_layout(user: str, view: str, columns: List[str]) -> None:
     """Save an ordered list of visible columns for (user, view).
     Preserves any existing widths_csv (width prefs live separately)."""
-    user = (user or "").strip().lower() or "default"
+    user = _normalise_ui_user(user)
     csv = ",".join(c.strip() for c in columns if c and c.strip())
     with connect() as c:
         c.execute(
@@ -5450,7 +5479,7 @@ VALID_WIDTHS = ("tiny", "small", "medium", "large", "huge")
 def get_column_widths(user: str, view: str) -> dict:
     """Return {column_key: 'small'|'medium'|'large'} for the user's view,
     or {} if nothing saved."""
-    user = (user or "").strip().lower() or "default"
+    user = _normalise_ui_user(user)
     with connect() as c:
         row = c.execute(
             'SELECT widths_csv FROM ui_prefs '
@@ -5470,11 +5499,27 @@ def get_column_widths(user: str, view: str) -> dict:
     return out
 
 
+def get_column_widths_with_default(user: str, view: str) -> dict:
+    """Return personal widths, then team/James fallback widths."""
+    user_norm = _normalise_ui_user(user)
+    personal = get_column_widths(user_norm, view)
+    if personal:
+        return personal
+    for fallback_user in (TEAM_DEFAULT_UI_USER, *JAMES_LAYOUT_FALLBACK_USERS):
+        fallback_norm = _normalise_ui_user(fallback_user)
+        if fallback_norm == user_norm:
+            continue
+        widths = get_column_widths(fallback_norm, view)
+        if widths:
+            return widths
+    return {}
+
+
 def save_column_widths(user: str, view: str, widths: dict) -> None:
     """Save per-column width presets for (user, view). Accepts a dict of
     {column_key: 'small'|'medium'|'large'}; entries with other values
     are silently dropped."""
-    user = (user or "").strip().lower() or "default"
+    user = _normalise_ui_user(user)
     pairs = []
     for k, v in (widths or {}).items():
         v = str(v or "").strip().lower()
@@ -5508,7 +5553,7 @@ def save_column_widths(user: str, view: str, widths: dict) -> None:
 
 def reset_column_layout(user: str, view: str) -> None:
     """Forget the saved layout — next load will use app default."""
-    user = (user or "").strip().lower() or "default"
+    user = _normalise_ui_user(user)
     with connect() as c:
         c.execute(
             'DELETE FROM ui_prefs WHERE "user" = ? AND "view" = ?',
@@ -5518,6 +5563,29 @@ def reset_column_layout(user: str, view: str) -> None:
             "INSERT INTO audit_log (event, actor, target, detail) "
             "VALUES (?, ?, ?, ?)",
             ("ui_prefs.reset", user, view, ""),
+        )
+
+
+def publish_team_default_column_layout(actor: str, view: str,
+                                       columns: List[str],
+                                       widths: dict) -> None:
+    """Publish the provided layout as the team fallback.
+
+    This writes only the reserved team-default row. It never changes any
+    individual user's saved view.
+    """
+    save_column_layout(TEAM_DEFAULT_UI_USER, view, columns)
+    save_column_widths(TEAM_DEFAULT_UI_USER, view, widths or {})
+    with connect() as c:
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "ui_prefs.publish_team_default",
+                _normalise_ui_user(actor),
+                view,
+                ",".join(c.strip() for c in columns if c and c.strip()),
+            ),
         )
 
 

@@ -194,8 +194,9 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _render_ordering_editor_enhancer", script)
         self.assertIn("w4s-ordering-active-row", script)
         self.assertIn("function hideGuide()", script)
-        self.assertIn("ENHANCER_VERSION = \"persistent-row-pan-v3\"",
+        self.assertIn("ENHANCER_VERSION = \"persistent-row-pan-v4\"",
                       script)
+        self.assertIn(".w4s-ordering-editor-frame img:hover", script)
         self.assertIn("const host = frame;", script)
         self.assertIn("function handlePointerMove", script)
         self.assertIn("function installSoon()", script)
@@ -235,6 +236,54 @@ class AppMemoryStructureTests(unittest.TestCase):
             "column_config=_ordering_add_to_po_column_config()",
             script,
         )
+
+    def test_ordering_uses_team_default_layout_without_overwriting_users(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "app.py").read_text(encoding="utf-8")
+        db_script = (root / "db.py").read_text(encoding="utf-8")
+
+        self.assertIn("TEAM_DEFAULT_UI_USER", db_script)
+        self.assertIn("JAMES_LAYOUT_FALLBACK_USERS", db_script)
+        self.assertIn("def get_column_layout_with_default", db_script)
+        self.assertIn("def get_column_widths_with_default", db_script)
+        self.assertIn("def publish_team_default_column_layout", db_script)
+        self.assertIn("personal_layout = db.get_column_layout", script)
+        self.assertIn("db.get_column_layout_with_default", script)
+        self.assertIn("db.get_column_widths_with_default", script)
+        self.assertIn("Team default", script)
+        self.assertIn("Existing personal saved views were not changed", script)
+
+    def test_product_images_feed_and_ordering_thumbnail_column(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "app.py").read_text(encoding="utf-8")
+        cin7_sync = (root / "cin7_sync.py").read_text(encoding="utf-8")
+        daily = (root / "daily_sync.sh").read_text(encoding="utf-8")
+
+        self.assertIn("def sync_product_images", cin7_sync)
+        self.assertIn(
+            '"product-images": ("no-days", sync_product_images)',
+            cin7_sync,
+        )
+        self.assertIn('"IncludeAttachments": "true"', cin7_sync)
+        self.assertIn('write_outputs("product_images", rows)', cin7_sync)
+        self.assertIn("PRODUCT_IMAGE_SYNC_FORCE", daily)
+        self.assertIn("cin7_sync product-images", daily)
+        self.assertIn('product_images = load("product_images")', script)
+        self.assertIn("def _product_image_lookup", script)
+        self.assertIn('"Image"', script)
+        self.assertIn("st.column_config.ImageColumn", script)
+        self.assertIn("Hover over the thumbnail", script)
+
+    def test_overview_surfaces_inventory_cost_vs_retail_value(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _stock_retail_bridge", script)
+        self.assertIn("Inventory value vs retail value", script)
+        self.assertIn("Stock cost", script)
+        self.assertIn("Stock retail", script)
+        self.assertIn("Stock retail by supplier", script)
 
     def test_ordering_optional_tools_are_lazy_toggled(self) -> None:
         script = (

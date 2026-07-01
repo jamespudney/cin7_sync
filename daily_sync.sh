@@ -61,6 +61,19 @@ CIN7_QUICK_SKIP_ASSEMBLIES=1 python cin7_sync.py quick --days 3 \
     >> "$LOG" 2>&1 || \
   echo "[$(stamp)] cin7_sync quick FAILED (continuing)" >> "$LOG"
 
+# Product thumbnails are attachment metadata, not buying-critical data.
+# Refresh weekly during the overnight job so buyer pages get images without
+# making live CIN7 calls during the workday. Set PRODUCT_IMAGE_SYNC_FORCE=1
+# on Render to force a one-off refresh after deploy.
+if [ "$(date -u +%u)" = "7" ] || [ "${PRODUCT_IMAGE_SYNC_FORCE:-0}" = "1" ]; then
+    echo "[$(stamp)] cin7_sync product-images" >> "$LOG"
+    python cin7_sync.py product-images >> "$LOG" 2>&1 || \
+      echo "[$(stamp)] cin7_sync product-images FAILED (continuing)" >> "$LOG"
+else
+    echo "[$(stamp)] cin7_sync product-images skipped (weekly Sunday refresh)" \
+      >> "$LOG"
+fi
+
 # v2.67.264 — BOM / parent-child structure. Previously refreshed
 # only by the weekend deep sync, leaving the engine's bulk-to-cut
 # rollup on week-stale (or absent) BOM data. boms is a per-product

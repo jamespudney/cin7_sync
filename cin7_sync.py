@@ -566,6 +566,75 @@ def sync_products(client: Cin7Client) -> None:
     write_outputs("products", rows)
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _attachment_rows(value: Any) -> List[dict]:
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, dict)]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [v for v in parsed if isinstance(v, dict)]
+    return []
+
+
+def _pick_main_product_image(attachments: Any) -> Optional[dict]:
+    """Choose CIN7's default product image from an Attachments list."""
+    rows = _attachment_rows(attachments)
+    image_rows = [
+        r for r in rows
+        if str(r.get("ContentType") or "").lower().startswith("image/")
+        and str(r.get("DownloadUrl") or "").strip()
+    ]
+    if not image_rows:
+        return None
+    return next(
+        (r for r in image_rows if _truthy(r.get("IsDefault"))),
+        image_rows[0],
+    )
+
+
+def sync_product_images(client: Cin7Client) -> None:
+    """Pull lightweight product image metadata from CIN7.
+
+    The dashboard consumes this as a cached lookup table, so buyers see
+    thumbnails without the Ordering page making live CIN7 calls.
+    """
+    log.info("Pulling product image attachment metadata...")
+    products = list(client.paginate(
+        "product", result_key="Products",
+        params={
+            "IncludeAttachments": "true",
+            "IncludeAttributes": "false",
+            "IncludeSuppliers": "false",
+            "IncludeReorderLevels": "false",
+        },
+    ))
+    rows: List[Dict[str, Any]] = []
+    for product in products:
+        image = _pick_main_product_image(product.get("Attachments"))
+        if not image:
+            continue
+        rows.append({
+            "SKU": product.get("SKU") or "",
+            "Name": product.get("Name") or "",
+            "ProductID": product.get("ID") or "",
+            "ImageUrl": image.get("DownloadUrl") or "",
+            "ImageFileName": image.get("FileName") or "",
+            "ImageContentType": image.get("ContentType") or "",
+            "ImageIsDefault": _truthy(image.get("IsDefault")),
+            "ImageSource": "cin7_product_attachment",
+        })
+    write_outputs("product_images", rows)
+
+
 def sync_stock(client: Cin7Client) -> None:
     log.info("Pulling stock on hand (productavailability)...")
     rows = list(client.paginate("ref/productavailability", result_key="ProductAvailabilityList"))
@@ -1819,6 +1888,7 @@ def sync_all(client: Cin7Client, days: int) -> None:
 COMMANDS = {
     "test": ("no-days", sync_test),
     "products": ("no-days", sync_products),
+    "product-images": ("no-days", sync_product_images),
     "stock": ("no-days", sync_stock),
     "customers": ("no-days", sync_customers),
     "suppliers": ("no-days", sync_suppliers),

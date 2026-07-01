@@ -21,6 +21,7 @@ import ast
 import glob
 import json
 import os
+import re
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Optional
@@ -879,6 +880,56 @@ def _ensure_columns(df: pd.DataFrame,
     return df
 
 
+def _json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _product_image_lookup(products_df: pd.DataFrame,
+                          image_df: pd.DataFrame) -> dict[str, str]:
+    """Return SKU -> main image URL from product_images, with products fallback."""
+    out: dict[str, str] = {}
+    if image_df is not None and not image_df.empty:
+        if {"SKU", "ImageUrl"}.issubset(set(image_df.columns)):
+            img = image_df[["SKU", "ImageUrl"]].copy()
+            img["SKU"] = img["SKU"].astype(str)
+            img["ImageUrl"] = img["ImageUrl"].fillna("").astype(str)
+            img = img[img["SKU"].str.len().gt(0) & img["ImageUrl"].str.len().gt(0)]
+            out.update(dict(zip(img["SKU"], img["ImageUrl"])))
+    if products_df is not None and not products_df.empty:
+        if {"SKU", "Attachments"}.issubset(set(products_df.columns)):
+            for _, row in products_df[["SKU", "Attachments"]].iterrows():
+                sku = str(row.get("SKU") or "")
+                if not sku or sku in out:
+                    continue
+                attachments = _json_list(row.get("Attachments"))
+                images = [
+                    a for a in attachments
+                    if isinstance(a, dict)
+                    and str(a.get("ContentType") or "").lower().startswith("image/")
+                    and str(a.get("DownloadUrl") or "").strip()
+                ]
+                if not images:
+                    continue
+                image = next(
+                    (
+                        a for a in images
+                        if str(a.get("IsDefault") or "").lower()
+                        in {"1", "true", "yes"}
+                    ),
+                    images[0],
+                )
+                out[sku] = str(image.get("DownloadUrl") or "")
+    return out
+
+
 def file_mtime(prefix: str) -> Optional[datetime]:
     return catalog_file_mtime(prefix, OUTPUT_DIR)
 
@@ -1247,6 +1298,105 @@ def _headline_stock_value(stock_df: pd.DataFrame,
     ))
 
 
+def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _default_supplier_name(suppliers_value) -> str:
+    sups = _json_list(suppliers_value)
+    if not sups:
+        return "Unknown"
+    chosen = next(
+        (
+            s for s in sups
+            if isinstance(s, dict)
+            and str(s.get("IsDefault") or "").lower() in {"1", "true", "yes"}
+        ),
+        sups[0],
+    )
+    if not isinstance(chosen, dict):
+        return "Unknown"
+    return str(
+        chosen.get("SupplierName")
+        or chosen.get("Name")
+        or chosen.get("Supplier")
+        or "Unknown"
+    )
+
+
+def _stock_retail_bridge(stock_df: pd.DataFrame,
+                         products_df: pd.DataFrame) -> dict:
+    """Compute current stock units, FIFO cost, and retail value by SKU.
+
+    Retail uses the first populated product price field we can find. If no
+    retail price exists for a SKU, it contributes 0 rather than inventing a
+    margin.
+    """
+    empty = {
+        "variants": 0,
+        "variants_in_stock": 0,
+        "stock_units": 0.0,
+        "stock_cost": 0.0,
+        "stock_retail": 0.0,
+        "detail_df": pd.DataFrame(),
+        "retail_price_col": None,
+    }
+    if stock_df is None or stock_df.empty or "SKU" not in stock_df.columns:
+        return empty
+    if products_df is None or products_df.empty or "SKU" not in products_df.columns:
+        return empty
+
+    stk = stock_df.copy()
+    stk["SKU"] = stk["SKU"].astype(str)
+    stk["OnHand"] = _to_num(stk.get("OnHand", 0)).fillna(0)
+    by_sku = stk.groupby("SKU", as_index=False)["OnHand"].sum()
+
+    p = products_df.copy()
+    p["SKU"] = p["SKU"].astype(str)
+    p = p.drop_duplicates("SKU", keep="first")
+    price_col = _first_existing_col(
+        p,
+        [
+            "PriceTier1",
+            "PriceTier 1",
+            "PriceTier1Price",
+            "Tier1Price",
+            "RetailPrice",
+            "Price",
+            "SalePrice",
+            "DefaultPrice",
+        ],
+    )
+    if price_col:
+        p["__retail_price"] = _to_num(p[price_col]).fillna(0)
+    else:
+        p["__retail_price"] = 0.0
+    if "Suppliers" in p.columns:
+        p["__supplier"] = p["Suppliers"].apply(_default_supplier_name)
+    else:
+        p["__supplier"] = "Unknown"
+
+    joined = by_sku.merge(
+        p[["SKU", "__retail_price", "__supplier"]],
+        on="SKU",
+        how="left",
+    )
+    joined["__retail_price"] = joined["__retail_price"].fillna(0)
+    joined["RetailValue"] = joined["OnHand"] * joined["__retail_price"]
+    return {
+        "variants": int(p["SKU"].nunique()),
+        "variants_in_stock": int((joined["OnHand"] > 0).sum()),
+        "stock_units": float(joined["OnHand"].sum()),
+        "stock_cost": _headline_stock_value(stock_df, products_df),
+        "stock_retail": float(joined["RetailValue"].sum()),
+        "detail_df": joined,
+        "retail_price_col": price_col,
+    }
+
+
 def _compute_slow_stock_holding(engine_df: pd.DataFrame,
                                   dormancy_warnings: dict) -> dict:
     """v2.67.53 — single source of truth for "slow-stock value on
@@ -1384,7 +1534,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
 <script>
 (() => {
   const ANCHOR_ID = %s;
-  const ENHANCER_VERSION = "persistent-row-pan-v3";
+  const ENHANCER_VERSION = "persistent-row-pan-v4";
   let doc = null;
   try {
     doc = window.parent && window.parent.document;
@@ -1420,6 +1570,18 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
         border-bottom: 1px solid rgba(245, 158, 11, 0.45);
         box-shadow: inset 4px 0 0 rgba(217, 119, 6, 0.92);
         transition: opacity 0.18s ease;
+      }
+      .w4s-ordering-editor-frame img {
+        transition: transform 0.14s ease, box-shadow 0.14s ease;
+        transform-origin: left center;
+      }
+      .w4s-ordering-editor-frame img:hover {
+        transform: scale(4);
+        position: relative;
+        z-index: 9999;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.22);
+        background: #fff;
+        border-radius: 6px;
       }
     `;
     doc.head.appendChild(style);
@@ -2672,6 +2834,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 
 products = load("products")
+product_images = load("product_images")
 stock = load("stock_on_hand")
 customers_file = _latest_file("customers")
 suppliers = load("suppliers")
@@ -7685,6 +7848,66 @@ if page == "Overview":
     except Exception:
         # Diagnostic must never break the tile.
         pass
+
+    _value_bridge = _stock_retail_bridge(stock, products)
+    st.markdown("#### Inventory value vs retail value")
+    vb1, vb2, vb3, vb4, vb5 = st.columns(5)
+    vb1.metric("Variants", _fmt_number(_value_bridge["variants"]))
+    vb2.metric("Variants in stock",
+               _fmt_number(_value_bridge["variants_in_stock"]))
+    vb3.metric("Stock units",
+               f"{_value_bridge['stock_units']:,.0f}")
+    vb4.metric("Stock cost", _fmt_money(_value_bridge["stock_cost"]),
+               help="Same FIFO value as the headline stock tile above.")
+    vb5.metric(
+        "Stock retail",
+        _fmt_money(_value_bridge["stock_retail"]),
+        help=(
+            "Current OnHand multiplied by the product retail price field "
+            f"({_value_bridge['retail_price_col'] or 'not found'})."
+        ),
+    )
+    _retail_detail = _value_bridge.get("detail_df", pd.DataFrame())
+    if (not _retail_detail.empty
+            and "__supplier" in _retail_detail.columns
+            and "RetailValue" in _retail_detail.columns
+            and float(_retail_detail["RetailValue"].sum() or 0) > 0):
+        _by_supplier = (
+            _retail_detail.groupby("__supplier", as_index=False)["RetailValue"]
+            .sum()
+            .sort_values("RetailValue", ascending=False)
+        )
+        _top = _by_supplier.head(8).copy()
+        _other = float(_by_supplier.iloc[8:]["RetailValue"].sum())
+        if _other > 0:
+            _top = pd.concat(
+                [
+                    _top,
+                    pd.DataFrame([{
+                        "__supplier": "Other",
+                        "RetailValue": _other,
+                    }]),
+                ],
+                ignore_index=True,
+            )
+        fig_stock_retail = px.pie(
+            _top,
+            names="__supplier",
+            values="RetailValue",
+            hole=0.62,
+            title="Stock retail by supplier",
+        )
+        fig_stock_retail.update_traces(
+            textposition="inside",
+            textinfo="percent",
+            hovertemplate="%{label}<br>%{value:$,.0f}<extra></extra>",
+        )
+        fig_stock_retail.update_layout(
+            margin=dict(l=0, r=0, t=45, b=0),
+            showlegend=True,
+            height=320,
+        )
+        st.plotly_chart(fig_stock_retail, width="stretch")
 
     # Sales invoiced in the last 30 days.
     #
@@ -14302,6 +14525,94 @@ elif page == "Ordering":
     if not ordering_supplier_snapshot_used:
         all_supplier_df = orderable_df[orderable_df["Supplier"] == sel_sup]
 
+    _product_images_by_sku = _product_image_lookup(products, product_images)
+    if "SKU" in all_supplier_df.columns:
+        all_supplier_df = all_supplier_df.copy()
+        all_supplier_df["Image"] = (
+            all_supplier_df["SKU"].astype(str)
+            .map(_product_images_by_sku)
+            .fillna("")
+        )
+
+    def _normalise_ordering_supplier_df(df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure supplier snapshots have the columns Ordering expects."""
+        out = df.copy()
+        text_defaults = {
+            "SKU": "",
+            "Name": "",
+            "Supplier": sel_sup,
+            "ABC": "—",
+            "Status": "⚪ No demand, no stock",
+            "Category": "",
+            "trend_flag": "Stable",
+            "freight_mode": "air",
+            "POCostBasis": "",
+            "Note": "",
+            "Source": "Auto",
+            "Image": "",
+            "last_6mo_series": "",
+            "last_12mo_series": "",
+        }
+        numeric_defaults = {
+            "reorder_qty": 0.0,
+            "POCost": 0.0,
+            "OnHandValue": 0.0,
+            "excess_value": 0.0,
+            "excess_units": 0.0,
+            "OnHand": 0.0,
+            "Allocated": 0.0,
+            "Available": 0.0,
+            "OnOrder": 0.0,
+            "unfulfilled": 0.0,
+            "target_stock": 0.0,
+            "avg_daily": 0.0,
+            "avg_month": 0.0,
+            "lead_time_days": 0.0,
+            "sku_lead_time_days": 0.0,
+            "sku_moq": 0.0,
+            "sku_eoq_qty": 0.0,
+            "units_12mo": 0.0,
+            "effective_units_12mo": 0.0,
+            "lineage_units_12mo": 0.0,
+            "units_45d": 0.0,
+            "units_prior_45d": 0.0,
+            "momentum": 0.0,
+            "customers_45d": 0.0,
+            "top_cust_pct": 0.0,
+            "DoC_days": 0.0,
+            "LengthMM": 0.0,
+            "AverageCost": 0.0,
+            "bulk_length_m": 0.0,
+        }
+        bool_defaults = {
+            "is_bulk_master": False,
+            "is_non_master_tube": False,
+            "Exclude?": False,
+            "Dropship?": False,
+        }
+        for col, default in text_defaults.items():
+            if col not in out.columns:
+                out[col] = default
+        for col, default in numeric_defaults.items():
+            if col not in out.columns:
+                out[col] = default
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(default)
+        for col, default in bool_defaults.items():
+            if col not in out.columns:
+                out[col] = default
+        if "trend_12m" not in out.columns:
+            out["trend_12m"] = [[] for _ in range(len(out))]
+        if "Image" in out.columns and "SKU" in out.columns:
+            missing_img = out["Image"].fillna("").astype(str).str.len().eq(0)
+            out.loc[missing_img, "Image"] = (
+                out.loc[missing_img, "SKU"].astype(str)
+                .map(_product_images_by_sku)
+                .fillna("")
+            )
+        return out
+
+    all_supplier_df = _normalise_ordering_supplier_df(all_supplier_df)
+
     # --- Apply per-SKU freight overrides (team buyers can flip per row)
     # State shape: session_state["freight_overrides"][sel_sup] = {sku: mode}
     if "freight_overrides" not in st.session_state:
@@ -14608,7 +14919,7 @@ elif page == "Ordering":
     # ignored and newly-added columns appear the next time the user hits
     # "Reset layout" or adds them back.
     default_editor_cols = [
-        "Include?", "🔍", "SKU", "Name", "ABC", "Status", "Category",
+        "Include?", "Image", "🔍", "SKU", "Name", "ABC", "Status", "Category",
         "trend_flag",
         "trend_12m", "last_6mo_series", "last_12mo_series", "units_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
@@ -14633,7 +14944,9 @@ elif page == "Ordering":
     # Load saved layout for the current user (falls back to 'default').
     _layout_user = st.session_state.get("current_user", "").strip() or "default"
     _layout_view = ORDERING_PO_EDITOR_VIEW
-    saved_layout = db.get_column_layout(_layout_user, _layout_view)
+    personal_layout = db.get_column_layout(_layout_user, _layout_view)
+    saved_layout = db.get_column_layout_with_default(
+        _layout_user, _layout_view)
     if saved_layout:
         # Keep only columns that still exist in the engine output, preserving
         # user's order. Drop unknown entries silently.
@@ -14657,6 +14970,7 @@ elif page == "Ordering":
     # / hide via the layout editor afterwards. Add new column names
     # to this set as they ship.
     _NEWLY_INTRODUCED_COLS = [
+        ("Image", "Include?"),
         ("avg_month", "avg_daily"),
         ("last_12mo_series", "last_6mo_series"),
         ("sku_lead_time_days", "lead_time_days"),
@@ -14677,6 +14991,7 @@ elif page == "Ordering":
     # `last_6mo_series` and get confused).
     COL_LABELS = {
         "Include?": "✓ Include on PO (checkbox)",
+        "Image": "Product image",
         "SKU": "SKU",
         "Name": "Product name",
         "ABC": "ABC class",
@@ -14725,7 +15040,7 @@ elif page == "Ordering":
     # first, then actions.
     PRESETS = {
         "Buyer essentials (default)": [
-            "Include?", "SKU", "Name", "ABC", "Status",
+            "Include?", "Image", "SKU", "Name", "ABC", "Status",
             "trend_flag", "last_6mo_series", "last_12mo_series",
             "avg_month",
             "OnHand", "Available", "OnOrder", "unfulfilled",
@@ -14737,13 +15052,13 @@ elif page == "Ordering":
         ],
         "Detailed view (everything)": list(default_editor_cols),
         "Minimal — just decide to buy": [
-            "Include?", "SKU", "Name", "ABC",
+            "Include?", "Image", "SKU", "Name", "ABC",
             "last_6mo_series", "last_12mo_series",
             "OnHand", "reorder_qty", "POCost",
             "Order qty", "Line value",
         ],
         "Financial view — $ focused": [
-            "Include?", "SKU", "Name", "ABC", "Status",
+            "Include?", "Image", "SKU", "Name", "ABC", "Status",
             "OnHand", "target_stock", "reorder_qty",
             "POCost", "POCostBasis",
             "excess_units", "excess_value",
@@ -14988,7 +15303,8 @@ elif page == "Ordering":
             "pick a width here for each visible column and hit Save. "
             "Leave anything blank to use the app default for that column."
         )
-        _saved_widths = db.get_column_widths(_layout_user, _layout_view)
+        _saved_widths = db.get_column_widths_with_default(
+            _layout_user, _layout_view)
         _w_rows = []
         for _k in preview_keys:
             _w_rows.append({
@@ -15025,7 +15341,7 @@ elif page == "Ordering":
                 if _k and _v in ("tiny", "small", "medium", "large", "huge"):
                     _picked_widths[_k] = _v
 
-        lb1, lb2, lb3 = st.columns([1, 1, 3])
+        lb1, lb2, lb3, lb4 = st.columns([1, 1, 1, 3])
         if lb1.button("💾 Save layout + widths",
                        key=f"save_layout_{_layout_user}",
                        type="primary",
@@ -15047,17 +15363,46 @@ elif page == "Ordering":
                        key=f"reset_layout_{_layout_user}",
                        use_container_width=True):
             db.reset_column_layout(_layout_user, _layout_view)
-            st.success("Layout + widths reset to app default. Refreshing…")
+            st.success("Layout + widths reset to team/app default. Refreshing…")
             st.rerun()
-        if saved_layout:
-            lb3.caption(
+        _layout_role = (
+            (current_user_profile or {}).get("role") or ""
+        ).strip().lower()
+        _can_publish_team_layout = (
+            _layout_role in {"admin", "super_admin"}
+            or str(_layout_user).strip().lower()
+            in {"james", "james pudney", "jamespudney"}
+        )
+        if lb3.button(
+            "⭐ Team default",
+            key=f"publish_team_default_layout_{_layout_user}",
+            disabled=not (_can_publish_team_layout and preview_keys),
+            use_container_width=True,
+            help=(
+                "Publish this preview as the default for users who have "
+                "not saved their own layout. Existing saved user views are "
+                "not changed."
+            ),
+        ):
+            db.publish_team_default_column_layout(
+                _layout_user, _layout_view, preview_keys, _picked_widths)
+            st.success(
+                "Published this Ordering layout as the team default. "
+                "Existing personal saved views were not changed."
+            )
+            st.rerun()
+        if personal_layout:
+            lb4.caption(
                 f":bookmark_tabs: Using **saved layout** for "
-                f"`{_layout_user}` ({len(saved_layout)} cols)."
+                f"`{_layout_user}` ({len(personal_layout)} cols)."
+            )
+        elif saved_layout:
+            lb4.caption(
+                f":bookmark_tabs: Using **team/James default** "
+                f"({len(saved_layout)} cols)."
             )
         else:
-            lb3.caption(
-                ":bookmark_tabs: Using **app default** layout."
-            )
+            lb4.caption(":bookmark_tabs: Using **app default** layout.")
 
         # --- Save current view AS A NAMED PRESET -------------------------
         # Captures the current column order + widths under a user-chosen
@@ -15343,6 +15688,12 @@ elif page == "Ordering":
                 row["Order qty"] * row["POCost"], 2)
             row["Include?"] = row["Order qty"] > 0
             row["Source"] = "Manual"
+            row["Image"] = _product_images_by_sku.get(str(row["SKU"]), "")
+            for _policy_col in (
+                "sku_lead_time_days", "sku_moq", "sku_eoq_qty"
+            ):
+                if _policy_col in ext:
+                    row[_policy_col] = ext.get(_policy_col) or 0
             # Populate context fields from engine_df if available.
             # Include ALL display-relevant columns so added rows don't
             # show blank cells next to the engine's auto rows — trend,
@@ -15388,6 +15739,14 @@ elif page == "Ordering":
                 ):
                     if fld in em_r.index:
                         val = em_r[fld]
+                        if (
+                            fld in (
+                                "sku_lead_time_days", "sku_moq",
+                                "sku_eoq_qty"
+                            )
+                            and row.get(fld) not in (None, "", 0, 0.0)
+                        ):
+                            continue
                         # Only overwrite row if engine has a real value;
                         # don't replace a populated Manual field with NaN.
                         if val is not None and not (
@@ -15400,6 +15759,14 @@ elif page == "Ordering":
                               ignore_index=True)
     else:
         editable = editable_auto
+
+    for _policy_col in (
+        "sku_lead_time_days", "sku_moq", "sku_eoq_qty"
+    ):
+        if _policy_col in editable.columns:
+            editable[_policy_col] = pd.to_numeric(
+                editable[_policy_col], errors="coerce"
+            ).fillna(0)
 
     # Build the column_config dict. After it's built we apply any saved
     # per-column width overrides (see "Column widths" in the layout editor).
@@ -15415,6 +15782,12 @@ elif page == "Ordering":
                      "See docs/demand-scoring.md for the full rules.",
                 disabled=True),
             "Include?": st.column_config.CheckboxColumn("✓", width="small"),
+            "Image": st.column_config.ImageColumn(
+                "Image",
+                width="small",
+                help="Main CIN7 product image. Hover over the thumbnail "
+                     "to enlarge it.",
+            ),
             "🔍": st.column_config.CheckboxColumn(
                 "🔍",
                 width="small",
@@ -15661,7 +16034,8 @@ elif page == "Ordering":
         "large":  "large",
         "huge":   400,     # very wide — good for long names or trend charts
     }
-    _saved_po_widths = db.get_column_widths(_layout_user, _layout_view)
+    _saved_po_widths = db.get_column_widths_with_default(
+        _layout_user, _layout_view)
     if _saved_po_widths:
         for _k, _w in _saved_po_widths.items():
             cfg = _po_col_cfg.get(_k)
@@ -15903,6 +16277,86 @@ elif page == "Ordering":
                 _render_sku_detail(_insp_pick)
         else:
             _ic2.empty()
+
+    def _filter_supplier_catalog(df: pd.DataFrame,
+                                 query: str) -> pd.DataFrame:
+        """Fast token search for the full supplier catalogue picker."""
+        if df.empty:
+            return df
+        q = str(query or "").strip().lower()
+        out = df.copy()
+        if not q:
+            if "reorder_qty" in out.columns:
+                out = out.assign(
+                    __sort_reorder=pd.to_numeric(
+                        out["reorder_qty"], errors="coerce").fillna(0)
+                ).sort_values(
+                    ["__sort_reorder", "SKU"],
+                    ascending=[False, True],
+                    kind="stable",
+                ).drop(columns=["__sort_reorder"], errors="ignore")
+            elif "SKU" in out.columns:
+                out = out.sort_values("SKU", kind="stable")
+            return out
+
+        search_cols = [
+            c for c in (
+                "SKU", "Name", "Category", "Status", "trend_flag", "ABC",
+                "last_6mo_series", "last_12mo_series"
+            )
+            if c in out.columns
+        ]
+        search_text = pd.Series("", index=out.index, dtype="object")
+        for col in search_cols:
+            search_text = (
+                search_text
+                + " "
+                + out[col].fillna("").astype(str).str.lower()
+            )
+        search_norm = search_text.str.replace(
+            r"[^a-z0-9]+", "", regex=True)
+        terms = [t for t in re.split(r"\s+", q) if t]
+        mask = pd.Series(True, index=out.index)
+        for term in terms:
+            term_norm = re.sub(r"[^a-z0-9]+", "", term)
+            term_mask = search_text.str.contains(
+                term, regex=False, na=False)
+            if term_norm:
+                term_mask = term_mask | search_norm.str.contains(
+                    term_norm, regex=False, na=False)
+            mask = mask & term_mask
+        out = out[mask].copy()
+        if out.empty:
+            return out
+
+        sku = (
+            out["SKU"].fillna("").astype(str).str.lower()
+            if "SKU" in out.columns
+            else pd.Series("", index=out.index, dtype="object")
+        )
+        name = (
+            out["Name"].fillna("").astype(str).str.lower()
+            if "Name" in out.columns
+            else pd.Series("", index=out.index, dtype="object")
+        )
+        q_norm = re.sub(r"[^a-z0-9]+", "", q)
+        out["__score"] = (
+            sku.eq(q).astype(int) * 100
+            + sku.str.startswith(q, na=False).astype(int) * 60
+            + sku.str.contains(q, regex=False, na=False).astype(int) * 35
+            + name.str.contains(q, regex=False, na=False).astype(int) * 15
+        )
+        if q_norm:
+            out["__score"] = out["__score"] + (
+                sku.str.replace(r"[^a-z0-9]+", "", regex=True)
+                .str.contains(q_norm, regex=False, na=False)
+                .astype(int) * 45
+            )
+        return out.sort_values(
+            ["__score", "SKU"],
+            ascending=[False, True],
+            kind="stable",
+        ).drop(columns=["__score"], errors="ignore")
 
     # v2.67.351 — click-to-copy SKU chips. James 2026-06-02 asked for
     # double-click-on-SKU-in-column → clipboard. Streamlit's data_editor
@@ -16736,9 +17190,9 @@ elif page == "Ordering":
                  "policy fields before saving.",
             width="small",
         )
-        # Helper grids are selection surfaces. Policy and PO-edit fields
-        # stay editable only in the main PO editor/Product Detail, keeping
-        # one source of truth while preserving the same visible layout.
+        # Helper grids are selection surfaces. Qty/freight stay finalised in
+        # the main editor, while SKU policy fields can be entered here and
+        # carried into the main editor for the normal Save edits flow.
         cfg["Order qty"] = st.column_config.NumberColumn(
             "Order qty",
             min_value=0,
@@ -16757,21 +17211,24 @@ elif page == "Ordering":
         )
         cfg["sku_lead_time_days"] = st.column_config.NumberColumn(
             "Sku Leadtime",
-            disabled=True,
             format="%d",
             width=_ordering_cfg_width("sku_lead_time_days", "small"),
+            help="Editable here before adding to the main PO editor. "
+                 "Click the main Save edits button after adding to persist.",
         )
         cfg["sku_moq"] = st.column_config.NumberColumn(
             "SKU MOQ",
-            disabled=True,
             format="%.2f",
             width=_ordering_cfg_width("sku_moq", "small"),
+            help="Editable here before adding to the main PO editor. "
+                 "Click the main Save edits button after adding to persist.",
         )
         cfg["sku_eoq_qty"] = st.column_config.NumberColumn(
             "SKU EOQ",
-            disabled=True,
             format="%.2f",
             width=_ordering_cfg_width("sku_eoq_qty", "small"),
+            help="Editable here before adding to the main PO editor. "
+                 "Click the main Save edits button after adding to persist.",
         )
         cfg["Note"] = st.column_config.TextColumn(
             "📝 Note",
@@ -16910,6 +17367,15 @@ elif page == "Ordering":
                 cost = float(cost_val) if not pd.isna(cost_val) else 0.0
             except TypeError:
                 cost = 0.0
+            def _helper_policy_value(field: str) -> float:
+                val = pd.to_numeric(
+                    rr.get(field, src.get(field, 0)),
+                    errors="coerce",
+                )
+                try:
+                    return float(val) if not pd.isna(val) else 0.0
+                except TypeError:
+                    return 0.0
             st.session_state[extra_key].append({
                 "SKU": sku_a,
                 "Name": str(src.get("Name", rr.get("Name", "")) or "")[:80],
@@ -16917,6 +17383,10 @@ elif page == "Ordering":
                 "Order qty": qty,
                 "Unit cost": cost,
                 "Line value": round(qty * cost, 2),
+                "sku_lead_time_days": int(round(
+                    _helper_policy_value("sku_lead_time_days"))),
+                "sku_moq": _helper_policy_value("sku_moq"),
+                "sku_eoq_qty": _helper_policy_value("sku_eoq_qty"),
                 "From supplier?": source_marker,
             })
             existing_extra_skus.add(sku_a)
@@ -17764,42 +18234,52 @@ elif page == "Ordering":
         if all_supplier_df.empty:
             st.info("No supplier SKUs found for this supplier.")
         else:
-            cat_controls = st.columns([3, 1])
-            catalog_query = cat_controls[0].text_input(
-                "Search supplier SKUs",
-                key=f"catalog_search_{sel_sup}",
-                placeholder="Type part of a SKU, product name, category, "
-                            "status, or trend...",
-            )
-            hide_visible_catalog = cat_controls[1].checkbox(
-                "Hide rows already above",
-                value=False,
-                key=f"catalog_hide_visible_{sel_sup}",
-                help="Useful when you only want SKUs that are not already "
-                     "in the reorder or pull-forward sections.",
-            )
+            _catalog_query_key = f"catalog_search_committed_{sel_sup}"
+            _catalog_hide_key = f"catalog_hide_visible_committed_{sel_sup}"
+            with st.form(f"catalog_search_form_{sel_sup}"):
+                cat_controls = st.columns([3, 1])
+                catalog_query_input = cat_controls[0].text_input(
+                    "Search supplier SKUs",
+                    value=st.session_state.get(_catalog_query_key, ""),
+                    key=f"catalog_search_input_{sel_sup}",
+                    placeholder="SKU, name, category, status, or trend...",
+                    help=(
+                        "Search accepts partial SKUs with or without "
+                        "hyphens/spaces, and multiple words narrow the "
+                        "result."
+                    ),
+                )
+                hide_visible_input = cat_controls[1].checkbox(
+                    "Hide rows already above",
+                    value=bool(st.session_state.get(_catalog_hide_key, False)),
+                    key=f"catalog_hide_visible_input_{sel_sup}",
+                    help="Useful when you only want SKUs that are not "
+                         "already in the reorder or pull-forward sections.",
+                )
+                fs1, fs2, fs3 = st.columns([1, 1, 4])
+                search_submitted = fs1.form_submit_button(
+                    "Search",
+                    type="primary",
+                    use_container_width=True,
+                )
+                search_cleared = fs2.form_submit_button(
+                    "Clear",
+                    use_container_width=True,
+                )
+            if search_submitted:
+                st.session_state[_catalog_query_key] = catalog_query_input
+                st.session_state[_catalog_hide_key] = hide_visible_input
+                st.rerun()
+            if search_cleared:
+                st.session_state[_catalog_query_key] = ""
+                st.session_state[_catalog_hide_key] = False
+                st.rerun()
+            catalog_query = st.session_state.get(_catalog_query_key, "")
+            hide_visible_catalog = bool(
+                st.session_state.get(_catalog_hide_key, False))
 
-            catalog_df = all_supplier_df.copy()
-            if catalog_query.strip():
-                q = catalog_query.strip().lower()
-                search_cols = [
-                    c for c in (
-                        "SKU", "Name", "Category", "Status",
-                        "trend_flag", "ABC"
-                    )
-                    if c in catalog_df.columns
-                ]
-                search_text = pd.Series(
-                    "", index=catalog_df.index, dtype="object")
-                for col in search_cols:
-                    search_text = (
-                        search_text
-                        + " "
-                        + catalog_df[col].fillna("").astype(str).str.lower()
-                    )
-                catalog_df = catalog_df[
-                    search_text.str.contains(q, regex=False, na=False)
-                ]
+            catalog_df = _filter_supplier_catalog(
+                all_supplier_df, catalog_query)
 
             if hide_visible_catalog and "SKU" in editable.columns:
                 visible_skus = set(editable["SKU"].astype(str).tolist())
@@ -17815,11 +18295,8 @@ elif page == "Ordering":
                 catalog_df["catalog_add_qty"] = cat_reorder_qty.mask(
                     cat_reorder_qty <= 0, 1.0)
                 catalog_df["Order qty"] = catalog_df["catalog_add_qty"]
-                if "SKU" in catalog_df.columns:
-                    catalog_df = catalog_df.sort_values(
-                        "SKU", kind="stable")
 
-                max_catalog_rows = 300
+                max_catalog_rows = 80 if str(catalog_query).strip() else 50
                 display_catalog_df = catalog_df.head(max_catalog_rows).copy()
                 if len(catalog_df) > max_catalog_rows:
                     st.caption(
@@ -17880,11 +18357,6 @@ elif page == "Ordering":
                         f"tweak.{skip_msg}"
                     )
                     st.rerun()
-                ac2.caption(
-                    "Default qty is the engine suggestion when one exists; "
-                    "otherwise it starts at 1. Change the final qty in the "
-                    "main PO editor after adding."
-                )
 
     # --- Sales-history migration manager (retiring -> successor) -------
     # Use case: a product is superseded (e.g. Smokies -> Sierra) and we
