@@ -98,10 +98,12 @@ USER_AGENT = (
 #   id           — variant's IP-internal id
 #   connections  — canonical SKU lives at connections[0].sku
 #   merged       — curated alternatives ("Combine sales/stock")
+#   replenishment_notes — top-level buyer replenishment note, when IP exposes
+#                   notes outside the warehouse block
 #   warehouse    — per-warehouse settings: lead_time, replenishment,
 #                   minimum_stock, above_moq, replenishment_notes
 #   tags         — variant-level tags (operational labels)
-FIELDS = "id,connections,merged,warehouse,tags"
+FIELDS = "id,connections,merged,replenishment_notes,warehouse,tags"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 

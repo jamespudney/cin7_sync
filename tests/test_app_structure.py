@@ -285,7 +285,10 @@ class AppMemoryStructureTests(unittest.TestCase):
         )
 
         self.assertIn("from data_paths import OUTPUT_DIR", notes_sync)
-        self.assertIn('FIELDS = "id,connections,tags,warehouse"', notes_sync)
+        self.assertIn(
+            'FIELDS = "id,connections,tags,replenishment_notes,warehouse"',
+            notes_sync,
+        )
         self.assertIn("replenishment_notes", notes_sync)
         self.assertIn("top-level (`replenishment_notes`)", notes_sync)
         self.assertIn("def _note_entries_for_variant", notes_sync)
@@ -295,6 +298,10 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn('"SKU", "VariantID", "WarehouseID", "Note", "Tags"',
                       notes_sync)
         self.assertIn("from data_paths import OUTPUT_DIR", ip_pull)
+        self.assertIn(
+            'FIELDS = "id,connections,merged,replenishment_notes,warehouse,tags"',
+            ip_pull,
+        )
         self.assertIn("top_note = _note_text(v)", ip_pull)
         self.assertNotIn('OUTPUT_DIR = Path("output")', ip_pull)
         self.assertIn("python ip_sync_notes.py", daily)
@@ -407,6 +414,16 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_ordering_sku_buying_preview", script)
         self.assertIn("_policy_preview_updates", script)
         self.assertIn("_policy_preview_clears", script)
+        self.assertIn("def _sync_helper_sku_buying_preview", script)
+        self.assertIn(
+            "_sync_helper_sku_buying_preview(upc_edited, upc_view)",
+            script,
+        )
+        self.assertIn(
+            "_sync_helper_sku_buying_preview(\n"
+            "                    catalog_edited, catalog_view)",
+            script,
+        )
         self.assertIn('st.session_state.pop("_reorder_apply_sig", None)',
                       script)
         self.assertIn('"sku_buying": sku_buying_settings', script)

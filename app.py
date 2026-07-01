@@ -16827,6 +16827,39 @@ elif page == "Ordering":
             st.session_state.pop("_reorder_apply_sig", None)
             st.rerun()
 
+    _preview_now = st.session_state.get("_ordering_sku_buying_preview", {})
+    if isinstance(_preview_now, dict) and _preview_now:
+        _existing_policy_edit_skus = {
+            str(_edit[0]) for _edit in _sku_buying_edits if _edit
+        }
+        for _sk, _payload in _preview_now.items():
+            if not isinstance(_payload, dict):
+                continue
+            _sk = str(_sk or "")
+            if not _sk or _sk in _existing_policy_edit_skus:
+                continue
+            _new_policy = (
+                _int_policy_cell(_payload.get("lead_time_days")),
+                _numeric_policy_cell(_payload.get("moq")),
+                _numeric_policy_cell(_payload.get("eoq_qty")),
+            )
+            _db_policy = sku_buying_settings_db.get(_sk, {}) or {}
+            _old_policy = (
+                _int_policy_cell(_db_policy.get("lead_time_days")),
+                _numeric_policy_cell(_db_policy.get("moq")),
+                (
+                    _numeric_policy_cell(_db_policy.get("eoq_qty"))
+                    or _numeric_policy_cell(_db_policy.get("pack_qty"))
+                ),
+            )
+            if (
+                _new_policy[0] != _old_policy[0]
+                or abs(_new_policy[1] - _old_policy[1]) > 0.001
+                or abs(_new_policy[2] - _old_policy[2]) > 0.001
+            ):
+                _sku_buying_edits.append((_sk, *_new_policy))
+                _existing_policy_edit_skus.add(_sk)
+
     # --- Persistent qty-edit detection + save/clear UI ---------------
     # Detect Order qty edits by comparing edited["Order qty"] to the
     # value we LOADED with (editable["Order qty"], which already has
@@ -17382,6 +17415,76 @@ elif page == "Ordering":
         if sort_by and sort_by in view.columns:
             view = view.sort_values(sort_by, na_position="last")
         return view[add_cols].reset_index(drop=True)
+
+    def _sync_helper_sku_buying_preview(
+        edited_df: pd.DataFrame,
+        loaded_view: pd.DataFrame,
+    ) -> None:
+        """Apply helper-grid SKU policy edits and rerun recommendation math."""
+        _policy_cols = {
+            "SKU", "sku_lead_time_days", "sku_moq", "sku_eoq_qty"
+        }
+        if (
+            edited_df is None
+            or loaded_view is None
+            or edited_df.empty
+            or loaded_view.empty
+            or not _policy_cols.issubset(set(edited_df.columns))
+            or not _policy_cols.issubset(set(loaded_view.columns))
+        ):
+            return
+
+        def _policy_tuple(row) -> tuple[int, float, float]:
+            return (
+                _int_policy_cell(row.get("sku_lead_time_days")),
+                _numeric_policy_cell(row.get("sku_moq")),
+                _numeric_policy_cell(row.get("sku_eoq_qty")),
+            )
+
+        loaded_lookup = {
+            str(_r.get("SKU") or ""): _policy_tuple(_r)
+            for _, _r in loaded_view.iterrows()
+        }
+        preview = st.session_state.get("_ordering_sku_buying_preview", {})
+        if not isinstance(preview, dict):
+            preview = {}
+        changed = False
+
+        for _, row in edited_df.iterrows():
+            sku_here = str(row.get("SKU") or "")
+            if not sku_here or sku_here not in loaded_lookup:
+                continue
+            new_policy = _policy_tuple(row)
+            if new_policy == loaded_lookup[sku_here]:
+                continue
+
+            db_policy = sku_buying_settings_db.get(sku_here, {}) or {}
+            persisted_policy = (
+                _int_policy_cell(db_policy.get("lead_time_days")),
+                _numeric_policy_cell(db_policy.get("moq")),
+                (
+                    _numeric_policy_cell(db_policy.get("eoq_qty"))
+                    or _numeric_policy_cell(db_policy.get("pack_qty"))
+                ),
+            )
+            if new_policy == persisted_policy:
+                if preview.pop(sku_here, None) is not None:
+                    changed = True
+                continue
+
+            payload = {
+                "lead_time_days": new_policy[0],
+                "moq": new_policy[1],
+                "eoq_qty": new_policy[2],
+            }
+            if preview.get(sku_here) != payload:
+                preview[sku_here] = payload
+                changed = True
+
+        if changed:
+            st.session_state["_ordering_sku_buying_preview"] = preview
+            st.session_state.pop("_reorder_apply_sig", None)
+            st.rerun()
 
     def _ordering_add_selected_rows_to_po(
         selected_rows: pd.DataFrame,
@@ -18328,6 +18431,7 @@ elif page == "Ordering":
                     column_config=_ordering_add_to_po_column_config(),
                 )
                 _render_ordering_editor_enhancer(_pull_forward_anchor)
+                _sync_helper_sku_buying_preview(upc_edited, upc_view)
 
                 tick_mask = upc_edited["Add?"].fillna(False).astype(bool)
                 n_ticked = int(tick_mask.sum())
@@ -18460,6 +18564,8 @@ elif page == "Ordering":
                     column_config=_ordering_add_to_po_column_config(),
                 )
                 _render_ordering_editor_enhancer(_all_supplier_anchor)
+                _sync_helper_sku_buying_preview(
+                    catalog_edited, catalog_view)
 
                 cat_tick_mask = (
                     catalog_edited["Add?"].fillna(False).astype(bool)

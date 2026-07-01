@@ -43,11 +43,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 cin7-sync/1.0"
 )
 
-# Request the full warehouse block. Inventory Planner's nested field allowlist
-# can return only the warehouse id when asked for `warehouse.replenishment_notes`
-# directly, which makes every note look blank. The broader field mirrors the
-# older ip_pull_alternates export that successfully surfaces buyer notes.
-FIELDS = "id,connections,tags,warehouse"
+# Request the top-level replenishment note plus the full warehouse block.
+# Inventory Planner's nested field allowlist can return only the warehouse id
+# when asked for `warehouse.replenishment_notes` directly, which makes every
+# warehouse note look blank. Some buyer notes are exposed at variant top-level
+# (`replenishment_notes`), so ask for that field explicitly too.
+FIELDS = "id,connections,tags,replenishment_notes,warehouse"
 
 
 def _setup_log(verbose: bool = False) -> logging.Logger:
