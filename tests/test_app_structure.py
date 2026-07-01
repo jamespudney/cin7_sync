@@ -414,6 +414,10 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("_ordering_sku_buying_preview", script)
         self.assertIn("_policy_preview_updates", script)
         self.assertIn("_policy_preview_clears", script)
+        self.assertIn("def _save_sku_buying_policy_edit", script)
+        self.assertIn("def _supplier_has_sku_buying_policy", script)
+        self.assertIn("def _overlay_sku_buying_policy_columns", script)
+        self.assertIn("Saved SKU buying settings for {persisted}", script)
         self.assertIn("def _sync_helper_sku_buying_preview", script)
         self.assertIn(
             "_sync_helper_sku_buying_preview(upc_edited, upc_view)",
@@ -468,7 +472,7 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("catalog_clear_", script)
         self.assertNotIn("catalog_search_form_", script)
         self.assertIn("max_catalog_rows = 80 if", script)
-        self.assertIn("Click the main Save edits button after adding", script)
+        self.assertIn("Edits here save immediately", script)
 
     def test_product_detail_buying_settings_are_above_demand_breakdown(self) -> None:
         script = (

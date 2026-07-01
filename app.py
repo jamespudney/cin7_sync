@@ -14745,6 +14745,51 @@ elif page == "Ordering":
             )
         return _normalise_ordering_supplier_df(live_df)
 
+    def _supplier_has_sku_buying_policy(df: pd.DataFrame) -> bool:
+        if df.empty or "SKU" not in df.columns:
+            return False
+        supplier_skus = set(df["SKU"].dropna().astype(str).tolist())
+        if not supplier_skus:
+            return False
+        for sku_s, policy in sku_buying_settings.items():
+            if str(sku_s) not in supplier_skus or not isinstance(policy, dict):
+                continue
+            if (
+                _positive_int_or_zero(policy.get("lead_time_days")) > 0
+                or _positive_float_or_zero(policy.get("moq")) > 0
+                or _positive_float_or_zero(policy.get("eoq_qty")) > 0
+                or _positive_float_or_zero(policy.get("pack_qty")) > 0
+            ):
+                return True
+        return False
+
+    def _overlay_sku_buying_policy_columns(
+            df: pd.DataFrame) -> pd.DataFrame:
+        """Make user-saved SKU policy values visible on any ordering grid.
+
+        Supplier snapshots are an acceleration layer and can lag behind the
+        team database. These columns are user input, so the shared DB/preview
+        value always wins over a blank or stale snapshot value.
+        """
+        if df.empty or "SKU" not in df.columns:
+            return df
+        out = df.copy()
+        for col in ("sku_lead_time_days", "sku_moq", "sku_eoq_qty"):
+            if col not in out.columns:
+                out[col] = 0.0
+        for sku_s in out["SKU"].dropna().astype(str).unique().tolist():
+            lt_days, sku_moq, sku_eoq = _sku_buying_values(sku_s)
+            if not (lt_days or sku_moq or sku_eoq):
+                continue
+            mask = out["SKU"].astype(str).eq(sku_s)
+            if lt_days:
+                out.loc[mask, "sku_lead_time_days"] = lt_days
+            if sku_moq:
+                out.loc[mask, "sku_moq"] = sku_moq
+            if sku_eoq:
+                out.loc[mask, "sku_eoq_qty"] = sku_eoq
+        return out
+
     def _positive_reorder_count(df: pd.DataFrame) -> int:
         if df.empty:
             return 0
@@ -14785,6 +14830,14 @@ elif page == "Ordering":
                     or _has_buyer_status(_live_candidate)):
                 all_supplier_df = _live_candidate
                 ordering_supplier_snapshot_used = False
+        elif _supplier_has_sku_buying_policy(all_supplier_df):
+            # User-entered lead time/MOQ/EOQ must not be hidden by an old
+            # supplier snapshot. Use the live engine rows for this supplier so
+            # target stock and suggested reorder use the current SKU policy.
+            all_supplier_df = _prepared_live_supplier_df()
+            ordering_supplier_snapshot_used = False
+
+    all_supplier_df = _overlay_sku_buying_policy_columns(all_supplier_df)
 
     def _apply_ordering_view_filters(source_df: pd.DataFrame,
                                      *,
@@ -15637,8 +15690,20 @@ elif page == "Ordering":
         except Exception:  # noqa: BLE001
             _aclass_low_90d_skus = set()
 
+    def _ip_note_text_for_sku(sku_s: str) -> str:
+        bits = []
+        for note_info in IP_NOTES.get(str(sku_s), []):
+            txt = str((note_info or {}).get("text") or "").strip()
+            if txt and txt not in bits:
+                bits.append(txt)
+        return " | ".join(bits)
+
     def _build_note(sku_s: str) -> str:
-        manual = latest_notes_map.get(sku_s, "") or ""
+        manual = (
+            latest_notes_map.get(sku_s, "")
+            or _ip_note_text_for_sku(sku_s)
+            or ""
+        )
         warning_info = dormancy_warnings_map.get(sku_s)
         # v2.67.48 — A-class grace note. Surface BEFORE the
         # warning_info check so it shows even when no dormancy
@@ -16756,15 +16821,57 @@ elif page == "Ordering":
                 # Case (a) or (b)
                 _ds_remove.append((sku_d, is_cin7_ds))
     if "Note" in edited.columns and "SKU" in edited.columns:
+        _loaded_note_values = {}
+        if "Note" in editable.columns and "SKU" in editable.columns:
+            for _, _loaded_note_row in editable.iterrows():
+                _loaded_note_values[
+                    str(_loaded_note_row.get("SKU") or "")
+                ] = str(_loaded_note_row.get("Note") or "").strip()
         for _, nrow in edited.iterrows():
             sku_e = str(nrow.get("SKU") or "")
             new_note = (nrow.get("Note") or "")
             if not sku_e:
                 continue
             new_note = str(new_note).strip()
-            old_note = (latest_notes_map.get(sku_e) or "").strip()
+            old_note = (
+                _loaded_note_values.get(
+                    sku_e, latest_notes_map.get(sku_e) or "")
+                or ""
+            ).strip()
             if new_note and new_note != old_note:
                 _changed_notes.append((sku_e, new_note))
+
+    def _save_sku_buying_policy_edit(
+        sku_e: str,
+        lt_days: int,
+        sku_moq: float,
+        sku_eoq: float,
+        actor: str,
+    ) -> None:
+        existing_policy = sku_buying_settings_db.get(sku_e, {}) or {}
+        note = str(existing_policy.get("note") or "")
+        existing_pack = _numeric_policy_cell(existing_policy.get("pack_qty"))
+        pack_to_keep = (
+            existing_pack if existing_pack > 0 and sku_eoq > 0 else None)
+        if (
+            lt_days <= 0
+            and sku_moq <= 0
+            and sku_eoq <= 0
+            and not pack_to_keep
+            and not note.strip()
+        ):
+            db.clear_sku_pack(sku_e, actor)
+        else:
+            db.set_sku_buying_settings(
+                sku=sku_e,
+                actor=actor,
+                pack_qty=pack_to_keep,
+                moq=(sku_moq if sku_moq > 0 else None),
+                lead_time_days=(int(lt_days) if lt_days > 0 else None),
+                eoq_qty=(sku_eoq if sku_eoq > 0 else None),
+                note=note,
+            )
+
     _policy_cols = {"SKU", "sku_lead_time_days", "sku_moq", "sku_eoq_qty"}
     _policy_preview_updates = {}
     _policy_preview_clears = []
@@ -17001,25 +17108,8 @@ elif page == "Ordering":
                 msgs.append(f"Saved {len(_changed_notes)} note edit(s)")
             if _sku_buying_edits:
                 for sku_e, lt_days, sku_moq, sku_eoq in _sku_buying_edits:
-                    existing_policy = (
-                        sku_buying_settings_db.get(sku_e, {}) or {})
-                    note = str(existing_policy.get("note") or "")
-                    pack_qty = _numeric_policy_cell(
-                        existing_policy.get("pack_qty"))
-                    if (lt_days <= 0 and sku_moq <= 0 and sku_eoq <= 0
-                            and pack_qty <= 0 and not note.strip()):
-                        db.clear_sku_pack(sku_e, actor)
-                    else:
-                        db.set_sku_buying_settings(
-                            sku=sku_e,
-                            actor=actor,
-                            pack_qty=(pack_qty if pack_qty > 0 else None),
-                            moq=(sku_moq if sku_moq > 0 else None),
-                            lead_time_days=(
-                                int(lt_days) if lt_days > 0 else None),
-                            eoq_qty=(sku_eoq if sku_eoq > 0 else None),
-                            note=note,
-                        )
+                    _save_sku_buying_policy_edit(
+                        sku_e, lt_days, sku_moq, sku_eoq, actor)
                 _preview = st.session_state.get(
                     "_ordering_sku_buying_preview", {})
                 if isinstance(_preview, dict):
@@ -17318,22 +17408,22 @@ elif page == "Ordering":
             "Sku Leadtime",
             format="%d",
             width=_ordering_cfg_width("sku_lead_time_days", "small"),
-            help="Editable here before adding to the main PO editor. "
-                 "Click the main Save edits button after adding to persist.",
+            help="Shared SKU setting. Edits here save immediately and "
+                 "recalculate the ordering tables.",
         )
         cfg["sku_moq"] = st.column_config.NumberColumn(
             "SKU MOQ",
             format="%.2f",
             width=_ordering_cfg_width("sku_moq", "small"),
-            help="Editable here before adding to the main PO editor. "
-                 "Click the main Save edits button after adding to persist.",
+            help="Shared SKU setting. Edits here save immediately and "
+                 "recalculate the ordering tables.",
         )
         cfg["sku_eoq_qty"] = st.column_config.NumberColumn(
             "SKU EOQ",
             format="%.2f",
             width=_ordering_cfg_width("sku_eoq_qty", "small"),
-            help="Editable here before adding to the main PO editor. "
-                 "Click the main Save edits button after adding to persist.",
+            help="Shared SKU setting. Edits here save immediately and "
+                 "recalculate the ordering tables.",
         )
         cfg["Note"] = st.column_config.TextColumn(
             "📝 Note",
@@ -17449,6 +17539,9 @@ elif page == "Ordering":
         if not isinstance(preview, dict):
             preview = {}
         changed = False
+        persisted = 0
+        actor = st.session_state.get("current_user", "").strip()
+        persisted_skus: set[str] = set()
 
         for _, row in edited_df.iterrows():
             sku_here = str(row.get("SKU") or "")
@@ -17477,12 +17570,33 @@ elif page == "Ordering":
                 "moq": new_policy[1],
                 "eoq_qty": new_policy[2],
             }
-            if preview.get(sku_here) != payload:
+            if actor:
+                if sku_here not in persisted_skus:
+                    _save_sku_buying_policy_edit(
+                        sku_here,
+                        new_policy[0],
+                        new_policy[1],
+                        new_policy[2],
+                        actor,
+                    )
+                    persisted_skus.add(sku_here)
+                    persisted += 1
+                if preview.pop(sku_here, None) is not None:
+                    changed = True
+                changed = True
+            elif preview.get(sku_here) != payload:
                 preview[sku_here] = payload
                 changed = True
 
         if changed:
             st.session_state["_ordering_sku_buying_preview"] = preview
+            if persisted:
+                try:
+                    st.toast(
+                        f"Saved SKU buying settings for {persisted} SKU"
+                        f"{'s' if persisted != 1 else ''}.")
+                except Exception:
+                    pass
             st.session_state.pop("_reorder_apply_sig", None)
             st.rerun()
 

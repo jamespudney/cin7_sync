@@ -126,6 +126,13 @@ project. Because these settings change target stock, they also affect
 optimum stock, excess/slow-stock tied-up value, and reorder suggestions
 after the next Ordering/ABC recalculation.
 
+Ordering shows these settings in the main reorder table, optional
+pull-forward table, and supplier catalogue table. Main reorder table edits
+are committed with **Save edits**. Helper-grid edits in optional
+pull-forward or supplier catalogue save immediately to the shared team
+database and then recalculate the ordering tables, so buyer-entered SKU
+policy values survive refreshes and deploys.
+
 #### Freight mode
 Air or Sea. Decision order:
 
