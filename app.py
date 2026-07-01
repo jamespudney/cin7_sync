@@ -14753,8 +14753,17 @@ elif page == "Ordering":
         #       items stay hidden to avoid clutter; they're still in
         #       the "📦 Dropship products" expander with full list.
         _is_dropship = s_df["SKU"].astype(str).isin(dropship_skus)
-        _has_any_demand = s_df.get(
-            "effective_units_12mo", pd.Series(dtype=float)).fillna(0) > 0
+        _supplier_reorder_qty = pd.to_numeric(
+            s_df.get("reorder_qty", pd.Series(0, index=s_df.index)),
+            errors="coerce",
+        ).fillna(0)
+        _has_any_demand = pd.to_numeric(
+            s_df.get(
+                "effective_units_12mo",
+                pd.Series(0, index=s_df.index),
+            ),
+            errors="coerce",
+        ).fillna(0) > 0
         # v2.67.318 — also keep OUT-OF-STOCK items that sold this year
         # even when the engine suggests 0. These are almost all 🎯 Project
         # / 💤 Dormant SKUs whose reorder was (correctly) suppressed —
@@ -14772,12 +14781,20 @@ elif page == "Ordering":
             axis=1,
         )
         keep_mask = (
-            (s_df["reorder_qty"] > 0)
+            (_supplier_reorder_qty > 0)
             | (_is_dropship & _has_any_demand)
             | (_out_of_stock & _has_any_demand)
         )
         s_df = s_df[keep_mask]
-    s_df = s_df.sort_values(["reorder_qty"], ascending=False)
+    _supplier_sort_reorder = pd.to_numeric(
+        s_df.get("reorder_qty", pd.Series(0, index=s_df.index)),
+        errors="coerce",
+    ).fillna(0)
+    s_df = (
+        s_df.assign(__sort_reorder=_supplier_sort_reorder)
+        .sort_values("__sort_reorder", ascending=False)
+        .drop(columns=["__sort_reorder"], errors="ignore")
+    )
 
     # Supplier-wide totals (unfiltered) — the "real" supplier picture
     sw_skus = len(all_supplier_df)

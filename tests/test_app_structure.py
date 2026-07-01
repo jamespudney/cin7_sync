@@ -391,6 +391,28 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("sku_buying_settings_db.get(sku_e", script)
         self.assertIn("Ordering and Product Detail use this", script)
 
+    def test_ordering_supplier_snapshot_columns_are_defensive(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _normalise_ordering_supplier_df", script)
+        self.assertIn('"reorder_qty": 0.0', script)
+        self.assertIn("_supplier_reorder_qty = pd.to_numeric", script)
+        self.assertIn('s_df.get("reorder_qty"', script)
+        self.assertNotIn('(s_df["reorder_qty"] > 0)', script)
+
+    def test_ordering_supplier_catalog_search_is_committed_and_bounded(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("def _filter_supplier_catalog", script)
+        self.assertIn("catalog_search_form_", script)
+        self.assertIn("form_submit_button", script)
+        self.assertIn("max_catalog_rows = 80 if", script)
+        self.assertIn("Click the main Save edits button after adding", script)
+
     def test_ordering_and_product_detail_show_12mo_series(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"
