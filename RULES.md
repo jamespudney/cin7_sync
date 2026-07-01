@@ -6,7 +6,7 @@
 
 **Versioning.** When you add or change a rule, bump the top-of-file date and mark which page / function it affects. When a rule becomes obsolete, strike it through — don't delete — so the reasoning stays visible.
 
-Last updated: 2026-06-30
+Last updated: 2026-07-01
 
 ---
 
@@ -252,6 +252,16 @@ places.
 **8.6 Data loader strategy.** Each loader (`_load_longest_sale_lines`, `_load_longest_purchase_lines`, `_load_longest_sales`) uses the same pattern: pick the largest-window CSV as the base, union any more-recently-written shorter-window files (captures intra-day data), dedupe on natural keys.
 
 **8.7 Streamlit cache memory discipline.** Large CSV, merged-source, and ABC-engine caches must be bounded with `max_entries`. NearSync creates fresh filenames/mtimes throughout the day; unbounded `@st.cache_data` entries can keep old snapshots resident until the Render web process exceeds memory. The biggest merged source loaders and `_abc_engine` keep one current entry, while the generic CSV reader keeps a small rolling set. The background ABC warmer must also respect `WARM_ENGINE_MIN_AVAILABLE_MB` (2500 MB on the shared 4 GB Render web instance) before spawning a second Python process.
+
+**8.8 Ordering supplier snapshots are an acceleration layer, not a
+calculation source.** `warm_engine.py` writes `engine_output.csv` first,
+then materializes one JSON row per orderable supplier/SKU into
+`ordering_engine_snapshots` + `ordering_supplier_rows`. The Ordering
+page may read a selected supplier from those tables to avoid reshaping
+the full engine dataframe on every buyer action, but only if the
+snapshot source mtime matches the current `engine_output.csv`. If the
+DB snapshot is missing, stale, empty, or unreadable, the page must fall
+back to `engine_output.csv` / `engine_df` without changing numbers.
 
 ---
 

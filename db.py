@@ -11,11 +11,13 @@ Streamlit sessions on one PC comfortably. Swap for Postgres later if hosted.
 
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 # DB_PATH lives in DATA_DIR so the SQLite file follows the persistent
 # disk on Render. data_paths.py defaults to the project folder locally.
@@ -441,6 +443,33 @@ CREATE TABLE IF NOT EXISTS sku_pack_settings (
     set_by          TEXT    NOT NULL,
     set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Materialized ordering supplier slices. warm_engine.py refreshes these
+-- after writing engine_output.csv so the Streamlit Ordering page can load
+-- one supplier's rows instead of reshaping the full engine dataframe on
+-- every buyer interaction. The dashboard must treat this as an optional
+-- acceleration layer: if the snapshot is missing or stale, fall back to
+-- engine_output.csv.
+CREATE TABLE IF NOT EXISTS ordering_engine_snapshots (
+    snapshot_key    TEXT PRIMARY KEY,
+    source_path     TEXT,
+    source_mtime    REAL,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    supplier_count  INTEGER NOT NULL DEFAULT 0,
+    source          TEXT,
+    built_at        TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS ordering_supplier_rows (
+    snapshot_key    TEXT NOT NULL,
+    supplier        TEXT NOT NULL,
+    sku             TEXT NOT NULL,
+    is_orderable    INTEGER NOT NULL DEFAULT 1,
+    row_json        TEXT NOT NULL,
+    PRIMARY KEY (snapshot_key, supplier, sku)
+);
+CREATE INDEX IF NOT EXISTS idx_ordering_supplier_rows_supplier
+    ON ordering_supplier_rows(snapshot_key, supplier);
 
 -- =========================================================================
 -- PO draft persistence (legacy v1 — single anonymous draft per supplier)
@@ -3746,6 +3775,38 @@ _PG_POST_CUTOVER_TABLES = [
     ("sku_pack_settings_add_eoq_qty",
       "ALTER TABLE sku_pack_settings "
       "ADD COLUMN IF NOT EXISTS eoq_qty DOUBLE PRECISION;"),
+    # Materialized Ordering supplier slices. The warm engine writes
+    # these after engine_output.csv so the dashboard can read one
+    # supplier's rows from Postgres instead of repeatedly reshaping
+    # the full engine dataframe.
+    ("ordering_engine_snapshots_table",
+      """
+      CREATE TABLE IF NOT EXISTS ordering_engine_snapshots (
+          snapshot_key    TEXT PRIMARY KEY,
+          source_path     TEXT,
+          source_mtime    DOUBLE PRECISION,
+          row_count       INTEGER NOT NULL DEFAULT 0,
+          supplier_count  INTEGER NOT NULL DEFAULT 0,
+          source          TEXT,
+          built_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("ordering_supplier_rows_table",
+      """
+      CREATE TABLE IF NOT EXISTS ordering_supplier_rows (
+          snapshot_key    TEXT NOT NULL,
+          supplier        TEXT NOT NULL,
+          sku             TEXT NOT NULL,
+          is_orderable    INTEGER NOT NULL DEFAULT 1,
+          row_json        TEXT NOT NULL,
+          PRIMARY KEY (snapshot_key, supplier, sku)
+      );
+      """),
+    ("ordering_supplier_rows_supplier_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_ordering_supplier_rows_supplier
+          ON ordering_supplier_rows(snapshot_key, supplier);
+      """),
     # v2.67.284 — supplier holiday / shutdown periods. Multiple
     # rows per supplier; the reorder engine adds the overlap with
     # the upcoming lead-time + cadence window to the target cover.
@@ -4491,6 +4552,241 @@ def all_supplier_configs() -> dict:
         _normalise_supplier_name(r["supplier_name"]): dict(r)
         for r in rows
     }
+
+
+# ---------------------------------------------------------------------------
+# Ordering materialized supplier snapshots
+# ---------------------------------------------------------------------------
+
+def _ordering_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _ordering_jsonable(value: Any) -> Any:
+    """Convert dataframe/numpy/pandas values into plain JSON values."""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [_ordering_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _ordering_jsonable(v)
+                for k, v in value.items()}
+    if hasattr(value, "item"):
+        try:
+            return _ordering_jsonable(value.item())
+        except Exception:  # noqa: BLE001
+            pass
+    text = str(value)
+    if text in {"nan", "NaN", "NaT", "<NA>"}:
+        return None
+    return text
+
+
+def _ordering_records(rows: Any) -> list[dict]:
+    if rows is None:
+        return []
+    if hasattr(rows, "to_dict"):
+        return list(rows.to_dict(orient="records"))
+    out = []
+    for row in rows:
+        out.append(dict(row))
+    return out
+
+
+def replace_ordering_supplier_snapshot(
+    rows: Any,
+    *,
+    source_path: str = "",
+    source_mtime: Optional[float] = None,
+    snapshot_key: Optional[str] = None,
+    source: str = "warm_engine",
+) -> dict:
+    """Replace the latest materialized Ordering supplier snapshot.
+
+    `rows` is usually the full engine dataframe. We store only orderable
+    master rows, one JSON payload per SKU. The app treats this as an
+    acceleration layer only; if it is absent or stale, it falls back to
+    engine_output.csv.
+    """
+    records = _ordering_records(rows)
+    if not snapshot_key:
+        if source_mtime:
+            snapshot_key = f"engine:{int(float(source_mtime))}"
+        else:
+            snapshot_key = (
+                "engine:" + datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            )
+
+    payload = []
+    suppliers = set()
+    for row in records:
+        if _ordering_truthy(row.get("is_non_master_tube")):
+            continue
+        sku = str(row.get("SKU") or row.get("sku") or "").strip()
+        supplier = _normalise_supplier_name(
+            row.get("Supplier") or row.get("supplier") or "")
+        if not sku or not supplier:
+            continue
+        safe_row = {
+            str(k): _ordering_jsonable(v)
+            for k, v in row.items()
+        }
+        safe_row["SKU"] = sku
+        safe_row["Supplier"] = supplier
+        payload.append((
+            snapshot_key,
+            supplier,
+            sku,
+            1,
+            json.dumps(safe_row, separators=(",", ":")),
+        ))
+        suppliers.add(supplier)
+
+    if not payload:
+        return {
+            "snapshot_key": snapshot_key,
+            "rows": 0,
+            "suppliers": 0,
+            "written": False,
+        }
+
+    with connect() as c:
+        c.execute(
+            "DELETE FROM ordering_supplier_rows WHERE snapshot_key = ?",
+            (snapshot_key,),
+        )
+        c.executemany(
+            """
+            INSERT INTO ordering_supplier_rows
+                (snapshot_key, supplier, sku, is_orderable, row_json)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_key, supplier, sku) DO UPDATE SET
+                is_orderable = excluded.is_orderable,
+                row_json = excluded.row_json
+            """,
+            payload,
+        )
+        c.execute(
+            """
+            INSERT INTO ordering_engine_snapshots
+                (snapshot_key, source_path, source_mtime, row_count,
+                 supplier_count, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_key) DO UPDATE SET
+                source_path = excluded.source_path,
+                source_mtime = excluded.source_mtime,
+                row_count = excluded.row_count,
+                supplier_count = excluded.supplier_count,
+                source = excluded.source,
+                built_at = datetime('now')
+            """,
+            (
+                snapshot_key,
+                source_path,
+                source_mtime,
+                len(payload),
+                len(suppliers),
+                source,
+            ),
+        )
+        # Keep only the newest snapshot. The insert order above means
+        # readers continue using the previous snapshot until the new
+        # metadata row exists.
+        c.execute(
+            "DELETE FROM ordering_supplier_rows WHERE snapshot_key <> ?",
+            (snapshot_key,),
+        )
+        c.execute(
+            "DELETE FROM ordering_engine_snapshots WHERE snapshot_key <> ?",
+            (snapshot_key,),
+        )
+    return {
+        "snapshot_key": snapshot_key,
+        "rows": len(payload),
+        "suppliers": len(suppliers),
+        "written": True,
+    }
+
+
+def get_latest_ordering_snapshot_meta() -> dict:
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT *
+              FROM ordering_engine_snapshots
+             ORDER BY built_at DESC
+             LIMIT 1
+            """
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def list_ordering_snapshot_suppliers(
+    snapshot_key: Optional[str] = None,
+) -> list[dict]:
+    if not snapshot_key:
+        meta = get_latest_ordering_snapshot_meta()
+        snapshot_key = meta.get("snapshot_key") if meta else None
+    if not snapshot_key:
+        return []
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT supplier, COUNT(*) AS sku_count
+              FROM ordering_supplier_rows
+             WHERE snapshot_key = ?
+             GROUP BY supplier
+             ORDER BY supplier
+            """,
+            (snapshot_key,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ordering_supplier_snapshot_rows(
+    supplier: str,
+    *,
+    snapshot_key: Optional[str] = None,
+) -> list[dict]:
+    supplier = _normalise_supplier_name(supplier)
+    if not supplier:
+        return []
+    if not snapshot_key:
+        meta = get_latest_ordering_snapshot_meta()
+        snapshot_key = meta.get("snapshot_key") if meta else None
+    if not snapshot_key:
+        return []
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT row_json
+              FROM ordering_supplier_rows
+             WHERE snapshot_key = ?
+               AND supplier = ?
+             ORDER BY sku
+            """,
+            (snapshot_key, supplier),
+        ).fetchall()
+
+    out: list[dict] = []
+    for row in rows:
+        try:
+            out.append(json.loads(row["row_json"]))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -163,6 +163,29 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("return pd.DataFrame()", accessor_block)
         self.assertIn("_abc_engine(", accessor_block)
 
+    def test_ordering_has_materialized_supplier_snapshot_fallback(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        app_script = (root / "app.py").read_text(encoding="utf-8")
+        warm_script = (
+            root / "warm_engine_helpers.py"
+        ).read_text(encoding="utf-8")
+        db_script = (root / "db.py").read_text(encoding="utf-8")
+
+        self.assertIn("ordering_engine_snapshots", db_script)
+        self.assertIn("ordering_supplier_rows", db_script)
+        self.assertIn("def replace_ordering_supplier_snapshot", db_script)
+        self.assertIn("def get_ordering_supplier_snapshot_rows", db_script)
+        self.assertIn("replace_ordering_supplier_snapshot(", warm_script)
+        self.assertIn("def _ordering_snapshot_matches_engine", app_script)
+        self.assertIn("def _load_ordering_supplier_snapshot", app_script)
+        self.assertIn("db.get_latest_ordering_snapshot_meta()", app_script)
+        self.assertIn("db.list_ordering_snapshot_suppliers", app_script)
+        self.assertIn("ordering_supplier_snapshot_used = False", app_script)
+        self.assertIn(
+            'orderable_df[orderable_df["Supplier"] == sel_sup]',
+            app_script,
+        )
+
     def test_ordering_editor_has_focus_scroll_enhancer(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"

@@ -163,6 +163,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   not rewrite saved column preferences. Selected rows drop into the main
   PO editor, where qty, freight, notes, and SKU buying policy edits still
   happen before saving/pushing.
+- **Ordering supplier snapshot acceleration** — `warm_engine.py` now
+  writes a materialized supplier/SKU snapshot into the team DB after
+  refreshing `engine_output.csv`. Ordering can load the selected
+  supplier's precomputed rows instead of reshaping the full engine table
+  on every rerun. This is only a serving cache: if it is stale, missing,
+  or unreadable, the page falls back to the existing engine dataframe.
 
 ### 2026-06-29
 

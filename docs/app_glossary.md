@@ -527,6 +527,15 @@ numeric fields (`target_stock`, `reorder_qty`, `lead_time_days`,
 Do not store `calc_trace` on `engine_df`; thousands of per-SKU markdown
 strings can push the Render web instance over memory.
 
+Ordering also has a supplier snapshot serving cache. After
+`warm_engine.py` writes `engine_output.csv`, it materializes one JSON row
+per orderable supplier/SKU into `ordering_engine_snapshots` and
+`ordering_supplier_rows`. The Ordering page can use that selected
+supplier slice to avoid reshaping the full engine dataframe on every
+widget rerun. It is not a calculation source: if the snapshot mtime does
+not match the current `engine_output.csv`, or the DB read fails, the
+page falls back to the normal engine dataframe.
+
 #### Cost basis chain — how the engine values stock (v2.67.180)
 The engine values inventory at `OnHand × EffectiveUnitCost`.
 EffectiveUnitCost is resolved per SKU via a fall-back chain — the

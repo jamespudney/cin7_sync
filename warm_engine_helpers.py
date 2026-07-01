@@ -156,10 +156,23 @@ def warm() -> dict[str, Any]:
     result_df.to_csv(tmp_path, index=False)
     tmp_path.replace(out_path)
 
+    ordering_snapshot = {}
+    try:
+        import db as _db
+        ordering_snapshot = _db.replace_ordering_supplier_snapshot(
+            result_df,
+            source_path=str(out_path),
+            source_mtime=out_path.stat().st_mtime,
+            source="warm_engine",
+        )
+    except Exception as exc:  # noqa: BLE001
+        ordering_snapshot = {"error": repr(exc)}
+
     return {
         "rows": int(len(result_df)) if hasattr(result_df, "__len__") else None,
         "cached_at": _dt.datetime.utcnow().isoformat() + "Z",
         "sources": bundle["_source_paths"],
+        "ordering_snapshot": ordering_snapshot,
     }
 
 

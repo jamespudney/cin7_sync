@@ -2838,6 +2838,43 @@ def _load_engine_output_snapshot() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _ordering_snapshot_matches_engine(meta: dict,
+                                      engine_mtime: Optional[float]) -> bool:
+    if not meta or engine_mtime is None:
+        return False
+    try:
+        snapshot_mtime = float(meta.get("source_mtime") or 0)
+        current_mtime = float(engine_mtime or 0)
+    except (TypeError, ValueError):
+        return False
+    return snapshot_mtime >= current_mtime - 2.0
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=64)
+def _load_ordering_supplier_snapshot(
+    supplier: str,
+    snapshot_key: str,
+    engine_mtime: Optional[float],
+) -> pd.DataFrame:
+    """Load one supplier's precomputed ordering rows from team DB.
+
+    `engine_mtime` is included only as a cache-busting input so a fresh
+    engine_output.csv invalidates supplier slices immediately.
+    """
+    if not supplier or not snapshot_key:
+        return pd.DataFrame()
+    try:
+        rows = db.get_ordering_supplier_snapshot_rows(
+            supplier,
+            snapshot_key=snapshot_key,
+        )
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+    return _normalise_engine_snapshot(pd.DataFrame(rows))
+
+
 def _sku_bin_view(df: pd.DataFrame) -> pd.DataFrame:
     """Return SKU -> Bin using only CIN7's Stock locator field."""
     if df is None or df.empty or "SKU" not in df.columns:
@@ -13907,8 +13944,33 @@ elif page == "Ordering":
 
     # Supplier dropdown: top 15 by 12mo spend first, then remainder
     # alphabetically. Spend = sum of purchase_lines.Total per supplier.
-    raw_suppliers = [s for s in engine_df["Supplier"].unique()
-                      if s and s != "(unassigned)"]
+    _ordering_engine_mtime = _engine_output_mtime()
+    try:
+        _ordering_snapshot_meta = db.get_latest_ordering_snapshot_meta()
+    except Exception:  # noqa: BLE001
+        _ordering_snapshot_meta = {}
+    _ordering_snapshot_key = str(
+        _ordering_snapshot_meta.get("snapshot_key") or "")
+    _ordering_snapshot_current = _ordering_snapshot_matches_engine(
+        _ordering_snapshot_meta,
+        _ordering_engine_mtime,
+    )
+    _snapshot_suppliers = []
+    if _ordering_snapshot_current and _ordering_snapshot_key:
+        try:
+            _snapshot_suppliers = db.list_ordering_snapshot_suppliers(
+                _ordering_snapshot_key)
+        except Exception:  # noqa: BLE001
+            _snapshot_suppliers = []
+    if _snapshot_suppliers:
+        raw_suppliers = [
+            r.get("supplier")
+            for r in _snapshot_suppliers
+            if r.get("supplier") and r.get("supplier") != "(unassigned)"
+        ]
+    else:
+        raw_suppliers = [s for s in engine_df["Supplier"].unique()
+                          if s and s != "(unassigned)"]
     if not raw_suppliers:
         st.info("No suppliers resolved yet. Set family/SKU supplier "
                 "assignments on the LED Tubes page.")
@@ -14227,7 +14289,17 @@ elif page == "Ordering":
 
     # --- Supplier-wide snapshot (BEFORE filters) ---
     # Totals for THIS supplier across ALL their MASTER SKUs.
-    all_supplier_df = orderable_df[orderable_df["Supplier"] == sel_sup]
+    ordering_supplier_snapshot_used = False
+    all_supplier_df = pd.DataFrame()
+    if _ordering_snapshot_current and _ordering_snapshot_key:
+        all_supplier_df = _load_ordering_supplier_snapshot(
+            sel_sup,
+            _ordering_snapshot_key,
+            _ordering_engine_mtime,
+        )
+        ordering_supplier_snapshot_used = not all_supplier_df.empty
+    if not ordering_supplier_snapshot_used:
+        all_supplier_df = orderable_df[orderable_df["Supplier"] == sel_sup]
 
     # --- Apply per-SKU freight overrides (team buyers can flip per row)
     # State shape: session_state["freight_overrides"][sel_sup] = {sku: mode}
@@ -16024,13 +16096,22 @@ elif page == "Ordering":
                     delta=f"+{_fmt_money(_live_total - mov_amt)} above",
                     delta_color="normal")
         else:
-            _live_cols[2].caption(
-                "💡 Set MOV in supplier config for gap visibility.")
-        st.caption(
-            ":wrench: **Note:** the 'Line value' column inside the "
-            "table doesn't auto-update when you edit 'Order qty' "
-            "(Streamlit limitation for disabled columns). The metrics "
-            "above reflect your edits in real time.")
+            _live_cols[2].metric(
+                "MOV gap (live)",
+                "—",
+                help="Set MOV in supplier config for gap visibility.",
+            )
+        with st.expander("Editor notes", expanded=False):
+            st.caption(
+                "The 'Line value' column inside the table does not "
+                "auto-update when you edit 'Order qty' because Streamlit "
+                "does not live-recompute disabled columns. The metrics "
+                "above reflect your edits in real time."
+            )
+            st.caption(
+                "Tick the 🔍 column on any row to see where its demand "
+                "comes from: children, monthly trend, and recent sales."
+            )
 
     # --- Drill into demand for any ticked SKU -------------------------
     # The :mag: column in the editor is a one-click toggle. Single-tick
@@ -16093,11 +16174,7 @@ elif page == "Ordering":
                 engine_df_full=engine_df,
             )
     else:
-        st.caption(
-            ":mag: **Tip:** tick the 🔍 column on any row above to "
-            "see where its demand comes from (children, monthly trend, "
-            "recent sales)."
-        )
+        pass
 
     # --- Save edits button (Exclude? + Dropship? + Note) --------------
     # Side-by-side with a status line so the buyer can see what will be
@@ -16399,11 +16476,11 @@ elif page == "Ordering":
             st.success(" • ".join(msgs) + ". Refreshing…")
             st.rerun()
     if save_disabled:
-        sec2.caption(
-            ":information_source: No pending edits — tick *Exclude?*, "
-            "*Dropship?*, type into *Note*, or edit SKU buying settings "
-            "to enable Save."
-        )
+        with sec2.expander("Why Save edits is disabled", expanded=False):
+            st.caption(
+                "No pending edits yet. Tick Exclude?, Dropship?, type "
+                "into Note, or edit SKU buying settings to enable Save."
+            )
     else:
         pending = []
         if _new_exclusions:
@@ -17544,13 +17621,14 @@ elif page == "Ordering":
     st.markdown("---")
     _up_hdr1, _up_hdr2 = st.columns([4, 1])
     _up_hdr1.markdown("### 📅 Optional pull-forward — not due today")
-    _up_hdr2.caption("ℹ️ Use only for MOV or freight consolidation.")
-    st.caption(
-        "These rows have **Suggested reorder = 0 today**. They are shown "
-        "only because the item may fall below target inside the selected "
-        "window. Tick them only if you deliberately want to pull future "
-        "demand into this PO."
-    )
+    with _up_hdr2.expander("Notes", expanded=False):
+        st.caption("Use only for MOV or freight consolidation.")
+        st.caption(
+            "These rows have Suggested reorder = 0 today. They are shown "
+            "only because the item may fall below target inside the "
+            "selected window. Tick them only if you deliberately want to "
+            "pull future demand into this PO."
+        )
     uw_col1, uw_col2 = st.columns([1, 3])
     upcoming_window = uw_col1.slider(
         "Pull-forward window (days)",
@@ -17561,13 +17639,14 @@ elif page == "Ordering":
              "Default follows supplier cadence where configured; increase "
              "only when deliberately consolidating freight or MOV.",
     )
-    uw_col2.caption(
-        "**How this works:** an item shows up here only when current "
-        "effective position is still above target today, so it is not in "
-        "the main reorder table. The optional qty is how much you would "
-        "pull forward if you choose to consolidate now. Moving the slider "
-        "reruns the table and recomputes the optional qty."
-    )
+    with uw_col2.expander("How this works", expanded=False):
+        st.caption(
+            "An item shows up here only when current effective position is "
+            "still above target today, so it is not in the main reorder "
+            "table. The optional qty is how much you would pull forward if "
+            "you choose to consolidate now. Moving the slider reruns the "
+            "table and recomputes the optional qty."
+        )
 
     # Build the optional pull-forward table from all_supplier_df (which has
     # engine-computed target_stock, reorder_qty, effective_pos ingredients)
@@ -17677,12 +17756,13 @@ elif page == "Ordering":
                     f"{skip_msg}"
                 )
                 st.rerun()
-            ub2.caption(
-                ":bulb: Tip: watch the *Days to target* column — items "
-                "sorted by that number are the closest optional "
-                "pull-forwards. A quick way to hit MOV is to tick the "
-                "top few, but they are not due today."
-            )
+            with ub2.expander("Pull-forward tip", expanded=False):
+                st.caption(
+                    "Watch the Days to target column. Items sorted by that "
+                    "number are the closest optional pull-forwards. A quick "
+                    "way to hit MOV is to tick the top few, but they are "
+                    "not due today."
+                )
 
     # --- All supplier SKUs — full catalogue add-to-PO picker ----------
     st.markdown("---")
