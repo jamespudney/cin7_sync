@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-06-29
+Last updated: 2026-07-01
 
 ---
 
@@ -152,6 +152,17 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 ---
 
 ## Shipped (since 2026-04-30)
+
+### 2026-07-01
+
+- **Ordering supplier add workflow** — the Ordering page now has three
+  buyer-facing SKU grids for a supplier: main reorder recommendations,
+  optional pull-forward, and an all-supplier-SKUs catalogue picker. The
+  optional and catalogue grids reuse the active saved PO editor column
+  layout and widths, adding only a front "Add to PO" checkbox. They do
+  not rewrite saved column preferences. Selected rows drop into the main
+  PO editor, where qty, freight, notes, and SKU buying policy edits still
+  happen before saving/pushing.
 
 ### 2026-06-29
 

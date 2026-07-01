@@ -186,6 +186,32 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("w4s-pull-forward-editor-", script)
         self.assertIn("_render_ordering_editor_enhancer(_pull_forward_anchor)",
                       script)
+        self.assertIn("w4s-all-supplier-editor-", script)
+        self.assertIn("_render_ordering_editor_enhancer(_all_supplier_anchor)",
+                      script)
+
+    def test_ordering_add_to_po_sections_reuse_saved_column_layout(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        helper_start = script.index("def _ordering_add_to_po_cols")
+        helper_end = script.index("# --- MOV auto-fill", helper_start)
+        helper_block = script[helper_start:helper_end]
+
+        self.assertIn("for col in editor_cols:", helper_block)
+        self.assertIn('if col in {"Include?", "🔍"}:', helper_block)
+        self.assertIn('return ["Add?"] + cols', helper_block)
+        self.assertIn("def _ordering_add_to_po_column_config", helper_block)
+        self.assertIn("def _ordering_add_to_po_view", helper_block)
+        self.assertIn("def _ordering_add_selected_rows_to_po", helper_block)
+        self.assertNotIn("save_column_layout", helper_block)
+        self.assertIn("All supplier SKUs — search and add to PO", script)
+        self.assertIn("Supplier catalogue", script)
+        self.assertIn(
+            "column_config=_ordering_add_to_po_column_config()",
+            script,
+        )
 
     def test_pull_forward_window_is_not_hardcoded_to_45_days(self) -> None:
         script = (

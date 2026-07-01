@@ -166,7 +166,15 @@ the table and recomputes the optional qty as
 `avg_daily × selected window`; it must not change the main reorder
 calculation unless the buyer ticks a row and adds it to the draft PO.
 
-**5.6 SKU-level buying policy overrides supplier defaults.** The
+**5.6 Ordering add-to-PO helper grids reuse the saved PO editor
+layout.** The main reorder table, optional pull-forward table, and
+all-supplier-SKUs picker must use the same buyer-configured column
+order and widths. Helper grids may replace the main action columns with
+a front `Add to PO` checkbox, but must not overwrite saved column
+layouts. Final qty, freight, notes, dropship/exclude, and SKU buying
+policy edits happen in the main PO editor or Product Detail.
+
+**5.7 SKU-level buying policy overrides supplier defaults.** The
 `sku_pack_settings` table now stores per-SKU `lead_time_days`, `moq`,
 and `eoq_qty` (plus legacy `pack_qty`). Product Detail and the Ordering
 grid edit the same row, so buyer changes must stay in sync across both

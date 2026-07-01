@@ -144,8 +144,9 @@ Air or Sea. Decision order:
    lead time on next refresh.
 
 #### Ordering PO editor row focus
-The Ordering page's main PO editor and optional pull-forward editor
-preserve the saved per-user column layout and width settings. A
+The Ordering page's main PO editor, optional pull-forward editor, and
+all-supplier-SKUs add picker preserve the saved per-user column layout
+and width settings. A
 browser-side enhancer supports sideways movement across wide column
 sets with horizontal wheel/trackpad input or modified left/right arrow
 keys. Buyers can also click-hold inside the grid and drag left/right to
@@ -166,6 +167,16 @@ window follows supplier cadence where configured, falling back to a
 short 21-day horizon instead of always starting at 45 days. Moving the
 slider reruns the table and recomputes the optional qty
 (`avg_daily × selected window`).
+
+#### All supplier SKUs add picker
+The bottom catalogue picker shows the selected supplier's SKU list with
+search across SKU, name, category, status, trend, and ABC. It uses the
+same saved column layout and widths as the main PO editor, but replaces
+the main editor's action columns with a front **Add to PO** checkbox.
+Ticked rows are appended to the main PO editor as extra lines. The
+picker does not save or rewrite column preferences; final qty, freight,
+notes, dropship/exclude, and SKU buying-policy edits are still made in
+the main PO editor or Product Detail.
 
 #### Status badges
 Status is the buyer action label and uses **Available** (OnHand -

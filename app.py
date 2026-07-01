@@ -15267,7 +15267,7 @@ elif page == "Ordering":
             row["Name"] = ext.get("Name", "")
             row["ABC"] = ext.get("ABC", "—")
             row["Status"] = "➕ Manual"
-            row["Order qty"] = int(ext.get("Order qty") or 0)
+            row["Order qty"] = float(ext.get("Order qty") or 0)
             row["POCost"] = float(ext.get("Unit cost") or 0)
             row["POCostBasis"] = "Manual entry"
             row["Line value"] = round(
@@ -16631,15 +16631,235 @@ elif page == "Ordering":
     _pull_forward_default_window = _pull_forward_window_default_days()
     _pull_forward_window_key = f"pull_forward_window_{sel_sup}"
 
+    def _ordering_add_to_po_cols() -> list[str]:
+        """Reuse the saved PO editor layout for add-to-PO helper grids.
+
+        This deliberately reads the active layout only; it never saves or
+        rewrites column preferences. The helper grids replace the main
+        editor's action columns with one front checkbox for adding rows.
+        """
+        cols = []
+        for col in editor_cols:
+            if col in {"Include?", "🔍"}:
+                continue
+            if col not in cols:
+                cols.append(col)
+        return ["Add?"] + cols
+
+    def _ordering_cfg_width(col: str, fallback="small"):
+        cfg = _po_col_cfg.get(col)
+        if isinstance(cfg, dict):
+            return cfg.get("width", fallback)
+        return fallback
+
+    def _ordering_add_to_po_column_config() -> dict:
+        cfg = dict(_po_col_cfg)
+        cfg["Add?"] = st.column_config.CheckboxColumn(
+            "✓ Add to PO",
+            help="Tick rows here, then click the add button below. "
+                 "The SKU is added to the main PO editor above, where "
+                 "the buyer can fine-tune qty, freight, notes, and "
+                 "policy fields before saving.",
+            width="small",
+        )
+        # Helper grids are selection surfaces. Policy and PO-edit fields
+        # stay editable only in the main PO editor/Product Detail, keeping
+        # one source of truth while preserving the same visible layout.
+        cfg["Order qty"] = st.column_config.NumberColumn(
+            "Order qty",
+            min_value=0,
+            step=0.01,
+            format="%.2f",
+            disabled=True,
+            width=_ordering_cfg_width("Order qty", "small"),
+            help="Starting qty that will be added to the main PO editor. "
+                 "Adjust it there after adding if needed.",
+        )
+        cfg["freight_mode"] = st.column_config.SelectboxColumn(
+            "Freight",
+            options=["air", "sea", "air (manual)", "sea (manual)"],
+            disabled=True,
+            width=_ordering_cfg_width("freight_mode", "small"),
+        )
+        cfg["sku_lead_time_days"] = st.column_config.NumberColumn(
+            "Sku Leadtime",
+            disabled=True,
+            format="%d",
+            width=_ordering_cfg_width("sku_lead_time_days", "small"),
+        )
+        cfg["sku_moq"] = st.column_config.NumberColumn(
+            "SKU MOQ",
+            disabled=True,
+            format="%.2f",
+            width=_ordering_cfg_width("sku_moq", "small"),
+        )
+        cfg["sku_eoq_qty"] = st.column_config.NumberColumn(
+            "SKU EOQ",
+            disabled=True,
+            format="%.2f",
+            width=_ordering_cfg_width("sku_eoq_qty", "small"),
+        )
+        cfg["Note"] = st.column_config.TextColumn(
+            "📝 Note",
+            disabled=True,
+            width=_ordering_cfg_width("Note", "large"),
+        )
+        cfg["Exclude?"] = st.column_config.CheckboxColumn(
+            "🚫 Exclude",
+            disabled=True,
+            width=_ordering_cfg_width("Exclude?", "small"),
+        )
+        cfg["Dropship?"] = st.column_config.CheckboxColumn(
+            "📦 Dropship",
+            disabled=True,
+            width=_ordering_cfg_width("Dropship?", "small"),
+        )
+        return cfg
+
+    _ADD_TO_PO_NUMERIC_DEFAULTS = {
+        "Order qty", "Line value", "POCost", "units_12mo", "avg_daily",
+        "avg_month", "LengthMM", "OnHand", "Allocated", "Available",
+        "OnOrder", "unfulfilled", "DoC_days", "target_stock",
+        "reorder_qty", "lead_time_days", "sku_lead_time_days",
+        "sku_moq", "sku_eoq_qty", "excess_units", "excess_value",
+        "units_45d", "momentum", "customers_45d", "top_cust_pct",
+    }
+
+    def _ordering_numeric_col(df: pd.DataFrame, col: str,
+                              default: float = 0.0) -> pd.Series:
+        if col in df.columns:
+            return pd.to_numeric(df[col], errors="coerce").fillna(default)
+        return pd.Series(default, index=df.index, dtype="float64")
+
+    def _ordering_add_to_po_view(
+        source_df: pd.DataFrame,
+        *,
+        source_label: str,
+        qty_col: str,
+        sort_by: str | None = None,
+    ) -> pd.DataFrame:
+        view = source_df.copy()
+        view["Add?"] = False
+        view["Include?"] = False
+        view["🔍"] = False
+        view["Source"] = source_label
+
+        qty = _ordering_numeric_col(view, qty_col, 0.0)
+        view["Order qty"] = qty.clip(lower=0)
+        cost = _ordering_numeric_col(view, "POCost", 0.0)
+        view["Line value"] = (view["Order qty"] * cost).round(2)
+        if "avg_month" not in view.columns:
+            view["avg_month"] = _ordering_numeric_col(
+                view, "avg_daily", 0.0) * 30.4
+        if "Note" not in view.columns:
+            view["Note"] = view["SKU"].astype(str).apply(_build_note)
+        else:
+            view["Note"] = view.apply(
+                lambda r: (
+                    _build_note(str(r.get("SKU") or ""))
+                    if not str(r.get("Note") or "").strip()
+                    else str(r.get("Note") or "")
+                ),
+                axis=1,
+            )
+
+        add_cols = _ordering_add_to_po_cols()
+        for col in add_cols:
+            if col in view.columns:
+                continue
+            if col in {"Add?", "Include?", "🔍", "Exclude?", "Dropship?"}:
+                view[col] = False
+            elif col == "trend_12m":
+                view[col] = [[] for _ in range(len(view))]
+            elif col in _ADD_TO_PO_NUMERIC_DEFAULTS:
+                view[col] = 0.0
+            else:
+                view[col] = ""
+
+        if sort_by and sort_by in view.columns:
+            view = view.sort_values(sort_by, na_position="last")
+        return view[add_cols].reset_index(drop=True)
+
+    def _ordering_add_selected_rows_to_po(
+        selected_rows: pd.DataFrame,
+        source_df: pd.DataFrame,
+        *,
+        source_marker: str,
+    ) -> tuple[int, int]:
+        if "Add?" not in selected_rows.columns:
+            return (0, 0)
+        selected = selected_rows[
+            selected_rows["Add?"].fillna(False).astype(bool)
+        ].copy()
+        if selected.empty:
+            return (0, 0)
+
+        source = source_df.copy()
+        source["_sku_key"] = source["SKU"].astype(str)
+        source_lookup = {
+            str(r.get("_sku_key") or ""): r
+            for _, r in source.iterrows()
+        }
+        existing_extra_skus = {
+            str(e.get("SKU") or "") for e in st.session_state.get(
+                extra_key, [])
+        }
+        visible_po_skus = set()
+        if "SKU" in editable.columns:
+            visible_po_skus = set(editable["SKU"].astype(str).tolist())
+
+        added = 0
+        skipped = 0
+        for _, rr in selected.iterrows():
+            sku_a = str(rr.get("SKU") or "")
+            if not sku_a:
+                continue
+            if sku_a in existing_extra_skus or sku_a in visible_po_skus:
+                skipped += 1
+                continue
+            src = source_lookup.get(sku_a, {})
+            qty_val = pd.to_numeric(
+                src.get("Order qty", rr.get("Order qty", 0)),
+                errors="coerce",
+            )
+            try:
+                qty = float(qty_val) if not pd.isna(qty_val) else 0.0
+            except TypeError:
+                qty = 0.0
+            if qty <= 0:
+                qty = 1.0
+            cost_val = pd.to_numeric(
+                src.get("POCost", rr.get("POCost", 0)),
+                errors="coerce",
+            )
+            try:
+                cost = float(cost_val) if not pd.isna(cost_val) else 0.0
+            except TypeError:
+                cost = 0.0
+            st.session_state[extra_key].append({
+                "SKU": sku_a,
+                "Name": str(src.get("Name", rr.get("Name", "")) or "")[:80],
+                "ABC": str(src.get("ABC", rr.get("ABC", "—")) or "—"),
+                "Order qty": qty,
+                "Unit cost": cost,
+                "Line value": round(qty * cost, 2),
+                "From supplier?": source_marker,
+            })
+            existing_extra_skus.add(sku_a)
+            visible_po_skus.add(sku_a)
+            added += 1
+        return (added, skipped)
+
     # --- MOV auto-fill — inline with demand --------------------------
     # If the current draft is under MOV, compute the N most-urgent
-    # optional pull-forward items and show a one-click "Auto-fill to MOV"
-    # button. Uses the same pull-forward logic as the section below, but
-    # prioritised by urgency (days_to_reorder ascending) and capped
-    # at the amount needed to cross MOV.
+    # supplier top-up items and show a one-click "Auto-fill to MOV"
+    # button. Eligibility is supplier-wide (not limited to the
+    # pull-forward slider); rows are prioritised by urgency
+    # (days_to_reorder ascending) until the draft crosses MOV.
     if mov_amt and po_value < mov_amt and not all_supplier_df.empty:
         shortfall = mov_amt - po_value
-        # Pick the user's chosen pull-forward window from session state.
+        # Use the current cadence/window only to size the starting
+        # quantities. It is not an eligibility cap for MOV top-up.
         _af_window = int(st.session_state.get(
             _pull_forward_window_key, _pull_forward_default_window))
 
@@ -16691,8 +16911,8 @@ elif page == "Ordering":
             st.warning(
                 f":warning: **MOV shortfall** "
                 f"{mov_ccy}${shortfall:,.0f}. "
-                f"The **{len(picks)} closest optional pull-forward item(s)** "
-                f"(soonest to hit target, within {_af_window}d window) "
+                f"The **{len(picks)} closest supplier top-up item(s)** "
+                f"(ranked by soonest to hit target) "
                 f"would bring this PO to "
                 f"**{mov_ccy}${running:,.0f}** — "
                 + ("**above MOV** :white_check_mark:" if will_cross
@@ -16749,17 +16969,17 @@ elif page == "Ordering":
                     })
                     added += 1
                 st.success(
-                    f"Added **{added}** optional pull-forward item(s) "
+                    f"Added **{added}** supplier top-up item(s) "
                     "to the draft. "
                     "Scroll up to fine-tune any quantity before "
                     "exporting the PO."
                 )
                 st.rerun()
             af_c2.caption(
-                ":bulb: Each line defaults to its *optional pull-forward* "
-                f"qty (avg_daily × {_af_window}d). These are not due "
-                "today; adjust the slider below the PO editor to change "
-                "the pull-forward window."
+                ":bulb: MOV top-up looks across eligible supplier SKUs, "
+                "ranked by urgency, and stops once the PO crosses MOV. "
+                "Starting quantities are conservative; fine-tune them "
+                "in the main PO editor."
             )
         elif cand.empty:
             st.info(
@@ -17397,8 +17617,7 @@ elif page == "Ordering":
             upc["Suggest"] = (
                 upc["avg_daily"] * upcoming_window
             ).round().astype(int)
-            upc["Line $"] = (upc["Suggest"] * upc["POCost"]).round(2)
-            upc["Add?"] = False
+            upc["Order qty"] = upc["Suggest"]
 
             # v2.67.358 — avg_month for buyer-friendly cadence view.
             # Computed inline (the engine_df one is on the master
@@ -17406,14 +17625,12 @@ elif page == "Ordering":
             # slice/copy so we derive locally).
             if "avg_daily" in upc.columns and "avg_month" not in upc.columns:
                 upc["avg_month"] = upc["avg_daily"] * 30.4
-            show_cols = ["SKU", "Name", "ABC", "trend_flag",
-                         "last_6mo_series", "last_12mo_series", "avg_month",
-                         "OnHand", "OnOrder", "eff_pos",
-                         "target_stock", "days_to_reorder",
-                         "avg_daily", "Suggest", "POCost", "Line $",
-                         "Add?"]
-            show_cols = [c for c in show_cols if c in upc.columns]
-            upc_view = upc[show_cols].sort_values("days_to_reorder")
+            upc_view = _ordering_add_to_po_view(
+                upc,
+                source_label="Pull-forward",
+                qty_col="Order qty",
+                sort_by="days_to_reorder",
+            )
 
             # Use a unique key so editing here doesn't clash with the
             # main PO editor's state.
@@ -17428,68 +17645,7 @@ elif page == "Ordering":
                 upc_view,
                 width="stretch", hide_index=True, height=350,
                 key=f"upcoming_editor_{sel_sup}_{upcoming_window}",
-                column_config={
-                    "Add?": st.column_config.CheckboxColumn(
-                        "✓ Add to PO",
-                        help="Tick + click 'Add ticked items' below. "
-                             "The SKU drops into the main PO editor "
-                             "above with the optional qty as the starting "
-                             "Order qty — you can fine-tune it there.",
-                        width="small",
-                    ),
-                    # v2.67.344 — pin SKU + Name in Upcoming Reorders
-                    # too, matching the main editor.
-                    "SKU": st.column_config.TextColumn(
-                        disabled=True, pinned=True),
-                    "Name": st.column_config.TextColumn(
-                        disabled=True, width="large", pinned=True),
-                    "ABC": st.column_config.TextColumn(
-                        disabled=True, width="small"),
-                    "trend_flag": st.column_config.TextColumn(
-                        "📈 Trend", disabled=True, width="small"),
-                    "last_6mo_series": st.column_config.TextColumn(
-                        "Last 6 months", disabled=True, width="medium",
-                        help="Units sold in each of the last 6 calendar "
-                             "months — oldest on the left, current month "
-                             "on the right. Same column as the main "
-                             "reorder table."),
-                    "last_12mo_series": st.column_config.TextColumn(
-                        "Last 12 months", disabled=True, width="large",
-                        help="Units sold in each of the last 12 calendar "
-                             "months — same demand buckets as Ordering "
-                             "and Product Detail."),
-                    "OnHand": st.column_config.NumberColumn(
-                        disabled=True, format="%.0f"),
-                    "OnOrder": st.column_config.NumberColumn(
-                        disabled=True, format="%.0f"),
-                    "eff_pos": st.column_config.NumberColumn(
-                        "Eff. pos", disabled=True, format="%.0f",
-                        help="Available + OnOrder. Available already "
-                             "nets allocated/backorders."),
-                    "target_stock": st.column_config.NumberColumn(
-                        "Target", disabled=True, format="%.0f"),
-                    "days_to_reorder": st.column_config.NumberColumn(
-                        "Days to target",
-                        disabled=True, format="%.0fd",
-                        help="Days until effective position drops below "
-                             "target at the engine's current velocity."),
-                    "avg_daily": st.column_config.NumberColumn(
-                        "Daily", disabled=True, format="%.2f"),
-                    "avg_month": st.column_config.NumberColumn(
-                        "Avg/month", disabled=True, format="%.0f",
-                        help="avg_daily × 30.4. Buyer-friendly "
-                             "view for cadence reasoning."),
-                    "Suggest": st.column_config.NumberColumn(
-                        "Optional qty", disabled=True, format="%.0f",
-                        help="avg_daily × window — enough to fill the "
-                             "pull-forward window if you choose to "
-                             "consolidate now. Adjust in the main editor "
-                             "after adding."),
-                    "POCost": st.column_config.NumberColumn(
-                        "PO cost", disabled=True, format="$%.2f"),
-                    "Line $": st.column_config.NumberColumn(
-                        disabled=True, format="$%.0f"),
-                },
+                column_config=_ordering_add_to_po_column_config(),
             )
             _render_ordering_editor_enhancer(_pull_forward_anchor)
 
@@ -17505,30 +17661,20 @@ elif page == "Ordering":
                 disabled=add_disabled,
                 use_container_width=True,
             ):
-                added_count = 0
-                for _, rr in upc_edited[tick_mask].iterrows():
-                    sku_u = str(rr.get("SKU") or "")
-                    if not sku_u:
-                        continue
-                    # Avoid duplicates if already in extras
-                    existing = [e.get("SKU") for e in
-                                 st.session_state[extra_key]]
-                    if sku_u in existing:
-                        continue
-                    st.session_state[extra_key].append({
-                        "SKU": sku_u,
-                        "Name": str(rr.get("Name") or "")[:80],
-                        "ABC": str(rr.get("ABC") or "—"),
-                        "Order qty": int(rr.get("Suggest") or 0),
-                        "Unit cost": float(rr.get("POCost") or 0),
-                        "Line value": round(
-                            float(rr.get("Line $") or 0), 2),
-                        "From supplier?": "✓",
-                    })
-                    added_count += 1
+                added_count, skipped_count = _ordering_add_selected_rows_to_po(
+                    upc_edited[tick_mask],
+                    upc,
+                    source_marker="✓ pull-forward",
+                )
+                skip_msg = (
+                    f" {skipped_count} already appeared in the main PO "
+                    "editor and were skipped."
+                    if skipped_count else ""
+                )
                 st.success(
                     f"Added **{added_count}** optional pull-forward "
                     f"item(s) to the main PO. Scroll up to review / tweak."
+                    f"{skip_msg}"
                 )
                 st.rerun()
             ub2.caption(
@@ -17537,6 +17683,143 @@ elif page == "Ordering":
                 "pull-forwards. A quick way to hit MOV is to tick the "
                 "top few, but they are not due today."
             )
+
+    # --- All supplier SKUs — full catalogue add-to-PO picker ----------
+    st.markdown("---")
+    with st.expander(
+        f"📚 All supplier SKUs — search and add to PO "
+        f"({len(all_supplier_df):,})",
+        expanded=False,
+    ):
+        st.caption(
+            "This uses the **same saved column layout** as the main PO "
+            "editor. Nothing here rewrites your column configuration. "
+            "Tick rows to add them to the main PO editor above."
+        )
+        if all_supplier_df.empty:
+            st.info("No supplier SKUs found for this supplier.")
+        else:
+            cat_controls = st.columns([3, 1])
+            catalog_query = cat_controls[0].text_input(
+                "Search supplier SKUs",
+                key=f"catalog_search_{sel_sup}",
+                placeholder="Type part of a SKU, product name, category, "
+                            "status, or trend...",
+            )
+            hide_visible_catalog = cat_controls[1].checkbox(
+                "Hide rows already above",
+                value=False,
+                key=f"catalog_hide_visible_{sel_sup}",
+                help="Useful when you only want SKUs that are not already "
+                     "in the reorder or pull-forward sections.",
+            )
+
+            catalog_df = all_supplier_df.copy()
+            if catalog_query.strip():
+                q = catalog_query.strip().lower()
+                search_cols = [
+                    c for c in (
+                        "SKU", "Name", "Category", "Status",
+                        "trend_flag", "ABC"
+                    )
+                    if c in catalog_df.columns
+                ]
+                search_text = pd.Series(
+                    "", index=catalog_df.index, dtype="object")
+                for col in search_cols:
+                    search_text = (
+                        search_text
+                        + " "
+                        + catalog_df[col].fillna("").astype(str).str.lower()
+                    )
+                catalog_df = catalog_df[
+                    search_text.str.contains(q, regex=False, na=False)
+                ]
+
+            if hide_visible_catalog and "SKU" in editable.columns:
+                visible_skus = set(editable["SKU"].astype(str).tolist())
+                catalog_df = catalog_df[
+                    ~catalog_df["SKU"].astype(str).isin(visible_skus)
+                ]
+
+            if catalog_df.empty:
+                st.info("No supplier SKUs match that filter.")
+            else:
+                cat_reorder_qty = _ordering_numeric_col(
+                    catalog_df, "reorder_qty", 0.0)
+                catalog_df["catalog_add_qty"] = cat_reorder_qty.mask(
+                    cat_reorder_qty <= 0, 1.0)
+                catalog_df["Order qty"] = catalog_df["catalog_add_qty"]
+                if "SKU" in catalog_df.columns:
+                    catalog_df = catalog_df.sort_values(
+                        "SKU", kind="stable")
+
+                max_catalog_rows = 300
+                display_catalog_df = catalog_df.head(max_catalog_rows).copy()
+                if len(catalog_df) > max_catalog_rows:
+                    st.caption(
+                        f"Showing the first {max_catalog_rows:,} of "
+                        f"{len(catalog_df):,} matching SKUs. Narrow the "
+                        "search to see more specific results."
+                    )
+
+                catalog_view = _ordering_add_to_po_view(
+                    display_catalog_df,
+                    source_label="Supplier catalogue",
+                    qty_col="Order qty",
+                )
+                _all_supplier_anchor = (
+                    f"w4s-all-supplier-editor-{_supplier_anchor_slug}"
+                )
+                st.markdown(
+                    f'<div id="{_all_supplier_anchor}"></div>',
+                    unsafe_allow_html=True,
+                )
+                catalog_edited = st.data_editor(
+                    catalog_view,
+                    width="stretch",
+                    hide_index=True,
+                    height=420,
+                    key=f"all_supplier_editor_{sel_sup}",
+                    column_config=_ordering_add_to_po_column_config(),
+                )
+                _render_ordering_editor_enhancer(_all_supplier_anchor)
+
+                cat_tick_mask = (
+                    catalog_edited["Add?"].fillna(False).astype(bool)
+                )
+                cat_ticked = int(cat_tick_mask.sum())
+                ac1, ac2 = st.columns([1, 3])
+                if ac1.button(
+                    f":heavy_plus_sign: Add {cat_ticked} selected SKU(s)",
+                    key=f"all_supplier_add_{sel_sup}",
+                    type="primary" if cat_ticked else "secondary",
+                    disabled=cat_ticked == 0,
+                    use_container_width=True,
+                ):
+                    added_count, skipped_count = (
+                        _ordering_add_selected_rows_to_po(
+                            catalog_edited[cat_tick_mask],
+                            display_catalog_df,
+                            source_marker="✓ supplier catalogue",
+                        )
+                    )
+                    skip_msg = (
+                        f" {skipped_count} already appeared in the main "
+                        "PO editor and were skipped."
+                        if skipped_count else ""
+                    )
+                    st.success(
+                        f"Added **{added_count}** supplier catalogue "
+                        f"SKU(s) to the main PO. Scroll up to review / "
+                        f"tweak.{skip_msg}"
+                    )
+                    st.rerun()
+                ac2.caption(
+                    "Default qty is the engine suggestion when one exists; "
+                    "otherwise it starts at 1. Change the final qty in the "
+                    "main PO editor after adding."
+                )
 
     # --- Sales-history migration manager (retiring -> successor) -------
     # Use case: a product is superseded (e.g. Smokies -> Sierra) and we
