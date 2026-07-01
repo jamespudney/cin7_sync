@@ -1384,7 +1384,7 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
 <script>
 (() => {
   const ANCHOR_ID = %s;
-  const ENHANCER_VERSION = "persistent-row-pan-v2";
+  const ENHANCER_VERSION = "persistent-row-pan-v3";
   let doc = null;
   try {
     doc = window.parent && window.parent.document;
@@ -1433,10 +1433,16 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
   function findEditorFrame(anchor) {
     const selectors = [
       '[data-testid="stDataFrame"]',
-      '[data-testid="stDataFrameResizable"]'
+      '[data-testid="stDataFrameResizable"]',
+      '[data-testid="stDataEditor"]'
     ].join(",");
-    return Array.from(doc.querySelectorAll(selectors))
-      .find((el) => isAfter(anchor, el));
+    const frames = Array.from(doc.querySelectorAll(selectors))
+      .filter((el) => isAfter(anchor, el));
+    if (frames.length) return frames[0];
+    const grids = Array.from(doc.querySelectorAll('[role="grid"]'))
+      .filter((el) => isAfter(anchor, el));
+    if (!grids.length) return null;
+    return grids[0].closest('[data-testid], section, div') || grids[0];
   }
 
   function widestScroller(root) {
@@ -1620,13 +1626,23 @@ def _render_ordering_editor_enhancer(anchor_id: str) -> None:
     return true;
   }
 
-  if (!install()) {
-    setTimeout(install, 300);
-    setTimeout(install, 900);
+  let attempts = 0;
+  function installSoon() {
+    if (install()) return;
+    attempts += 1;
+    if (attempts < 24) {
+      setTimeout(installSoon, Math.min(250 + attempts * 120, 1600));
+    }
   }
+  const observer = new MutationObserver(() => install());
+  try {
+    observer.observe(doc.body, {childList: true, subtree: true});
+    setTimeout(() => observer.disconnect(), 20000);
+  } catch (e) {}
+  installSoon();
 })();
 </script>
-""" % _anchor_js, height=0)
+""" % _anchor_js, height=1)
 
 
 # ---------------------------------------------------------------------------
@@ -11297,12 +11313,44 @@ elif page == "Ordering":
         ip_lead_times_by_sku = db.get_ip_lead_times()
     except Exception:  # noqa: BLE001
         ip_lead_times_by_sku = {}
+    def _positive_float_or_zero(value) -> float:
+        try:
+            val = float(pd.to_numeric(value, errors="coerce"))
+        except (TypeError, ValueError):
+            return 0.0
+        return val if val > 0 else 0.0
+
+    def _positive_int_or_zero(value) -> int:
+        val = _positive_float_or_zero(value)
+        return int(round(val)) if val > 0 else 0
+
     try:
-        sku_buying_settings = {
+        sku_buying_settings_db = {
             str(r["sku"]): dict(r) for r in db.all_sku_pack()
         }
     except Exception:  # noqa: BLE001
-        sku_buying_settings = {}
+        sku_buying_settings_db = {}
+    sku_buying_settings = {
+        str(k): dict(v) for k, v in sku_buying_settings_db.items()
+    }
+    _sku_buying_preview = st.session_state.get(
+        "_ordering_sku_buying_preview", {})
+    if isinstance(_sku_buying_preview, dict):
+        for _preview_sku, _preview_vals in _sku_buying_preview.items():
+            if not isinstance(_preview_vals, dict):
+                continue
+            _preview_sku = str(_preview_sku or "")
+            if not _preview_sku:
+                continue
+            _base_policy = dict(sku_buying_settings.get(_preview_sku, {}))
+            _base_policy["sku"] = _preview_sku
+            _base_policy["lead_time_days"] = _positive_int_or_zero(
+                _preview_vals.get("lead_time_days"))
+            _base_policy["moq"] = _positive_float_or_zero(
+                _preview_vals.get("moq"))
+            _base_policy["eoq_qty"] = _positive_float_or_zero(
+                _preview_vals.get("eoq_qty"))
+            sku_buying_settings[_preview_sku] = _base_policy
     _today_for_engine = date.today()
 
     def _sku_policy_float(sku: str, key: str) -> float:
@@ -16118,18 +16166,26 @@ elif page == "Ordering":
             if new_note and new_note != old_note:
                 _changed_notes.append((sku_e, new_note))
     _policy_cols = {"SKU", "sku_lead_time_days", "sku_moq", "sku_eoq_qty"}
+    _policy_preview_updates = {}
+    _policy_preview_clears = []
     if _policy_cols.issubset(set(edited.columns)):
         _loaded_policy = {}
-        if _policy_cols.issubset(set(editable.columns)):
-            for _, _r in editable.iterrows():
-                _sk = str(_r.get("SKU") or "")
-                if not _sk:
-                    continue
-                _loaded_policy[_sk] = (
-                    _int_policy_cell(_r.get("sku_lead_time_days")),
-                    _numeric_policy_cell(_r.get("sku_moq")),
-                    _numeric_policy_cell(_r.get("sku_eoq_qty")),
-                )
+        for _sk in edited["SKU"].astype(str).tolist():
+            if not _sk:
+                continue
+            _db_policy = sku_buying_settings_db.get(_sk, {}) or {}
+            _loaded_policy[_sk] = (
+                _int_policy_cell(_db_policy.get("lead_time_days")),
+                _numeric_policy_cell(_db_policy.get("moq")),
+                (
+                    _numeric_policy_cell(_db_policy.get("eoq_qty"))
+                    or _numeric_policy_cell(_db_policy.get("pack_qty"))
+                ),
+            )
+        _preview_now = st.session_state.get(
+            "_ordering_sku_buying_preview", {})
+        if not isinstance(_preview_now, dict):
+            _preview_now = {}
         for _, _r in edited.iterrows():
             _sk = str(_r.get("SKU") or "")
             if not _sk:
@@ -16146,6 +16202,30 @@ elif page == "Ordering":
                 or abs(_new_policy[2] - _old_policy[2]) > 0.001
             ):
                 _sku_buying_edits.append((_sk, *_new_policy))
+                _policy_preview_updates[_sk] = {
+                    "lead_time_days": _new_policy[0],
+                    "moq": _new_policy[1],
+                    "eoq_qty": _new_policy[2],
+                }
+            elif _sk in _preview_now:
+                _policy_preview_clears.append(_sk)
+    if _policy_preview_updates or _policy_preview_clears:
+        _preview = st.session_state.setdefault(
+            "_ordering_sku_buying_preview", {})
+        if not isinstance(_preview, dict):
+            _preview = {}
+            st.session_state["_ordering_sku_buying_preview"] = _preview
+        _preview_changed = False
+        for _sk in _policy_preview_clears:
+            if _preview.pop(_sk, None) is not None:
+                _preview_changed = True
+        for _sk, _payload in _policy_preview_updates.items():
+            if _preview.get(_sk) != _payload:
+                _preview[_sk] = _payload
+                _preview_changed = True
+        if _preview_changed:
+            st.session_state.pop("_reorder_apply_sig", None)
+            st.rerun()
 
     # --- Persistent qty-edit detection + save/clear UI ---------------
     # Detect Order qty edits by comparing edited["Order qty"] to the
@@ -16288,7 +16368,8 @@ elif page == "Ordering":
                 msgs.append(f"Saved {len(_changed_notes)} note edit(s)")
             if _sku_buying_edits:
                 for sku_e, lt_days, sku_moq, sku_eoq in _sku_buying_edits:
-                    existing_policy = sku_buying_settings.get(sku_e, {}) or {}
+                    existing_policy = (
+                        sku_buying_settings_db.get(sku_e, {}) or {})
                     note = str(existing_policy.get("note") or "")
                     pack_qty = _numeric_policy_cell(
                         existing_policy.get("pack_qty"))
@@ -16306,6 +16387,11 @@ elif page == "Ordering":
                             eoq_qty=(sku_eoq if sku_eoq > 0 else None),
                             note=note,
                         )
+                _preview = st.session_state.get(
+                    "_ordering_sku_buying_preview", {})
+                if isinstance(_preview, dict):
+                    for sku_e, *_ in _sku_buying_edits:
+                        _preview.pop(sku_e, None)
                 st.session_state.pop("_reorder_apply_sig", None)
                 msgs.append(
                     f"Saved SKU buying settings for "
@@ -16358,14 +16444,10 @@ elif page == "Ordering":
                     changed = True
         if changed:
             st.success(
-                "Freight mode overrides saved. Reorder qty will "
-                "recalculate on next refresh using the new lead times."
+                "Freight mode overrides saved. Recalculating reorder qty…"
             )
-            # Show a button to trigger rerun
-            if st.button(":arrows_counterclockwise: Apply freight "
-                          "overrides now",
-                          key=f"apply_freight_overrides_{sel_sup}"):
-                st.rerun()
+            st.session_state.pop("_reorder_apply_sig", None)
+            st.rerun()
 
     po_lines = edited[(edited["Include?"]) & (edited["Order qty"] > 0)]
 

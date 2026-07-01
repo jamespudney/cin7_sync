@@ -171,10 +171,12 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _render_ordering_editor_enhancer", script)
         self.assertIn("w4s-ordering-active-row", script)
         self.assertIn("function hideGuide()", script)
-        self.assertIn("ENHANCER_VERSION = \"persistent-row-pan-v2\"",
+        self.assertIn("ENHANCER_VERSION = \"persistent-row-pan-v3\"",
                       script)
         self.assertIn("const host = frame;", script)
         self.assertIn("function handlePointerMove", script)
+        self.assertIn("function installSoon()", script)
+        self.assertIn("new MutationObserver", script)
         self.assertIn("\"ArrowUp\", \"ArrowDown\", \"PageUp\", \"PageDown\", \"Escape\"",
                       script)
         self.assertIn("w4s-ordering-dragging", script)
@@ -254,6 +256,12 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def set_sku_buying_settings", db_script)
         self.assertIn("_migrate_sku_pack_buying_settings", db_script)
         self.assertIn("sku_buying_settings = {", script)
+        self.assertIn("sku_buying_settings_db = {", script)
+        self.assertIn("_ordering_sku_buying_preview", script)
+        self.assertIn("_policy_preview_updates", script)
+        self.assertIn("_policy_preview_clears", script)
+        self.assertIn('st.session_state.pop("_reorder_apply_sig", None)',
+                      script)
         self.assertIn('"sku_buying": sku_buying_settings', script)
         self.assertIn('lead_time_basis = "sku"', script)
         self.assertIn('"sku_lead_time_days"', script)
@@ -262,6 +270,7 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("SKU buying policy", script)
         self.assertIn("db.set_sku_buying_settings", script)
         self.assertIn("_sku_buying_edits", script)
+        self.assertIn("sku_buying_settings_db.get(sku_e", script)
         self.assertIn("Ordering and Product Detail use this", script)
 
     def test_ordering_and_product_detail_show_12mo_series(self) -> None:
