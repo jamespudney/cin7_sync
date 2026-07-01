@@ -12,6 +12,7 @@ knowledge export.
 Output
 ------
     DATA_DIR/output/ip_notes_<stamp>.csv
+    DATA_DIR/output/ip-notes-probe_<sku>_<stamp>.csv for --sku smoke tests
 
 Columns match the existing dashboard loader:
     SKU, VariantID, WarehouseID, Note, Tags
@@ -42,13 +43,11 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 cin7-sync/1.0"
 )
 
-# Keep the payload lean. Inventory Planner's field allowlist is picky about
-# nested warehouse values, so request the note sub-field explicitly.
-FIELDS = (
-    "id,connections,tags,"
-    "warehouse.warehouse,"
-    "warehouse.replenishment_notes"
-)
+# Request the full warehouse block. Inventory Planner's nested field allowlist
+# can return only the warehouse id when asked for `warehouse.replenishment_notes`
+# directly, which makes every note look blank. The broader field mirrors the
+# older ip_pull_alternates export that successfully surfaces buyer notes.
+FIELDS = "id,connections,tags,warehouse"
 
 
 def _setup_log(verbose: bool = False) -> logging.Logger:
@@ -129,6 +128,14 @@ def _note_text(warehouse: Dict[str, Any]) -> str:
         if text:
             return text
     return ""
+
+
+def _safe_filename_token(value: str) -> str:
+    token = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "_"
+        for ch in str(value or "")
+    ).strip("._")
+    return token or "all"
 
 
 def _api_get(url: str,
@@ -220,6 +227,10 @@ def main() -> int:
     parser.add_argument(
         "--verbose", action="store_true",
         help="Print debug-level logs.")
+    parser.add_argument(
+        "--allow-empty", action="store_true",
+        help="Publish an empty live ip_notes CSV. Normally blocked so a "
+             "bad API field request cannot hide existing notes.")
     args = parser.parse_args()
 
     load_dotenv()
@@ -244,12 +255,18 @@ def main() -> int:
     log = _setup_log(args.verbose)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    notes_csv = OUTPUT_DIR / f"ip_notes_{stamp}.csv"
+    is_probe = bool(args.sku.strip() or args.limit_pages is not None)
+    if is_probe:
+        safe_sku = _safe_filename_token(args.sku.strip() or "page-test")
+        notes_csv = OUTPUT_DIR / f"ip-notes-probe_{safe_sku}_{stamp}.csv"
+    else:
+        notes_csv = OUTPUT_DIR / f"ip_notes_{stamp}.csv"
+    tmp_csv = OUTPUT_DIR / f".{notes_csv.name}.tmp"
 
     n_variants = 0
     n_note_rows = 0
     seen = set()
-    with notes_csv.open("w", newline="", encoding="utf-8") as f:
+    with tmp_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["SKU", "VariantID", "WarehouseID", "Note", "Tags"])
         for variant in fetch_variants(
@@ -283,9 +300,20 @@ def main() -> int:
                 ])
                 n_note_rows += 1
 
+    if n_note_rows == 0 and not (is_probe or args.allow_empty):
+        empty_csv = OUTPUT_DIR / f"empty-ip-notes_{stamp}.csv"
+        tmp_csv.replace(empty_csv)
+        log.error(
+            "Done, but 0 note rows were found across %d variants. "
+            "Did not publish a live ip_notes CSV; wrote diagnostic file: %s",
+            n_variants, empty_csv,
+        )
+        return 2
+
+    tmp_csv.replace(notes_csv)
     log.info("Done. Variants scanned: %d", n_variants)
     log.info("Note rows written: %d", n_note_rows)
-    log.info("Notes CSV: %s", notes_csv)
+    log.info("%s CSV: %s", "Probe" if is_probe else "Notes", notes_csv)
     return 0
 
 

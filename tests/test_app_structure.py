@@ -285,7 +285,11 @@ class AppMemoryStructureTests(unittest.TestCase):
         )
 
         self.assertIn("from data_paths import OUTPUT_DIR", notes_sync)
-        self.assertIn("warehouse.replenishment_notes", notes_sync)
+        self.assertIn('FIELDS = "id,connections,tags,warehouse"', notes_sync)
+        self.assertIn("replenishment_notes", notes_sync)
+        self.assertIn("ip-notes-probe_", notes_sync)
+        self.assertIn("empty-ip-notes_", notes_sync)
+        self.assertIn("Did not publish a live ip_notes CSV", notes_sync)
         self.assertIn('"SKU", "VariantID", "WarehouseID", "Note", "Tags"',
                       notes_sync)
         self.assertIn("from data_paths import OUTPUT_DIR", ip_pull)
