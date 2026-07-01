@@ -14734,82 +14734,115 @@ elif page == "Ordering":
 
         all_supplier_df = all_supplier_df.apply(_apply_override, axis=1)
 
-    # --- Then apply filters to get the working view ---
-    s_df = all_supplier_df.copy()
+    def _prepared_live_supplier_df() -> pd.DataFrame:
+        live_df = orderable_df[orderable_df["Supplier"] == sel_sup]
+        if "SKU" in live_df.columns:
+            live_df = live_df.copy()
+            live_df["Image"] = (
+                live_df["SKU"].astype(str)
+                .map(_product_images_by_sku)
+                .fillna("")
+            )
+        return _normalise_ordering_supplier_df(live_df)
 
-    # Freight mode filtering:
-    #   "Air only" → keep only rows whose freight_mode == 'air'
-    #                 (auto-computed from supplier's air_max_length_mm)
-    #   "Sea only" → keep all rows but force freight_mode='sea' for the
-    #                 status / lead-time displayed
-    if freight_mode_choice == "Air only":
-        s_df = s_df[s_df["freight_mode"] == "air"]
-    elif freight_mode_choice == "Sea only":
-        # Force all to sea — recompute effective lead time using supplier's
-        # sea lead time so the reorder qty reflects the longer wait.
-        cfg_sel = supp_configs.get(sel_sup, {})
-        sea_days = cfg_sel.get("lead_time_sea_days") or 35
-        s_df = s_df.copy()
-        s_df["freight_mode"] = "sea"
-        s_df["lead_time_days"] = sea_days
+    def _apply_ordering_view_filters(source_df: pd.DataFrame,
+                                     *,
+                                     relax_status_if_empty: bool = False
+                                     ) -> pd.DataFrame:
+        # Freight mode filtering:
+        #   "Air only" → keep only rows whose freight_mode == 'air'
+        #                 (auto-computed from supplier's air_max_length_mm)
+        #   "Sea only" → keep all rows but force freight_mode='sea' for the
+        #                 status / lead-time displayed
+        out = source_df.copy()
+        if freight_mode_choice == "Air only":
+            out = out[out["freight_mode"] == "air"]
+        elif freight_mode_choice == "Sea only":
+            # Force all to sea — recompute effective lead time using supplier's
+            # sea lead time so the reorder qty reflects the longer wait.
+            cfg_sel = supp_configs.get(sel_sup, {})
+            sea_days = cfg_sel.get("lead_time_sea_days") or 35
+            out = out.copy()
+            out["freight_mode"] = "sea"
+            out["lead_time_days"] = sea_days
 
-    if abc_filter:
-        s_df = s_df[s_df["ABC"].isin(abc_filter)]
-    if status_filter:
-        s_df = s_df[s_df["Status"].isin(status_filter)]
-    if only_reorder_positive:
-        # Keep two kinds of rows:
-        #   (a) Normal items with a positive reorder suggestion (engine
-        #       thinks we should buy them).
-        #   (b) Dropship items with ANY active 12-month demand — these
-        #       are "candidates the buyer might want to decide on":
-        #       either add to this PO (tick Include?) or promote to
-        #       stocked (untick Dropship?). Pure-zero-demand dropship
-        #       items stay hidden to avoid clutter; they're still in
-        #       the "📦 Dropship products" expander with full list.
-        _is_dropship = s_df["SKU"].astype(str).isin(dropship_skus)
-        _supplier_reorder_qty = pd.to_numeric(
-            s_df.get("reorder_qty", pd.Series(0, index=s_df.index)),
+        if abc_filter:
+            out = out[out["ABC"].isin(abc_filter)]
+        if status_filter:
+            status_out = out[out["Status"].isin(status_filter)]
+            if (not relax_status_if_empty
+                    or not status_out.empty
+                    or out.empty):
+                out = status_out
+        if only_reorder_positive:
+            # Keep two kinds of rows:
+            #   (a) Normal items with a positive reorder suggestion (engine
+            #       thinks we should buy them).
+            #   (b) Dropship items with ANY active 12-month demand — these
+            #       are "candidates the buyer might want to decide on":
+            #       either add to this PO (tick Include?) or promote to
+            #       stocked (untick Dropship?). Pure-zero-demand dropship
+            #       items stay hidden to avoid clutter; they're still in
+            #       the "📦 Dropship products" expander with full list.
+            _is_dropship = out["SKU"].astype(str).isin(dropship_skus)
+            _supplier_reorder_qty = pd.to_numeric(
+                out.get("reorder_qty", pd.Series(0, index=out.index)),
+                errors="coerce",
+            ).fillna(0)
+            _has_any_demand = pd.to_numeric(
+                out.get(
+                    "effective_units_12mo",
+                    pd.Series(0, index=out.index),
+                ),
+                errors="coerce",
+            ).fillna(0) > 0
+            # v2.67.318 — also keep OUT-OF-STOCK items that sold this year
+            # even when the engine suggests 0. These are almost all 🎯 Project
+            # / 💤 Dormant SKUs whose reorder was (correctly) suppressed —
+            # but the buyer still needs to SEE them to decide whether to
+            # manually order (e.g. 1 roll of a project neon for shelf
+            # presence). Without this, the methodology fixes (v2.67.310-317)
+            # made every project SKU vanish from its supplier's view, which
+            # is what James hit with Neonica's neon/profile products.
+            _out_of_stock = out.apply(
+                lambda r: normalise_planning_quantity(
+                    r.get("OnHand", 0),
+                    is_bulk_master=bool(r.get("is_bulk_master", False)),
+                    bulk_length_m=float(r.get("bulk_length_m") or 0),
+                ) <= 0,
+                axis=1,
+            )
+            keep_mask = (
+                (_supplier_reorder_qty > 0)
+                | (_is_dropship & _has_any_demand)
+                | (_out_of_stock & _has_any_demand)
+            )
+            out = out[keep_mask]
+        _supplier_sort_reorder = pd.to_numeric(
+            out.get("reorder_qty", pd.Series(0, index=out.index)),
             errors="coerce",
         ).fillna(0)
-        _has_any_demand = pd.to_numeric(
-            s_df.get(
-                "effective_units_12mo",
-                pd.Series(0, index=s_df.index),
-            ),
-            errors="coerce",
-        ).fillna(0) > 0
-        # v2.67.318 — also keep OUT-OF-STOCK items that sold this year
-        # even when the engine suggests 0. These are almost all 🎯 Project
-        # / 💤 Dormant SKUs whose reorder was (correctly) suppressed —
-        # but the buyer still needs to SEE them to decide whether to
-        # manually order (e.g. 1 roll of a project neon for shelf
-        # presence). Without this, the methodology fixes (v2.67.310-317)
-        # made every project SKU vanish from its supplier's view, which
-        # is what James hit with Neonica's neon/profile products.
-        _out_of_stock = s_df.apply(
-            lambda r: normalise_planning_quantity(
-                r.get("OnHand", 0),
-                is_bulk_master=bool(r.get("is_bulk_master", False)),
-                bulk_length_m=float(r.get("bulk_length_m") or 0),
-            ) <= 0,
-            axis=1,
+        return (
+            out.assign(__sort_reorder=_supplier_sort_reorder)
+            .sort_values("__sort_reorder", ascending=False)
+            .drop(columns=["__sort_reorder"], errors="ignore")
         )
-        keep_mask = (
-            (_supplier_reorder_qty > 0)
-            | (_is_dropship & _has_any_demand)
-            | (_out_of_stock & _has_any_demand)
-        )
-        s_df = s_df[keep_mask]
-    _supplier_sort_reorder = pd.to_numeric(
-        s_df.get("reorder_qty", pd.Series(0, index=s_df.index)),
-        errors="coerce",
-    ).fillna(0)
-    s_df = (
-        s_df.assign(__sort_reorder=_supplier_sort_reorder)
-        .sort_values("__sort_reorder", ascending=False)
-        .drop(columns=["__sort_reorder"], errors="ignore")
+
+    # --- Then apply filters to get the working view ---
+    s_df = _apply_ordering_view_filters(
+        all_supplier_df,
+        relax_status_if_empty=True,
     )
+    if s_df.empty and ordering_supplier_snapshot_used:
+        live_supplier_df = _prepared_live_supplier_df()
+        live_s_df = _apply_ordering_view_filters(
+            live_supplier_df,
+            relax_status_if_empty=True,
+        )
+        if not live_s_df.empty:
+            all_supplier_df = live_supplier_df
+            s_df = live_s_df
+            ordering_supplier_snapshot_used = False
 
     # Supplier-wide totals (unfiltered) — the "real" supplier picture
     sw_skus = len(all_supplier_df)

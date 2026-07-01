@@ -399,9 +399,12 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("def _normalise_ordering_supplier_df", script)
         self.assertIn('"reorder_qty": 0.0', script)
         self.assertIn("_supplier_reorder_qty = pd.to_numeric", script)
-        self.assertIn('s_df.get("reorder_qty"', script)
+        self.assertIn('out.get("reorder_qty"', script)
         self.assertIn("_product_names_by_sku", script)
         self.assertIn("missing_name", script)
+        self.assertIn("def _apply_ordering_view_filters", script)
+        self.assertIn("relax_status_if_empty=True", script)
+        self.assertIn("live_supplier_df = _prepared_live_supplier_df()", script)
         self.assertNotIn('(s_df["reorder_qty"] > 0)', script)
 
     def test_ordering_supplier_catalog_search_is_committed_and_bounded(self) -> None:
