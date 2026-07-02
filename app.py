@@ -10951,7 +10951,7 @@ elif page == "Supplier Pricing":
             st.dataframe(df_packs, hide_index=True, width="stretch",
                           column_config={
                               "lead_time_days": st.column_config.NumberColumn(
-                                  "Sku Leadtime", format="%d"),
+                                  "Sku LT", format="%d"),
                               "moq": st.column_config.NumberColumn(
                                   "SKU MOQ", format="%g"),
                               "eoq_qty": st.column_config.NumberColumn(
@@ -10972,7 +10972,7 @@ elif page == "Supplier Pricing":
                     key="pq_sku")
             with pq2:
                 pq_lt = st.number_input(
-                    "Sku Leadtime (0=default)",
+                    "Sku LT (0=default)",
                     min_value=0, max_value=365, value=0, step=1,
                     key="pq_lt")
             with pq3:
@@ -11987,15 +11987,17 @@ elif page == "Ordering":
         _obs_lt = _ip_row.get("observed_lead_time_days")
         _conf_lt_ip = _ip_row.get("configured_lead_time_days")
         lead_time_basis = "supplier"
-        if _sku_lt_int and 1 <= _sku_lt_int <= 365:
-            lead_time_days = _sku_lt_int
-            lead_time_basis = "sku"
-        elif _obs_lt and 3 <= int(_obs_lt) <= 120:
+        if _obs_lt and 3 <= int(_obs_lt) <= 120:
             lead_time_days = int(_obs_lt)
             lead_time_basis = "ip_observed"
         elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
             lead_time_days = int(_conf_lt_ip)
             lead_time_basis = "ip_configured"
+        vendor_lead_time_days = lead_time_days
+        vendor_lead_time_basis = lead_time_basis
+        if _sku_lt_int and 1 <= _sku_lt_int <= 365:
+            lead_time_days = _sku_lt_int
+            lead_time_basis = "sku"
 
         # Safety factor by class
         abc = row.get("ABC") or "C"
@@ -12310,6 +12312,7 @@ elif page == "Ordering":
         result = {
             "target_stock": target,
             "reorder_qty": reorder,
+            "vendor_lead_time_days": vendor_lead_time_days,
             "lead_time_days": lead_time_days,
             "sku_lead_time_days": (
                 _sku_lt_int if _sku_lt_int and _sku_lt_int > 0 else 0),
@@ -12673,7 +12676,8 @@ elif page == "Ordering":
         if lead_time_basis == "sku":
             lead_time_basis_note = (
                 " — SKU-level lead-time override from buying settings; "
-                "overrides IP and supplier defaults.\n\n")
+                f"overrides Vendor LT {vendor_lead_time_days:g}d "
+                f"({vendor_lead_time_basis}).\n\n")
         elif lead_time_basis == "ip_observed":
             lead_time_basis_note = (
                 " — IP's measured average PO-to-receipt time for "
@@ -12791,7 +12795,8 @@ elif page == "Ordering":
     # identical values — skipping it removes the 10k-row markdown
     # rebuild that was spiking memory and crashing Render on every
     # navigation, holiday save, and cadence save.
-    _reorder_cols = ("target_stock", "reorder_qty", "lead_time_days",
+    _reorder_cols = ("target_stock", "reorder_qty",
+                       "vendor_lead_time_days", "lead_time_days",
                        "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
                        "freight_mode", "excess_units", "excess_value")
     try:
@@ -12814,6 +12819,8 @@ elif page == "Ordering":
         applied = engine_df.apply(_compute_target_and_reorder, axis=1)
         engine_df["target_stock"] = applied.apply(lambda x: x["target_stock"])
         engine_df["reorder_qty"] = applied.apply(lambda x: x["reorder_qty"])
+        engine_df["vendor_lead_time_days"] = applied.apply(
+            lambda x: x["vendor_lead_time_days"])
         engine_df["lead_time_days"] = applied.apply(lambda x: x["lead_time_days"])
         engine_df["sku_lead_time_days"] = applied.apply(
             lambda x: x["sku_lead_time_days"])
@@ -13113,9 +13120,11 @@ elif page == "Ordering":
             f"**Reorder-math 12mo:** {_eff_u12:.0f}"
             f"  ·  **Raw direct+FG 12mo:** {_raw_u12:.0f}  \n"
             f"**Target stock:** {float(_r.get('target_stock') or 0):.0f}"
-            f"  ·  **Lead time:** "
+            f"  ·  **Used LT:** "
             f"{float(_r.get('lead_time_days') or 0):.0f}d "
             f"({_r.get('freight_mode') or '—'})"
+            f"  ·  **Vendor LT:** "
+            f"{float(_r.get('vendor_lead_time_days') or 0):.0f}d"
             f"  ·  **SKU LT/MOQ/EOQ:** "
             f"{float(_r.get('sku_lead_time_days') or 0):.0f}d / "
             f"{float(_r.get('sku_moq') or 0):g} / "
@@ -14845,6 +14854,7 @@ elif page == "Ordering":
             "target_stock": 0.0,
             "avg_daily": 0.0,
             "avg_month": 0.0,
+            "vendor_lead_time_days": 0.0,
             "lead_time_days": 0.0,
             "sku_lead_time_days": 0.0,
             "sku_moq": 0.0,
@@ -14918,13 +14928,14 @@ elif page == "Ordering":
             if not override_mode:
                 return row
             if override_mode == "air" and lt_air_sel:
-                new_lt = lt_air_sel
+                vendor_new_lt = lt_air_sel
                 new_mode = "air (manual)"
             elif override_mode == "sea":
-                new_lt = lt_sea_sel
+                vendor_new_lt = lt_sea_sel
                 new_mode = "sea (manual)"
             else:
                 return row
+            new_lt = vendor_new_lt
             sku_lt_override, sku_moq_override, sku_eoq_override = (
                 _sku_buying_values(sku_here))
             if sku_lt_override:
@@ -14992,6 +15003,7 @@ elif page == "Ordering":
                 bulk_length_m=bulk_len_m,
             )
             row = row.copy()
+            row["vendor_lead_time_days"] = vendor_new_lt
             row["lead_time_days"] = new_lt
             row["sku_lead_time_days"] = sku_lt_override
             row["sku_moq"] = sku_moq_override
@@ -15130,7 +15142,12 @@ elif page == "Ordering":
             sea_days = cfg_sel.get("lead_time_sea_days") or 35
             out = out.copy()
             out["freight_mode"] = "sea"
-            out["lead_time_days"] = sea_days
+            out["vendor_lead_time_days"] = sea_days
+            _sku_lt = pd.to_numeric(
+                out.get("sku_lead_time_days", 0),
+                errors="coerce",
+            ).fillna(0)
+            out["lead_time_days"] = _sku_lt.where(_sku_lt > 0, sea_days)
 
         if abc_filter:
             out = out[out["ABC"].isin(abc_filter)]
@@ -15325,8 +15342,9 @@ elif page == "Ordering":
         "DoC_days",
         "target_stock", "reorder_qty",
         "Order qty", "Line value",
-        "freight_mode", "lead_time_days",
-        "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
+        "freight_mode", "vendor_lead_time_days",
+        "sku_lead_time_days", "lead_time_days",
+        "sku_moq", "sku_eoq_qty",
         "POCost", "POCostBasis", "excess_units", "excess_value",
         "Note", "Exclude?", "Dropship?",
         "Source",
@@ -15370,7 +15388,8 @@ elif page == "Ordering":
         ("Image", "Include?"),
         ("avg_month", "avg_daily"),
         ("last_12mo_series", "last_6mo_series"),
-        ("sku_lead_time_days", "lead_time_days"),
+        ("vendor_lead_time_days", "freight_mode"),
+        ("sku_lead_time_days", "vendor_lead_time_days"),
         ("sku_moq", "sku_lead_time_days"),
         ("sku_eoq_qty", "sku_moq"),
     ]
@@ -15412,8 +15431,9 @@ elif page == "Ordering":
         "Order qty": "✏ Order qty (editable)",
         "Line value": "Line $ value",
         "freight_mode": "Freight (air/sea)",
-        "lead_time_days": "Lead time (days)",
-        "sku_lead_time_days": "Sku Leadtime",
+        "vendor_lead_time_days": "Vendor LT",
+        "lead_time_days": "Used LT",
+        "sku_lead_time_days": "Sku LT",
         "sku_moq": "SKU MOQ",
         "sku_eoq_qty": "SKU EOQ / batch qty",
         "POCost": "PO cost (FixedCost)",
@@ -15442,7 +15462,8 @@ elif page == "Ordering":
             "avg_month",
             "OnHand", "Available", "OnOrder", "unfulfilled",
             "target_stock", "reorder_qty", "freight_mode",
-            "lead_time_days", "sku_lead_time_days", "sku_moq",
+            "vendor_lead_time_days", "sku_lead_time_days",
+            "lead_time_days", "sku_moq",
             "sku_eoq_qty",
             "POCost", "Order qty", "Line value",
             "Note", "Exclude?", "Dropship?",
@@ -16133,7 +16154,8 @@ elif page == "Ordering":
                     "OnHand", "Allocated", "Available",
                     "OnOrder", "unfulfilled", "DoC_days",
                     "target_stock", "reorder_qty",
-                    "freight_mode", "lead_time_days",
+                    "freight_mode", "vendor_lead_time_days",
+                    "lead_time_days",
                     "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
                     "excess_units", "excess_value",
                     "last_6mo", "last_6mo_series", "last_12mo_series",
@@ -16328,10 +16350,19 @@ elif page == "Ordering":
                 options=["air", "sea", "air (manual)", "sea (manual)"],
                 width="small",
             ),
+            "vendor_lead_time_days": st.column_config.NumberColumn(
+                "Vendor LT",
+                disabled=True,
+                help="Supplier/IP/freight lead time before any SKU-specific "
+                     "override. This is the default used when Sku LT is 0.",
+            ),
             "lead_time_days": st.column_config.NumberColumn(
-                "LT (d)", disabled=True),
+                "Used LT",
+                disabled=True,
+                help="Final lead time used by the reorder engine after "
+                     "applying Sku LT if one is set."),
             "sku_lead_time_days": st.column_config.NumberColumn(
-                "Sku Leadtime",
+                "Sku LT",
                 min_value=0,
                 max_value=365,
                 step=1,
@@ -17682,8 +17713,23 @@ elif page == "Ordering":
             disabled=True,
             width=_ordering_cfg_width("freight_mode", "small"),
         )
+        cfg["vendor_lead_time_days"] = st.column_config.NumberColumn(
+            "Vendor LT",
+            format="%d",
+            disabled=True,
+            width=_ordering_cfg_width("vendor_lead_time_days", "small"),
+            help="Supplier/IP/freight lead time before any SKU-specific "
+                 "override.",
+        )
+        cfg["lead_time_days"] = st.column_config.NumberColumn(
+            "Used LT",
+            format="%d",
+            disabled=True,
+            width=_ordering_cfg_width("lead_time_days", "small"),
+            help="Final lead time used by the reorder engine.",
+        )
         cfg["sku_lead_time_days"] = st.column_config.NumberColumn(
-            "Sku Leadtime",
+            "Sku LT",
             format="%d",
             width=_ordering_cfg_width("sku_lead_time_days", "small"),
             help="Shared SKU setting. Edits here save immediately and "
@@ -17724,8 +17770,9 @@ elif page == "Ordering":
         "Order qty", "Line value", "POCost", "units_12mo", "avg_daily",
         "avg_month", "LengthMM", "OnHand", "Allocated", "Available",
         "OnOrder", "unfulfilled", "DoC_days", "target_stock",
-        "reorder_qty", "lead_time_days", "sku_lead_time_days",
-        "sku_moq", "sku_eoq_qty", "excess_units", "excess_value",
+        "reorder_qty", "vendor_lead_time_days", "lead_time_days",
+        "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
+        "excess_units", "excess_value",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
     }
 
@@ -21349,6 +21396,11 @@ elif page == "Product Detail":
         _pd_effective_lt = (
             float(_pd_engine_row.get("lead_time_days") or 0)
             if _pd_engine_row is not None else 0)
+        _pd_vendor_lt = (
+            float(_pd_engine_row.get("vendor_lead_time_days") or 0)
+            if _pd_engine_row is not None else 0)
+        if not _pd_vendor_lt and _pd_effective_lt and not _pd_sku_lt:
+            _pd_vendor_lt = _pd_effective_lt
         _pd_supplier_lt_bits = []
         if _pd_cfg.get("lead_time_air_days"):
             _pd_supplier_lt_bits.append(
@@ -21373,14 +21425,22 @@ elif page == "Product Detail":
             if _pd_engine_row is not None else "")
 
         st.markdown("### Buying settings")
-        bs1, bs2, bs3, bs4 = st.columns(4)
+        bs1, bs2, bs3, bs4, bs5, bs6 = st.columns(6)
         bs1.metric("Supplier", _pd_supplier or "—")
         bs2.metric(
-            "Effective lead time",
+            "Vendor LT",
+            f"{_pd_vendor_lt:.0f}d" if _pd_vendor_lt else "—",
+            help="Supplier/IP/freight lead time before SKU override.")
+        bs3.metric(
+            "Sku LT",
+            f"{_pd_sku_lt:.0f}d" if _pd_sku_lt else "—",
+            help="Buyer-entered SKU override. 0/blank uses Vendor LT.")
+        bs4.metric(
+            "Used LT",
             f"{_pd_effective_lt:.0f}d" if _pd_effective_lt else "—",
-            help="Lead time currently shown by the cached engine row.")
-        bs3.metric("SKU MOQ", f"{_pd_sku_moq:g}" if _pd_sku_moq else "—")
-        bs4.metric("SKU EOQ", f"{_pd_sku_eoq:g}" if _pd_sku_eoq else "—")
+            help="Final lead time currently used by the cached engine row.")
+        bs5.metric("SKU MOQ", f"{_pd_sku_moq:g}" if _pd_sku_moq else "—")
+        bs6.metric("SKU EOQ", f"{_pd_sku_eoq:g}" if _pd_sku_eoq else "—")
         st.caption(
             "Supplier defaults: "
             f"{', '.join(_pd_supplier_lt_bits) or '—'} · "
@@ -21391,7 +21451,7 @@ elif page == "Product Detail":
         with st.form(f"pd_buying_settings_{sku}"):
             b1, b2, b3 = st.columns(3)
             pd_lt = b1.number_input(
-                "Sku Leadtime (days, 0=default)",
+                "Sku LT (days, 0=default)",
                 min_value=0, max_value=365,
                 value=int(_pd_sku_lt or 0),
                 step=1,

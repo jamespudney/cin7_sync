@@ -65,9 +65,11 @@ rank + 40% of 12-month quantity rank):
 How long from placing the PO to receiving the goods. Set per supplier
 in the Supplier configuration expander below. Air vs sea toggles use
 different LTs; the engine picks the faster one when the supplier offers
-air AND the item qualifies. A SKU-level **Sku Leadtime** can be set in
-Ordering or Product Detail; when present, that duration overrides IP and
-supplier default lead-time days for that SKU.
+air AND the item qualifies. A SKU-level **Sku LT** can be set in
+Ordering or Product Detail; when present, that duration overrides the
+calculated Vendor LT for that SKU. Ordering displays this as
+**Vendor LT** (default), **Sku LT** (manual override), and **Used LT**
+(final engine value).
 
 #### Safety %
 A buffer added on top of lead-time demand to absorb variance (a big
@@ -233,12 +235,17 @@ recommend both the individual SKU and the supplier pack.
 Set per supplier (e.g. Blebox $250). The PO summary flags when the
 current draft is below MOV so you can consolidate.
 
-#### SKU buying settings (Sku Leadtime / MOQ / EOQ)
+#### SKU buying settings (Sku LT / MOQ / EOQ)
 These are per-SKU overrides stored in `sku_pack_settings` and editable
 from both Ordering and Product Detail:
 
-- **Sku Leadtime** — manual lead-time duration in days. Blank/0 means use
-  IP observed/configured lead time, then supplier defaults.
+- **Vendor LT** — the supplier/IP/freight lead time before SKU-specific
+  overrides. This is the default lead time when Sku LT is blank/0.
+- **Sku LT** — manual SKU-level lead-time duration in days. Blank/0 means
+  use Vendor LT. Existing buyer-entered Sku LT values are never overwritten
+  by supplier defaults.
+- **Used LT** — the final lead time the reorder engine uses after applying
+  Sku LT when present.
 - **SKU MOQ** — minimum order quantity for that SKU. It can lift the
   target stock and floor the suggested reorder when a positive reorder
   exists.
@@ -261,17 +268,18 @@ Air or Sea. Decision order:
 2. **Supplier default**: otherwise air when the supplier offers it
    AND the SKU's length fits the supplier's `air_max_length_mm` (e.g.
    Topmet UPS caps at 2200mm). Sea is the fallback.
-3. **SKU lead-time override**: when `Sku Leadtime` is set for the SKU,
-   that duration wins. The freight METHOD is still from rules 1-2 or the
-   manual override; this is a duration override.
-4. **IP lead time** (v2.67.343): when IP has an observed or configured
+3. **IP lead time** (v2.67.343): when IP has an observed or configured
    lead time for the SKU, that DURATION wins (it's the real measured
    PO-to-receipt time). The freight METHOD (air/sea) is still set by
    rules 1-2 above.
+4. **SKU lead-time override**: when `Sku LT` is set for the SKU,
+   that duration wins over Vendor LT. The freight METHOD is still from
+   rules 1-2 or the manual override; this is a duration override.
 5. **Per-row override**: the buyer can flip any row's mode via the
    Freight column dropdown ("air"/"sea"/"air (manual)"/"sea
-   (manual)"). The reorder qty recalculates with the new lead time on
-   next refresh.
+   (manual)"). This changes Vendor LT for that row; Sku LT still wins
+   if it is filled. The reorder qty recalculates with the new lead time
+   on next refresh.
 
 The Inspect panel's calc trace shows the reason next to the lead-time
 line, e.g. `Lead time: 35 days (sea (category rule: Profiles -

@@ -155,6 +155,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ### 2026-07-02
 
+- **Ordering lead-time labels clarified** — Ordering and Product Detail
+  now split lead time into `Vendor LT` (supplier/IP/freight baseline),
+  `Sku LT` (buyer-entered SKU override), and `Used LT` (final engine
+  lead time). Existing buyer-entered SKU lead-time values remain stored
+  in the same `sku_pack_settings.lead_time_days` field and are not
+  overwritten by defaults.
 - **Altar'd State sales exclusion** — sales headers and sale-lines for
   Altar'd State are now filtered out at reporting/load time because
   that customer belongs to the separated manufacturing business, not
@@ -382,7 +388,7 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   matching the live upgrade and avoiding Blueprint downgrades to
   Standard/2 GB.
 - **SKU buying policy overrides** — Ordering and Product Detail now share
-  per-SKU buying settings for `Sku Leadtime`, `SKU MOQ`, and `SKU EOQ /
+  per-SKU buying settings for `Sku LT`, `SKU MOQ`, and `SKU EOQ /
   batch qty` from `sku_pack_settings`. SKU lead time overrides IP and
   supplier lead-time duration, SKU MOQ/EOQ shape target stock and
   suggested reorder, and both pages show Last 12 months beside the
