@@ -57,6 +57,7 @@ from engine.sku_rules import _is_strip_sku
 from engine.sku_rules import _parse_length
 from engine.sku_rules import _parse_strip_base
 from engine.sku_rules import _parse_tube_sku
+from engine.sku_rules import parse_pack_purchase_sku
 from engine.sku_rules import parse_sourcing_rule
 from engine.reorder_math import (
     excess_units_over_target,
@@ -6243,6 +6244,40 @@ def _abc_engine(products: pd.DataFrame,
     # A SKU with an explicit supplier is clearly intended to be bought.
     has_cin7_supplier = set(cin7_supplier_local.keys())
 
+    # Purchase-pack rollup: a sellable child SKU can feed a purchasable pack
+    # SKU, e.g. SNFX-L-CR-SCKT sales planning SNFX-L-CR-SCKT-X100 purchases.
+    # Keep this intentionally narrow to avoid accidental family inflation:
+    # only exact base -> final -X<number> pack, and only where the base is not
+    # itself supplier-assigned. Ambiguous bases with multiple pack candidates
+    # are skipped until a human can set an explicit rule.
+    product_skus = set(products["SKU"].astype(str))
+    pack_candidates_by_base: dict[str, list[tuple[str, int]]] = {}
+    for _sku in product_skus:
+        _pack = parse_pack_purchase_sku(_sku)
+        if not _pack:
+            continue
+        _base_sku, _pack_size = _pack
+        if _base_sku not in product_skus:
+            continue
+        pack_candidates_by_base.setdefault(_base_sku, []).append(
+            (_sku, _pack_size))
+
+    pack_rollup_rules: list[tuple[str, str, float, int]] = []
+    for _base_sku, _candidates in pack_candidates_by_base.items():
+        if _base_sku in has_cin7_supplier:
+            continue
+        _supplier_candidates = [
+            _c for _c in _candidates if _c[0] in has_cin7_supplier
+        ]
+        _usable_candidates = (
+            _supplier_candidates if _supplier_candidates else _candidates)
+        if len(_usable_candidates) != 1:
+            continue
+        _master_sku, _pack_size = _usable_candidates[0]
+        pack_rollup_rules.append(
+            (_base_sku, _master_sku, 1.0 / float(_pack_size), _pack_size))
+    pack_rollup_child_skus = {child for child, _, _, _ in pack_rollup_rules}
+
     def _global_is_master(sku: str) -> bool:
         """A SKU is a MASTER (orderable) if there's evidence it's bought
         from a supplier, AND it's not explicitly marked as assembled-from.
@@ -6257,6 +6292,11 @@ def _abc_engine(products: pd.DataFrame,
           5. Default → master (no evidence of assembly)
         """
         rule = rule_by_sku.get(sku, {})
+        # Sellable child SKU whose demand is planned through an exact
+        # -X<number> purchase pack. This prevents duplicate target/reorder
+        # math: the child demand is rolled into the pack SKU below.
+        if sku in pack_rollup_child_skus:
+            return False
         # 2: Explicit Assemble-from always wins
         if rule.get("SourceFraction") is not None:
             return False
@@ -6464,6 +6504,37 @@ def _abc_engine(products: pd.DataFrame,
             master_rollup_notes.setdefault(master_sku, []).append(
                 f"{sku}: {own_units:.0f} × {qty_per:g} = {consumption:.1f}"
             )
+
+    # 5d-2. Exact purchase-pack rollup.
+    # Unlike tube/strip rollups, these SKUs don't encode length. The final
+    # -X<number> suffix is a purchasing pack size. If customers buy
+    # SNFX-L-CR-SCKT as individual sockets and we buy SNFX-L-CR-SCKT-X100,
+    # 100 sold units become 1 purchase-pack demand unit.
+    for child_sku, master_sku, qty_per, pack_size in pack_rollup_rules:
+        own_units = float(
+            vel.loc[vel["SKU"] == child_sku, "units_12mo"].sum())
+        own_units_90d = float(
+            vel.loc[vel["SKU"] == child_sku, "units_90d"].sum())
+        # Exact purchase packs replenish the same base SKU. Unlike the
+        # broader tube/strip family rollups, FG assembly consumption of the
+        # base is real demand for the pack and must stay included here.
+        own_units = max(0.0,
+                         own_units
+                         + float(migration_inflow.get(child_sku, 0))
+                         - float(migration_outflow.get(child_sku, 0)))
+        if own_units == 0 and own_units_90d == 0:
+            continue
+        consumption = own_units * qty_per
+        consumption_90d = own_units_90d * qty_per
+        master_rollup_inflow[master_sku] = (
+            master_rollup_inflow.get(master_sku, 0) + consumption
+        )
+        master_rollup_inflow_90d[master_sku] = (
+            master_rollup_inflow_90d.get(master_sku, 0) + consumption_90d
+        )
+        master_rollup_notes.setdefault(master_sku, []).append(
+            f"{child_sku}: {own_units:.0f} units ÷ {pack_size:g}/pack "
+            f"= {consumption:.2f} packs")
 
     # 5da. LED-STRIP rollup (pattern-based; BOMs rarely populated).
     # For each strip family base (e.g. LEDIRIS6000-180), find the
@@ -6860,6 +6931,16 @@ def _abc_engine(products: pd.DataFrame,
                     monthly_24[master_sku][i] += (
                         monthly_24[ch_sku][i] * ratio)
 
+    # Purchase-pack monthly rollup: child individual-unit demand becomes
+    # master pack-equivalent demand for buyer-visible history.
+    for child_sku, master_sku, qty_per, _pack_size in pack_rollup_rules:
+        if child_sku in monthly_12:
+            for i in range(12):
+                monthly_12[master_sku][i] += monthly_12[child_sku][i] * qty_per
+        if child_sku in monthly_24:
+            for i in range(24):
+                monthly_24[master_sku][i] += monthly_24[child_sku][i] * qty_per
+
     # --- Migration + BOM rollup of 45d / prior-45d / 90d units ---------
     # Same pattern as the monthly buckets above, but for the
     # short-window aggregates the buyer sees in the Ordering grid:
@@ -6914,6 +6995,19 @@ def _abc_engine(products: pd.DataFrame,
                 uprior_dict[master_sku] = uprior_dict.get(master_sku, 0) + uprior_dict[ch_sku] * ratio
             if ch_sku in u90_dict:
                 u90_dict[master_sku] = u90_dict.get(master_sku, 0) + u90_dict[ch_sku] * ratio
+
+    # Purchase-pack short-window rollup.
+    for child_sku, master_sku, qty_per, _pack_size in pack_rollup_rules:
+        if child_sku in u45_dict:
+            u45_dict[master_sku] = (
+                u45_dict.get(master_sku, 0) + u45_dict[child_sku] * qty_per)
+        if child_sku in uprior_dict:
+            uprior_dict[master_sku] = (
+                uprior_dict.get(master_sku, 0)
+                + uprior_dict[child_sku] * qty_per)
+        if child_sku in u90_dict:
+            u90_dict[master_sku] = (
+                u90_dict.get(master_sku, 0) + u90_dict[child_sku] * qty_per)
 
     # Write back. Replace the raw values so the Ordering grid columns
     # (`units_45d`, `momentum`, `units_90d`) reflect the full lineage
@@ -6998,6 +7092,19 @@ def _abc_engine(products: pd.DataFrame,
                 _dest_names = _cust_names.setdefault(_master, {})
                 for _cid, _nm in _cust_names[_ch_sku].items():
                     _dest_names.setdefault(_cid, _nm)
+
+    # Purchase-pack customer rollup. Customer counts remain distinct buyer
+    # counts, while volumes are converted to pack equivalents.
+    for _child_sku, _master_sku, _qty_per, _pack_size in pack_rollup_rules:
+        for _src_map in (_cust_qty_45d, _cust_qty_12mo):
+            if _child_sku in _src_map:
+                _dest = _src_map.setdefault(_master_sku, {})
+                for _cid, _q in _src_map[_child_sku].items():
+                    _dest[_cid] = _dest.get(_cid, 0) + _q * _qty_per
+        if _child_sku in _cust_names:
+            _dest_names = _cust_names.setdefault(_master_sku, {})
+            for _cid, _nm in _cust_names[_child_sku].items():
+                _dest_names.setdefault(_cid, _nm)
 
     # Recompute customer-derived columns from the rolled-up maps
     _new_cust_count: dict = {}
@@ -12235,7 +12342,7 @@ elif page == "Ordering":
                 )
             if rollup_in > 0:
                 demand_lines.append(
-                    f"- Tube rollup IN from MP variants / cuts: "
+                    f"- Demand rollup IN from variants / packs / cuts: "
                     f"**+{rollup_in:.0f}** units "
                     f"(see tube_rollup_notes)\n"
                 )

@@ -29,6 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from dotenv import load_dotenv
 
 from cin7_sync import Cin7Client, OUTPUT_DIR, _extract_sale_lines
+from engine.sku_rules import parse_pack_purchase_sku
 from engine.sku_movement_audit import NON_MOVEMENT_COMPONENT_SALE_STATUSES
 
 
@@ -203,6 +204,39 @@ def local_direct_sales(
         total += qty
         rows.append(row)
     return total, rows, source
+
+
+def local_pack_purchase_rollup(
+    sku: str,
+    start: date,
+    end: date,
+) -> Optional[Dict[str, Any]]:
+    """Audit exact base-SKU demand that should feed an -X<number> pack SKU."""
+    parsed = parse_pack_purchase_sku(sku)
+    if not parsed:
+        return None
+    base_sku, pack_size = parsed
+    base_asm_qty, base_asm_rows, asm_source = local_assembly_consumption(
+        base_sku, start, end)
+    base_direct_qty, base_direct_rows, sale_source = local_direct_sales(
+        base_sku,
+        start,
+        end,
+        suppress_nonmovement_component_lines=base_asm_qty > 0,
+    )
+    base_total = float(base_direct_qty + base_asm_qty)
+    return {
+        "base_sku": base_sku,
+        "pack_size": pack_size,
+        "base_direct_qty": float(base_direct_qty),
+        "base_assembly_qty": float(base_asm_qty),
+        "base_total_qty": base_total,
+        "pack_equivalent_qty": base_total / float(pack_size),
+        "sale_source": sale_source,
+        "assembly_source": asm_source,
+        "direct_rows": base_direct_rows,
+        "assembly_rows": base_asm_rows,
+    }
 
 
 def local_bom_rollup_estimate(
@@ -804,6 +838,7 @@ def main() -> int:
     )
     bom_qty, bom_rows, bom_path, bom_sl_path = local_bom_rollup_estimate(
         sku, start, end)
+    pack_rollup = local_pack_purchase_rollup(sku, start, end)
 
     print("\n[Local synced data]")
     print(f"  Direct invoice sales      : {direct_qty:g}")
@@ -818,6 +853,18 @@ def main() -> int:
     print(f"    assembly file           : {asm_path or '(missing)'}")
     print(f"  Engine-correct local MTD  : {direct_qty + asm_qty:g}")
     print("    (Use direct + FG assembly. Do not add BOM estimate if FG rows exist.)")
+    if pack_rollup:
+        print("  Purchase-pack sibling rollup:")
+        print(f"    base SKU                : {pack_rollup['base_sku']}")
+        print(f"    base direct sales       : {pack_rollup['base_direct_qty']:g}")
+        print(f"    base FG assembly        : {pack_rollup['base_assembly_qty']:g}")
+        print(f"    pack size               : {pack_rollup['pack_size']:g}")
+        print("    pack-equivalent demand  : "
+              f"{pack_rollup['pack_equivalent_qty']:g}")
+        print(f"    sale-line file          : {pack_rollup['sale_source'] or '(missing)'}")
+        print("    note                    : this is the demand the engine rolls "
+              "into the -X pack purchase SKU when the base SKU is sellable "
+              "but not supplier-assigned.")
 
     print("\n  Local direct sale rows:")
     _summarise(direct_rows, "InvoiceDate")
@@ -829,6 +876,11 @@ def main() -> int:
             print(f"    {parent}: {qty:g}")
     print("\n  Local BOM kit-sale estimate rows:")
     _summarise(bom_rows, "InvoiceDate")
+    if pack_rollup:
+        print("\n  Local purchase-pack base direct sale rows:")
+        _summarise(pack_rollup["direct_rows"], "InvoiceDate")
+        print("\n  Local purchase-pack base FG assembly rows:")
+        _summarise(pack_rollup["assembly_rows"], "CompletionDate")
 
     live_direct_qty: Optional[float] = None
     live_asm_qty: Optional[float] = None
@@ -861,6 +913,35 @@ def main() -> int:
                 }
                 for r in live_product_rows
             ], "CompletionDate")
+            if pack_rollup:
+                live_pack_base_qty, live_pack_base_rows, live_pack_base_by_type = (
+                    live_product_movements(
+                        client,
+                        str(pack_rollup["base_sku"]),
+                        start,
+                        end,
+                        verbose=False,
+                    ))
+                print("\n[Live CIN7 purchase-pack base movement demand] "
+                      f"{pack_rollup['base_sku']} total: "
+                      f"{live_pack_base_qty:g} units = "
+                      f"{live_pack_base_qty / float(pack_rollup['pack_size']):g} "
+                      f"packs of {pack_rollup['pack_size']:g}")
+                print("  By type signed qty:")
+                for typ, qty in sorted(live_pack_base_by_type.items()):
+                    print(f"    {typ}: {qty:g}")
+                _summarise([
+                    {
+                        "CompletionDate": r.get("Date"),
+                        "AssemblyNumber": r.get("Number"),
+                        "ComponentSKU": pack_rollup["base_sku"],
+                        "ParentSKU": r.get("Type"),
+                        "Customer": r.get("FromTo"),
+                        "Quantity": r.get("Quantity"),
+                        "Status": "CIN7 movement",
+                    }
+                    for r in live_pack_base_rows
+                ], "CompletionDate")
         if args.live_sales:
             live_direct_qty, live_direct_rows = live_sales(
                 client, sku, start, end, max_headers=args.max_live_sales)
@@ -887,14 +968,25 @@ def main() -> int:
     headline_asm = live_asm_qty if live_asm_qty is not None else asm_qty
     print("\n[Conclusion]")
     if live_product_movement_qty is not None:
-        print("  Correct MTD demand        : "
+        print("  Correct period demand     : "
               f"{live_product_movement_qty:g} "
               "(from live CIN7 product Movements)")
     else:
         print(f"  Direct sales used         : {headline_direct:g}")
         print(f"  FG assembly used          : {headline_asm:g}")
-        print(f"  Correct MTD demand        : {headline_direct + headline_asm:g}")
+        print(f"  Correct period demand     : {headline_direct + headline_asm:g}")
     print(f"  Kit-sale BOM estimate     : {bom_qty:g} (audit only when FG exists)")
+    if pack_rollup:
+        print("  Purchase-pack equivalent  : "
+              f"{pack_rollup['pack_equivalent_qty']:g} packs from "
+              f"{pack_rollup['base_total_qty']:g} base units")
+    if (live_product_movement_qty is not None
+            and abs(live_product_movement_qty
+                    - (direct_qty + asm_qty)) > 0.0001):
+        print("  FINDING: live CIN7 product Movements differ from synced "
+              "direct+FG CSV demand.")
+        print("           The app/AI will be wrong until sale-line/assembly "
+              "sync and ABC warm catch up.")
     if live_asm_qty is not None and abs(live_asm_qty - asm_qty) > 0.0001:
         print("  FINDING: live CIN7 FG assembly total differs from synced CSV.")
         print("           The app/AI will be wrong until the assembly sync catches up.")

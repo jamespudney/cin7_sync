@@ -268,3 +268,27 @@ def _parse_strip_base(sku: str) -> Optional[tuple]:
     if voltage:
         base = f"{base}-{voltage}"
     return (base, length_m)
+
+
+def parse_pack_purchase_sku(sku: str) -> Optional[tuple[str, int]]:
+    """Return ``(base_sku, pack_size)`` for purchase-pack SKUs.
+
+    Example: ``SNFX-L-CR-SCKT-X100`` is the 100-pack buying SKU for
+    ``SNFX-L-CR-SCKT``. This is deliberately strict: it only matches a final
+    ``-X<number>`` suffix so unrelated SKUs containing ``X100`` elsewhere do
+    not get rolled together.
+    """
+    sku_s = str(sku or "").strip()
+    if not sku_s:
+        return None
+    match = re.match(r"^(.+)-X(\d+)$", sku_s, flags=re.IGNORECASE)
+    if not match:
+        return None
+    base = match.group(1).strip()
+    try:
+        pack_size = int(match.group(2))
+    except ValueError:
+        return None
+    if not base or pack_size <= 1:
+        return None
+    return base, pack_size

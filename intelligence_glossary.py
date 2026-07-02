@@ -118,8 +118,8 @@ at the 12-month average sales rate.
 Direct sales of THIS SKU + **assembly consumption** (the SKU consumed
 as a component in kit-builds, from CIN7's FG-XXXX tasks — see Assembly
 consumption below) + sales rolled up from child variants (MP variants,
-cuts) + sales migrated from retiring SKUs. Used for the reorder math,
-NOT the raw "units_12mo" figure on its own.
+cuts, exact purchase packs) + sales migrated from retiring SKUs. Used
+for the reorder math, NOT the raw "units_12mo" figure on its own.
 
 #### Lineage units / visible 12mo demand
 `lineage_units_12mo` is the buyer-visible 12-month demand total from
@@ -203,6 +203,24 @@ family chart uses direct component sales + FG component consumption.
 Kit sale-lines remain visible as an audit trail, but are not added to
 that chart because the FG rows are the actual component movement and
 counting both would double-count.
+
+#### Purchase-pack rollup (`-X<number>`)
+Some items are sold or consumed as an individual base SKU, but bought
+from the supplier as a pack SKU. Example:
+`SNFX-L-CR-SCKT` is the individual socket movement, while
+`SNFX-L-CR-SCKT-X100` is the 100-pack buying SKU.
+
+The engine recognises a strict final `-X<number>` suffix only when:
+- the unsuffixed base SKU exists in CIN7,
+- the base SKU is not itself supplier-assigned as a bought item, and
+- there is one clear pack SKU for that base.
+
+When those safeguards pass, base direct sales plus FG assembly
+consumption roll into the pack as **base units ÷ pack size**. The pack
+SKU receives effective demand, 45d/90d demand, visible monthly history,
+customer counts, reorder/status, optimum stock, and slow-stock effects.
+The base row is treated as non-master for buying math so we do not
+recommend both the individual SKU and the supplier pack.
 
 #### FixedCost / AverageCost / PO cost
 - **FixedCost** — the agreed supplier price on the SKU's supplier record

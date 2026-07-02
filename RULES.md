@@ -6,7 +6,7 @@
 
 **Versioning.** When you add or change a rule, bump the top-of-file date and mark which page / function it affects. When a rule becomes obsolete, strike it through — don't delete — so the reasoning stays visible.
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 ---
 
@@ -51,6 +51,22 @@ Anything else is a child / phantom / cut / assembly.
 **2.6 Multi-component kit rollup.** Kit sales (LEDKIT-*, LEDFIX-*) distribute demand to EVERY component in the BOM proportionally — not just the first component. Each component separately gets `kit_sales × its_BOM_quantity`.
 
 **2.7 Intermediate rolls that get direct purchase history become alternate masters.** Don't roll them up; treat them as their own masters with their own reorder logic.
+
+**2.8 Exact purchase-pack SKU rollup.** A final `-X<number>` suffix means
+the SKU is a supplier buying pack only when the unsuffixed base SKU also
+exists, the base SKU is not supplier-assigned, and there is one clear
+pack candidate. Example: `SNFX-L-CR-SCKT` sales/FG consumption feed
+`SNFX-L-CR-SCKT-X100` as `base units ÷ 100`.
+
+- Count base direct sales plus FG assembly consumption in the pack
+  rollup. The pack is how that exact base item is replenished.
+- Do not apply this when the base SKU is itself a bought/supplier SKU or
+  when multiple pack candidates make the mapping ambiguous.
+- The rollup affects `effective_units_12mo`, 45d/90d units, visible
+  monthly buckets, customer metrics, Status/Trend, suggested reorder,
+  optimum stock, and slow/excess stock. The base row becomes non-master
+  for buying math so the app does not recommend both the base SKU and
+  the pack SKU.
 
 ---
 

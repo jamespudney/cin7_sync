@@ -8,7 +8,7 @@ Claude sessions to pick up where we left off.
 to "Shipped" with a date. When something new comes up, add it to
 "Active backlog" or "Future / wishlist".
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 ---
 
@@ -152,6 +152,17 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 ---
 
 ## Shipped (since 2026-04-30)
+
+### 2026-07-02
+
+- **Exact purchase-pack demand rollup** — the ABC engine now recognises
+  strict final `-X<number>` supplier pack SKUs when the exact base SKU
+  exists and the mapping is unambiguous. Base SKU direct sales plus
+  Finished Goods assembly consumption roll into the pack in pack
+  equivalents, e.g. `SNFX-L-CR-SCKT` demand feeds
+  `SNFX-L-CR-SCKT-X100` as `units ÷ 100`. This affects visible monthly
+  demand, 45d/90d demand, customer counts, reorder/status/slow-stock
+  math, and the live CIN7 demand audit output.
 
 ### 2026-07-01
 

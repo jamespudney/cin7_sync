@@ -35,6 +35,7 @@ from engine.sku_rules import (
     _parse_length,
     _parse_strip_base,
     _parse_tube_sku,
+    parse_pack_purchase_sku,
     parse_sourcing_rule,
 )
 from engine.sku_movement_audit import (
@@ -2317,6 +2318,19 @@ class SkuRuleTests(unittest.TestCase):
 
         self.assertTrue(_is_strip_sku("LEDIRIS-WW-24V-5M", "LED tape"))
         self.assertEqual(_parse_strip_base("LEDIRIS-WW-24V-5M"), ("LEDIRIS-WW-24V", 5.0))
+
+    def test_purchase_pack_sku_parser_is_strict(self) -> None:
+        self.assertEqual(
+            parse_pack_purchase_sku("SNFX-L-CR-SCKT-X100"),
+            ("SNFX-L-CR-SCKT", 100),
+        )
+        self.assertEqual(
+            parse_pack_purchase_sku("ABC-X2"),
+            ("ABC", 2),
+        )
+        self.assertIsNone(parse_pack_purchase_sku("SNFX-L-CR-SCKT"))
+        self.assertIsNone(parse_pack_purchase_sku("SNFX-L-CR-SCKT-X1"))
+        self.assertIsNone(parse_pack_purchase_sku("SNFX-L-CR-SCKT-01X2"))
 
 
 if __name__ == "__main__":

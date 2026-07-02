@@ -14,7 +14,11 @@ For each Stock-typed SKU, the engine looks at:
    master by shared SKU base, for example
    `LED-TSB2835-300-24-6000-0305` credits demand to
    `LED-TSB2835-300-24-6000-100M`. Migration-aware so a successor
-   inherits its predecessor's velocity.
+   inherits its predecessor's velocity. Exact purchase-pack SKUs with
+   a final `-X<number>` suffix can also inherit demand from the exact
+   base SKU in pack equivalents; for example 250 units sold/consumed
+   of `SNFX-L-CR-SCKT` become 2.5 packs of
+   `SNFX-L-CR-SCKT-X100`.
 2. **On-hand stock.** Current physical inventory.
 3. **Available stock.** Physical minus reserved/allocated.
 4. **Open POs.** Quantity already on order with the supplier.
@@ -89,6 +93,12 @@ Where:
   The Ordering Inspect panel's strip movement audit shows the exact
   synced CIN7 sale lines behind that rollup, normalised to master-roll
   equivalents, plus top-customer concentration.
+- **Purchase-pack rollups** — exact final suffixes like `-X100` are
+  treated as buying pack sizes only when the unsuffixed base SKU exists,
+  the base is not itself supplier-assigned, and there is one clear pack
+  SKU. Direct base sales and FG assembly consumption roll into the pack
+  as `base units ÷ pack size`, so the buyer sees demand on the SKU they
+  actually reorder without duplicating the base row.
 - **Override flags** — `db.sku_policy_overrides` rows take
   precedence over the engine's suggestion if present.
 
