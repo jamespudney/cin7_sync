@@ -15622,6 +15622,12 @@ elif page == "Ordering":
                                      "Refreshing…")
                         st.rerun()
 
+        st.info(
+            "Column layout mode is open. Save, reset, or hide this panel "
+            "to return to the PO table."
+        )
+        st.stop()
+
     # Session-state extras key (defined here so merge happens BEFORE editor)
     extra_key = f"po_extra_lines_{sel_sup}"
     if extra_key not in st.session_state:

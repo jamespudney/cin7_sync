@@ -252,6 +252,9 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("db.get_column_widths_with_default", script)
         self.assertIn("Team default", script)
         self.assertIn("Existing personal saved views were not changed", script)
+        self.assertIn("Column layout mode is open", script)
+        self.assertIn("to return to the PO table", script)
+        self.assertIn("st.stop()", script)
 
     def test_product_images_feed_and_ordering_thumbnail_column(self) -> None:
         root = Path(__file__).resolve().parents[1]
