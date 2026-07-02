@@ -3897,36 +3897,69 @@ IP_ALTS_FORWARD = _ip_alts["forward"]
 IP_ALTS_REVERSE = _ip_alts["reverse"]
 
 
+def _clean_note_text(value) -> str:
+    text = str(value or "").strip()
+    return "" if text.lower() in {"", "nan", "none", "nat"} else text
+
+
+def _sku_note_key(value) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+
+def _ip_notes_candidate_files() -> list[Path]:
+    files = list(OUTPUT_DIR.glob("ip_notes_*.csv"))
+    stable = OUTPUT_DIR / "ip_notes.csv"
+    if stable.exists():
+        files.append(stable)
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _read_ip_notes_file(path: Path) -> dict:
+    try:
+        df = pd.read_csv(path, low_memory=False)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Could not read {path.name}: {exc}")
+        return {}
+
+    notes: dict = {}
+    for _, row in df.iterrows():
+        sku = str(row.get("SKU") or "").strip()
+        text = _clean_note_text(row.get("Note"))
+        if not sku or not text:
+            continue
+        notes.setdefault(sku, []).append({
+            "text": text,
+            "warehouse_id": _clean_note_text(row.get("WarehouseID")),
+            "tags": _clean_note_text(row.get("Tags")),
+        })
+    return notes
+
+
 def _load_ip_notes() -> dict:
     """Read the latest output/ip_notes_*.csv into {SKU: [note dicts]}.
 
     Each note dict has: text, warehouse_id, tags. Multiple notes per SKU
     are preserved (a variant can have a note per warehouse).
     """
-    p = _latest_file("ip_notes")
-    if p is None:
-        return {}
-    try:
-        df = pd.read_csv(p, low_memory=False)
-    except Exception as exc:  # noqa: BLE001
-        st.warning(f"Could not read {p.name}: {exc}")
-        return {}
-
-    notes: dict = {}
-    for _, row in df.iterrows():
-        sku = str(row.get("SKU") or "").strip()
-        text = str(row.get("Note") or "").strip()
-        if not sku or not text:
-            continue
-        notes.setdefault(sku, []).append({
-            "text": text,
-            "warehouse_id": str(row.get("WarehouseID") or ""),
-            "tags": str(row.get("Tags") or ""),
-        })
-    return notes
+    for p in _ip_notes_candidate_files():
+        notes = _read_ip_notes_file(p)
+        if notes:
+            return notes
+    return {}
 
 
 IP_NOTES = _load_ip_notes()
+IP_NOTES_BY_SKU_KEY = {
+    _sku_note_key(sku): entries
+    for sku, entries in IP_NOTES.items()
+}
+
+
+def _ip_notes_for_sku(sku: str) -> list[dict]:
+    return (
+        IP_NOTES.get(str(sku or "").strip(), [])
+        or IP_NOTES_BY_SKU_KEY.get(_sku_note_key(sku), [])
+    )
 
 
 def _load_cin7_alternatives() -> dict:
@@ -4392,7 +4425,7 @@ def render_demand_breakdown(
     # REPLACEMENT" on LED-XRD-60W-24, we surface LED-E60L24DC-KO as a
     # candidate alternative. The parser is heuristic; matches are shown
     # as suggestions, not as authoritative substitutes.
-    _sku_notes = IP_NOTES.get(str(sku), [])
+    _sku_notes = _ip_notes_for_sku(str(sku))
     if _sku_notes:
         st.markdown("#### :memo: Team notes from Inventory Planner")
         for _n in _sku_notes:
@@ -15692,15 +15725,15 @@ elif page == "Ordering":
 
     def _ip_note_text_for_sku(sku_s: str) -> str:
         bits = []
-        for note_info in IP_NOTES.get(str(sku_s), []):
-            txt = str((note_info or {}).get("text") or "").strip()
+        for note_info in _ip_notes_for_sku(str(sku_s)):
+            txt = _clean_note_text((note_info or {}).get("text"))
             if txt and txt not in bits:
                 bits.append(txt)
         return " | ".join(bits)
 
     def _build_note(sku_s: str) -> str:
         manual = (
-            latest_notes_map.get(sku_s, "")
+            _clean_note_text(latest_notes_map.get(sku_s, ""))
             or _ip_note_text_for_sku(sku_s)
             or ""
         )
@@ -17483,8 +17516,8 @@ elif page == "Ordering":
             view["Note"] = view.apply(
                 lambda r: (
                     _build_note(str(r.get("SKU") or ""))
-                    if not str(r.get("Note") or "").strip()
-                    else str(r.get("Note") or "")
+                    if not _clean_note_text(r.get("Note"))
+                    else _clean_note_text(r.get("Note"))
                 ),
                 axis=1,
             )

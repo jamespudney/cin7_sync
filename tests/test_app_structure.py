@@ -276,6 +276,7 @@ class AppMemoryStructureTests(unittest.TestCase):
 
     def test_inventory_planner_notes_sync_writes_to_shared_output(self) -> None:
         root = Path(__file__).resolve().parents[1]
+        script = (root / "app.py").read_text(encoding="utf-8")
         notes_sync = (root / "ip_sync_notes.py").read_text(encoding="utf-8")
         ip_pull = (root / "ip_pull_alternates.py").read_text(encoding="utf-8")
         daily = (root / "daily_sync.sh").read_text(encoding="utf-8")
@@ -307,6 +308,12 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("python ip_sync_notes.py", daily)
         self.assertIn("python ip_sync_notes.py", catalog)
         self.assertIn("LED-SMOKIES38-B-3", docs)
+        self.assertIn("def _ip_notes_candidate_files", script)
+        self.assertIn("def _read_ip_notes_file", script)
+        self.assertIn("if notes:\n            return notes", script)
+        self.assertIn("IP_NOTES_BY_SKU_KEY", script)
+        self.assertIn("_ip_notes_for_sku", script)
+        self.assertIn("_clean_note_text", script)
 
     def test_overview_surfaces_inventory_cost_vs_retail_value(self) -> None:
         script = (
