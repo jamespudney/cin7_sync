@@ -816,14 +816,17 @@ that to a 10-unit MOQ automatically; the buyer can manually override
 when a live project really needs more.
 
 #### LED strip family rollup
-LED strip cut variants roll up to the bulk-roll master by shared SKU
-base. Known strip prefixes, including `LED-TSB`, are recognised by
-SKU, so `LED-TSB2835-300-24-6000-0305` contributes demand to
-`LED-TSB2835-300-24-6000-100M` without depending on the product name
-containing the word "strip". If the engine still suggests zero after
-the rollup, check concentration/project logic: one-customer demand may
-be shown for manual review rather than converted into an automatic
-buy.
+LED strip cut variants roll up to the active buying-roll master by
+shared SKU base. Known strip prefixes, including `LED-TSB`, are
+recognised by SKU, so `LED-TSB2835-300-24-6000-0305` contributes demand
+to `LED-TSB2835-300-24-6000-100M` without depending on the product name
+containing the word "strip". If a larger historical family member is
+discontinued/inactive, the app plans onto the largest active buying roll
+instead. Direct PO history alone does not create an alternate master;
+CIN7 BOM/sourcing structure is the source of truth. If the engine still
+suggests zero after the rollup, check concentration/project logic:
+one-customer demand may be shown for manual review rather than converted
+into an automatic buy.
 
 The Ordering Inspect panel includes a **Strip family movement audit**
 for these rows. It reads the synced CIN7 `sale_lines`, excludes credited
@@ -920,6 +923,16 @@ purpose.
 - **Gross Marketplace Revenue** = Section 6 "Gross Sales (est.)"
   (Net Sales + Discounts). For marketing / conversion / discount
   rate tracking.
+
+**Excluded customer sales.** Altar'd State sales are intentionally
+removed from Wired4Signs operational analytics because they belong to
+the separated manufacturing business, not Shopify / LED channel demand.
+This exclusion is applied to CIN7 sale headers and sale lines before
+ABC/reorder demand, dashboards, Monthly Metrics, customer metrics,
+slow-stock cleared revenue, and AI sales tools aggregate anything.
+Treat apostrophe variants (`Altar’d State`, `Altar'd State`, `ALTARD
+STATE`) as the same excluded customer. Do not describe these rows as
+missing or stale; they are deliberately out of scope.
 
 **Discounts.** Sourced from `shopify_monthly_discounts` table
 (populated by `python shopify_discounts.py sync` daily). The

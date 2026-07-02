@@ -55,6 +55,7 @@ def _load_data():
         sys.path.insert(0, str(_here))
     from data_paths import OUTPUT_DIR
     import db
+    from sales_exclusions import filter_excluded_sales_customers
 
     def _latest(pattern: str) -> Path | None:
         matches = sorted(
@@ -75,7 +76,8 @@ def _load_data():
 
     products = pd.read_csv(products_csv, low_memory=False)
     stock = pd.read_csv(stock_csv, low_memory=False)
-    sale_lines = pd.read_csv(sale_lines_csv, low_memory=False)
+    sale_lines = filter_excluded_sales_customers(
+        pd.read_csv(sale_lines_csv, low_memory=False))
 
     warnings = db.get_dormancy_warnings()
     return {

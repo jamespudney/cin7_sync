@@ -18,13 +18,14 @@ engine signals. Inconsistent with what staff see in the dashboard.
 This module replicates the **headline engine signals** so the worker's
 listener can answer slow-mover / overstock / dormancy questions
 correctly. Faithful to the dashboard for the most common questions;
-some edge cases (bulk-master rollup, A-class grace, multi-tier
-dormancy refinement) are simplified.
+some edge cases (A-class grace, multi-tier dormancy refinement) are
+simplified.
 
 Drift sources (will fix in v2.67.70 with shared Postgres):
 - No A-class grace check (worker may flag A-class as dormant when
   dashboard wouldn't)
-- No bulk-master rollup (per-foot children counted separately)
+- Bulk/strip rollup is BOM-first with a naming fallback; still less rich
+  than the dashboard engine but no longer direct-sales-only.
 - No buyer manual corrections (those live in web service's DB)
 
 Output columns added to engine_df:
@@ -40,7 +41,8 @@ Output columns added to engine_df:
 - is_non_master_tube        bool — heuristic: SKU has per-foot suffix
 
 Public API:
-  compute_engine_signals(products, stock, sale_lines) -> pd.DataFrame
+  compute_engine_signals(products, stock, sale_lines, boms=None)
+  -> pd.DataFrame
 """
 
 from __future__ import annotations
@@ -51,6 +53,8 @@ from typing import Optional
 
 import pandas as pd
 
+from engine.sku_rules import _is_strip_sku, _parse_strip_base
+from sales_exclusions import filter_excluded_sales_customers
 from storage_dimensions import ensure_storage_dim_column
 
 log = logging.getLogger("worker_engine")
@@ -102,9 +106,20 @@ def _normalise_bin_aliases(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _is_discontinued(name: object, status: object) -> bool:
+    text = f"{name or ''} {status or ''}".lower()
+    status_s = str(status or "").strip().lower()
+    return (
+        "[discontinued]" in text
+        or "discontinued" in text
+        or status_s in {"discontinued", "inactive", "obsolete"}
+    )
+
+
 def compute_engine_signals(products: pd.DataFrame,
                               stock: pd.DataFrame,
-                              sale_lines: pd.DataFrame
+                              sale_lines: pd.DataFrame,
+                              boms: Optional[pd.DataFrame] = None
                               ) -> pd.DataFrame:
     """Compute the engine signals on the worker. Returns engine_df with
     one row per SKU and all derived columns."""
@@ -151,8 +166,6 @@ def compute_engine_signals(products: pd.DataFrame,
                           "1830", "2135", "2440", "2745", "3050")):
             return True
         return False
-    df["is_non_master_tube"] = df["SKU"].apply(_is_non_master)
-
     # 4. Compute 12mo + 90d demand from sale_lines.
     today_ts = pd.Timestamp(datetime.now().date())
     cutoff_12mo = today_ts - pd.Timedelta(days=365)
@@ -161,7 +174,7 @@ def compute_engine_signals(products: pd.DataFrame,
     eff_12mo_map: dict = {}
     eff_90d_map: dict = {}
     if sale_lines is not None and not sale_lines.empty:
-        sl = sale_lines.copy()
+        sl = filter_excluded_sales_customers(sale_lines).copy()
         if "SKU" in sl.columns and "Quantity" in sl.columns:
             sl["SKU"] = sl["SKU"].astype(str)
             sl["__qty"] = _to_num(sl["Quantity"]).fillna(0)
@@ -182,10 +195,86 @@ def compute_engine_signals(products: pd.DataFrame,
                 eff_90d_map = (sl[sl["__dt"] >= cutoff_90d]
                                 .groupby("SKU")["__qty"].sum().to_dict())
 
+    non_master_skus: set[str] = set()
+
+    # 4b. CIN7 BOM rollup. BOMs are the source of truth for assembly /
+    # cut relationships: if SKU A is built from component B, demand on A
+    # should plan B.
+    if boms is not None and not boms.empty:
+        for _, row in boms.iterrows():
+            asm = str(row.get("AssemblySKU") or "").strip()
+            comp = str(row.get("ComponentSKU") or "").strip()
+            if not asm or not comp or asm == comp:
+                continue
+            try:
+                qty_per = float(row.get("Quantity") or 0)
+            except (TypeError, ValueError):
+                qty_per = 0.0
+            if qty_per <= 0:
+                continue
+            u12 = float(eff_12mo_map.get(asm, 0))
+            u90 = float(eff_90d_map.get(asm, 0))
+            if u12 or u90:
+                eff_12mo_map[comp] = eff_12mo_map.get(comp, 0) + u12 * qty_per
+                eff_90d_map[comp] = eff_90d_map.get(comp, 0) + u90 * qty_per
+                non_master_skus.add(asm)
+
+    # 4c. Naming fallback for BOM-sparse LED strip families. Pick the
+    # largest active roll as the buying master and convert child/cut
+    # movement into master-roll equivalents.
+    bom_assemblies = set()
+    if boms is not None and not boms.empty and "AssemblySKU" in boms.columns:
+        bom_assemblies = set(boms["AssemblySKU"].dropna().astype(str))
+    strip_families: dict[str, list[tuple[str, float, str, str]]] = {}
+    for _, row in products.iterrows():
+        sku_s = str(row.get("SKU") or "").strip()
+        if not sku_s or sku_s in bom_assemblies:
+            continue
+        name = str(row.get("Name") or "")
+        if not _is_strip_sku(sku_s, name):
+            continue
+        parsed = _parse_strip_base(sku_s)
+        if not parsed:
+            continue
+        base, length_m = parsed
+        if length_m <= 0:
+            continue
+        strip_families.setdefault(base, []).append(
+            (sku_s, float(length_m), name, str(row.get("Status") or "")))
+
+    for _, members in strip_families.items():
+        if len(members) < 2:
+            continue
+        sorted_members = sorted(members, key=lambda item: -item[1])
+        active_members = [
+            m for m in sorted_members
+            if not _is_discontinued(m[2], m[3])
+        ]
+        master_sku, master_len, _, _ = (active_members or sorted_members)[0]
+        if master_len <= 0:
+            continue
+        for child_sku, child_len, _, _ in sorted_members:
+            if child_sku == master_sku:
+                continue
+            u12 = float(eff_12mo_map.get(child_sku, 0))
+            u90 = float(eff_90d_map.get(child_sku, 0))
+            if not (u12 or u90):
+                continue
+            qty_per = child_len / master_len
+            eff_12mo_map[master_sku] = (
+                eff_12mo_map.get(master_sku, 0) + u12 * qty_per)
+            eff_90d_map[master_sku] = (
+                eff_90d_map.get(master_sku, 0) + u90 * qty_per)
+            non_master_skus.add(child_sku)
+
+    df["is_non_master_tube"] = df["SKU"].apply(
+        lambda s: _is_non_master(s) or s in non_master_skus)
     df["effective_units_12mo"] = df["SKU"].map(
-        lambda s: float(eff_12mo_map.get(s, 0)))
+        lambda s: 0.0 if s in non_master_skus
+        else float(eff_12mo_map.get(s, 0)))
     df["effective_units_90d"] = df["SKU"].map(
-        lambda s: float(eff_90d_map.get(s, 0)))
+        lambda s: 0.0 if s in non_master_skus
+        else float(eff_90d_map.get(s, 0)))
 
     # 5. ABC classification — pragmatic 3-tier:
     # A = top 20% by annual_value AMONG SKUs with any 12mo sales

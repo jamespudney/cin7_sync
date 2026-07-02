@@ -46,11 +46,11 @@ Anything else is a child / phantom / cut / assembly.
 - **Method C — SKU substitution.** Fallback when sourcing rule names a master SKU.
 - **Method D — Family-prefix sibling.** If all else fails, find a master SKU sharing the same family prefix (e.g. `LED-01.018-*`) and use it.
 
-**2.5 LED strip rollup — convert metres to master units.** Strip cuts sold in metres must be converted: `consumption_master_rolls = consumption_metres / bulk_roll_length`. Not `×100`. The earlier bug inflated target stock by 100×.
+**2.5 LED strip rollup — convert metres to active buying-roll units.** Strip cuts sold in metres must be converted: `consumption_master_rolls = consumption_metres / active_buying_roll_length`. Not `×100`. The earlier bug inflated target stock by 100×. If a larger historical family member is discontinued, retired, or inactive, it must not steal demand from the current active buying roll; e.g. a discontinued 50m roll should not stop a live 25m roll from receiving 5m/per-foot family demand.
 
 **2.6 Multi-component kit rollup.** Kit sales (LEDKIT-*, LEDFIX-*) distribute demand to EVERY component in the BOM proportionally — not just the first component. Each component separately gets `kit_sales × its_BOM_quantity`.
 
-**2.7 Intermediate rolls that get direct purchase history become alternate masters.** Don't roll them up; treat them as their own masters with their own reorder logic.
+**2.7 PO history is not a master rule.** Direct purchase history alone does not make an intermediate strip roll an alternate master. CIN7 BOM/sourcing structure is the source of truth. PO history can contain historical, emergency, or discontinued buys, so letting it block rollup can make best sellers look dormant in reorder math or Slack PO commentary. Demand drill-ins, 45d/90d columns, customer counts, Trend/Status, reorder math, slow stock, and bot answers must use the same child-to-active-master rollup.
 
 **2.8 Exact purchase-pack SKU rollup.** A final `-X<number>` suffix means
 the SKU is a supplier buying pack only when the unsuffixed base SKU also
@@ -77,6 +77,17 @@ pack candidate. Example: `SNFX-L-CR-SCKT` sales/FG consumption feed
 **3.1.1 When to filter by InvoiceDate, not UpdatedSince.** CIN7's `saleList` API uses the `UpdatedSince` parameter — so the file we sync contains every sale UPDATED (status change, payment, etc.) in the window, not sales CREATED. Any metric that says "last 30 days" / "this month" / "this year" MUST filter client-side on `InvoiceDate` (or `OrderDate`) after loading. Sites that must do this: Overview "Sales invoiced", Overview "Today / MTD / YoY" tiles, FixedCost Audit window, Monthly Metrics (already done). Failure mode: overstated sales (e.g. $870k instead of $489k in a real test against CIN7's own dashboard).
 
 **3.1.2 Matching CIN7's "Revenue" on the Overview dashboard.** CIN7's dashboard Revenue is **pre-tax**. Our `sales_headers.InvoiceAmount` includes tax + shipping. To match exactly, subtract the sum of `sale_lines.Tax` for SaleIDs in the same window. We show both numbers in the Overview metric (main figure = invoiced incl. tax; `pre-tax ≈` sub-number = CIN7 Revenue equivalent).
+
+**3.1.3 Excluded sales customers.** Sales for **Altar'd State** are
+excluded from Wired4Signs analytics because they belong to the separated
+manufacturing side of the business, not Shopify / LED channel demand.
+This exclusion applies before aggregation to both sale headers and sale
+lines, including ABC/reorder demand, sales dashboards, monthly metrics,
+customer metrics, slow-stock cleared revenue, AI sales tools, and Slack
+bot sales/demand answers. The source CIN7 CSVs remain untouched; the app
+and reporting loaders filter these rows at read time. Match apostrophe
+variants (`Altar’d State`, `Altar'd State`, `ALTARD STATE`) as the same
+excluded customer.
 
 **3.2 Unfulfilled sales reduce effective position.** Count `BACKORDERED + ORDERED + ORDERING` as unfulfilled units. Subtract from `OnHand + OnOrder − Allocated` before comparing against target to get the real reorder need.
 

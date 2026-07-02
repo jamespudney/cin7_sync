@@ -12,6 +12,7 @@ from typing import Any
 import pandas as pd
 
 from engine.sku_rules import _is_strip_sku, _parse_strip_base
+from sales_exclusions import filter_excluded_sales_customers
 
 
 EXCLUDED_SALE_STATUSES = {"CREDITED", "VOIDED", "CANCELLED", "CANCELED"}
@@ -40,7 +41,9 @@ def _empty_audit(reason: str) -> dict[str, Any]:
 
 def _clean_sale_lines(sale_lines_df: pd.DataFrame | None) -> pd.DataFrame:
     """Return sale lines with safe date/quantity columns and status filter."""
-    sl = sale_lines_df.copy() if sale_lines_df is not None else pd.DataFrame()
+    sl = filter_excluded_sales_customers(
+        sale_lines_df) if sale_lines_df is not None else pd.DataFrame()
+    sl = sl.copy()
     if sl.empty:
         sl = pd.DataFrame()
     for col in ("SKU", "InvoiceDate", "OrderDate", "Quantity", "Status"):
@@ -261,6 +264,7 @@ def build_strip_movement_audit(sku: str,
         return _empty_audit("SKU length could not be parsed.")
 
     product_names: dict[str, str] = {}
+    product_statuses: dict[str, str] = {}
     family: dict[str, float] = {sku_s: float(selected_len)}
 
     if products_df is not None and not products_df.empty and "SKU" in products_df.columns:
@@ -269,7 +273,9 @@ def build_strip_movement_audit(sku: str,
             if not row_sku:
                 continue
             name = str(row.get("Name") or "")
+            status = str(row.get("Status") or "")
             product_names[row_sku] = name
+            product_statuses[row_sku] = status
             if not _is_strip_sku(row_sku, name):
                 continue
             row_parse = _parse_strip_base(row_sku)
@@ -288,10 +294,29 @@ def build_strip_movement_audit(sku: str,
     if not family:
         return _empty_audit("No matching strip family SKUs found.")
 
-    master_len = max(family.values()) if family else selected_len
-    # For 50m/100m masters, display in master-roll equivalents. If a
-    # smaller cut SKU is inspected directly, still normalise to the
-    # largest family roll so the audit answers "what should we buy?"
+    def _is_discontinued(row_sku: str) -> bool:
+        text = (
+            f"{product_names.get(row_sku, '')} "
+            f"{product_statuses.get(row_sku, '')}"
+        ).lower()
+        status_s = product_statuses.get(row_sku, "").strip().lower()
+        return (
+            "[discontinued]" in text
+            or "discontinued" in text
+            or status_s in {"discontinued", "inactive", "obsolete"}
+        )
+
+    active_lengths = [
+        length for row_sku, length in family.items()
+        if not _is_discontinued(row_sku)
+    ]
+    master_len = (
+        max(active_lengths)
+        if active_lengths else max(family.values()) if family else selected_len
+    )
+    # Display in the active buying roll's equivalents. If a larger
+    # historical family member is discontinued, do not normalise demand
+    # onto that retired size.
     normalise_len = master_len if master_len >= selected_len else selected_len
 
     sl = _clean_sale_lines(sale_lines_df)
@@ -326,7 +351,10 @@ def build_strip_movement_audit(sku: str,
             "SKU": row_sku,
             "Role": (
                 "selected" if row_sku == sku_s
-                else "family master" if length_m == master_len
+                else "family master" if length_m == normalise_len
+                and not _is_discontinued(row_sku)
+                else "retired family master" if length_m > normalise_len
+                and _is_discontinued(row_sku)
                 else "child/cut"
             ),
             "Name": product_names.get(row_sku, "")[:80],

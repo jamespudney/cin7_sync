@@ -32,6 +32,8 @@ from typing import List, Optional, Tuple
 import duckdb  # type: ignore
 import pandas as pd
 
+from sales_exclusions import filter_excluded_sales_customers
+
 APP_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = APP_DIR / "output"
 WAREHOUSE_PATH = APP_DIR / "warehouse.duckdb"
@@ -152,6 +154,12 @@ def load_all() -> None:
                 log.warning("  SKIP %s — no data", table)
                 summary.append((table, "SKIP", 0))
                 continue
+            if table in {"sales", "sale_lines"}:
+                before_excl = len(df)
+                df = filter_excluded_sales_customers(df)
+                if len(df) < before_excl:
+                    log.info("  sales exclusions: %d -> %d rows",
+                             before_excl, len(df))
             df = _dedupe(df, dedupe_cols)
             # Register with DuckDB and materialise as a real table
             con.register("tmp_df", df)

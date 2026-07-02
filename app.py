@@ -71,6 +71,7 @@ from engine.sku_movement_audit import (
     calendar_month_periods,
     NON_MOVEMENT_COMPONENT_SALE_STATUSES,
 )
+from sales_exclusions import filter_excluded_sales_customers
 from storage_dimensions import (
     ensure_storage_dim_column,
     storage_dim_source_columns,
@@ -2840,6 +2841,7 @@ stock = load("stock_on_hand")
 customers_file = _latest_file("customers")
 suppliers = load("suppliers")
 sales_headers = load("sales_last_30d")
+sales_headers = filter_excluded_sales_customers(sales_headers)
 purchase_headers = load("purchases_last_30d")
 # v2.67.51 — `purchase_lines` reassigned below, AFTER the longest-window
 # loader is defined. We previously did `load("purchase_lines_last_90d")`
@@ -3351,6 +3353,7 @@ def _load_longest_sale_lines_cached(fingerprint: tuple) -> pd.DataFrame:
         base = base.sort_values(
             "InvoiceDate", na_position="first", kind="stable")
         base = base.drop_duplicates(subset=second_key, keep="last")
+    base = filter_excluded_sales_customers(base)
     base = _ensure_columns(base, _EMPTY_SALE_LINES_COLS)
     return base.reset_index(drop=True)
 
@@ -3457,6 +3460,7 @@ def _load_longest_sales_cached(fingerprint: tuple) -> pd.DataFrame:
         base = pd.concat([base, more], ignore_index=True)
     if "SaleID" in base.columns:
         base = base.drop_duplicates(subset=["SaleID"], keep="last")
+    base = filter_excluded_sales_customers(base)
     base = _ensure_columns(base, _EMPTY_SALES_COLS)
     return base.reset_index(drop=True)
 
@@ -6536,24 +6540,31 @@ def _abc_engine(products: pd.DataFrame,
             f"{child_sku}: {own_units:.0f} units ÷ {pack_size:g}/pack "
             f"= {consumption:.2f} packs")
 
-    # 5da. LED-STRIP rollup (pattern-based; BOMs rarely populated).
+    # 5da. LED-STRIP rollup (pattern-based fallback; BOMs remain
+    # authoritative when present).
     # For each strip family base (e.g. LEDIRIS6000-180), find the
-    # largest-length variant and treat it as the bulk master. Roll up
-    # cut/roll sales by (their length in metres × units sold).
-    # Intermediate rolls with direct purchase history stay as
-    # alternate masters (don't roll them up).
+    # largest ACTIVE/orderable variant and treat it as the buying master.
+    # Roll up cut/roll sales by (their length in metres × units sold).
+    #
+    # Important: direct PO history alone is NOT enough to split a strip
+    # family into alternate masters. The source of truth for "this SKU is
+    # bought separately" is the CIN7 BOM / sourcing rule. PO history can
+    # include historical or exception buys; letting it block rollup made
+    # good sellers like White Lily 100m/25m look dormant in PO commentary
+    # while Product Detail correctly showed family movement.
     strip_rollup_notes: dict = {}
     strip_rollup_inflow: dict = {}
     strip_rollup_inflow_90d: dict = {}
     strip_non_master_skus: set = set()
     strip_master_skus: set = set()
+    strip_rollup_rules: list[tuple[str, str, float]] = []
     # Track each strip master's roll length in metres — used to flag
     # bulk masters (≥50m) where the engine can suggest fractional
     # reorder qtys. e.g. 0.40 of a 100m roll instead of rounding up
     # to a full 100m roll when only 40m is needed.
     bulk_master_lengths: dict = {}
 
-    # Build base-family index: {base: [(sku, length_m, name, purchased_bool)]}
+    # Build base-family index: {base: [(sku, length_m, name, status)]}
     strip_family_index: dict = {}
     for _, p in products.iterrows():
         sku_s = str(p.get("SKU"))
@@ -6574,38 +6585,43 @@ def _abc_engine(products: pd.DataFrame,
         if not parse:
             continue
         base, length_m = parse
-        # Was this SKU directly purchased in our PO history?
-        purchased = sku_s in sup_by_sku_local
         strip_family_index.setdefault(base, []).append(
-            (sku_s, length_m, p.get("Name", ""), purchased))
+            (sku_s, length_m, p.get("Name", ""), p.get("Status", "")))
+
+    def _strip_member_discontinued(name: object, status: object) -> bool:
+        text = f"{name or ''} {status or ''}".lower()
+        status_s = str(status or "").strip().lower()
+        return (
+            "[discontinued]" in text
+            or "discontinued" in text
+            or status_s in {"discontinued", "inactive", "obsolete"}
+        )
 
     # For each family, pick bulk master + decide rollup targets
     for base, members in strip_family_index.items():
         if len(members) < 2:
             continue  # nothing to roll up
-        # Largest-length variant = primary bulk master
+        # Largest active variant = primary buying master. If the
+        # largest historical family member is discontinued (common when
+        # moving from 50m to 25m rolls), do not plan demand onto it.
         sorted_members = sorted(members, key=lambda x: -x[1])
-        bulk_sku, bulk_len, bulk_name, bulk_purchased = sorted_members[0]
+        active_members = [
+            m for m in sorted_members
+            if not _strip_member_discontinued(m[2], m[3])
+        ]
+        master_pool = active_members or sorted_members
+        bulk_sku, bulk_len, bulk_name, bulk_status = master_pool[0]
         strip_master_skus.add(bulk_sku)
         bulk_master_lengths[bulk_sku] = float(bulk_len or 0)
         if bulk_len <= 0:
             continue
-        # Additional masters: any intermediate with direct PO history
-        alternate_masters = set()
-        for sku_m, length_m, _, purchased in sorted_members[1:]:
-            if purchased and length_m >= 1.0:
-                alternate_masters.add(sku_m)
-                strip_master_skus.add(sku_m)
-                bulk_master_lengths[sku_m] = float(length_m or 0)
 
         # Roll up each non-master's sales. CRITICAL: convert consumption
         # from METRES to the master's UNIT count. 1 × 100m roll = 1 unit
         # in CIN7, NOT 100 units. If we keep it in metres we inflate
         # target stock by 100×.
-        for sku_m, length_m, nm, purchased in sorted_members:
+        for sku_m, length_m, nm, status_m in sorted_members:
             if sku_m == bulk_sku:
-                continue
-            if sku_m in alternate_masters:
                 continue
             own_units = float(vel.loc[vel["SKU"] == sku_m,
                                        "units_12mo"].sum())
@@ -6626,6 +6642,9 @@ def _abc_engine(products: pd.DataFrame,
             # Convert metres → master rolls
             consumption_in_master_units = consumption_m / bulk_len
             consumption_in_master_units_90d = consumption_m_90d / bulk_len
+            strip_rollup_rules.append(
+                (sku_m, bulk_sku, float(length_m) / float(bulk_len))
+            )
             strip_rollup_inflow[bulk_sku] = (
                 strip_rollup_inflow.get(bulk_sku, 0)
                 + consumption_in_master_units
@@ -6931,6 +6950,18 @@ def _abc_engine(products: pd.DataFrame,
                     monthly_24[master_sku][i] += (
                         monthly_24[ch_sku][i] * ratio)
 
+    # Strip-family fallback rollup — same child→buying-master rules as
+    # the effective-demand pass above. This keeps "Last 6 months",
+    # sparklines, and current-month checks aligned with reorder math for
+    # BOM-sparse strip families.
+    for child_sku, master_sku, qty_per in strip_rollup_rules:
+        if child_sku in monthly_12:
+            for i in range(12):
+                monthly_12[master_sku][i] += monthly_12[child_sku][i] * qty_per
+        if child_sku in monthly_24:
+            for i in range(24):
+                monthly_24[master_sku][i] += monthly_24[child_sku][i] * qty_per
+
     # Purchase-pack monthly rollup: child individual-unit demand becomes
     # master pack-equivalent demand for buyer-visible history.
     for child_sku, master_sku, qty_per, _pack_size in pack_rollup_rules:
@@ -6995,6 +7026,19 @@ def _abc_engine(products: pd.DataFrame,
                 uprior_dict[master_sku] = uprior_dict.get(master_sku, 0) + uprior_dict[ch_sku] * ratio
             if ch_sku in u90_dict:
                 u90_dict[master_sku] = u90_dict.get(master_sku, 0) + u90_dict[ch_sku] * ratio
+
+    # Strip-family fallback short-window rollup.
+    for child_sku, master_sku, qty_per in strip_rollup_rules:
+        if child_sku in u45_dict:
+            u45_dict[master_sku] = (
+                u45_dict.get(master_sku, 0) + u45_dict[child_sku] * qty_per)
+        if child_sku in uprior_dict:
+            uprior_dict[master_sku] = (
+                uprior_dict.get(master_sku, 0)
+                + uprior_dict[child_sku] * qty_per)
+        if child_sku in u90_dict:
+            u90_dict[master_sku] = (
+                u90_dict.get(master_sku, 0) + u90_dict[child_sku] * qty_per)
 
     # Purchase-pack short-window rollup.
     for child_sku, master_sku, qty_per, _pack_size in pack_rollup_rules:
@@ -7092,6 +7136,19 @@ def _abc_engine(products: pd.DataFrame,
                 _dest_names = _cust_names.setdefault(_master, {})
                 for _cid, _nm in _cust_names[_ch_sku].items():
                     _dest_names.setdefault(_cid, _nm)
+
+    # Strip-family fallback customer rollup. Customer counts stay
+    # distinct, while quantities convert to master-roll equivalents.
+    for _child_sku, _master_sku, _qty_per in strip_rollup_rules:
+        for _src_map in (_cust_qty_45d, _cust_qty_12mo):
+            if _child_sku in _src_map:
+                _dest = _src_map.setdefault(_master_sku, {})
+                for _cid, _q in _src_map[_child_sku].items():
+                    _dest[_cid] = _dest.get(_cid, 0) + _q * _qty_per
+        if _child_sku in _cust_names:
+            _dest_names = _cust_names.setdefault(_master_sku, {})
+            for _cid, _nm in _cust_names[_child_sku].items():
+                _dest_names.setdefault(_cid, _nm)
 
     # Purchase-pack customer rollup. Customer counts remain distinct buyer
     # counts, while volumes are converted to pack equivalents.

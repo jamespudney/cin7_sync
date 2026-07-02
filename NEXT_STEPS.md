@@ -155,6 +155,13 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ### 2026-07-02
 
+- **Altar'd State sales exclusion** — sales headers and sale-lines for
+  Altar'd State are now filtered out at reporting/load time because
+  that customer belongs to the separated manufacturing business, not
+  Wired4Signs LED/channel demand. This applies to dashboard sales,
+  ABC/reorder demand, Monthly Metrics, customer metrics, slow-stock
+  cleared sales, AI tools, Slack bot demand answers, SKU movement
+  audits, and warehouse loads while leaving the raw CIN7 CSVs intact.
 - **Exact purchase-pack demand rollup** — the ABC engine now recognises
   strict final `-X<number>` supplier pack SKUs when the exact base SKU
   exists and the mapping is unambiguous. Base SKU direct sales plus
@@ -163,6 +170,14 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   `SNFX-L-CR-SCKT-X100` as `units ÷ 100`. This affects visible monthly
   demand, 45d/90d demand, customer counts, reorder/status/slow-stock
   math, and the live CIN7 demand audit output.
+- **Active strip buying-roll rollup** — LED strip family demand now
+  rolls onto the largest active buying roll instead of being blocked by
+  historical direct PO purchases. Discontinued/inactive larger rolls no
+  longer steal demand from current bought sizes, so SKUs such as
+  `LED-WLWW-30K-IP67-25` and `LED-WLWW-30K-16-IP20-100` can inherit
+  child/cut family movement consistently in visible demand columns,
+  reorder math, slow/excess stock, and Slack PO commentary. CIN7
+  BOM/sourcing remains the source of truth when present.
 
 ### 2026-07-01
 

@@ -1409,6 +1409,7 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         import pandas as pd
         import glob as _glob
         from data_paths import OUTPUT_DIR
+        from sales_exclusions import filter_excluded_sales_customers
         # Just enough to power the AI tools. Real engine_df is
         # built by Streamlit; here we use a slim version (products +
         # stock + sales) which the AI's get_sku_details +
@@ -1425,6 +1426,7 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         sale_lines = (
             pd.read_csv(sl_path, low_memory=False)
             if sl_path else pd.DataFrame())
+        sale_lines = filter_excluded_sales_customers(sale_lines)
         if sl_path:
             log.info("Listener loaded sale lines from %s", Path(sl_path).name)
         asm_files = _glob.glob(str(OUTPUT_DIR / "assemblies_last_*d_*.csv"))
@@ -1435,6 +1437,32 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         if asm_path:
             log.info("Listener loaded assemblies from %s",
                      Path(asm_path).name)
+
+        boms_files = sorted(_glob.glob(str(OUTPUT_DIR / "boms_*.csv")))
+        boms_path = boms_files[-1] if boms_files else None
+        boms = (
+            pd.read_csv(boms_path, low_memory=False)
+            if boms_path else pd.DataFrame())
+        if boms_path:
+            log.info("Listener loaded BOMs from %s", Path(boms_path).name)
+
+        # Prefer the dashboard's canonical warmed engine snapshot when
+        # available. It carries the full reorder/BOM/strip-family logic,
+        # so PO commentary stays aligned with the app. If the worker's
+        # disk does not have it, fall back to the local worker engine.
+        engine_files = sorted(_glob.glob(str(OUTPUT_DIR / "engine_output.csv")))
+        engine_path = engine_files[-1] if engine_files else None
+        if engine_path:
+            try:
+                engine_df = pd.read_csv(engine_path, low_memory=False)
+                ensure_storage_dim_column(engine_df)
+                log.info("Listener loaded canonical engine from %s",
+                         Path(engine_path).name)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not load engine_output.csv: %s", exc)
+                engine_df = pd.DataFrame()
+        else:
+            engine_df = pd.DataFrame()
 
         # v2.67.69 — full engine intelligence on the worker.
         # Earlier versions merged products+stock for a slim engine_df
@@ -1447,10 +1475,11 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         # service's _abc_engine; v2.67.70 (Postgres migration) will
         # eliminate any remaining drift.
         try:
-            import worker_engine
-            engine_df = worker_engine.compute_engine_signals(
-                products, stock, sale_lines)
-            ensure_storage_dim_column(engine_df)
+            if engine_df is None or engine_df.empty:
+                import worker_engine
+                engine_df = worker_engine.compute_engine_signals(
+                    products, stock, sale_lines, boms=boms)
+                ensure_storage_dim_column(engine_df)
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "worker_engine.compute_engine_signals failed: "

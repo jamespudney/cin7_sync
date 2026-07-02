@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from cin7_sync import Cin7Client, OUTPUT_DIR, _extract_sale_lines
 from engine.sku_rules import parse_pack_purchase_sku
 from engine.sku_movement_audit import NON_MOVEMENT_COMPONENT_SALE_STATUSES
+from sales_exclusions import filter_excluded_sales_customers
 
 
 BAD_SALE_STATUSES = {"CREDITED", "VOIDED", "CANCELLED", "CANCELED"}
@@ -187,6 +188,8 @@ def local_direct_sales(
     suppress_nonmovement_component_lines: bool = False,
 ) -> Tuple[float, List[Dict[str, Any]], str]:
     source_rows, source = _read_app_window_csv("sale_lines")
+    source_rows = filter_excluded_sales_customers(
+        pd.DataFrame(source_rows)).to_dict(orient="records")
     rows = []
     total = 0.0
     for row in source_rows:
@@ -246,6 +249,8 @@ def local_bom_rollup_estimate(
 ) -> Tuple[float, List[Dict[str, Any]], Optional[Path], str]:
     bom_path = _latest(["boms"])
     sale_lines, sl_source = _read_app_window_csv("sale_lines")
+    sale_lines = filter_excluded_sales_customers(
+        pd.DataFrame(sale_lines)).to_dict(orient="records")
     boms = _read_csv(bom_path)
     children = []
     ratios: Dict[str, float] = {}

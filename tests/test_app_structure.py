@@ -50,7 +50,129 @@ from engine.reorder_math import (
     fractional_bulk_order_allowed,
     normalise_planning_quantity,
 )
+from sales_exclusions import (
+    excluded_sales_customer_mask,
+    filter_excluded_sales_customers,
+)
 from storage_dimensions import extract_storage_dim
+
+
+class SalesExclusionTests(unittest.TestCase):
+    def test_altard_state_customer_is_excluded_across_apostrophes(self) -> None:
+        sales = pd.DataFrame([
+            {"Customer": "Altar’d State", "Total": 100, "Quantity": 2},
+            {"Customer": "Altar'd State", "Total": 50, "Quantity": 1},
+            {"Customer": "ALTARD STATE", "Total": 25, "Quantity": 1},
+            {"Customer": "Regular LED Customer", "Total": 200, "Quantity": 4},
+        ])
+
+        mask = excluded_sales_customer_mask(sales)
+        self.assertEqual(mask.tolist(), [True, True, True, False])
+
+        filtered = filter_excluded_sales_customers(sales)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered.iloc[0]["Customer"], "Regular LED Customer")
+
+    def test_sales_audit_uses_excluded_customer_filter(self) -> None:
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": "LED-TEST",
+                "InvoiceDate": "2026-06-01",
+                "OrderDate": "2026-06-01",
+                "Quantity": 10,
+                "Customer": "Altar’d State",
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LED-TEST",
+                "InvoiceDate": "2026-06-02",
+                "OrderDate": "2026-06-02",
+                "Quantity": 3,
+                "Customer": "Regular LED Customer",
+                "Status": "AUTHORISED",
+            },
+        ])
+
+        audit = build_sku_sales_audit(
+            "LED-TEST",
+            sale_lines,
+            today=pd.Timestamp("2026-06-18"),
+            months=1,
+        )
+
+        self.assertTrue(audit["ok"])
+        self.assertEqual(
+            audit["summary"]["current_invoice_qty"],
+            3.0,
+        )
+
+
+class DemandRollupTests(unittest.TestCase):
+    def test_strip_audit_uses_active_buying_roll_not_discontinued_larger_roll(
+            self) -> None:
+        products = pd.DataFrame([
+            {
+                "SKU": "LED-WLWW-30K-IP67-50",
+                "Name": "[Discontinued] White Lily LED Strip 3000K 50m",
+                "Status": "Discontinued",
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-25",
+                "Name": "White Lily LED Strip 3000K 25m",
+                "Status": "Active",
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-5",
+                "Name": "White Lily LED Strip 3000K 5m",
+                "Status": "Active",
+            },
+        ])
+        sale_lines = pd.DataFrame([
+            {
+                "SKU": "LED-WLWW-30K-IP67-25",
+                "InvoiceDate": "2026-07-01",
+                "Quantity": 1,
+                "Customer": "Customer A",
+                "Status": "AUTHORISED",
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-5",
+                "InvoiceDate": "2026-07-01",
+                "Quantity": 5,
+                "Customer": "Customer B",
+                "Status": "AUTHORISED",
+            },
+        ])
+
+        audit = build_strip_movement_audit(
+            "LED-WLWW-30K-IP67-25",
+            products,
+            sale_lines,
+            today=pd.Timestamp("2026-07-02"),
+        )
+
+        self.assertTrue(audit["ok"])
+        self.assertEqual(audit["master_length_m"], 25.0)
+        self.assertEqual(
+            audit["summary"]["direct_master_rolls_12mo"],
+            1.0,
+        )
+        self.assertEqual(
+            audit["summary"]["child_master_rolls_12mo"],
+            1.0,
+        )
+        self.assertEqual(
+            audit["summary"]["total_master_rolls_12mo"],
+            2.0,
+        )
+        roles = dict(zip(
+            audit["family_rows"]["SKU"],
+            audit["family_rows"]["Role"],
+        ))
+        self.assertEqual(
+            roles["LED-WLWW-30K-IP67-50"],
+            "retired family master",
+        )
 
 
 class PageConfigTests(unittest.TestCase):
@@ -185,6 +307,27 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn(
             'orderable_df[orderable_df["Supplier"] == sel_sup]',
             app_script,
+        )
+
+    def test_strip_family_rollup_feeds_visible_demand_windows(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("strip_rollup_rules: list[tuple[str, str, float]]",
+                      script)
+        self.assertIn("direct PO history alone is NOT enough", script)
+        self.assertIn("_strip_member_discontinued", script)
+        self.assertNotIn("alternate_masters", script)
+        self.assertGreaterEqual(
+            script.count(
+                "for child_sku, master_sku, qty_per in strip_rollup_rules"
+            ),
+            2,
+        )
+        self.assertIn(
+            "for _child_sku, _master_sku, _qty_per in strip_rollup_rules",
+            script,
         )
 
     def test_ordering_editor_has_focus_scroll_enhancer(self) -> None:
@@ -2251,6 +2394,56 @@ class IncomingStockTests(unittest.TestCase):
             products, stock, pd.DataFrame())
 
         self.assertEqual(result.iloc[0].get("Bin", ""), "")
+
+    def test_worker_engine_rolls_strip_child_demand_to_active_master(self) -> None:
+        products = pd.DataFrame([
+            {
+                "SKU": "LED-WLWW-30K-IP67-50",
+                "Name": "[Discontinued] White Lily LED Strip 3000K 50m",
+                "Status": "Discontinued",
+                "AverageCost": 10.0,
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-25",
+                "Name": "White Lily LED Strip 3000K 25m",
+                "Status": "Active",
+                "AverageCost": 10.0,
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-5",
+                "Name": "White Lily LED Strip 3000K 5m",
+                "Status": "Active",
+                "AverageCost": 10.0,
+            },
+        ])
+        stock = pd.DataFrame([
+            {"SKU": "LED-WLWW-30K-IP67-25", "OnHand": 0},
+            {"SKU": "LED-WLWW-30K-IP67-5", "OnHand": 0},
+        ])
+        sale_lines = pd.DataFrame([{
+            "SKU": "LED-WLWW-30K-IP67-5",
+            "InvoiceDate": "2026-07-01",
+            "Quantity": 5,
+            "Customer": "Regular LED Customer",
+        }])
+
+        result = worker_engine.compute_engine_signals(
+            products, stock, sale_lines)
+        by_sku = result.set_index("SKU")
+
+        self.assertEqual(
+            by_sku.loc["LED-WLWW-30K-IP67-25",
+                       "effective_units_12mo"],
+            1.0,
+        )
+        self.assertTrue(
+            bool(by_sku.loc["LED-WLWW-30K-IP67-5", "is_non_master_tube"])
+        )
+        self.assertEqual(
+            by_sku.loc["LED-WLWW-30K-IP67-5",
+                       "effective_units_12mo"],
+            0.0,
+        )
 
     def test_storage_dimension_extracts_named_cin7_field(self) -> None:
         row = {

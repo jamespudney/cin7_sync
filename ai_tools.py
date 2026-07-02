@@ -38,6 +38,7 @@ import pandas as pd
 
 import db
 from engine.sku_movement_audit import build_sku_current_month_movement
+from sales_exclusions import filter_excluded_sales_customers
 from storage_dimensions import ensure_storage_dim_column, extract_storage_dim
 
 
@@ -2474,7 +2475,7 @@ def get_velocity(engine_df: pd.DataFrame,
         return {"error": "sku is required"}
     if sale_lines_df is None or sale_lines_df.empty:
         return {"error": "Sale lines not loaded yet."}
-    sl = sale_lines_df.copy()
+    sl = filter_excluded_sales_customers(sale_lines_df).copy()
     if "InvoiceDate" not in sl.columns:
         return {"error": "Sale lines missing InvoiceDate column."}
     sl["InvoiceDate"] = pd.to_datetime(sl["InvoiceDate"], errors="coerce")
@@ -2848,7 +2849,7 @@ def get_sales_totals(engine_df: pd.DataFrame,
     rev_by_bucket: dict = {}
     headers = _SALES_FULL_HOLDER.get("df")
     if headers is not None and not headers.empty:
-        h = headers.copy()
+        h = filter_excluded_sales_customers(headers).copy()
         if "InvoiceDate" in h.columns:
             h["InvoiceDate"] = pd.to_datetime(
                 h["InvoiceDate"], errors="coerce")
@@ -2883,7 +2884,8 @@ def get_sales_totals(engine_df: pd.DataFrame,
     # Lines (units, orders)
     units = 0.0
     orders = 0
-    sl = sale_lines_df.copy() if sale_lines_df is not None else pd.DataFrame()
+    sl = filter_excluded_sales_customers(
+        sale_lines_df) if sale_lines_df is not None else pd.DataFrame()
     if not sl.empty and "InvoiceDate" in sl.columns:
         sl["InvoiceDate"] = pd.to_datetime(
             sl["InvoiceDate"], errors="coerce")
@@ -2941,7 +2943,7 @@ def set_sales_full_headers(headers_df: pd.DataFrame) -> None:
     """Called by the Streamlit page on AI Assistant page load. Stores
     the merged sales-headers DataFrame so get_sales_totals can read
     it without recomputing per-tool-call."""
-    _SALES_FULL_HOLDER["df"] = headers_df
+    _SALES_FULL_HOLDER["df"] = filter_excluded_sales_customers(headers_df)
 
 
 def set_products(products_df: pd.DataFrame) -> None:
@@ -3159,7 +3161,8 @@ def set_sale_lines_longest(sale_lines_df: pd.DataFrame) -> None:
     """v2.67.51 — stash the merged longest-window sale-lines DataFrame
     so get_sale_order can return full line detail per sale without
     each tool call having to merge windows itself."""
-    _SALE_LINES_LONGEST_HOLDER["df"] = sale_lines_df
+    _SALE_LINES_LONGEST_HOLDER["df"] = filter_excluded_sales_customers(
+        sale_lines_df)
 
 
 def set_assemblies(assemblies_df: pd.DataFrame) -> None:
@@ -4942,7 +4945,7 @@ def get_sale_order(engine_df: pd.DataFrame,
                       "An empty filter would dump every sale line."),
         }
 
-    df = sl.copy()
+    df = filter_excluded_sales_customers(sl).copy()
 
     if order_number and "OrderNumber" in df.columns:
         order_norm = order_number.upper().lstrip("SO-").lstrip("SO")
@@ -5152,6 +5155,18 @@ def get_sale_live(engine_df: pd.DataFrame,
         return {
             "matched": 0,
             "note": "CIN7 returned an empty sale object.",
+        }
+    visible_sale = filter_excluded_sales_customers(pd.DataFrame([{
+        "Customer": sale.get("Customer"),
+    }]))
+    if visible_sale.empty:
+        return {
+            "matched": 0,
+            "source": "cin7_live_api",
+            "order_number": order_number,
+            "note": ("That sale is excluded from Wired4Signs analytics "
+                     "because the customer belongs to the separated "
+                     "manufacturing business."),
         }
 
     # Extract line items and enrich with current OnHand from
