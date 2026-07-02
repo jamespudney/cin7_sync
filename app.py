@@ -13716,7 +13716,45 @@ elif page == "Ordering":
             cfg_labels = [_cfg_label(s) for s in cfg_options]
             cfg_label_to_sup = dict(zip(cfg_labels, cfg_options))
 
-            scol1, scol2 = st.columns([1, 3])
+            def _cfg_supplier_from_label(label: object) -> str:
+                label_s = str(label or "").strip()
+                if label_s in cfg_label_to_sup:
+                    return cfg_label_to_sup[label_s]
+                if "  —  $" in label_s:
+                    return label_s.split("  —  $", 1)[0].strip()
+                return label_s
+
+            def _cfg_label_for_supplier(supplier_name: str) -> str | None:
+                for label, mapped_supplier in cfg_label_to_sup.items():
+                    if mapped_supplier == supplier_name:
+                        return label
+                return None
+
+            # Keep supplier config aligned with the Draft PO supplier by
+            # default. The config form renders above the PO supplier
+            # picker, so read the picker from session_state. This prevents
+            # the "editing Neonica while drafting Snapfix" trap Andrew
+            # hit on 2026-07-02.
+            _active_po_supplier = str(
+                st.session_state.get("ordering_active_supplier") or ""
+            ).strip()
+            if not _active_po_supplier:
+                _active_po_supplier = _cfg_supplier_from_label(
+                    st.session_state.get("ord_supplier_label"))
+            if _active_po_supplier not in cfg_options:
+                _active_po_supplier = ""
+            _active_po_label = (
+                _cfg_label_for_supplier(_active_po_supplier)
+                if _active_po_supplier else None
+            )
+            _follow_key = "sc_follow_draft_supplier"
+            if _follow_key not in st.session_state:
+                st.session_state[_follow_key] = True
+            if (_active_po_label
+                    and st.session_state.get(_follow_key, True)):
+                st.session_state["sc_sup_label"] = _active_po_label
+
+            scol1, scol2 = st.columns([1.2, 2.8])
             cfg_label_pick = scol1.selectbox(
                 "Supplier to configure  "
                 "(top 15 by 12mo spend, then A-Z)",
@@ -13724,6 +13762,26 @@ elif page == "Ordering":
             )
             cfg_supplier = cfg_label_to_sup[cfg_label_pick]
             existing = supp_configs.get(cfg_supplier, {})
+            follow_draft_supplier = scol2.checkbox(
+                "Keep Supplier configuration aligned with Draft PO supplier",
+                key=_follow_key,
+                help=(
+                    "When this is on, the supplier config form follows the "
+                    "supplier selected in Draft PO by supplier. Turn it off "
+                    "only when you intentionally want to edit a different "
+                    "supplier's defaults."
+                ),
+            )
+            _config_supplier_mismatch = bool(
+                _active_po_supplier and cfg_supplier != _active_po_supplier)
+            if _active_po_supplier and follow_draft_supplier:
+                scol2.caption(
+                    f"Draft PO supplier: **{_active_po_supplier}**. "
+                    "Supplier configuration is following it.")
+            elif _config_supplier_mismatch:
+                scol2.warning(
+                    f"Draft PO supplier is **{_active_po_supplier}**, but "
+                    f"this form is editing **{cfg_supplier}**.")
 
             # v2.67.347 — widget keys are supplier-specific so switching
             # suppliers in the picker properly re-renders the fields
@@ -13952,6 +14010,13 @@ elif page == "Ordering":
                 # name `submitted` for its own form_submit_button —
                 # without the rename the handler below would fire on
                 # any holiday-Add click.
+                _mismatch_ack = True
+                if _config_supplier_mismatch:
+                    _mismatch_ack = st.checkbox(
+                        f"I understand this will change {cfg_supplier}, "
+                        f"not the Draft PO supplier {_active_po_supplier}.",
+                        key=f"sc_mismatch_ack_{_sk}",
+                    )
                 sc_submitted = st.form_submit_button(
                     "Save supplier config", type="primary")
 
@@ -14083,6 +14148,15 @@ elif page == "Ordering":
             # button removed; both moved INSIDE the main st.form
             # above so they commit atomically. Handler below now
             # runs `if sc_submitted:` against the form_submit_button.
+            if (sc_submitted and _config_supplier_mismatch
+                    and not _mismatch_ack):
+                st.error(
+                    "Not saved: Supplier configuration is editing "
+                    f"{cfg_supplier}, while the Draft PO supplier is "
+                    f"{_active_po_supplier}. Tick the confirmation box "
+                    "or turn alignment back on."
+                )
+                sc_submitted = False
             if sc_submitted:
                 _ss = st.session_state
                 _sfA_save = float(_ss.get(f"sc_sfA_{_sk}", sf_A))
@@ -14433,6 +14507,7 @@ elif page == "Ordering":
             key="ord_supplier_label",
         )
         sel_sup = label_to_supplier[sel_label]
+        st.session_state["ordering_active_supplier"] = sel_sup
     with sc_row1[1]:
         freight_mode_choice = st.radio(
             "Freight mode for this PO",

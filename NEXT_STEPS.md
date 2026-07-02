@@ -178,6 +178,12 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   child/cut family movement consistently in visible demand columns,
   reorder math, slow/excess stock, and Slack PO commentary. CIN7
   BOM/sourcing remains the source of truth when present.
+- **Supplier config / Draft PO alignment guardrail** — Supplier
+  configuration now follows the selected Draft PO supplier by default.
+  If a buyer intentionally edits a different supplier's defaults while
+  building a PO, the page shows the mismatch and requires an explicit
+  acknowledgement before saving, preventing accidental edits such as
+  changing Neonica while working on a Snapfix PO.
 
 ### 2026-07-01
 

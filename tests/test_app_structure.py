@@ -492,6 +492,24 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertNotIn("No MOV configured for {sel_sup}. To enable",
                          script)
 
+    def test_supplier_config_follows_draft_po_supplier_by_default(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('st.session_state["ordering_active_supplier"] = sel_sup',
+                      script)
+        self.assertIn("Keep Supplier configuration aligned with Draft PO supplier",
+                      script)
+        self.assertIn("sc_follow_draft_supplier", script)
+        self.assertIn("_config_supplier_mismatch", script)
+        self.assertIn("Draft PO supplier is **{_active_po_supplier}**",
+                      script)
+        self.assertIn("I understand this will change {cfg_supplier}",
+                      script)
+        self.assertIn("Not saved: Supplier configuration is editing",
+                      script)
+
     def test_pull_forward_window_is_not_hardcoded_to_45_days(self) -> None:
         script = (
             Path(__file__).resolve().parents[1] / "app.py"
