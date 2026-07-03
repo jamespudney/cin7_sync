@@ -153,10 +153,20 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
 
 ## Shipped (since 2026-04-30)
 
+### 2026-07-03
+
+- **Ordering lead-time and minimums guardrail** — `Vendor LT` now means
+  the supplier/freight default only; IP observed/configured lead time and
+  buyer-entered `Sku LT` flow into `Used LT`. The Ordering grids also
+  recalculate displayed Vendor LT from supplier configuration even when
+  reading an older cached supplier snapshot. Supplier MOQ/MOV and SKU
+  Sku LT/MOQ/EOQ values are protected from accidental zero/blank reloads,
+  so buyer-entered values stick until deliberately changed or cleared.
+
 ### 2026-07-02
 
 - **Ordering lead-time labels clarified** — Ordering and Product Detail
-  now split lead time into `Vendor LT` (supplier/IP/freight baseline),
+  now split lead time into `Vendor LT` (supplier/freight default),
   `Sku LT` (buyer-entered SKU override), and `Used LT` (final engine
   lead time). Existing buyer-entered SKU lead-time values remain stored
   in the same `sku_pack_settings.lead_time_days` field and are not

@@ -14,11 +14,11 @@ rank + 40% of 12-month quantity rank):
 How long from placing the PO to receiving the goods. Set per supplier
 in the Supplier configuration expander below. Air vs sea toggles use
 different LTs; the engine picks the faster one when the supplier offers
-air AND the item qualifies. A SKU-level **Sku LT** can be set in
-Ordering or Product Detail; when present, that duration overrides the
-calculated Vendor LT for that SKU. Ordering displays this as
-**Vendor LT** (default), **Sku LT** (manual override), and **Used LT**
-(final engine value).
+air AND the item qualifies. Inventory Planner can still provide an
+observed lead-time duration, and a SKU-level **Sku LT** can be set in
+Ordering or Product Detail. Ordering displays this as **Vendor LT**
+(supplier/freight default), **Sku LT** (manual override), and **Used LT**
+(the final engine value after IP and SKU overrides).
 
 #### Safety %
 A buffer added on top of lead-time demand to absorb variance (a big
@@ -114,13 +114,13 @@ current draft is below MOV so you can consolidate.
 These are per-SKU overrides stored in `sku_pack_settings` and editable
 from both Ordering and Product Detail:
 
-- **Vendor LT** — the supplier/IP/freight lead time before SKU-specific
-  overrides. This is the default lead time when Sku LT is blank/0.
+- **Vendor LT** — the supplier/freight default lead time before IP and
+  SKU-specific overrides.
 - **Sku LT** — manual SKU-level lead-time duration in days. Blank/0 means
   use Vendor LT. Existing buyer-entered Sku LT values are never overwritten
   by supplier defaults.
 - **Used LT** — the final lead time the reorder engine uses after applying
-  Sku LT when present.
+  IP observed/configured lead time and then Sku LT when present.
 - **SKU MOQ** — minimum order quantity for that SKU. It can lift the
   target stock and floor the suggested reorder when a positive reorder
   exists.
@@ -154,9 +154,9 @@ Air or Sea. Decision order:
    that duration wins over Vendor LT. The freight METHOD is still from
    rules 1-2 or the manual override; this is a duration override.
 5. **Per-row override**: the buyer can flip any row's mode via the
-   Freight column dropdown. This changes Vendor LT for that row; Sku LT
-   still wins if it is filled. The reorder qty recalculates with the new
-   lead time on next refresh.
+   Freight column dropdown. This changes the row's supplier/freight
+   default shown as Vendor LT; Sku LT still wins if it is filled. The
+   reorder qty recalculates with the new lead time on next refresh.
 
 #### Ordering PO editor row focus
 The Ordering page's main PO editor, optional pull-forward editor, and

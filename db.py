@@ -4475,6 +4475,18 @@ def set_supplier_config(
     # DB never accumulates near-duplicates that lookups miss.
     supplier_name = _normalise_supplier_name(supplier_name)
     with connect() as c:
+        existing = c.execute(
+            "SELECT moq_units, mov_amount, mov_currency "
+            "FROM supplier_config WHERE supplier_name = ?",
+            (supplier_name,),
+        ).fetchone()
+        if existing is not None:
+            if moq_units is None and existing["moq_units"] is not None:
+                moq_units = existing["moq_units"]
+            if mov_amount is None and existing["mov_amount"] is not None:
+                mov_amount = existing["mov_amount"]
+            if not mov_currency and existing["mov_currency"]:
+                mov_currency = existing["mov_currency"]
         c.execute(
             """
             INSERT INTO supplier_config
@@ -4547,7 +4559,11 @@ def all_supplier_configs() -> dict:
     callers can lookup with either the canonical or a not-quite-canonical
     string and still match."""
     with connect() as c:
-        rows = c.execute("SELECT * FROM supplier_config").fetchall()
+        # Historical rows may differ only by hidden whitespace. When their
+        # normalised names collide below, let the newest saved config win.
+        rows = c.execute(
+            "SELECT * FROM supplier_config ORDER BY set_at ASC"
+        ).fetchall()
     return {
         _normalise_supplier_name(r["supplier_name"]): dict(r)
         for r in rows
@@ -5940,6 +5956,22 @@ def set_sku_buying_settings(
     if _lt is not None and _lt <= 0:
         _lt = None
     with connect() as c:
+        existing = c.execute(
+            "SELECT pack_qty, moq, lead_time_days, eoq_qty, note "
+            "FROM sku_pack_settings WHERE sku = ?",
+            (sku,),
+        ).fetchone()
+        if existing is not None:
+            if _pack <= 0 and existing["pack_qty"]:
+                _pack = existing["pack_qty"]
+            if _moq is None and existing["moq"] is not None:
+                _moq = existing["moq"]
+            if _lt is None and existing["lead_time_days"] is not None:
+                _lt = existing["lead_time_days"]
+            if _eoq is None and existing["eoq_qty"] is not None:
+                _eoq = existing["eoq_qty"]
+            if not note and existing["note"]:
+                note = existing["note"]
         c.execute(
             """
             INSERT INTO sku_pack_settings

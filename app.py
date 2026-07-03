@@ -11968,6 +11968,11 @@ elif page == "Ordering":
         else:
             lead_time_days = lt_sea
             freight_mode_used = "sea"
+        # Buyer-facing Vendor LT must mean the supplier/freight default
+        # only. IP observed/configured and Sku LT can still change Used LT
+        # below, but they should not make "Vendor LT" vary unexpectedly.
+        vendor_lead_time_days = lead_time_days
+        vendor_lead_time_basis = "supplier"
 
         # v2.67.285 — prefer IP's observed actual lead time when
         # we have one. IP literally measures PO-to-receipt time
@@ -11993,8 +11998,6 @@ elif page == "Ordering":
         elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
             lead_time_days = int(_conf_lt_ip)
             lead_time_basis = "ip_configured"
-        vendor_lead_time_days = lead_time_days
-        vendor_lead_time_basis = lead_time_basis
         if _sku_lt_int and 1 <= _sku_lt_int <= 365:
             lead_time_days = _sku_lt_int
             lead_time_basis = "sku"
@@ -13770,7 +13773,9 @@ elif page == "Ordering":
                 cfg_labels, key="sc_sup_label",
             )
             cfg_supplier = cfg_label_to_sup[cfg_label_pick]
-            existing = supp_configs.get(cfg_supplier, {})
+            cfg_supplier_key = " ".join(str(cfg_supplier).split()).strip()
+            existing = supp_configs.get(
+                cfg_supplier_key, supp_configs.get(cfg_supplier, {}))
             follow_draft_supplier = scol2.checkbox(
                 "Keep Supplier configuration aligned with Draft PO supplier",
                 key=_follow_key,
@@ -14179,6 +14184,15 @@ elif page == "Ordering":
                 _airmax_save = int(_ss.get(f"sc_airmax_{_sk}", air_max))
                 _moq_save = float(_ss.get(f"sc_moq_{_sk}", moq))
                 _mov_save = float(_ss.get(f"sc_mov_{_sk}", mov))
+                _existing_moq_save = float(existing.get("moq_units") or 0)
+                _existing_mov_save = float(existing.get("mov_amount") or 0)
+                _minimums_preserved = []
+                if _moq_save <= 0 and _existing_moq_save > 0:
+                    _moq_save = _existing_moq_save
+                    _minimums_preserved.append("MOQ")
+                if _mov_save <= 0 and _existing_mov_save > 0:
+                    _mov_save = _existing_mov_save
+                    _minimums_preserved.append("MOV")
                 _movccy_save = (_ss.get(f"sc_movccy_{_sk}", mov_ccy)
                                 or "USD")
                 _pref_save = (_ss.get(f"sc_pref_{_sk}", pref_freight)
@@ -14196,8 +14210,14 @@ elif page == "Ordering":
                     f"{_sfC_save:.0f}%  ·  sea LT {_ltsea_save}d  ·  "
                     f"cadence {_cadence_save}d"
                 )
+                if _minimums_preserved:
+                    st.caption(
+                        "Protected existing "
+                        + "/".join(_minimums_preserved)
+                        + " from being cleared by a zero reload."
+                    )
                 db.set_supplier_config(
-                    cfg_supplier,
+                    cfg_supplier_key or cfg_supplier,
                     lead_time_sea_days=_ltsea_save,
                     lead_time_air_days=(_ltair_save
                                          if _ltair_save > 0 else None),
@@ -14821,6 +14841,41 @@ elif page == "Ordering":
             .fillna("")
         )
 
+    def _vendor_default_lead_time_for_row(row: pd.Series) -> float:
+        """Return the supplier/freight LT before IP or SKU overrides."""
+        supplier_raw = row.get("Supplier") or sel_sup
+        supplier_norm = " ".join(str(supplier_raw).split()).strip()
+        cfg = supp_configs.get(
+            supplier_norm, supp_configs.get(supplier_raw, {}))
+        lt_sea = float(cfg.get("lead_time_sea_days") or 35)
+        lt_air = cfg.get("lead_time_air_days")
+        try:
+            lt_air_f = float(lt_air) if lt_air else None
+        except (TypeError, ValueError):
+            lt_air_f = None
+
+        freight_mode = str(row.get("freight_mode") or "").lower()
+        category = str(row.get("Category") or "").strip()
+        try:
+            length_mm = float(row.get("LengthMM") or 0)
+        except (TypeError, ValueError):
+            length_mm = 0.0
+        category_rule_sea = (
+            category in _FREIGHT_SEA_CATEGORIES
+            and _FREIGHT_SEA_LEN_MIN_MM <= length_mm <= _FREIGHT_SEA_LEN_MAX_MM
+        )
+        if "sea" in freight_mode or category_rule_sea:
+            return lt_sea
+        if "air" in freight_mode and lt_air_f:
+            return lt_air_f
+
+        air_default = bool(cfg.get("air_eligible_default") or 0)
+        air_max_len = cfg.get("air_max_length_mm")
+        if air_default and lt_air_f:
+            if not air_max_len or not length_mm or length_mm <= air_max_len:
+                return lt_air_f
+        return lt_sea
+
     def _normalise_ordering_supplier_df(df: pd.DataFrame) -> pd.DataFrame:
         """Ensure supplier snapshots have the columns Ordering expects."""
         out = df.copy()
@@ -14906,6 +14961,9 @@ elif page == "Ordering":
                 .map(_product_names_by_sku)
                 .fillna("")
             )
+        if not out.empty:
+            out["vendor_lead_time_days"] = out.apply(
+                _vendor_default_lead_time_for_row, axis=1)
         return out
 
     all_supplier_df = _normalise_ordering_supplier_df(all_supplier_df)
@@ -16353,8 +16411,8 @@ elif page == "Ordering":
             "vendor_lead_time_days": st.column_config.NumberColumn(
                 "Vendor LT",
                 disabled=True,
-                help="Supplier/IP/freight lead time before any SKU-specific "
-                     "override. This is the default used when Sku LT is 0.",
+                help="Supplier/freight default lead time before IP and "
+                     "SKU-specific overrides.",
             ),
             "lead_time_days": st.column_config.NumberColumn(
                 "Used LT",
@@ -17160,6 +17218,13 @@ elif page == "Ordering":
         existing_policy = sku_buying_settings_db.get(sku_e, {}) or {}
         note = str(existing_policy.get("note") or "")
         existing_pack = _numeric_policy_cell(existing_policy.get("pack_qty"))
+        existing_has_policy = bool(
+            _int_policy_cell(existing_policy.get("lead_time_days")) > 0
+            or _numeric_policy_cell(existing_policy.get("moq")) > 0
+            or _numeric_policy_cell(existing_policy.get("eoq_qty")) > 0
+            or existing_pack > 0
+            or note.strip()
+        )
         pack_to_keep = (
             existing_pack if existing_pack > 0 and sku_eoq > 0 else None)
         if (
@@ -17168,6 +17233,7 @@ elif page == "Ordering":
             and sku_eoq <= 0
             and not pack_to_keep
             and not note.strip()
+            and not existing_has_policy
         ):
             db.clear_sku_pack(sku_e, actor)
         else:
@@ -17718,8 +17784,8 @@ elif page == "Ordering":
             format="%d",
             disabled=True,
             width=_ordering_cfg_width("vendor_lead_time_days", "small"),
-            help="Supplier/IP/freight lead time before any SKU-specific "
-                 "override.",
+            help="Supplier/freight default lead time before IP and "
+                 "SKU-specific overrides.",
         )
         cfg["lead_time_days"] = st.column_config.NumberColumn(
             "Used LT",
@@ -21430,7 +21496,8 @@ elif page == "Product Detail":
         bs2.metric(
             "Vendor LT",
             f"{_pd_vendor_lt:.0f}d" if _pd_vendor_lt else "—",
-            help="Supplier/IP/freight lead time before SKU override.")
+            help="Supplier/freight default lead time before IP and "
+                 "SKU override.")
         bs3.metric(
             "Sku LT",
             f"{_pd_sku_lt:.0f}d" if _pd_sku_lt else "—",
@@ -21484,8 +21551,16 @@ elif page == "Product Detail":
                         "an author for audit logging.")
                 else:
                     legacy_pack = _pd_pos_float(_pd_policy.get("pack_qty"))
+                    _pd_existing_has_policy = bool(
+                        _pd_sku_lt > 0
+                        or _pd_sku_moq > 0
+                        or _pd_sku_eoq > 0
+                        or legacy_pack > 0
+                        or str(_pd_policy.get("note") or "").strip()
+                    )
                     if (pd_lt <= 0 and pd_moq <= 0 and pd_eoq <= 0
-                            and legacy_pack <= 0 and not pd_note.strip()):
+                            and legacy_pack <= 0 and not pd_note.strip()
+                            and not _pd_existing_has_policy):
                         db.clear_sku_pack(sku, actor)
                         st.success(f"Cleared SKU buying settings for {sku}.")
                     else:

@@ -609,6 +609,21 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn('"vendor_lead_time_days": "Vendor LT"', script)
         self.assertIn('"lead_time_days": "Used LT"', script)
         self.assertIn('"sku_lead_time_days": "Sku LT"', script)
+        self.assertIn("Buyer-facing Vendor LT must mean", script)
+        self.assertIn("def _vendor_default_lead_time_for_row", script)
+        self.assertIn("Protected existing ", script)
+        self.assertIn("and not existing_has_policy", script)
+        self.assertIn("and not _pd_existing_has_policy", script)
+        self.assertIn(
+            "SELECT moq_units, mov_amount, mov_currency", db_script)
+        self.assertIn(
+            "SELECT pack_qty, moq, lead_time_days, eoq_qty, note",
+            db_script,
+        )
+        self.assertIn(
+            "SELECT * FROM supplier_config ORDER BY set_at ASC",
+            db_script,
+        )
         self.assertIn('"sku_moq"', script)
         self.assertIn('"sku_eoq_qty"', script)
         self.assertIn("SKU buying policy", script)
