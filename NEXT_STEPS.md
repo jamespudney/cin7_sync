@@ -161,7 +161,9 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   recalculate displayed Vendor LT from supplier configuration even when
   reading an older cached supplier snapshot. Supplier MOQ/MOV and SKU
   Sku LT/MOQ/EOQ values are protected from accidental zero/blank reloads,
-  so buyer-entered values stick until deliberately changed or cleared.
+  and stale data-editor previews can no longer mask saved SKU values with
+  temporary zeroes, so buyer-entered values stick until deliberately
+  changed or cleared.
 
 ### 2026-07-02
 

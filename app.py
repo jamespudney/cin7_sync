@@ -11794,21 +11794,43 @@ elif page == "Ordering":
     _sku_buying_preview = st.session_state.get(
         "_ordering_sku_buying_preview", {})
     if isinstance(_sku_buying_preview, dict):
-        for _preview_sku, _preview_vals in _sku_buying_preview.items():
+        _stale_zero_preview_skus = []
+        for _preview_sku, _preview_vals in list(_sku_buying_preview.items()):
             if not isinstance(_preview_vals, dict):
                 continue
             _preview_sku = str(_preview_sku or "")
             if not _preview_sku:
                 continue
             _base_policy = dict(sku_buying_settings.get(_preview_sku, {}))
-            _base_policy["sku"] = _preview_sku
-            _base_policy["lead_time_days"] = _positive_int_or_zero(
+            _preview_lt = _positive_int_or_zero(
                 _preview_vals.get("lead_time_days"))
-            _base_policy["moq"] = _positive_float_or_zero(
-                _preview_vals.get("moq"))
-            _base_policy["eoq_qty"] = _positive_float_or_zero(
+            _preview_moq = _positive_float_or_zero(_preview_vals.get("moq"))
+            _preview_eoq = _positive_float_or_zero(
                 _preview_vals.get("eoq_qty"))
+            _base_has_value = bool(
+                _positive_int_or_zero(_base_policy.get("lead_time_days")) > 0
+                or _positive_float_or_zero(_base_policy.get("moq")) > 0
+                or _positive_float_or_zero(_base_policy.get("eoq_qty")) > 0
+                or _positive_float_or_zero(_base_policy.get("pack_qty")) > 0
+            )
+            if (
+                _base_has_value
+                and _preview_lt <= 0
+                and _preview_moq <= 0
+                and _preview_eoq <= 0
+            ):
+                # A stale data-editor reload can send blank/zero policy cells
+                # before the DB values are repainted. Never let that temporary
+                # preview mask buyer-entered LT/MOQ/EOQ values.
+                _stale_zero_preview_skus.append(_preview_sku)
+                continue
+            _base_policy["sku"] = _preview_sku
+            _base_policy["lead_time_days"] = _preview_lt
+            _base_policy["moq"] = _preview_moq
+            _base_policy["eoq_qty"] = _preview_eoq
             sku_buying_settings[_preview_sku] = _base_policy
+        for _preview_sku in _stale_zero_preview_skus:
+            _sku_buying_preview.pop(_preview_sku, None)
     _today_for_engine = date.today()
 
     def _sku_policy_float(sku: str, key: str) -> float:
@@ -17225,6 +17247,16 @@ elif page == "Ordering":
             or existing_pack > 0
             or note.strip()
         )
+        if (
+            existing_has_policy
+            and lt_days <= 0
+            and sku_moq <= 0
+            and sku_eoq <= 0
+        ):
+            # Zero/blank cells can arrive from a data-editor reload before
+            # saved DB values are repainted. Clearing buyer policy must be a
+            # deliberate clear action, not an incidental table save.
+            return
         pack_to_keep = (
             existing_pack if existing_pack > 0 and sku_eoq > 0 else None)
         if (
@@ -17283,6 +17315,13 @@ elif page == "Ordering":
                 or abs(_new_policy[1] - _old_policy[1]) > 0.001
                 or abs(_new_policy[2] - _old_policy[2]) > 0.001
             ):
+                if (
+                    _old_policy[0] > 0
+                    or _old_policy[1] > 0
+                    or _old_policy[2] > 0
+                ) and not any(_new_policy):
+                    _policy_preview_clears.append(_sk)
+                    continue
                 _sku_buying_edits.append((_sk, *_new_policy))
                 _policy_preview_updates[_sk] = {
                     "lead_time_days": _new_policy[0],
@@ -17951,6 +17990,17 @@ elif page == "Ordering":
                     or _numeric_policy_cell(db_policy.get("pack_qty"))
                 ),
             )
+            if (
+                (
+                    persisted_policy[0] > 0
+                    or persisted_policy[1] > 0
+                    or persisted_policy[2] > 0
+                )
+                and not any(new_policy)
+            ):
+                if preview.pop(sku_here, None) is not None:
+                    changed = True
+                continue
             if new_policy == persisted_policy:
                 if preview.pop(sku_here, None) is not None:
                     changed = True

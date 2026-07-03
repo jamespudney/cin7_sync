@@ -612,6 +612,9 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("Buyer-facing Vendor LT must mean", script)
         self.assertIn("def _vendor_default_lead_time_for_row", script)
         self.assertIn("Protected existing ", script)
+        self.assertIn("_stale_zero_preview_skus", script)
+        self.assertIn("Never let that temporary", script)
+        self.assertIn("deliberate clear action", script)
         self.assertIn("and not existing_has_policy", script)
         self.assertIn("and not _pd_existing_has_policy", script)
         self.assertIn(
