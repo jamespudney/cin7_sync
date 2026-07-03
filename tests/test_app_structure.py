@@ -35,6 +35,7 @@ from engine.sku_rules import (
     _parse_length,
     _parse_strip_base,
     _parse_tube_sku,
+    is_bulk_strip_roll_length,
     parse_pack_purchase_sku,
     parse_sourcing_rule,
 )
@@ -174,10 +175,65 @@ class DemandRollupTests(unittest.TestCase):
             "retired family master",
         )
 
+    def test_strip_audit_does_not_crown_short_finished_length_as_master(
+            self) -> None:
+        products = pd.DataFrame([
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2350",
+                "Name": "Nicho 3000K 2.35m finished length",
+                "Status": "Active",
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "Name": "Nicho 3000K 2m finished length",
+                "Status": "Active",
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-1",
+                "Name": "Nicho 3000K 1m finished length",
+                "Status": "Active",
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-0600",
+                "Name": "Nicho 3000K 600mm finished length",
+                "Status": "Active",
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-0300",
+                "Name": "Nicho 3000K 300mm finished length",
+                "Status": "Active",
+            },
+        ])
+        sale_lines = pd.DataFrame([{
+            "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+            "InvoiceDate": "2026-07-02",
+            "Quantity": 5,
+            "Customer": "Regular LED Customer",
+            "Status": "AUTHORISED",
+        }])
+
+        audit = build_strip_movement_audit(
+            "LED-NEON-FLEX-NICHO-3000K-2350",
+            products,
+            sale_lines,
+            today=pd.Timestamp("2026-07-03"),
+        )
+
+        self.assertFalse(audit["ok"])
+        self.assertIn("No active bulk buying roll", audit["reason"])
+
 
 class PageConfigTests(unittest.TestCase):
     def test_ordering_column_preferences_keep_stable_view_key(self) -> None:
         self.assertEqual(ORDERING_PO_EDITOR_VIEW, "ordering_po_editor")
+
+    def test_ordering_grid_does_not_force_pinned_columns(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("pinned=True", script)
+        self.assertIn("Do not auto-pin any columns", script)
 
     def test_missing_slack_oauth_env_vars_reports_optional_setup(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -317,6 +373,8 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("strip_rollup_rules: list[tuple[str, str, float]]",
                       script)
         self.assertIn("direct PO history alone is NOT enough", script)
+        self.assertIn("is_bulk_strip_roll_length(bulk_len)", script)
+        self.assertIn("short finished length", script)
         self.assertIn("_strip_member_discontinued", script)
         self.assertNotIn("alternate_masters", script)
         self.assertGreaterEqual(
@@ -1132,6 +1190,13 @@ class ReorderMathTests(unittest.TestCase):
 
 
 class StripRollupParsingTests(unittest.TestCase):
+    def test_bulk_strip_roll_length_guard_only_allows_buying_rolls(self) -> None:
+        self.assertFalse(is_bulk_strip_roll_length(0.3))
+        self.assertFalse(is_bulk_strip_roll_length(2.35))
+        self.assertFalse(is_bulk_strip_roll_length(5))
+        self.assertTrue(is_bulk_strip_roll_length(25))
+        self.assertTrue(is_bulk_strip_roll_length(100))
+
     def test_tsb_0305_child_links_to_100m_master_base(self) -> None:
         master = "LED-TSB2835-300-24-6000-100M"
         child = "LED-TSB2835-300-24-6000-0305"
@@ -2483,6 +2548,59 @@ class IncomingStockTests(unittest.TestCase):
             by_sku.loc["LED-WLWW-30K-IP67-5",
                        "effective_units_12mo"],
             0.0,
+        )
+
+    def test_worker_engine_does_not_roll_short_finished_lengths_by_name(
+            self) -> None:
+        products = pd.DataFrame([
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2350",
+                "Name": "Nicho 3000K 2.35m finished length",
+                "Status": "Active",
+                "AverageCost": 10.0,
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+                "Name": "Nicho 3000K 2m finished length",
+                "Status": "Active",
+                "AverageCost": 10.0,
+            },
+            {
+                "SKU": "LED-NEON-FLEX-NICHO-3000K-0300",
+                "Name": "Nicho 3000K 300mm finished length",
+                "Status": "Active",
+                "AverageCost": 10.0,
+            },
+        ])
+        stock = pd.DataFrame([
+            {"SKU": "LED-NEON-FLEX-NICHO-3000K-2350", "OnHand": 0},
+            {"SKU": "LED-NEON-FLEX-NICHO-3000K-2", "OnHand": 0},
+            {"SKU": "LED-NEON-FLEX-NICHO-3000K-0300", "OnHand": 0},
+        ])
+        sale_lines = pd.DataFrame([{
+            "SKU": "LED-NEON-FLEX-NICHO-3000K-2",
+            "InvoiceDate": "2026-07-01",
+            "Quantity": 5,
+            "Customer": "Regular LED Customer",
+        }])
+
+        result = worker_engine.compute_engine_signals(
+            products, stock, sale_lines)
+        by_sku = result.set_index("SKU")
+
+        self.assertEqual(
+            by_sku.loc["LED-NEON-FLEX-NICHO-3000K-2350",
+                       "effective_units_12mo"],
+            0.0,
+        )
+        self.assertFalse(
+            bool(by_sku.loc["LED-NEON-FLEX-NICHO-3000K-2",
+                            "is_non_master_tube"])
+        )
+        self.assertEqual(
+            by_sku.loc["LED-NEON-FLEX-NICHO-3000K-2",
+                       "effective_units_12mo"],
+            5.0,
         )
 
     def test_storage_dimension_extracts_named_cin7_field(self) -> None:

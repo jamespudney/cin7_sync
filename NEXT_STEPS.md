@@ -164,6 +164,16 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   and stale data-editor previews can no longer mask saved SKU values with
   temporary zeroes, so buyer-entered values stick until deliberately
   changed or cleared.
+- **Strip rollup parent guard** — the name-based LED strip fallback now
+  rolls demand only into active bulk buying rolls (`25m+`, such as
+  25m/50m/100m). Short finished lengths such as Nicho 1m/2m/2.35m are
+  no longer treated as parents merely because they are the longest active
+  SKU in a naming family. CIN7 BOM/sourcing remains the source of truth
+  for real component/kit relationships.
+- **Ordering column layout control** — the main Ordering grid no longer
+  auto-pins SKU or Name. Buyers can use the column organiser to decide
+  which columns belong at the front without Streamlit forcing pinned
+  defaults.
 
 ### 2026-07-02
 

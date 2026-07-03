@@ -270,6 +270,23 @@ def _parse_strip_base(sku: str) -> Optional[tuple]:
     return (base, length_m)
 
 
+BULK_STRIP_ROLL_MIN_LENGTH_M = 25.0
+
+
+def is_bulk_strip_roll_length(length_m: float) -> bool:
+    """True when a parsed strip length is a real buying-master roll.
+
+    CIN7 BOMs remain the source of truth for kit/cut relationships. This
+    guard is only for the naming fallback used when BOMs are absent: short
+    finished lengths such as 1m/2m/2.35m must not be crowned as family
+    masters just because they are the longest SKU in a naming family.
+    """
+    try:
+        return float(length_m or 0) >= BULK_STRIP_ROLL_MIN_LENGTH_M
+    except (TypeError, ValueError):
+        return False
+
+
 def parse_pack_purchase_sku(sku: str) -> Optional[tuple[str, int]]:
     """Return ``(base_sku, pack_size)`` for purchase-pack SKUs.
 

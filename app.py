@@ -57,6 +57,7 @@ from engine.sku_rules import _is_strip_sku
 from engine.sku_rules import _parse_length
 from engine.sku_rules import _parse_strip_base
 from engine.sku_rules import _parse_tube_sku
+from engine.sku_rules import is_bulk_strip_roll_length
 from engine.sku_rules import parse_pack_purchase_sku
 from engine.sku_rules import parse_sourcing_rule
 from engine.reorder_math import (
@@ -6549,9 +6550,10 @@ def _abc_engine(products: pd.DataFrame,
     # Important: direct PO history alone is NOT enough to split a strip
     # family into alternate masters. The source of truth for "this SKU is
     # bought separately" is the CIN7 BOM / sourcing rule. PO history can
-    # include historical or exception buys; letting it block rollup made
-    # good sellers like White Lily 100m/25m look dormant in PO commentary
-    # while Product Detail correctly showed family movement.
+    # include historical or exception buys. Also, the naming fallback is
+    # ONLY allowed to target true bulk buying rolls (25m/50m/100m style);
+    # never crown a short finished length like 2m/2.35m as a parent just
+    # because it is the longest SKU in a naming family.
     strip_rollup_notes: dict = {}
     strip_rollup_inflow: dict = {}
     strip_rollup_inflow_90d: dict = {}
@@ -6611,6 +6613,8 @@ def _abc_engine(products: pd.DataFrame,
         ]
         master_pool = active_members or sorted_members
         bulk_sku, bulk_len, bulk_name, bulk_status = master_pool[0]
+        if not is_bulk_strip_roll_length(bulk_len):
+            continue
         strip_master_skus.add(bulk_sku)
         bulk_master_lengths[bulk_sku] = float(bulk_len or 0)
         if bulk_len <= 0:
@@ -16469,15 +16473,11 @@ elif page == "Ordering":
                 "Excess u", disabled=True, format="%.0f"),
             "excess_value": st.column_config.NumberColumn(
                 "Excess $", disabled=True, format="$%.0f"),
-            # v2.67.344 — pin SKU + Name to the left so they stay
-            # visible when the buyer scrolls horizontally. `pinned=True`
-            # is Streamlit 1.41+; requirements.txt pins streamlit>=1.35
-            # but Render pulls the latest at deploy time so the kwarg
-            # is available.
-            "SKU": st.column_config.TextColumn(
-                disabled=True, pinned=True),
+            # Do not auto-pin any columns. Buyers can choose their own
+            # ordering in the column layout organiser.
+            "SKU": st.column_config.TextColumn(disabled=True),
             "Name": st.column_config.TextColumn(
-                disabled=True, width="large", pinned=True),
+                disabled=True, width="large"),
             "ABC": st.column_config.TextColumn(disabled=True,
                                                   width="small"),
             "Status": st.column_config.TextColumn(disabled=True,

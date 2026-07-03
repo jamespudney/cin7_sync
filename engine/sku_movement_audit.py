@@ -11,7 +11,11 @@ from typing import Any
 
 import pandas as pd
 
-from engine.sku_rules import _is_strip_sku, _parse_strip_base
+from engine.sku_rules import (
+    _is_strip_sku,
+    _parse_strip_base,
+    is_bulk_strip_roll_length,
+)
 from sales_exclusions import filter_excluded_sales_customers
 
 
@@ -306,18 +310,22 @@ def build_strip_movement_audit(sku: str,
             or status_s in {"discontinued", "inactive", "obsolete"}
         )
 
-    active_lengths = [
+    active_bulk_lengths = [
         length for row_sku, length in family.items()
         if not _is_discontinued(row_sku)
+        and is_bulk_strip_roll_length(length)
     ]
-    master_len = (
-        max(active_lengths)
-        if active_lengths else max(family.values()) if family else selected_len
-    )
-    # Display in the active buying roll's equivalents. If a larger
+    if not active_bulk_lengths:
+        return _empty_audit(
+            "No active bulk buying roll found in this strip family. "
+            "CIN7 BOMs remain the source of truth; short finished lengths "
+            "are not treated as parents by naming fallback."
+        )
+    master_len = max(active_bulk_lengths)
+    # Display in the active bulk buying roll's equivalents. If a larger
     # historical family member is discontinued, do not normalise demand
     # onto that retired size.
-    normalise_len = master_len if master_len >= selected_len else selected_len
+    normalise_len = master_len
 
     sl = _clean_sale_lines(sale_lines_df)
     if sl.empty or "SKU" not in sl.columns:

@@ -54,6 +54,7 @@ from typing import Optional
 import pandas as pd
 
 from engine.sku_rules import _is_strip_sku, _parse_strip_base
+from engine.sku_rules import is_bulk_strip_roll_length
 from sales_exclusions import filter_excluded_sales_customers
 from storage_dimensions import ensure_storage_dim_column
 
@@ -220,8 +221,10 @@ def compute_engine_signals(products: pd.DataFrame,
                 non_master_skus.add(asm)
 
     # 4c. Naming fallback for BOM-sparse LED strip families. Pick the
-    # largest active roll as the buying master and convert child/cut
-    # movement into master-roll equivalents.
+    # largest active BULK buying roll as the master and convert child/cut
+    # movement into master-roll equivalents. Short finished lengths must
+    # not become masters; CIN7 BOMs remain the source of truth for those
+    # relationships.
     bom_assemblies = set()
     if boms is not None and not boms.empty and "AssemblySKU" in boms.columns:
         bom_assemblies = set(boms["AssemblySKU"].dropna().astype(str))
@@ -251,6 +254,8 @@ def compute_engine_signals(products: pd.DataFrame,
             if not _is_discontinued(m[2], m[3])
         ]
         master_sku, master_len, _, _ = (active_members or sorted_members)[0]
+        if not is_bulk_strip_roll_length(master_len):
+            continue
         if master_len <= 0:
             continue
         for child_sku, child_len, _, _ in sorted_members:

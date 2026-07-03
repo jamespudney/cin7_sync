@@ -830,11 +830,14 @@ recognised by SKU, so `LED-TSB2835-300-24-6000-0305` contributes demand
 to `LED-TSB2835-300-24-6000-100M` without depending on the product name
 containing the word "strip". If a larger historical family member is
 discontinued/inactive, the app plans onto the largest active buying roll
-instead. Direct PO history alone does not create an alternate master;
-CIN7 BOM/sourcing structure is the source of truth. If the engine still
-suggests zero after the rollup, check concentration/project logic:
-one-customer demand may be shown for manual review rather than converted
-into an automatic buy.
+instead. The name-based fallback is intentionally limited to real bulk
+buying rolls (`25m+`, such as 25m/50m/100m). It must not turn a short
+finished length such as 1m, 2m, or 2.35m into a parent simply because it
+is the longest active SKU in a naming family. Direct PO history alone
+does not create an alternate master; CIN7 BOM/sourcing structure is the
+source of truth. If the engine still suggests zero after the rollup,
+check concentration/project logic: one-customer demand may be shown for
+manual review rather than converted into an automatic buy.
 
 The Ordering Inspect panel includes a **Strip family movement audit**
 for these rows. It reads the synced CIN7 `sale_lines`, excludes credited
