@@ -174,6 +174,13 @@ See `SAAS_NOTES.md`. Don't touch until at least 1-2 paying customers.
   auto-pins SKU or Name. Buyers can use the column organiser to decide
   which columns belong at the front without Streamlit forcing pinned
   defaults.
+- **Anodizing & Powder coating work queue** — added a Buying page that
+  reads CIN7 BOM service components to find finished SKUs made from raw
+  channels/accessories plus outside finishing services such as
+  `OSC-POWDERCOAT-BK-LRG-FT`. The page calculates the finished-SKU send
+  quantity from the ABC/reorder target, shows raw component availability,
+  and groups service SKUs into a vendor order summary for the current
+  manual CIN7 assembly/removal-assembly workflow.
 
 ### 2026-07-02
 

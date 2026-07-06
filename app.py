@@ -44,6 +44,7 @@ from app_config import (
     PAGE_OPTIONS,
 )
 from app_pages.data_health import render_data_health
+from app_pages.coating_work_orders import render_anodizing_powder_coating
 from app_pages.my_profile import render_my_profile
 from app_pages.ordering_layout import ORDERING_PO_EDITOR_VIEW
 from app_pages.overview_actions import render_attention_queue
@@ -24826,6 +24827,24 @@ elif page == "AI Assistant":
 #
 # Edits go through db.update_demand_signal which writes a 'demand_signal.update'
 # row to audit_log per change, so the trail of who-changed-what stays intact.
+
+# ---------------------------------------------------------------------------
+# Page: Anodizing & Powder coating
+# ---------------------------------------------------------------------------
+
+elif page == "Anodizing & Powder coating":
+    render_anodizing_powder_coating(
+        boms=boms,
+        products=products,
+        stock=stock,
+        engine_df=_get_engine_df(),
+        product_images=product_images,
+        product_image_lookup=_product_image_lookup,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
+        rows_selector=rows_selector,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Page: Slow Movers (v2.67.38) — dedicated stock-reduction workspace.

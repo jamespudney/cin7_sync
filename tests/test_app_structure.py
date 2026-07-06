@@ -14,6 +14,7 @@ import po_dispatch_reminder
 import slack_listener
 import so_lookup
 import worker_engine
+from app_pages.coating_work_orders import build_coating_work_orders
 from app_config import (
     PAGE_CAPTIONS,
     PAGE_DESCRIPTIONS,
@@ -223,6 +224,129 @@ class DemandRollupTests(unittest.TestCase):
         self.assertIn("No active bulk buying roll", audit["reason"])
 
 
+class CoatingWorkOrderTests(unittest.TestCase):
+    def test_powder_coating_queue_uses_cin7_bom_service_component(self) -> None:
+        boms = pd.DataFrame([
+            {
+                "AssemblySKU": "LED-AL-PL55B-FL-1",
+                "AssemblyName": "PL55 black finished channel",
+                "ComponentSKU": "LED-AL-PL55-FL-1",
+                "ComponentName": "PL55 raw channel",
+                "Quantity": 1,
+                "BOMType": "Assembly",
+            },
+            {
+                "AssemblySKU": "LED-AL-PL55B-FL-1",
+                "AssemblyName": "PL55 black finished channel",
+                "ComponentSKU": "OSC-POWDERCOAT-BK-LRG-FT",
+                "ComponentName": "Powder coat black large per foot",
+                "Quantity": 3,
+                "BOMType": "Assembly",
+            },
+        ])
+        products = pd.DataFrame([
+            {
+                "SKU": "LED-AL-PL55B-FL-1",
+                "Name": "PL55 black finished channel",
+                "Suppliers": "Topmet",
+            },
+            {
+                "SKU": "LED-AL-PL55-FL-1",
+                "Name": "PL55 raw channel",
+            },
+            {
+                "SKU": "OSC-POWDERCOAT-BK-LRG-FT",
+                "Name": "Powder coat black large per foot",
+                "Suppliers": '[{"SupplierName": "Powder Coating Vendor"}]',
+            },
+        ])
+        stock = pd.DataFrame([
+            {
+                "SKU": "LED-AL-PL55B-FL-1",
+                "OnHand": 2,
+                "Available": 2,
+                "OnOrder": 0,
+                "Allocated": 0,
+            },
+            {
+                "SKU": "LED-AL-PL55-FL-1",
+                "OnHand": 10,
+                "Available": 10,
+                "OnOrder": 0,
+                "Allocated": 0,
+            },
+        ])
+        engine_df = pd.DataFrame([{
+            "SKU": "LED-AL-PL55B-FL-1",
+            "Name": "PL55 black finished channel",
+            "OnHand": 2,
+            "Available": 2,
+            "OnOrder": 0,
+            "target_stock": 7,
+            "reorder_qty": 5,
+            "ABC": "A",
+            "trend_flag": "Stable",
+            "Status": "🔴 Reorder now",
+            "effective_units_12mo": 40,
+            "units_45d": 8,
+            "avg_month": 3,
+            "Supplier": "Topmet",
+        }])
+
+        result = build_coating_work_orders(
+            boms=boms,
+            products=products,
+            stock=stock,
+            engine_df=engine_df,
+            image_lookup={},
+        )
+        lines = result["lines"]
+        service_summary = result["service_summary"]
+
+        self.assertEqual(len(lines), 1)
+        row = lines.iloc[0]
+        self.assertEqual(row["Finished SKU"], "LED-AL-PL55B-FL-1")
+        self.assertEqual(row["Coating type"], "Powder coating")
+        self.assertEqual(row["Send qty"], 5)
+        self.assertEqual(row["Service qty"], 15)
+        self.assertIn("LED-AL-PL55-FL-1", row["Raw component(s)"])
+        self.assertEqual(row["Raw status"], "Raw available")
+        self.assertIn("Powder Coating Vendor", row["Coating vendor"])
+
+        self.assertEqual(len(service_summary), 1)
+        self.assertEqual(
+            service_summary.iloc[0]["Service SKU"],
+            "OSC-POWDERCOAT-BK-LRG-FT",
+        )
+        self.assertEqual(service_summary.iloc[0]["Service_qty"], 15)
+
+    def test_anodizing_service_component_is_detected(self) -> None:
+        boms = pd.DataFrame([{
+            "AssemblySKU": "LED-AL-ANOD-1",
+            "AssemblyName": "Anodized profile",
+            "ComponentSKU": "OSC-ANODIZING-CLEAR-FT",
+            "ComponentName": "Clear anodizing per foot",
+            "Quantity": 2,
+        }])
+
+        result = build_coating_work_orders(
+            boms=boms,
+            products=pd.DataFrame(),
+            stock=pd.DataFrame(),
+            engine_df=pd.DataFrame([{
+                "SKU": "LED-AL-ANOD-1",
+                "reorder_qty": 4,
+                "target_stock": 4,
+                "Available": 0,
+                "OnOrder": 0,
+            }]),
+            image_lookup={},
+        )
+
+        self.assertEqual(result["lines"].iloc[0]["Coating type"], "Anodizing")
+        self.assertEqual(result["lines"].iloc[0]["Service qty"], 8)
+
+
 class PageConfigTests(unittest.TestCase):
     def test_ordering_column_preferences_keep_stable_view_key(self) -> None:
         self.assertEqual(ORDERING_PO_EDITOR_VIEW, "ordering_po_editor")
@@ -273,6 +397,16 @@ class PageConfigTests(unittest.TestCase):
             self.assertIn(page, PAGE_DESCRIPTIONS)
             self.assertIn(page, PAGE_GROUP_BY_NAME)
             self.assertTrue(PAGE_DESCRIPTIONS[page])
+
+    def test_anodizing_powder_coating_is_buying_page(self) -> None:
+        self.assertIn(
+            "Anodizing & Powder coating",
+            PAGE_GROUPS["Buying"],
+        )
+        self.assertIn(
+            "Anodizing & Powder coating",
+            PAGE_DESCRIPTIONS,
+        )
 
 
 class AppMemoryStructureTests(unittest.TestCase):

@@ -193,6 +193,21 @@ picker does not save or rewrite column preferences; final qty, freight,
 notes, dropship/exclude, and SKU buying-policy edits are still made in
 the main PO editor or Product Detail.
 
+#### Anodizing & Powder coating queue
+The Buying page **Anodizing & Powder coating** is driven by CIN7 BOM
+structure. A finished SKU appears only when its BOM contains a service
+component whose SKU/name looks like powder coating or anodizing, for
+example `OSC-POWDERCOAT-BK-LRG-FT`. The page does not infer these
+relationships from finished SKU names.
+
+The suggested send quantity comes from the finished SKU's current
+replenishment position: engine reorder qty first, otherwise target stock
+minus available plus on-order. The page also lists the non-service raw
+components in the same BOM, the raw quantity needed, raw available
+stock, and a service-SKU summary so buyers can place the outside-service
+order and warehouse can complete the CIN7 assembly/removal-assembly
+workflow.
+
 #### Status badges
 Status is the buyer action label and uses **Available** (OnHand -
 Allocated), not just OnHand:
