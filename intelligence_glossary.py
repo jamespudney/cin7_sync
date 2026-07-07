@@ -310,20 +310,15 @@ slider reruns the table and recomputes the optional qty
 (`avg_daily × selected window`).
 
 #### Finishing Work Orders queue
-The Buying page **Finishing Work Orders** is driven by CIN7 BOM
-structure. A finished SKU appears only when its BOM contains a service
-component whose SKU/name looks like powder coating or anodizing, for
-example `OSC-POWDERCOAT-BK-LRG-FT`. The page does not infer these
-relationships from finished SKU names.
+The Buying page **Finishing Work Orders** is driven by CIN7 BOM structure.
+A finished SKU appears only when its BOM contains a powder coating or
+anodizing service component (e.g. `OSC-POWDERCOAT-BK-LRG-FT`).
 
-The suggested send quantity comes from the finished SKU's current
-replenishment position: engine reorder qty first, otherwise target stock
-minus available plus on-order. The page also lists the non-service raw
-components in the same BOM, the raw quantity needed, raw available
-stock, and a service-SKU summary so buyers can place the outside-service
-order and warehouse can complete the CIN7 assembly/removal-assembly
-workflow.
-
+Process-first workflow (v2.67.370+): buyers filter by All / Powder coating
+/ Anodizing, tick SKUs to action, edit send quantities, and use the
+pre-built **PO Comment** (finished SKU + name + qty) when raising the
+CIN7 service PO. Column layout saves per-user. SKUs can be excluded and
+reinstated using the same do-not-reorder flag table as Ordering.
 #### Status badges (Ordering page)
 Computed in `_status()` using **Available** (not OnHand) so a SKU that's
 oversold (Allocated > OnHand) reads as urgent, not as Overstocked
@@ -842,28 +837,19 @@ when a live project really needs more.
 
 #### LED strip family rollup
 LED strip cut variants roll up to the active buying-roll master by
-shared SKU base. Known strip prefixes, including `LED-TSB`, are
-recognised by SKU, so `LED-TSB2835-300-24-6000-0305` contributes demand
-to `LED-TSB2835-300-24-6000-100M` without depending on the product name
-containing the word "strip". If a larger historical family member is
-discontinued/inactive, the app plans onto the largest active buying roll
-instead. The name-based fallback is intentionally limited to real bulk
-buying rolls (`25m+`, such as 25m/50m/100m). It must not turn a short
-finished length such as 1m, 2m, or 2.35m into a parent simply because it
-is the longest active SKU in a naming family. Direct PO history alone
-does not create an alternate master; CIN7 BOM/sourcing structure is the
-source of truth. If the engine still suggests zero after the rollup,
-check concentration/project logic: one-customer demand may be shown for
-manual review rather than converted into an automatic buy.
+shared SKU base. A strip-family member is only classified as a
+non-master cut — and has its demand rolled up to the bulk master —
+if there is explicit evidence of an assembly relationship in CIN7:
+a BOM entry, a BillOfMaterial flag, or a SourceFraction sourcing rule.
 
-The Ordering Inspect panel includes a **Strip family movement audit**
-for these rows. It reads the synced CIN7 `sale_lines`, excludes credited
-/ voided / cancelled lines, and shows direct master sales plus child/cut
-sales normalised into master-roll equivalents. For a 100m roll, 40m of
-family movement appears as `0.40` roll equivalent. The audit also shows
-the top customer's share so buyers can tell whether a zero reorder is
-coming from missing movement or from project/concentration logic.
+Without any of these, the SKU is a **standalone purchased product**
+that happens to share a naming pattern. It keeps its own demand
+calculation, its own ABC class, and its own reorder suggestion —
+completely independent of the bulk roll (v2.67.372).
 
+The name-based fallback applies only to bulk buying rolls (≥ 25m).
+Short finished lengths are never crowned as family masters. Direct
+PO history alone does not create a master/cut relationship.
 #### Monthly Metrics — formulas & commission caveats (v2.67.290)
 The Monthly Metrics page is the commission base, so every metric
 needs to be auditable. The full methodology lives in an in-app
@@ -1079,15 +1065,14 @@ It can still be run immediately from Cashflow via **Sync from
 QuickBooks**.
 
 #### is_non_master_tube (engine column)
-True for SKUs that are children of a bulk-roll master (per-foot
-cuts, BOM derivatives). Their stock and demand roll up to the
-master. Most calculations filter `~is_non_master_tube` so they
-operate on parents + standalones only — avoids double-counting.
-You'll see this filter on the Ordering page (parents_only
-toggle), the Slow Movers page (auto-applied unless 'show all
-flagged' is on), and the Optimum / Excess / Dead-stock math on
-the headline tiles.
+True for SKUs that are children of a bulk-roll master (per-foot cuts,
+BOM derivatives). Their demand rolls up to the master. Most calculations
+filter `~is_non_master_tube` to operate on parents + standalones only.
 
+A SKU is only marked `is_non_master_tube` if it has a BOM, BillOfMaterial
+flag, or SourceFraction sourcing rule (v2.67.372). A SKU with no BOM that
+shares a naming pattern with a bulk roll is treated as a standalone
+purchased product and gets its own independent demand and reorder.
 #### Engine-snapshot writers (provenance, v2.67.36+)
 The engine writes two persistence tables during each recompute:
 - **`sku_dormancy_log`** — one row per SKU that's ever been
