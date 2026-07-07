@@ -7278,6 +7278,22 @@ def _abc_engine(products: pd.DataFrame,
     # Last 6 months total (sum of most recent 6 monthly buckets)
     df["last_6mo"] = df["trend_12m"].apply(
         lambda buckets: float(sum(buckets[-6:])) if buckets else 0.0)
+
+    # v2.67.373 — Recent avg/mo: sum of last 6 months ÷ active months
+    # (months with at least 1 unit sold). This is what the buyer naturally
+    # computes when they look at the Last 6 months column — the recent
+    # run rate, not the engine's adjusted reorder velocity (avg_month).
+    # Kept separate so reorder math is not affected.
+    def _recent_avg_mo(buckets):
+        if not buckets:
+            return 0.0
+        last6 = buckets[-6:]
+        active = sum(1 for v in last6 if v > 0)
+        if active == 0:
+            return 0.0
+        return float(sum(last6)) / active
+
+    df["recent_avg_mo"] = df["trend_12m"].apply(_recent_avg_mo)
     # Buyer-visible demand total from the same 12 monthly buckets shown in
     # the Ordering grid. This is deliberately separate from
     # `effective_units_12mo`, which remains the reorder-math source of
@@ -14968,6 +14984,7 @@ elif page == "Ordering":
             "target_stock": 0.0,
             "avg_daily": 0.0,
             "avg_month": 0.0,
+            "recent_avg_mo": 0.0,
             "vendor_lead_time_days": 0.0,
             "lead_time_days": 0.0,
             "sku_lead_time_days": 0.0,
@@ -15466,7 +15483,7 @@ elif page == "Ordering":
         "trend_flag",
         "trend_12m", "last_6mo_series", "last_12mo_series", "units_12mo",
         "units_45d", "momentum", "customers_45d", "top_cust_pct",
-        "avg_daily", "avg_month", "LengthMM",
+        "avg_daily", "avg_month", "recent_avg_mo", "LengthMM",
         "OnHand", "Allocated", "Available", "OnOrder",
         "DoC_days",
         "target_stock", "reorder_qty",
@@ -15521,6 +15538,7 @@ elif page == "Ordering":
         ("sku_lead_time_days", "vendor_lead_time_days"),
         ("sku_moq", "sku_lead_time_days"),
         ("sku_eoq_qty", "sku_moq"),
+        ("recent_avg_mo", "avg_month"),
     ]
     for _new, _after in _NEWLY_INTRODUCED_COLS:
         if _new not in editor_cols and _new in default_editor_cols:
@@ -15547,7 +15565,8 @@ elif page == "Ordering":
         "last_12mo_series": "Last 12 months (trend numbers)",
         "units_12mo": "12mo units sold",
         "avg_daily": "Avg daily units",
-        "avg_month": "Avg/month",
+        "avg_month": "Avg/month (engine velocity)",
+        "recent_avg_mo": "Recent avg/mo (last 6mo ÷ active months)",
         "LengthMM": "Length (mm)",
         "OnHand": "On hand",
         "Allocated": "Allocated",
@@ -15588,7 +15607,7 @@ elif page == "Ordering":
         "Buyer essentials (default)": [
             "Include?", "Image", "SKU", "Name", "ABC", "Status",
             "trend_flag", "last_6mo_series", "last_12mo_series",
-            "avg_month",
+            "avg_month", "recent_avg_mo",
             "OnHand", "Available", "OnOrder", "unfulfilled",
             "target_stock", "reorder_qty", "freight_mode",
             "vendor_lead_time_days", "sku_lead_time_days",
@@ -16431,12 +16450,17 @@ elif page == "Ordering":
                 "Daily", disabled=True, format="%.2f"),
             "avg_month": st.column_config.NumberColumn(
                 "Avg/month",
-                help="Avg monthly units = avg_daily × 30.4 (days/mo). "
-                     "Buyer-friendly view of velocity for cadence "
-                     "reasoning (\"~60 a month\" is easier to "
-                     "compare against MOQ + lead-time than "
-                     "\"2.0/day\"). Same number, different scale.",
-                disabled=True, format="%.0f"),
+                help="Engine buying velocity × 30.4 days/mo. Used in "
+                     "reorder math. May differ from recent sales rate "
+                     "due to trend/project/dormancy adjustments. "
+                     "See Recent avg/mo for the raw sales run rate.",
+                disabled=True, format="%.1f"),
+            "recent_avg_mo": st.column_config.NumberColumn(
+                "Recent avg/mo",
+                help="Last 6 months total ÷ active months (months with "
+                     "≥1 unit sold). Matches what the buyer reads from "
+                     "the Last 6 months column. Not used in reorder math.",
+                disabled=True, format="%.1f"),
             "LengthMM": st.column_config.NumberColumn(
                 "Len mm", disabled=True),
             "OnHand": st.column_config.NumberColumn(disabled=True),
