@@ -208,6 +208,15 @@ stock, and a service-SKU summary so buyers can place the outside-service
 order and warehouse can complete the CIN7 assembly/removal-assembly
 workflow.
 
+**Workflow (v2.67.370+):** the page is process-first (All / Powder
+coating / Anodizing filter). Buyers tick finished SKUs to action, edit
+send quantities, and the **PO Comment** field is pre-built with the
+finished SKU name and quantity — paste it into the CIN7 service PO line
+so the vendor and warehouse know what each batch produces. Column layout
+is saved per-user (same drag-to-reorder editor as Ordering). SKUs can be
+excluded from the queue and reinstated via the archived panel at the
+bottom (uses the same do-not-reorder flag table as the Ordering page).
+
 #### Status badges
 Status is the buyer action label and uses **Available** (OnHand -
 Allocated), not just OnHand:
@@ -728,13 +737,33 @@ to `LED-TSB2835-300-24-6000-100M` without depending on the product name
 containing the word "strip". If a larger historical family member is
 discontinued/inactive, the app plans onto the largest active buying roll
 instead. The name-based fallback is intentionally limited to real bulk
-buying rolls (`25m+`, such as 25m/50m/100m). It must not turn a short
-finished length such as 1m, 2m, or 2.35m into a parent simply because it
-is the longest active SKU in a naming family. Direct PO history alone
-does not create an alternate master; CIN7 BOM/sourcing structure is the
-source of truth. If the engine still suggests zero after the rollup,
-check concentration/project logic: one-customer demand may be shown for
-manual review rather than converted into an automatic buy.
+buying rolls (any size ≥ 25m). It must not turn a short finished length
+such as 1m, 2m, or 2.35m into a parent simply because it is the longest
+active SKU in a naming family.
+
+**BOM is the source of truth for the rollup relationship (v2.67.372).**
+A strip-family member is only classified as a non-master cut — and has
+its demand rolled up to the bulk master — if there is explicit evidence
+of an assembly relationship in CIN7:
+
+- A CIN7 BOM entry (the SKU appears as an assembly with components), or
+- `BillOfMaterial = True` in the product master, or
+- A `SourceFraction` sourcing rule in AdditionalAttribute1.
+
+Without any of these, the SKU is treated as a **standalone purchased
+product** that happens to share a naming pattern with the bulk roll. It
+gets its own demand calculation, its own ABC class, and its own reorder
+suggestion — completely independent of the bulk roll. The bulk roll's
+demand is not inflated by this SKU's sales.
+
+Example: `LED-WLWW-30K-16-IP20-5` (5m reel) and `LED-WLWW-30K-16-IP20-25`
+(25m roll) may share a name family, but if the 5m has no BOM they are
+two completely separate products. Each is planned independently.
+
+Direct PO history alone does not create an alternate master. If the
+engine still suggests zero after the rollup, check concentration/project
+logic: one-customer demand may be shown for manual review rather than
+converted into an automatic buy.
 
 The Ordering Inspect panel includes a **Strip family movement audit**
 for these rows. It reads the synced CIN7 `sale_lines`, excludes credited
@@ -967,6 +996,13 @@ You'll see this filter on the Ordering page (parents_only
 toggle), the Slow Movers page (auto-applied unless 'show all
 flagged' is on), and the Optimum / Excess / Dead-stock math on
 the headline tiles.
+
+**Important (v2.67.372):** a SKU is only marked `is_non_master_tube`
+if it has a BOM, BillOfMaterial flag, or SourceFraction sourcing rule
+proving it is assembled/cut from a bulk master. A SKU with no BOM that
+merely shares a naming pattern with a larger roll is treated as a
+standalone product — `is_non_master_tube = False` — and gets its own
+independent demand and reorder calculation.
 
 #### Engine-snapshot writers (provenance, v2.67.36+)
 The engine writes two persistence tables during each recompute:
