@@ -228,28 +228,36 @@ class DemandRollupTests(unittest.TestCase):
             self) -> None:
         """LED-WLWW-30K-16-IP20-5 regression test.
 
-        A fixed-length reel that has a CIN7 supplier assigned is independently
-        orderable even when a larger sibling (≥25m) exists in the same naming
-        family. It must NOT be added to strip_non_master_skus and must remain
-        visible in the Ordering page.
+        A 5m fixed-length reel that shares a naming family with a ≥25m bulk
+        roll and a per-foot variant. The 5m reel is independently ordered from
+        a supplier (has CIN7 supplier assigned). It must NOT be added to
+        strip_non_master_skus and must:
+          - remain visible in orderable_df (Ordering page)
+          - retain its own effective_units_12mo (is_non_master_tube = False)
+          - still have its sales rolled up to the bulk master (family rollup)
 
-        Both the zero-demand path and the has-demand path are tested because
-        the guard must fire in both branches.
+        The fix guards both paths in app.py that add to strip_non_master_skus:
+          1. zero-demand path  (own_units == 0 and own_units_90d == 0)
+          2. has-demand path   (sales rolled up + non-master flagged)
         """
         from engine.sku_rules import _is_strip_sku, _parse_strip_base
 
-        # Confirm the SKU DOES enter strip parsing via name match
+        # Confirm the SKU enters strip parsing via name keyword match
         self.assertTrue(
             _is_strip_sku("LED-WLWW-30K-16-IP20-5",
                           "Wide Lily LED Strip 3000K 16mm IP20 5m"))
-        # Confirm it parses as length 5m
+        # Confirm it parses correctly as length 5m
         parsed = _parse_strip_base("LED-WLWW-30K-16-IP20-5")
         self.assertIsNotNone(parsed)
         self.assertAlmostEqual(parsed[1], 5.0)
-
-        # The fix lives in app.py engine logic (has_cin7_supplier guard),
-        # so we validate the sku_rules layer here and rely on the integration
-        # test in test_wlww_independently_supplied for the full engine path.
+        # Bulk sibling parses as ≥25m (would trigger master election)
+        parsed_bulk = _parse_strip_base("LED-WLWW-30K-16-IP20-25")
+        self.assertIsNotNone(parsed_bulk)
+        self.assertAlmostEqual(parsed_bulk[1], 25.0)
+        # The has_cin7_supplier guard in app.py prevents the 5m from
+        # landing in strip_non_master_skus, so is_non_master_tube stays
+        # False and effective_units_12mo uses real demand.
+        # Full engine path tested in the Ordering integration tests.
 
 
 class CoatingWorkOrderTests(unittest.TestCase):
