@@ -309,8 +309,8 @@ short 21-day horizon instead of always starting at 45 days. Moving the
 slider reruns the table and recomputes the optional qty
 (`avg_daily × selected window`).
 
-#### Anodizing & Powder coating queue
-The Buying page **Anodizing & Powder coating** is driven by CIN7 BOM
+#### Finishing Work Orders queue
+The Buying page **Finishing Work Orders** is driven by CIN7 BOM
 structure. A finished SKU appears only when its BOM contains a service
 component whose SKU/name looks like powder coating or anodizing, for
 example `OSC-POWDERCOAT-BK-LRG-FT`. The page does not infer these
@@ -451,7 +451,9 @@ on hand. Computed by the engine on every recompute. Definitions:
   re-classifies it as active. The Ordering page renders ❗ in the
   Status column and a `⚠️ WAS slow-moving` auto-prefix in the
   Notes column. Auto-lifts after 90 days of sustained activity, or
-  the buyer can dismiss manually from the Slow Movers page.
+  the buyer can dismiss manually from the Slow Movers page. The ❗
+  prefix is treated as a warning badge only: Status filters still use
+  the underlying base status such as 🔴 Reorder now.
 - **A-class grace (v2.67.48)** — A-class SKUs with positive 12mo
   demand are EXEMPT from dormancy flagging. Reasoning: A-class is
   by definition a steady-revenue mover; if the buyer over-bought

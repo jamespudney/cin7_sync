@@ -131,25 +131,56 @@ def _normalise_boms(boms: pd.DataFrame) -> pd.DataFrame:
 
 
 def _summarise_service_lines(service_lines: pd.DataFrame) -> pd.DataFrame:
+    """Summarise service lines by vendor/service SKU.
+    Handles both old 'Coating type' and new 'Process' column name."""
     if service_lines is None or service_lines.empty:
         return pd.DataFrame()
-    return (
-        service_lines.groupby(
-            ["Coating type", "Service SKU", "Service name", "Vendor"],
+    df = service_lines.copy()
+    # Normalise column name — rows built before v2.67.371 use "Coating type"
+    if "Coating type" in df.columns and "Process" not in df.columns:
+        df = df.rename(columns={"Coating type": "Process"})
+    elif "Process" not in df.columns:
+        df["Process"] = ""
+    grp = (
+        df.groupby(
+            ["Process", "Service SKU", "Service name", "Vendor"],
             dropna=False,
         )
         .agg(
-            Service_qty=("Service qty", "sum"),
-            Finished_lines=("Finished SKU", "nunique"),
-            Send_units=("Send qty", "sum"),
-            Finished_SKUs=(
-                "Finished SKU",
-                lambda x: ", ".join(sorted(set(map(str, x)))),
-            ),
+            **{
+                "Qty to order": ("Service qty", "sum"),
+                "Lines": ("Finished SKU", "nunique"),
+                "Send qty total": ("Send qty", "sum"),
+                "Finished SKUs": (
+                    "Finished SKU",
+                    lambda x: ", ".join(sorted(set(map(str, x)))),
+                ),
+                "Finished names": (
+                    "Finished name",
+                    lambda x: ", ".join(
+                        sorted(set(str(v) for v in x if v))),
+                ) if "Finished name" in df.columns else (
+                    "Finished SKU",
+                    lambda x: ""),
+                "PO Comment": (
+                    "PO Comment",
+                    lambda x: " | ".join(
+                        sorted(set(str(v) for v in x if v))),
+                ) if "PO Comment" in df.columns else (
+                    "Finished SKU",
+                    lambda x: ""),
+            }
         )
         .reset_index()
-        .sort_values(["Coating type", "Service_qty"], ascending=[True, False])
+        .sort_values(["Process", "Qty to order"], ascending=[True, False])
     )
+    col_order = [
+        "Process", "Vendor", "Service SKU", "Service name",
+        "Qty to order", "Send qty total", "Lines",
+        "Finished SKUs", "Finished names", "PO Comment",
+    ]
+    cols = [c for c in col_order if c in grp.columns]
+    return grp[cols]
 
 
 def build_coating_work_orders(
