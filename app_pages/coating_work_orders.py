@@ -281,7 +281,7 @@ def build_coating_work_orders(
             )
             if service_qty > 0:
                 service_summary_rows.append({
-                    "Coating type": service.get("Coating type"),
+                    "Process": service.get("Coating type") or "",
                     "Service SKU": service_sku,
                     "Service name": service_name,
                     "Vendor": service_vendor,
@@ -290,6 +290,10 @@ def build_coating_work_orders(
                     "Finished SKU": assembly_sku,
                     "Finished name": assembly_name,
                     "Send qty": action_qty,
+                    "PO Comment": (
+                        f"Finishing for: {assembly_sku} — "
+                        f"{assembly_name} × {_compact_num(action_qty)}"
+                    ),
                 })
 
         # v2.67.370 — column order mirrors the Ordering page so buyers
@@ -537,26 +541,48 @@ def render_anodizing_powder_coating(
             )
 
     with tabs[1]:
+        st.caption(
+            "One row per coating/anodizing service SKU. Use this to raise "
+            "the vendor PO — paste the **PO Comment** into each CIN7 line "
+            "so the vendor knows which finished SKUs the batch produces."
+        )
         if service_summary.empty:
             st.info("No positive service quantities in the current filters.")
         else:
+            _SVC_COL_CONFIG = {
+                "Process": st.column_config.TextColumn("Process", width="medium"),
+                "Vendor": st.column_config.TextColumn("Vendor", width="medium"),
+                "Service SKU": st.column_config.TextColumn(
+                    "Service SKU", width="medium"),
+                "Service name": st.column_config.TextColumn(
+                    "Service name", width="large"),
+                "Qty to order": st.column_config.NumberColumn(
+                    "Qty to order", format="%.0f"),
+                "Send qty total": st.column_config.NumberColumn(
+                    "Raw send total", format="%.0f"),
+                "Lines": st.column_config.NumberColumn(
+                    "Finished lines", format="%.0f"),
+                "Finished SKUs": st.column_config.TextColumn(
+                    "Finished SKUs", width="large"),
+                "Finished names": st.column_config.TextColumn(
+                    "Finished names", width="large"),
+                "PO Comment": st.column_config.TextColumn(
+                    "PO Comment (copy to CIN7)", width="large",
+                    help="Paste into the CIN7 PO line Comment field — "
+                         "gives vendor and warehouse full context."),
+            }
             st.dataframe(
                 service_summary,
                 width="stretch",
                 height=420,
-                column_config={
-                    "Service_qty": st.column_config.NumberColumn(
-                        "Service qty", format="%.2f"),
-                    "Send_units": st.column_config.NumberColumn(
-                        "Finished send units", format="%.2f"),
-                },
+                column_config=_SVC_COL_CONFIG,
             )
             st.download_button(
-                "Download service-order summary CSV",
+                "⬇ Download vendor send CSV",
                 data=service_summary.to_csv(index=False),
-                file_name="coating_service_order_summary.csv",
+                file_name="finishing_vendor_send.csv",
                 mime="text/csv",
-                width="stretch",
+                use_container_width=True,
             )
 
     with tabs[2]:
