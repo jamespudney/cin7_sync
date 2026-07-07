@@ -6642,7 +6642,12 @@ def _abc_engine(products: pd.DataFrame,
             own_units_90d = max(0.0, own_units_90d - float(
                 assembly_units_90d_map.get(sku_m, 0)))
             if (own_units == 0 and own_units_90d == 0) or length_m == 0:
-                strip_non_master_skus.add(sku_m)
+                # v2.67.372 — if this strip-family member has its own
+                # CIN7 supplier it is independently ordered regardless
+                # of zero demand in the window. Don't hide it from
+                # Ordering by adding it to strip_non_master_skus.
+                if sku_m not in has_cin7_supplier:
+                    strip_non_master_skus.add(sku_m)
                 continue
             consumption_m = own_units * length_m
             consumption_m_90d = own_units_90d * length_m
@@ -6665,7 +6670,12 @@ def _abc_engine(products: pd.DataFrame,
                 f"= {consumption_m:.1f}m = "
                 f"{consumption_in_master_units:.2f} × {bulk_len:g}m rolls"
             )
-            strip_non_master_skus.add(sku_m)
+            # v2.67.372 — guard: a strip-family member with its own
+            # CIN7 supplier is independently ordered. Roll up its sales
+            # contribution to the master (above) but do NOT hide it from
+            # Ordering — it needs its own reorder recommendation.
+            if sku_m not in has_cin7_supplier:
+                strip_non_master_skus.add(sku_m)
 
     # Merge strip rollup into the master_rollup_inflow tracked above
     for master_sku, consumption in strip_rollup_inflow.items():
