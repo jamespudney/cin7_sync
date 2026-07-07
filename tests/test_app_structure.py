@@ -254,9 +254,11 @@ class DemandRollupTests(unittest.TestCase):
         parsed_bulk = _parse_strip_base("LED-WLWW-30K-16-IP20-25")
         self.assertIsNotNone(parsed_bulk)
         self.assertAlmostEqual(parsed_bulk[1], 25.0)
-        # The has_cin7_supplier guard in app.py prevents the 5m from
-        # landing in strip_non_master_skus, so is_non_master_tube stays
-        # False and effective_units_12mo uses real demand.
+        # The BOM-absence guard in app.py prevents the 5m from landing
+        # in strip_non_master_skus: no BOM, no BillOfMaterial flag,
+        # no sourcing rule → straight purchased product → is_non_master_tube
+        # stays False and effective_units_12mo uses real demand.
+        # Sales still roll up to the bulk master (correct for planning).
         # Full engine path tested in the Ordering integration tests.
 
 

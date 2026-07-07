@@ -6642,11 +6642,21 @@ def _abc_engine(products: pd.DataFrame,
             own_units_90d = max(0.0, own_units_90d - float(
                 assembly_units_90d_map.get(sku_m, 0)))
             if (own_units == 0 and own_units_90d == 0) or length_m == 0:
-                # v2.67.372 — if this strip-family member has its own
-                # CIN7 supplier it is independently ordered regardless
-                # of zero demand in the window. Don't hide it from
-                # Ordering by adding it to strip_non_master_skus.
-                if sku_m not in has_cin7_supplier:
+                # v2.67.372 — the strip parser is a naming-based
+                # fallback for SKUs with no CIN7 BOM. If a family
+                # member has no BOM, no BillOfMaterial flag, and no
+                # sourcing rule it has no assembly relationship and is
+                # a straight purchased product — don't hide it from
+                # Ordering by classifying it as a non-master cut.
+                # Example: LED-WLWW-30K-16-IP20-5 is an independently
+                # ordered 5m reel that coexists with a 25m bulk roll
+                # in the same naming family.
+                _has_no_bom = (
+                    sku_m not in bom_components_by_asm
+                    and not bom_flag_by_sku.get(sku_m, False)
+                    and not rule_by_sku.get(sku_m, {}).get("SourceFraction")
+                )
+                if not _has_no_bom:
                     strip_non_master_skus.add(sku_m)
                 continue
             consumption_m = own_units * length_m
@@ -6670,11 +6680,18 @@ def _abc_engine(products: pd.DataFrame,
                 f"= {consumption_m:.1f}m = "
                 f"{consumption_in_master_units:.2f} × {bulk_len:g}m rolls"
             )
-            # v2.67.372 — guard: a strip-family member with its own
-            # CIN7 supplier is independently ordered. Roll up its sales
-            # contribution to the master (above) but do NOT hide it from
-            # Ordering — it needs its own reorder recommendation.
-            if sku_m not in has_cin7_supplier:
+            # v2.67.372 — BOM-absence guard: if a strip-family member
+            # has no BOM, no BillOfMaterial flag, and no sourcing rule
+            # it is a straight purchased product. Still roll up its
+            # sales to the bulk master (correct for master planning)
+            # but do NOT classify it as non-master — it needs its own
+            # reorder recommendation in the Ordering page.
+            _has_no_bom_d = (
+                sku_m not in bom_components_by_asm
+                and not bom_flag_by_sku.get(sku_m, False)
+                and not rule_by_sku.get(sku_m, {}).get("SourceFraction")
+            )
+            if not _has_no_bom_d:
                 strip_non_master_skus.add(sku_m)
 
     # Merge strip rollup into the master_rollup_inflow tracked above
