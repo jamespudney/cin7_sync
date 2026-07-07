@@ -442,7 +442,7 @@ def render_anodizing_powder_coating(
     )
     c4.metric(
         "Raw-short lines",
-        fmt_number(int((action_lines["Raw status"] == "Raw short").sum())),
+        fmt_number(int((action_lines["Stock ready?"] == "Raw short").sum())),
     )
 
     filters = st.container(border=True)
@@ -460,7 +460,7 @@ def render_anodizing_powder_coating(
             key="coating_process_filter",
         )
         raw_filter = f3.multiselect(
-            "Raw status",
+            "Stock ready?",
             ["Raw available", "Raw short", "Check BOM", "No action"],
             default=["Raw available", "Raw short", "Check BOM"],
             key="coating_raw_filter",
@@ -477,7 +477,7 @@ def render_anodizing_powder_coating(
     if coating_filter:
         view = view[view["Process"].isin(coating_filter)]
     if raw_filter:
-        view = view[view["Raw status"].isin(raw_filter)]
+        view = view[view["Stock ready?"].isin(raw_filter)]
     if query:
         q = query.strip()
         mask = pd.Series(False, index=view.index)
