@@ -269,7 +269,9 @@ on hand. Computed by the engine on every recompute. Definitions:
   re-classifies it as active. The Ordering page renders ❗ in the
   Status column and a `⚠️ WAS slow-moving` auto-prefix in the
   Notes column. Auto-lifts after 90 days of sustained activity, or
-  the buyer can dismiss manually from the Slow Movers page.
+  the buyer can dismiss manually from the Slow Movers page. The ❗
+  prefix is treated as a warning badge only: Status filters still use
+  the underlying base status such as 🔴 Reorder now.
 - **A-class grace (v2.67.48)** — A-class SKUs with positive 12mo
   demand are EXEMPT from dormancy flagging. Reasoning: A-class is
   by definition a steady-revenue mover; if the buyer over-bought
@@ -15237,7 +15239,19 @@ elif page == "Ordering":
         if abc_filter:
             out = out[out["ABC"].isin(abc_filter)]
         if status_filter:
-            status_out = out[out["Status"].isin(status_filter)]
+            status_series = out.get(
+                "Status", pd.Series("", index=out.index)
+            ).astype(str)
+            # The once-slow warning prefix is a badge, not a separate
+            # status bucket. Keep rows like "❗ 🔴 Reorder now" visible
+            # when buyers filter for the base "🔴 Reorder now" status.
+            status_base = status_series.str.replace(
+                r"^❗\s*", "", regex=True
+            )
+            status_out = out[
+                status_series.isin(status_filter)
+                | status_base.isin(status_filter)
+            ]
             if (not relax_status_if_empty
                     or not status_out.empty
                     or out.empty):
@@ -24829,10 +24843,10 @@ elif page == "AI Assistant":
 # row to audit_log per change, so the trail of who-changed-what stays intact.
 
 # ---------------------------------------------------------------------------
-# Page: Anodizing & Powder coating
+# Page: Finishing Work Orders
 # ---------------------------------------------------------------------------
 
-elif page == "Anodizing & Powder coating":
+elif page in ("Finishing Work Orders", "Anodizing & Powder coating"):
     render_anodizing_powder_coating(
         boms=boms,
         products=products,

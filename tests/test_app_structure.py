@@ -400,11 +400,11 @@ class PageConfigTests(unittest.TestCase):
 
     def test_anodizing_powder_coating_is_buying_page(self) -> None:
         self.assertIn(
-            "Anodizing & Powder coating",
+            "Finishing Work Orders",
             PAGE_GROUPS["Buying"],
         )
         self.assertIn(
-            "Anodizing & Powder coating",
+            "Finishing Work Orders",
             PAGE_DESCRIPTIONS,
         )
 
@@ -846,6 +846,21 @@ class AppMemoryStructureTests(unittest.TestCase):
         self.assertIn("Main PO grid should mean", script)
         self.assertIn("keep_mask = _supplier_reorder_qty > 0", script)
         self.assertNotIn('(s_df["reorder_qty"] > 0)', script)
+
+    def test_warning_prefixed_statuses_still_match_base_filter(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "app.py"
+        ).read_text(encoding="utf-8")
+
+        filter_pos = script.index("def _apply_ordering_view_filters")
+        status_pos = script.index("if status_filter:", filter_pos)
+        reorder_pos = script.index("if only_reorder_positive:", status_pos)
+        block = script[status_pos:reorder_pos]
+        self.assertIn("status_base = status_series.str.replace", block)
+        self.assertIn('r"^❗\\s*"', block)
+        self.assertIn("status_series.isin(status_filter)", block)
+        self.assertIn("status_base.isin(status_filter)", block)
+        self.assertIn("warning prefix is a badge", block)
 
     def test_ordering_supplier_catalog_search_is_committed_and_bounded(self) -> None:
         script = (
