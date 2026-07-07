@@ -103,7 +103,7 @@ PAGE_GROUPS = OrderedDict({
     ],
     "Buying": [
         "Ordering",
-        "Anodizing & Powder coating",
+        "Finishing Work Orders",
         "Slow Movers",
         "Supplier Pricing",
         "FixedCost Audit",
@@ -139,7 +139,7 @@ PAGE_DESCRIPTIONS = {
     "AI Assistant": "Natural-language Q&A grounded in live CIN7 + Shopify data.",
     "Data Health": "Sync freshness, CSV row counts, data integrity flags.",
     "Ordering": "ABC-driven reorder workbench with PO drafts.",
-    "Anodizing & Powder coating": (
+    "Finishing Work Orders": (
         "BOM-driven coating/anodizing work queue for finished SKU replenishment."
     ),
     "Slow Movers": "Stock-reduction workspace: dormant SKUs, value tied up, dismiss/flag.",

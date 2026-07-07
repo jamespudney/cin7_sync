@@ -292,39 +292,47 @@ def build_coating_work_orders(
                     "Send qty": action_qty,
                 })
 
+        # v2.67.370 — column order mirrors the Ordering page so buyers
+        # have a consistent mental model across both pages.
+        # PO comment context: finished SKU + name + qty for the vendor.
+        _po_comment = (
+            f"Finishing for: {assembly_sku} — {assembly_name} × "
+            f"{_compact_num(action_qty)}"
+        )
         rows.append({
             "Image": image_lookup.get(assembly_sku, ""),
             "Finished SKU": assembly_sku,
             "Finished name": assembly_name,
-            "Coating type": " + ".join(coating_types),
-            "Send qty": action_qty,
-            "Service qty": service_qty_total,
-            "Service SKU(s)": "\n".join(service_bits),
-            "Coating vendor": ", ".join(dict.fromkeys(service_vendor_bits)),
-            "Raw component(s)": "\n".join(material_bits),
-            "Raw required": "\n".join(raw_required_bits),
-            "Raw available": "\n".join(raw_available_bits),
-            "Buildable from raw": buildable,
-            "Raw status": raw_status,
-            "Finished OnHand": onhand,
-            "Finished Available": available,
-            "Finished OnOrder": on_order,
-            "Target stock": target,
-            "Engine reorder": reorder_qty,
             "ABC": eng.get("ABC") or "",
-            "Trend": eng.get("trend_flag") or "",
             "Status": eng.get("Status") or "",
-            "12mo demand": _num(
-                eng.get("effective_units_12mo", eng.get("units_12mo", 0))),
-            "45d units": _num(eng.get("units_45d", 0)),
+            "Process": " + ".join(coating_types),
+            "Trend": eng.get("trend_flag") or "",
+            "Last 6 months": eng.get("last_6mo_series") or "",
             "Avg/month": _num(eng.get("avg_month", 0)),
+            "units_12mo": _num(
+                eng.get("effective_units_12mo", eng.get("units_12mo", 0))),
+            "units_45d": _num(eng.get("units_45d", 0)),
+            "OnHand": onhand,
+            "Available": available,
+            "OnOrder": on_order,
+            "Target stock": target,
+            "Suggested send": reorder_qty,
+            "Send qty": action_qty,
+            "Stock ready?": raw_status,
+            "Raw profile/part": "\n".join(material_bits),
+            "Raw needed": "\n".join(raw_required_bits),
+            "Raw on hand": "\n".join(raw_available_bits),
+            "Buildable": buildable,
+            "Coating service": "\n".join(service_bits),
+            "Vendor": ", ".join(dict.fromkeys(service_vendor_bits)),
+            "PO Comment": _po_comment,
             "Supplier": eng.get("Supplier") or _supplier_label(prod.get("Suppliers")),
         })
 
     lines = pd.DataFrame(rows)
     if not lines.empty:
         lines = lines.sort_values(
-            ["Send qty", "45d units", "12mo demand"],
+            ["Send qty", "units_45d", "units_12mo"],
             ascending=[False, False, False],
         )
 
@@ -350,18 +358,18 @@ def render_anodizing_powder_coating(
     fmt_money,
     rows_selector,
 ) -> None:
-    st.header("Anodizing & Powder coating")
-
-    with st.expander("How this should be used", expanded=False):
-        st.markdown(
-            "This page is driven by CIN7 BOMs. A finished SKU appears here "
-            "only when its BOM contains a powder-coating or anodizing service "
-            "component, for example `OSC-POWDERCOAT-BK-LRG-FT`.\n\n"
-            "Operationally this is a work-order queue: order the service SKU "
-            "from the coating/anodizing vendor, send the raw component out, "
-            "then complete the CIN7 assembly/removal-assembly process to turn "
-            "the raw item plus service into the finished coated SKU."
-        )
+    st.header("🎨 Finishing Work Orders")
+    st.info(
+        "**Outsourced finishing queue — raw profiles + coating service = finished stock.**  \n"
+        "This page shows which finished SKUs need raw material sent to a powder coating "
+        "or anodizing vendor. Relationships are driven entirely by CIN7 BOMs — a SKU "
+        "appears here only if its BOM contains a coating/anodizing service component "
+        "(e.g. `OSC-POWDERCOAT-BK-LRG-FT`).  \n"
+        "**Workflow:** decide qty to send → raise vendor PO (service SKU goes in PO with "
+        "finished SKU context in the Comment field) → send raw stock → receive service → "
+        "complete CIN7 assembly to produce the finished SKU.",
+        icon="ℹ️",
+    )
 
     if boms is None or boms.empty:
         st.warning(
@@ -409,7 +417,7 @@ def render_anodizing_powder_coating(
             "Search finished SKU, raw SKU, service SKU, or name",
             key="coating_search",
         )
-        coating_opts = sorted(lines["Coating type"].dropna().unique().tolist())
+        coating_opts = sorted(lines["Process"].dropna().unique().tolist())
         coating_filter = f2.multiselect(
             "Process",
             coating_opts,
@@ -432,7 +440,7 @@ def render_anodizing_powder_coating(
     if action_only:
         view = view[view["Send qty"].fillna(0) > 0]
     if coating_filter:
-        view = view[view["Coating type"].isin(coating_filter)]
+        view = view[view["Process"].isin(coating_filter)]
     if raw_filter:
         view = view[view["Raw status"].isin(raw_filter)]
     if query:
@@ -441,10 +449,11 @@ def render_anodizing_powder_coating(
         for col in (
             "Finished SKU",
             "Finished name",
-            "Service SKU(s)",
-            "Raw component(s)",
-            "Coating vendor",
+            "Coating service",
+            "Raw profile/part",
+            "Vendor",
             "Supplier",
+            "Process",
         ):
             if col in view.columns:
                 mask |= view[col].astype(str).str.contains(
@@ -458,43 +467,73 @@ def render_anodizing_powder_coating(
         ]
         service_summary = _summarise_service_lines(filtered_service_lines)
 
-    tabs = st.tabs(["Work queue", "Service order summary", "All coated SKUs"])
+    tabs = st.tabs(["🔴 Action now", "📋 Send to vendor", "📦 All finishing SKUs"])
+
+    _COL_CONFIG = {
+        "Image": st.column_config.ImageColumn("Image", width="small"),
+        "Finished SKU": st.column_config.TextColumn("Finished SKU", width="medium"),
+        "Finished name": st.column_config.TextColumn("Name", width="large"),
+        "ABC": st.column_config.TextColumn("ABC", width="small"),
+        "Status": st.column_config.TextColumn("Status", width="medium"),
+        "Process": st.column_config.TextColumn("Process", width="medium"),
+        "Trend": st.column_config.TextColumn("Trend", width="medium"),
+        "Last 6 months": st.column_config.TextColumn("Last 6 mo", width="medium"),
+        "Avg/month": st.column_config.NumberColumn("Avg/mo", format="%.1f"),
+        "units_12mo": st.column_config.NumberColumn("12mo units", format="%.0f"),
+        "units_45d": st.column_config.NumberColumn("45d units", format="%.0f"),
+        "OnHand": st.column_config.NumberColumn("On Hand", format="%.0f"),
+        "Available": st.column_config.NumberColumn("Available", format="%.0f"),
+        "OnOrder": st.column_config.NumberColumn("On Order", format="%.0f"),
+        "Target stock": st.column_config.NumberColumn("Target", format="%.1f"),
+        "Suggested send": st.column_config.NumberColumn("Suggested", format="%.0f"),
+        "Send qty": st.column_config.NumberColumn("Send qty", format="%.0f"),
+        "Stock ready?": st.column_config.TextColumn("Stock ready?", width="medium"),
+        "Raw profile/part": st.column_config.TextColumn("Raw profile/part", width="large"),
+        "Raw needed": st.column_config.TextColumn("Raw needed", width="medium"),
+        "Raw on hand": st.column_config.TextColumn("Raw on hand", width="medium"),
+        "Buildable": st.column_config.NumberColumn("Buildable", format="%.0f"),
+        "Coating service": st.column_config.TextColumn("Coating service", width="large"),
+        "Vendor": st.column_config.TextColumn("Vendor", width="medium"),
+        "PO Comment": st.column_config.TextColumn(
+            "PO Comment (copy to CIN7)", width="large",
+            help="Paste this into the CIN7 PO line Comment field so the "
+                 "vendor and warehouse know which finished SKU this batch is for."),
+        "Supplier": st.column_config.TextColumn("Supplier", width="medium"),
+    }
+
+    # Column order mirrors the Ordering page: identity → demand → stock
+    # position → action quantities → raw/service detail → PO context
+    _COL_ORDER = [
+        "Image", "Finished SKU", "Finished name", "ABC", "Status", "Process",
+        "Trend", "Last 6 months", "Avg/month", "units_12mo", "units_45d",
+        "OnHand", "Available", "OnOrder",
+        "Target stock", "Suggested send", "Send qty",
+        "Stock ready?", "Raw profile/part", "Raw needed", "Raw on hand",
+        "Buildable", "Coating service", "Vendor", "PO Comment", "Supplier",
+    ]
+
+    def _ordered(df: pd.DataFrame) -> pd.DataFrame:
+        cols = [c for c in _COL_ORDER if c in df.columns]
+        extra = [c for c in df.columns if c not in cols]
+        return df[cols + extra]
 
     with tabs[0]:
         st.caption(
-            "Recommended queue based on finished-SKU target stock and current "
-            "available/on-order position. Use this to decide what to send to "
-            "the coating vendor."
+            "Finishing SKUs at or below target stock — decide quantities, "
+            "copy the **PO Comment** into your CIN7 service PO line so "
+            "the vendor knows which finished SKU each batch produces."
         )
         limit = rows_selector(key="coating_work_queue_rows")
-        show = view.head(limit)
-        st.dataframe(
-            show,
-            width="stretch",
-            height=620,
-            column_config={
-                "Image": st.column_config.ImageColumn("Image", width="small"),
-                "Send qty": st.column_config.NumberColumn(format="%.2f"),
-                "Service qty": st.column_config.NumberColumn(format="%.2f"),
-                "Buildable from raw": st.column_config.NumberColumn(format="%.2f"),
-                "Finished OnHand": st.column_config.NumberColumn(format="%.2f"),
-                "Finished Available": st.column_config.NumberColumn(format="%.2f"),
-                "Finished OnOrder": st.column_config.NumberColumn(format="%.2f"),
-                "Target stock": st.column_config.NumberColumn(format="%.2f"),
-                "Engine reorder": st.column_config.NumberColumn(format="%.2f"),
-                "12mo demand": st.column_config.NumberColumn(format="%.2f"),
-                "45d units": st.column_config.NumberColumn(format="%.2f"),
-                "Avg/month": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
+        show = _ordered(view.head(limit))
+        st.dataframe(show, width="stretch", height=620, column_config=_COL_CONFIG)
         if not show.empty:
             st.download_button(
-                "Download work-order CSV",
+                "⬇ Download work-order CSV",
                 data=show.drop(columns=["Image"], errors="ignore").to_csv(
                     index=False),
-                file_name="anodizing_powder_coating_work_queue.csv",
+                file_name="finishing_work_orders.csv",
                 mime="text/csv",
-                width="stretch",
+                use_container_width=True,
             )
 
     with tabs[1]:
@@ -522,18 +561,10 @@ def render_anodizing_powder_coating(
 
     with tabs[2]:
         all_limit = rows_selector(key="coating_all_rows")
-        all_view = lines.head(all_limit)
+        all_view = _ordered(lines.head(all_limit))
         st.caption(
             "All finished SKUs whose CIN7 BOM includes a powder-coating or "
             "anodizing service component, including rows with no action today."
         )
-        st.dataframe(
-            all_view,
-            width="stretch",
-            height=620,
-            column_config={
-                "Image": st.column_config.ImageColumn("Image", width="small"),
-                "Send qty": st.column_config.NumberColumn(format="%.2f"),
-                "Service qty": st.column_config.NumberColumn(format="%.2f"),
-            },
-        )
+        st.dataframe(all_view, width="stretch", height=620,
+                     column_config=_COL_CONFIG)
