@@ -6642,7 +6642,15 @@ def _abc_engine(products: pd.DataFrame,
             own_units_90d = max(0.0, own_units_90d - float(
                 assembly_units_90d_map.get(sku_m, 0)))
             if (own_units == 0 and own_units_90d == 0) or length_m == 0:
-                strip_non_master_skus.add(sku_m)
+                # v2.67.372 — only classify as non-master if there is a
+                # BOM or sourcing rule proving this SKU is cut/assembled
+                # from the bulk roll. Without a BOM it is a standalone
+                # purchased product that shares a naming pattern only.
+                if (sku_m in bom_components_by_asm
+                        or bom_flag_by_sku.get(sku_m, False)
+                        or rule_by_sku.get(sku_m, {}).get("SourceFraction")):
+                    strip_non_master_skus.add(sku_m)
+                continue
                 continue
             consumption_m = own_units * length_m
             consumption_m_90d = own_units_90d * length_m
@@ -6665,7 +6673,29 @@ def _abc_engine(products: pd.DataFrame,
                 f"= {consumption_m:.1f}m = "
                 f"{consumption_in_master_units:.2f} × {bulk_len:g}m rolls"
             )
-            strip_non_master_skus.add(sku_m)
+            # v2.67.372 — same BOM guard: only roll up and hide if
+            # there is evidence (BOM or sourcing rule) this SKU is
+            # produced from the bulk master. Without a BOM, keep it
+            # as an independently orderable SKU with its own demand.
+            if (sku_m in bom_components_by_asm
+                    or bom_flag_by_sku.get(sku_m, False)
+                    or rule_by_sku.get(sku_m, {}).get("SourceFraction")):
+                strip_non_master_skus.add(sku_m)
+            else:
+                # No BOM — remove any rollup already added for this SKU
+                # and let it keep its own demand calculation.
+                strip_rollup_inflow[bulk_sku] = (
+                    strip_rollup_inflow.get(bulk_sku, 0)
+                    - consumption_in_master_units)
+                strip_rollup_inflow_90d[bulk_sku] = (
+                    strip_rollup_inflow_90d.get(bulk_sku, 0)
+                    - consumption_in_master_units_90d)
+                strip_rollup_rules[:] = [
+                    r for r in strip_rollup_rules if r[0] != sku_m]
+                if bulk_sku in strip_rollup_notes:
+                    strip_rollup_notes[bulk_sku] = [
+                        n for n in strip_rollup_notes[bulk_sku]
+                        if not n.startswith(sku_m)]
 
     # Merge strip rollup into the master_rollup_inflow tracked above
     for master_sku, consumption in strip_rollup_inflow.items():
@@ -14839,32 +14869,7 @@ elif page == "Ordering":
     # are not directly orderable — their demand is rolled up into their
     # master. Showing them would suggest ordering assembled products.
     # Exception: show them in the "full detail" expander at the bottom.
-    # v2.67.372 — also include non-master SKUs that have no BOM and no
-    # sourcing rule (straight purchased products mis-classified as strip
-    # cuts due to naming heuristic). These appear as informational rows
-    # with reorder_qty=0 — all rollup calculations are unchanged.
-    _bom_absent_non_masters = (
-        engine_df["is_non_master_tube"].fillna(False)
-        & ~engine_df["SKU"].isin(bom_components_by_asm)
-        & ~engine_df["SKU"].map(lambda s: bom_flag_by_sku.get(s, False))
-        & ~engine_df["SKU"].map(
-            lambda s: bool(rule_by_sku.get(s, {}).get("SourceFraction")))
-    )
-    orderable_df = engine_df[
-        ~engine_df["is_non_master_tube"] | _bom_absent_non_masters
-    ].copy()
-    # Zero out reorder_qty for these informational rows so the engine
-    # does not suggest ordering them independently (their demand is
-    # already counted at the bulk master level).
-    if _bom_absent_non_masters.any():
-        _info_mask = orderable_df["is_non_master_tube"].fillna(False)
-        orderable_df.loc[_info_mask, "reorder_qty"] = 0.0
-        orderable_df.loc[_info_mask, "suggested_reorder"] = 0.0
-        orderable_df.loc[_info_mask, "Status"] = (
-            orderable_df.loc[_info_mask, "Status"]
-            .fillna("")
-            .apply(lambda s: s if s else "ℹ️ Informational — demand counted at bulk master")
-        )
+    orderable_df = engine_df[~engine_df["is_non_master_tube"]]
 
     # --- Supplier-wide snapshot (BEFORE filters) ---
     # Totals for THIS supplier across ALL their MASTER SKUs.
