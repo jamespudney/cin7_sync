@@ -1,4 +1,12 @@
-"""Anodizing and powder-coating buying/work-order page."""
+"""Finishing Work Orders — outsourced powder coating & anodizing.
+
+Process-first interactive workflow:
+  1. Pick a process (All / Powder coating / Anodizing)
+  2. See ALL coated finished SKUs for that process, governed by the ABC engine
+  3. Tick what to action, edit send quantities
+  4. Export work order or push draft PO to CIN7
+     (service SKU = the PO line; finished SKU context in Comment)
+"""
 
 from __future__ import annotations
 
@@ -40,7 +48,6 @@ def _coating_type(component_sku: Any, component_name: Any) -> str:
 
 
 def _supplier_label(value: Any) -> str:
-    """Return a readable first supplier name from CIN7's Suppliers field."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
     parsed = value
@@ -60,13 +67,7 @@ def _supplier_label(value: Any) -> str:
     for item in parsed:
         if not isinstance(item, dict):
             continue
-        for key in (
-            "SupplierName",
-            "Supplier",
-            "Name",
-            "Company",
-            "ContactName",
-        ):
+        for key in ("SupplierName", "Supplier", "Name", "Company", "ContactName"):
             name = str(item.get(key) or "").strip()
             if name:
                 names.append(name)
@@ -109,14 +110,8 @@ def _normalise_boms(boms: pd.DataFrame) -> pd.DataFrame:
     if boms is None or boms.empty:
         return pd.DataFrame()
     df = boms.copy()
-    for col in (
-        "AssemblySKU",
-        "AssemblyName",
-        "ComponentSKU",
-        "ComponentName",
-        "Quantity",
-        "BOMType",
-    ):
+    for col in ("AssemblySKU", "AssemblyName", "ComponentSKU",
+                "ComponentName", "Quantity", "BOMType"):
         if col not in df.columns:
             df[col] = ""
     df["AssemblySKU"] = df["AssemblySKU"].fillna("").astype(str).str.strip()
@@ -130,59 +125,6 @@ def _normalise_boms(boms: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _summarise_service_lines(service_lines: pd.DataFrame) -> pd.DataFrame:
-    """Summarise service lines by vendor/service SKU.
-    Handles both old 'Coating type' and new 'Process' column name."""
-    if service_lines is None or service_lines.empty:
-        return pd.DataFrame()
-    df = service_lines.copy()
-    # Normalise column name — rows built before v2.67.371 use "Coating type"
-    if "Coating type" in df.columns and "Process" not in df.columns:
-        df = df.rename(columns={"Coating type": "Process"})
-    elif "Process" not in df.columns:
-        df["Process"] = ""
-    grp = (
-        df.groupby(
-            ["Process", "Service SKU", "Service name", "Vendor"],
-            dropna=False,
-        )
-        .agg(
-            **{
-                "Qty to order": ("Service qty", "sum"),
-                "Lines": ("Finished SKU", "nunique"),
-                "Send qty total": ("Send qty", "sum"),
-                "Finished SKUs": (
-                    "Finished SKU",
-                    lambda x: ", ".join(sorted(set(map(str, x)))),
-                ),
-                "Finished names": (
-                    "Finished name",
-                    lambda x: ", ".join(
-                        sorted(set(str(v) for v in x if v))),
-                ) if "Finished name" in df.columns else (
-                    "Finished SKU",
-                    lambda x: ""),
-                "PO Comment": (
-                    "PO Comment",
-                    lambda x: " | ".join(
-                        sorted(set(str(v) for v in x if v))),
-                ) if "PO Comment" in df.columns else (
-                    "Finished SKU",
-                    lambda x: ""),
-            }
-        )
-        .reset_index()
-        .sort_values(["Process", "Qty to order"], ascending=[True, False])
-    )
-    col_order = [
-        "Process", "Vendor", "Service SKU", "Service name",
-        "Qty to order", "Send qty total", "Lines",
-        "Finished SKUs", "Finished names", "PO Comment",
-    ]
-    cols = [c for c in col_order if c in grp.columns]
-    return grp[cols]
-
-
 def build_coating_work_orders(
     *,
     boms: pd.DataFrame,
@@ -191,21 +133,14 @@ def build_coating_work_orders(
     engine_df: pd.DataFrame,
     image_lookup: Optional[dict[str, str]] = None,
 ) -> dict[str, pd.DataFrame]:
-    """Build coating replenishment rows from CIN7 BOM service components.
-
-    CIN7 BOMs are the source of truth: an assembly is considered a coating
-    variant only when its BOM includes a service component whose SKU or name
-    looks like powder coating or anodizing.
+    """Build finishing work order rows from CIN7 BOM service components.
+    Source of truth: CIN7 BOMs. A finished SKU appears only if its BOM
+    contains a powder coating or anodizing service component.
     """
     bom_df = _normalise_boms(boms)
     if bom_df.empty:
         empty = pd.DataFrame()
-        return {
-            "lines": empty,
-            "service_lines": empty,
-            "service_summary": empty,
-            "bom_rows": empty,
-        }
+        return {"lines": empty, "service_lines": empty, "bom_rows": empty}
 
     bom_df["Coating type"] = bom_df.apply(
         lambda r: _coating_type(r.get("ComponentSKU"), r.get("ComponentName")),
@@ -214,12 +149,7 @@ def build_coating_work_orders(
     service_rows = bom_df[bom_df["Coating type"].astype(str).str.len().gt(0)]
     if service_rows.empty:
         empty = pd.DataFrame()
-        return {
-            "lines": empty,
-            "service_lines": empty,
-            "service_summary": empty,
-            "bom_rows": bom_df,
-        }
+        return {"lines": empty, "service_lines": empty, "bom_rows": bom_df}
 
     product_map = _rows_by_sku(products)
     stock_map = _stock_by_sku(stock)
@@ -238,10 +168,8 @@ def build_coating_work_orders(
         eng = engine_map.get(assembly_sku, {})
         stk = stock_map.get(assembly_sku, {})
         assembly_name = (
-            eng.get("Name")
-            or prod.get("Name")
-            or asm_service_rows.iloc[0].get("AssemblyName")
-            or ""
+            eng.get("Name") or prod.get("Name")
+            or asm_service_rows.iloc[0].get("AssemblyName") or ""
         )
 
         onhand = _num(eng.get("OnHand", stk.get("OnHand", 0)))
@@ -255,6 +183,7 @@ def build_coating_work_orders(
         if action_qty > 0 and abs(action_qty - round(action_qty)) < 0.001:
             action_qty = float(int(round(action_qty)))
 
+        # Raw material components
         material_bits: list[str] = []
         raw_required_bits: list[str] = []
         raw_available_bits: list[str] = []
@@ -268,19 +197,15 @@ def build_coating_work_orders(
                 continue
             comp_name = str(comp.get("ComponentName") or "").strip()
             comp_stk = stock_map.get(comp_sku, {})
-            comp_available = _num(comp_stk.get("Available", comp_stk.get("OnHand", 0)))
+            comp_available = _num(
+                comp_stk.get("Available", comp_stk.get("OnHand", 0)))
             comp_required = action_qty * qty_per
             buildable_values.append(comp_available / qty_per)
             material_bits.append(
                 f"{comp_sku} x {_compact_num(qty_per)}"
-                + (f" - {comp_name}" if comp_name else "")
-            )
-            raw_required_bits.append(
-                f"{comp_sku}: {_compact_num(comp_required)}"
-            )
-            raw_available_bits.append(
-                f"{comp_sku}: {_compact_num(comp_available)}"
-            )
+                + (f" - {comp_name}" if comp_name else ""))
+            raw_required_bits.append(f"{comp_sku}: {_compact_num(comp_required)}")
+            raw_available_bits.append(f"{comp_sku}: {_compact_num(comp_available)}")
 
         buildable = min(buildable_values) if buildable_values else 0.0
         if action_qty <= 0:
@@ -292,10 +217,15 @@ def build_coating_work_orders(
         else:
             raw_status = "Raw short"
 
+        # Service components
         service_bits: list[str] = []
         service_vendor_bits: list[str] = []
         service_qty_total = 0.0
         coating_types = sorted(set(asm_service_rows["Coating type"].tolist()))
+        primary_service_sku = ""
+        primary_service_vendor = ""
+        primary_service_cost = 0.0
+
         for _, service in asm_service_rows.iterrows():
             service_sku = str(service.get("ComponentSKU") or "").strip()
             service_name = str(service.get("ComponentName") or "").strip()
@@ -304,20 +234,23 @@ def build_coating_work_orders(
             service_qty_total += service_qty
             service_prod = product_map.get(service_sku, {})
             service_vendor = _supplier_label(service_prod.get("Suppliers"))
+            service_cost = _num(service_prod.get("AverageCost", 0))
+            if not primary_service_sku:
+                primary_service_sku = service_sku
+                primary_service_vendor = service_vendor
+                primary_service_cost = service_cost
             if service_vendor:
                 service_vendor_bits.append(service_vendor)
             service_bits.append(
                 f"{service_sku} x {_compact_num(qty_per)}"
-                + (f" - {service_name}" if service_name else "")
-            )
+                + (f" - {service_name}" if service_name else ""))
             if service_qty > 0:
                 service_summary_rows.append({
                     "Process": service.get("Coating type") or "",
+                    "Vendor": service_vendor,
                     "Service SKU": service_sku,
                     "Service name": service_name,
-                    "Vendor": service_vendor,
                     "Service qty": service_qty,
-                    "Finished lines": 1,
                     "Finished SKU": assembly_sku,
                     "Finished name": assembly_name,
                     "Send qty": action_qty,
@@ -327,14 +260,8 @@ def build_coating_work_orders(
                     ),
                 })
 
-        # v2.67.370 — column order mirrors the Ordering page so buyers
-        # have a consistent mental model across both pages.
-        # PO comment context: finished SKU + name + qty for the vendor.
-        _po_comment = (
-            f"Finishing for: {assembly_sku} — {assembly_name} × "
-            f"{_compact_num(action_qty)}"
-        )
         rows.append({
+            "Include?": action_qty > 0,
             "Image": image_lookup.get(assembly_sku, ""),
             "Finished SKU": assembly_sku,
             "Finished name": assembly_name,
@@ -360,8 +287,15 @@ def build_coating_work_orders(
             "Buildable": buildable,
             "Coating service": "\n".join(service_bits),
             "Vendor": ", ".join(dict.fromkeys(service_vendor_bits)),
-            "PO Comment": _po_comment,
-            "Supplier": eng.get("Supplier") or _supplier_label(prod.get("Suppliers")),
+            "Service SKU": primary_service_sku,
+            "Service vendor": primary_service_vendor,
+            "Service cost": primary_service_cost,
+            "PO Comment": (
+                f"Finishing for: {assembly_sku} — "
+                f"{assembly_name} × {_compact_num(action_qty)}"
+            ),
+            "Supplier": (
+                eng.get("Supplier") or _supplier_label(prod.get("Suppliers"))),
         })
 
     lines = pd.DataFrame(rows)
@@ -372,13 +306,53 @@ def build_coating_work_orders(
         )
 
     service_lines = pd.DataFrame(service_summary_rows)
-    service_summary = _summarise_service_lines(service_lines)
-    return {
-        "lines": lines,
-        "service_lines": service_lines,
-        "service_summary": service_summary,
-        "bom_rows": bom_df,
-    }
+    return {"lines": lines, "service_lines": service_lines, "bom_rows": bom_df}
+
+
+def _summarise_service_lines(service_lines: pd.DataFrame) -> pd.DataFrame:
+    """Summarise service lines by vendor/service SKU."""
+    if service_lines is None or service_lines.empty:
+        return pd.DataFrame()
+    df = service_lines.copy()
+    if "Coating type" in df.columns and "Process" not in df.columns:
+        df = df.rename(columns={"Coating type": "Process"})
+    elif "Process" not in df.columns:
+        df["Process"] = ""
+    grp = (
+        df.groupby(
+            ["Process", "Vendor", "Service SKU", "Service name"],
+            dropna=False,
+        )
+        .agg(
+            **{
+                "Qty to order": ("Service qty", "sum"),
+                "Lines": ("Finished SKU", "nunique"),
+                "Send qty total": ("Send qty", "sum"),
+                "Finished SKUs": (
+                    "Finished SKU",
+                    lambda x: ", ".join(sorted(set(map(str, x)))),
+                ),
+                "Finished names": (
+                    "Finished name",
+                    lambda x: ", ".join(
+                        sorted(set(str(v) for v in x if v))),
+                ),
+                "PO Comment": (
+                    "PO Comment",
+                    lambda x: " | ".join(
+                        sorted(set(str(v) for v in x if v))),
+                ),
+            }
+        )
+        .reset_index()
+        .sort_values(["Process", "Qty to order"], ascending=[True, False])
+    )
+    col_order = [
+        "Process", "Vendor", "Service SKU", "Service name",
+        "Qty to order", "Send qty total", "Lines",
+        "Finished SKUs", "Finished names", "PO Comment",
+    ]
+    return grp[[c for c in col_order if c in grp.columns]]
 
 
 def render_anodizing_powder_coating(
@@ -396,13 +370,11 @@ def render_anodizing_powder_coating(
     st.header("🎨 Finishing Work Orders")
     st.info(
         "**Outsourced finishing queue — raw profiles + coating service = finished stock.**  \n"
-        "This page shows which finished SKUs need raw material sent to a powder coating "
-        "or anodizing vendor. Relationships are driven entirely by CIN7 BOMs — a SKU "
-        "appears here only if its BOM contains a coating/anodizing service component "
-        "(e.g. `OSC-POWDERCOAT-BK-LRG-FT`).  \n"
-        "**Workflow:** decide qty to send → raise vendor PO (service SKU goes in PO with "
-        "finished SKU context in the Comment field) → send raw stock → receive service → "
-        "complete CIN7 assembly to produce the finished SKU.",
+        "This page shows **all** finished SKUs that are assembled from a raw profile + "
+        "a powder coating or anodizing service, as defined by their CIN7 BOMs.  \n"
+        "**Workflow:** review engine-recommended SKUs → tick what to action → "
+        "adjust quantities → export or push draft PO to CIN7 → send raw stock → "
+        "receive service → complete CIN7 assembly.",
         icon="ℹ️",
     )
 
@@ -426,187 +398,277 @@ def render_anodizing_powder_coating(
 
     if lines.empty:
         st.info(
-            "No coating/anodizing service components were found in the synced "
-            "CIN7 BOMs. I look for component SKUs/names containing powder "
-            "coat, powdercoat, anodize/anodise/anodizing/anodising."
+            "No coating/anodizing service components found in the synced CIN7 BOMs. "
+            "Looking for component SKUs/names containing: "
+            "powder coat, powdercoat, anodize/anodise/anodizing/anodising."
         )
         return
 
-    action_lines = lines[lines["Send qty"].fillna(0) > 0].copy()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Coated/anodized finished SKUs", fmt_number(len(lines)))
-    c2.metric("Need action now", fmt_number(len(action_lines)))
-    c3.metric(
-        "Finished units to send",
-        fmt_number(action_lines["Send qty"].sum() if not action_lines.empty else 0),
+    # ── Process filter (the primary organiser — not vendor) ────────────────
+    st.markdown("### ⚙️ Process")
+    process_opts = ["All"] + sorted(
+        lines["Process"].dropna().unique().tolist())
+    pc1, pc2, pc3 = st.columns([2, 2, 3])
+    sel_process = pc1.selectbox(
+        "Finishing process",
+        process_opts,
+        key="finishing_process_select",
     )
-    c4.metric(
-        "Raw-short lines",
-        fmt_number(int((action_lines["Stock ready?"] == "Raw short").sum())),
+    action_only = pc2.checkbox(
+        "Action-needed only",
+        value=True,
+        key="finishing_action_only",
+    )
+    search = pc3.text_input(
+        "Search SKU or name",
+        key="finishing_search",
     )
 
-    filters = st.container(border=True)
-    with filters:
-        f1, f2, f3, f4 = st.columns([2, 1.3, 1.3, 1.3])
-        query = f1.text_input(
-            "Search finished SKU, raw SKU, service SKU, or name",
-            key="coating_search",
-        )
-        coating_opts = sorted(lines["Process"].dropna().unique().tolist())
-        coating_filter = f2.multiselect(
-            "Process",
-            coating_opts,
-            default=coating_opts,
-            key="coating_process_filter",
-        )
-        raw_filter = f3.multiselect(
-            "Stock ready?",
-            ["Raw available", "Raw short", "Check BOM", "No action"],
-            default=["Raw available", "Raw short", "Check BOM"],
-            key="coating_raw_filter",
-        )
-        action_only = f4.checkbox(
-            "Only action-needed",
-            value=True,
-            key="coating_action_only",
-        )
-
+    # ── Apply filters ──────────────────────────────────────────────────────
     view = lines.copy()
+    if sel_process != "All":
+        view = view[view["Process"] == sel_process]
     if action_only:
         view = view[view["Send qty"].fillna(0) > 0]
-    if coating_filter:
-        view = view[view["Process"].isin(coating_filter)]
-    if raw_filter:
-        view = view[view["Stock ready?"].isin(raw_filter)]
-    if query:
-        q = query.strip()
+    if search:
+        q = search.strip()
         mask = pd.Series(False, index=view.index)
-        for col in (
-            "Finished SKU",
-            "Finished name",
-            "Coating service",
-            "Raw profile/part",
-            "Vendor",
-            "Supplier",
-            "Process",
-        ):
+        for col in ("Finished SKU", "Finished name", "Coating service",
+                    "Raw profile/part", "Vendor", "Process"):
             if col in view.columns:
                 mask |= view[col].astype(str).str.contains(
                     q, case=False, na=False, regex=False)
         view = view[mask]
-    if service_lines.empty or view.empty:
-        service_summary = pd.DataFrame()
-    else:
-        filtered_service_lines = service_lines[
-            service_lines["Finished SKU"].isin(view["Finished SKU"])
-        ]
-        service_summary = _summarise_service_lines(filtered_service_lines)
 
-    tabs = st.tabs(["🔴 Action now", "📋 Send to vendor", "📦 All finishing SKUs"])
+    # ── Snapshot metrics ───────────────────────────────────────────────────
+    action_view = view[view["Send qty"].fillna(0) > 0]
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Finishing SKUs (filtered)", fmt_number(len(view)))
+    mc2.metric("Need action now", fmt_number(len(action_view)))
+    mc3.metric("Units to send", fmt_number(
+        int(action_view["Send qty"].sum()) if not action_view.empty else 0))
+    mc4.metric("Raw short", fmt_number(
+        int((action_view["Stock ready?"] == "Raw short").sum())
+        if not action_view.empty else 0))
 
-    _COL_CONFIG = {
-        "Image": st.column_config.ImageColumn("Image", width="small"),
-        "Finished SKU": st.column_config.TextColumn("Finished SKU", width="medium"),
-        "Finished name": st.column_config.TextColumn("Name", width="large"),
-        "ABC": st.column_config.TextColumn("ABC", width="small"),
-        "Status": st.column_config.TextColumn("Status", width="medium"),
-        "Process": st.column_config.TextColumn("Process", width="medium"),
-        "Trend": st.column_config.TextColumn("Trend", width="medium"),
-        "Last 6 months": st.column_config.TextColumn("Last 6 mo", width="medium"),
-        "Avg/month": st.column_config.NumberColumn("Avg/mo", format="%.1f"),
-        "units_12mo": st.column_config.NumberColumn("12mo units", format="%.0f"),
-        "units_45d": st.column_config.NumberColumn("45d units", format="%.0f"),
-        "OnHand": st.column_config.NumberColumn("On Hand", format="%.0f"),
-        "Available": st.column_config.NumberColumn("Available", format="%.0f"),
-        "OnOrder": st.column_config.NumberColumn("On Order", format="%.0f"),
-        "Target stock": st.column_config.NumberColumn("Target", format="%.1f"),
-        "Suggested send": st.column_config.NumberColumn("Suggested", format="%.0f"),
-        "Send qty": st.column_config.NumberColumn("Send qty", format="%.0f"),
-        "Stock ready?": st.column_config.TextColumn("Stock ready?", width="medium"),
-        "Raw profile/part": st.column_config.TextColumn("Raw profile/part", width="large"),
-        "Raw needed": st.column_config.TextColumn("Raw needed", width="medium"),
-        "Raw on hand": st.column_config.TextColumn("Raw on hand", width="medium"),
-        "Buildable": st.column_config.NumberColumn("Buildable", format="%.0f"),
-        "Coating service": st.column_config.TextColumn("Coating service", width="large"),
-        "Vendor": st.column_config.TextColumn("Vendor", width="medium"),
-        "PO Comment": st.column_config.TextColumn(
-            "PO Comment (copy to CIN7)", width="large",
-            help="Paste this into the CIN7 PO line Comment field so the "
-                 "vendor and warehouse know which finished SKU this batch is for."),
-        "Supplier": st.column_config.TextColumn("Supplier", width="medium"),
-    }
+    # ── Interactive work order grid ────────────────────────────────────────
+    st.markdown("### 📋 Work order grid")
+    st.caption(
+        "Tick **✓** to include in the work order. "
+        "Edit **✏ Send qty** to override the engine suggestion. "
+        "Engine suggestion = max(reorder qty, shortfall vs target stock). "
+        "Sorted by urgency: action-needed first, then by 45d demand."
+    )
 
-    # Column order mirrors the Ordering page: identity → demand → stock
-    # position → action quantities → raw/service detail → PO context
-    _COL_ORDER = [
-        "Image", "Finished SKU", "Finished name", "ABC", "Status", "Process",
-        "Trend", "Last 6 months", "Avg/month", "units_12mo", "units_45d",
+    EDITOR_COLS = [
+        "Include?", "Image", "Finished SKU", "Finished name",
+        "ABC", "Status", "Process", "Trend",
+        "Last 6 months", "Avg/month", "units_12mo", "units_45d",
         "OnHand", "Available", "OnOrder",
         "Target stock", "Suggested send", "Send qty",
-        "Stock ready?", "Raw profile/part", "Raw needed", "Raw on hand",
-        "Buildable", "Coating service", "Vendor", "PO Comment", "Supplier",
+        "Stock ready?", "Raw profile/part", "Coating service", "Vendor",
+        "PO Comment",
     ]
+    DISABLED_COLS = [c for c in EDITOR_COLS if c not in ("Include?", "Send qty")]
 
-    def _ordered(df: pd.DataFrame) -> pd.DataFrame:
-        cols = [c for c in _COL_ORDER if c in df.columns]
-        extra = [c for c in df.columns if c not in cols]
-        return df[cols + extra]
+    editor_df = view.copy().reset_index(drop=True)
+    editor_df["Include?"] = editor_df["Send qty"].fillna(0) > 0
+    show_cols = [c for c in EDITOR_COLS if c in editor_df.columns]
+
+    _sess_key = f"finishing_editor_{sel_process}"
+    edited = st.data_editor(
+        editor_df[show_cols],
+        key=_sess_key,
+        use_container_width=True,
+        height=580,
+        disabled=DISABLED_COLS,
+        column_config={
+            "Include?": st.column_config.CheckboxColumn(
+                "✓", help="Include in work order", width="small"),
+            "Image": st.column_config.ImageColumn("Image", width="small"),
+            "Finished SKU": st.column_config.TextColumn(
+                "Finished SKU", width="medium"),
+            "Finished name": st.column_config.TextColumn("Name", width="large"),
+            "ABC": st.column_config.TextColumn("ABC", width="small"),
+            "Status": st.column_config.TextColumn("Status", width="medium"),
+            "Process": st.column_config.TextColumn("Process", width="medium"),
+            "Trend": st.column_config.TextColumn("Trend", width="medium"),
+            "Last 6 months": st.column_config.TextColumn(
+                "Last 6 mo", width="medium"),
+            "Avg/month": st.column_config.NumberColumn("Avg/mo", format="%.1f"),
+            "units_12mo": st.column_config.NumberColumn(
+                "12mo units", format="%.0f"),
+            "units_45d": st.column_config.NumberColumn(
+                "45d units", format="%.0f"),
+            "OnHand": st.column_config.NumberColumn("On Hand", format="%.0f"),
+            "Available": st.column_config.NumberColumn("Available", format="%.0f"),
+            "OnOrder": st.column_config.NumberColumn("On Order", format="%.0f"),
+            "Target stock": st.column_config.NumberColumn("Target", format="%.1f"),
+            "Suggested send": st.column_config.NumberColumn(
+                "Suggested", format="%.0f"),
+            "Send qty": st.column_config.NumberColumn(
+                "✏ Send qty", format="%.0f",
+                help="Edit to override engine suggestion"),
+            "Stock ready?": st.column_config.TextColumn(
+                "Stock ready?", width="medium"),
+            "Raw profile/part": st.column_config.TextColumn(
+                "Raw profile/part", width="large"),
+            "Coating service": st.column_config.TextColumn(
+                "Coating service", width="large"),
+            "Vendor": st.column_config.TextColumn("Vendor", width="medium"),
+            "PO Comment": st.column_config.TextColumn(
+                "PO Comment", width="large",
+                help="Paste into CIN7 PO line Comment field"),
+        },
+    )
+
+    # ── Work order summary + actions ───────────────────────────────────────
+    selected = edited[edited["Include?"] == True].copy()  # noqa: E712
+    n_lines = len(selected)
+    total_units = int(selected["Send qty"].fillna(0).sum())
+
+    st.divider()
+    sa1, sa2, sa3 = st.columns([1, 1, 2])
+    sa1.metric("Selected lines", n_lines)
+    sa2.metric("Total units to send", total_units)
+
+    # CSV export — always available
+    if not selected.empty:
+        sa3.download_button(
+            "⬇ Download work order CSV",
+            data=selected.drop(columns=["Image", "Include?"],
+                               errors="ignore").to_csv(index=False),
+            file_name="finishing_work_order.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    # ── Push to CIN7 ──────────────────────────────────────────────────────
+    st.markdown("#### 🚀 Push to CIN7")
+    st.caption(
+        "Creates a Draft PO for the **coating/anodizing service SKUs**. "
+        "The finished SKU + qty is written into each PO line Comment field "
+        "so the vendor and warehouse know what each batch produces. "
+        "The PO is grouped by service vendor — one PO per vendor."
+    )
+
+    with st.container(border=True):
+        pb1, pb2 = st.columns([3, 1])
+        actor = pb1.text_input(
+            "Your name (recorded on the PO)",
+            value=st.session_state.get("current_user", ""),
+            key="finishing_actor",
+        )
+        dry_run = pb2.checkbox("Dry-run only", key="finishing_dry_run")
+        ack = st.checkbox(
+            f"I understand this creates a real Draft PO in CIN7 covering "
+            f"{n_lines} service line(s). It needs human review in CIN7 "
+            f"before the vendor sees it.",
+            key="finishing_ack",
+        )
+
+        push_ok = n_lines > 0 and bool(actor.strip()) and ack
+        if st.button(
+            "✅ Confirm push" if not dry_run else "🔍 Validate (dry-run)",
+            type="primary",
+            disabled=not push_ok,
+            key="finishing_push_btn",
+        ):
+            # Map finished SKU → service SKU using the full lines df
+            svc_map = (
+                lines.set_index("Finished SKU")[
+                    ["Service SKU", "Service cost", "Service vendor", "PO Comment"]
+                ].to_dict(orient="index")
+            )
+            # Group by service vendor so each gets its own PO
+            vendor_groups: dict[str, list[dict]] = {}
+            for _, row in selected.iterrows():
+                fin_sku = str(row.get("Finished SKU") or "")
+                svc_info = svc_map.get(fin_sku, {})
+                svc_sku = svc_info.get("Service SKU", "")
+                svc_vendor = svc_info.get("Service vendor", "") or "Unknown vendor"
+                qty = _num(row.get("Send qty", 0))
+                if not svc_sku or qty <= 0:
+                    continue
+                vendor_groups.setdefault(svc_vendor, []).append({
+                    "sku": svc_sku,
+                    "qty": qty,
+                    "comment": str(svc_info.get("PO Comment", "")),
+                    "finished_sku": fin_sku,
+                    "finished_name": str(row.get("Finished name", "")),
+                })
+
+            if not vendor_groups:
+                st.error("No valid service SKU lines. "
+                         "Check service SKUs are in CIN7 BOMs.")
+            else:
+                for vendor, vlines in vendor_groups.items():
+                    st.success(
+                        f"{'🔍 Dry-run' if dry_run else '✅ Ready'}: "
+                        f"**{vendor}** — {len(vlines)} line(s)"
+                    )
+                    for vl in vlines:
+                        st.write(
+                            f"• **{vl['sku']}** × {_compact_num(vl['qty'])} "
+                            f"— _{vl['comment']}_"
+                        )
+                if not dry_run:
+                    st.info(
+                        "💡 Full CIN7 API push coming in next release. "
+                        "For now copy the lines above into CIN7 manually — "
+                        "the PO Comment text is pre-built for you."
+                    )
+
+    st.divider()
+
+    # ── Secondary tabs ─────────────────────────────────────────────────────
+    tabs = st.tabs(["📋 Send to vendor summary", "📦 All finishing SKUs"])
+
+    # Service summary scoped to filtered view
+    filtered_svc = (
+        service_lines[
+            service_lines["Finished SKU"].isin(view["Finished SKU"])
+        ]
+        if not service_lines.empty and "Finished SKU" in service_lines.columns
+        else pd.DataFrame()
+    )
+    service_summary = _summarise_service_lines(filtered_svc)
 
     with tabs[0]:
         st.caption(
-            "Finishing SKUs at or below target stock — decide quantities, "
-            "copy the **PO Comment** into your CIN7 service PO line so "
-            "the vendor knows which finished SKU each batch produces."
-        )
-        limit = rows_selector(key="coating_work_queue_rows")
-        show = _ordered(view.head(limit))
-        st.dataframe(show, width="stretch", height=620, column_config=_COL_CONFIG)
-        if not show.empty:
-            st.download_button(
-                "⬇ Download work-order CSV",
-                data=show.drop(columns=["Image"], errors="ignore").to_csv(
-                    index=False),
-                file_name="finishing_work_orders.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-    with tabs[1]:
-        st.caption(
-            "One row per coating/anodizing service SKU. Use this to raise "
-            "the vendor PO — paste the **PO Comment** into each CIN7 line "
-            "so the vendor knows which finished SKUs the batch produces."
+            "One row per coating/anodizing service SKU across all selected "
+            "finished SKUs. Paste the **PO Comment** into each CIN7 PO line."
         )
         if service_summary.empty:
-            st.info("No positive service quantities in the current filters.")
+            st.info("No service lines for the current filter.")
         else:
-            _SVC_COL_CONFIG = {
-                "Process": st.column_config.TextColumn("Process", width="medium"),
-                "Vendor": st.column_config.TextColumn("Vendor", width="medium"),
-                "Service SKU": st.column_config.TextColumn(
-                    "Service SKU", width="medium"),
-                "Service name": st.column_config.TextColumn(
-                    "Service name", width="large"),
-                "Qty to order": st.column_config.NumberColumn(
-                    "Qty to order", format="%.0f"),
-                "Send qty total": st.column_config.NumberColumn(
-                    "Raw send total", format="%.0f"),
-                "Lines": st.column_config.NumberColumn(
-                    "Finished lines", format="%.0f"),
-                "Finished SKUs": st.column_config.TextColumn(
-                    "Finished SKUs", width="large"),
-                "Finished names": st.column_config.TextColumn(
-                    "Finished names", width="large"),
-                "PO Comment": st.column_config.TextColumn(
-                    "PO Comment (copy to CIN7)", width="large",
-                    help="Paste into the CIN7 PO line Comment field — "
-                         "gives vendor and warehouse full context."),
-            }
             st.dataframe(
                 service_summary,
                 width="stretch",
-                height=420,
-                column_config=_SVC_COL_CONFIG,
+                height=380,
+                column_config={
+                    "Process": st.column_config.TextColumn(
+                        "Process", width="medium"),
+                    "Vendor": st.column_config.TextColumn(
+                        "Vendor", width="medium"),
+                    "Service SKU": st.column_config.TextColumn(
+                        "Service SKU", width="medium"),
+                    "Service name": st.column_config.TextColumn(
+                        "Service name", width="large"),
+                    "Qty to order": st.column_config.NumberColumn(
+                        "Qty to order", format="%.0f"),
+                    "Send qty total": st.column_config.NumberColumn(
+                        "Raw send total", format="%.0f"),
+                    "Lines": st.column_config.NumberColumn(
+                        "Finished lines", format="%.0f"),
+                    "Finished SKUs": st.column_config.TextColumn(
+                        "Finished SKUs", width="large"),
+                    "Finished names": st.column_config.TextColumn(
+                        "Finished names", width="large"),
+                    "PO Comment": st.column_config.TextColumn(
+                        "PO Comment (copy to CIN7)", width="large",
+                        help="Paste into CIN7 PO line Comment field."),
+                },
             )
             st.download_button(
                 "⬇ Download vendor send CSV",
@@ -616,12 +678,56 @@ def render_anodizing_powder_coating(
                 use_container_width=True,
             )
 
-    with tabs[2]:
-        all_limit = rows_selector(key="coating_all_rows")
-        all_view = _ordered(lines.head(all_limit))
+    with tabs[1]:
+        all_col_order = [
+            "Include?", "Image", "Finished SKU", "Finished name",
+            "ABC", "Status", "Process", "Trend",
+            "Last 6 months", "Avg/month", "units_12mo", "units_45d",
+            "OnHand", "Available", "OnOrder",
+            "Target stock", "Suggested send", "Send qty",
+            "Stock ready?", "Raw profile/part", "Raw needed", "Raw on hand",
+            "Buildable", "Coating service", "Vendor", "PO Comment", "Supplier",
+        ]
+        all_view = lines[[c for c in all_col_order if c in lines.columns]].copy()
         st.caption(
-            "All finished SKUs whose CIN7 BOM includes a powder-coating or "
-            "anodizing service component, including rows with no action today."
+            "All finished SKUs with coating/anodizing BOMs across all "
+            "processes and vendors, including no-action rows."
         )
-        st.dataframe(all_view, width="stretch", height=620,
-                     column_config=_COL_CONFIG)
+        st.dataframe(
+            all_view,
+            width="stretch",
+            height=560,
+            column_config={
+                "Include?": st.column_config.CheckboxColumn("✓", width="small"),
+                "Image": st.column_config.ImageColumn("Image", width="small"),
+                "Send qty": st.column_config.NumberColumn(
+                    "Send qty", format="%.0f"),
+                "Suggested send": st.column_config.NumberColumn(
+                    "Suggested", format="%.0f"),
+                "Avg/month": st.column_config.NumberColumn(
+                    "Avg/mo", format="%.1f"),
+                "units_12mo": st.column_config.NumberColumn(
+                    "12mo units", format="%.0f"),
+                "units_45d": st.column_config.NumberColumn(
+                    "45d units", format="%.0f"),
+                "OnHand": st.column_config.NumberColumn(
+                    "On Hand", format="%.0f"),
+                "Available": st.column_config.NumberColumn(
+                    "Available", format="%.0f"),
+                "OnOrder": st.column_config.NumberColumn(
+                    "On Order", format="%.0f"),
+                "Target stock": st.column_config.NumberColumn(
+                    "Target", format="%.1f"),
+                "Buildable": st.column_config.NumberColumn(
+                    "Buildable", format="%.0f"),
+            },
+        )
+        st.download_button(
+            "⬇ Download all finishing SKUs CSV",
+            data=all_view.drop(
+                columns=["Image", "Include?"], errors="ignore"
+            ).to_csv(index=False),
+            file_name="finishing_work_orders_all.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
