@@ -6642,7 +6642,15 @@ def _abc_engine(products: pd.DataFrame,
             own_units_90d = max(0.0, own_units_90d - float(
                 assembly_units_90d_map.get(sku_m, 0)))
             if (own_units == 0 and own_units_90d == 0) or length_m == 0:
-                strip_non_master_skus.add(sku_m)
+                # v2.67.372 — only classify as non-master if there is a
+                # BOM or sourcing rule proving this SKU is cut/assembled
+                # from the bulk roll. Without a BOM it is a standalone
+                # purchased product that shares a naming pattern only.
+                if (sku_m in bom_components_by_asm
+                        or bom_flag_by_sku.get(sku_m, False)
+                        or rule_by_sku.get(sku_m, {}).get("SourceFraction")):
+                    strip_non_master_skus.add(sku_m)
+                continue
                 continue
             consumption_m = own_units * length_m
             consumption_m_90d = own_units_90d * length_m
@@ -6665,7 +6673,29 @@ def _abc_engine(products: pd.DataFrame,
                 f"= {consumption_m:.1f}m = "
                 f"{consumption_in_master_units:.2f} × {bulk_len:g}m rolls"
             )
-            strip_non_master_skus.add(sku_m)
+            # v2.67.372 — same BOM guard: only roll up and hide if
+            # there is evidence (BOM or sourcing rule) this SKU is
+            # produced from the bulk master. Without a BOM, keep it
+            # as an independently orderable SKU with its own demand.
+            if (sku_m in bom_components_by_asm
+                    or bom_flag_by_sku.get(sku_m, False)
+                    or rule_by_sku.get(sku_m, {}).get("SourceFraction")):
+                strip_non_master_skus.add(sku_m)
+            else:
+                # No BOM — remove any rollup already added for this SKU
+                # and let it keep its own demand calculation.
+                strip_rollup_inflow[bulk_sku] = (
+                    strip_rollup_inflow.get(bulk_sku, 0)
+                    - consumption_in_master_units)
+                strip_rollup_inflow_90d[bulk_sku] = (
+                    strip_rollup_inflow_90d.get(bulk_sku, 0)
+                    - consumption_in_master_units_90d)
+                strip_rollup_rules[:] = [
+                    r for r in strip_rollup_rules if r[0] != sku_m]
+                if bulk_sku in strip_rollup_notes:
+                    strip_rollup_notes[bulk_sku] = [
+                        n for n in strip_rollup_notes[bulk_sku]
+                        if not n.startswith(sku_m)]
 
     # Merge strip rollup into the master_rollup_inflow tracked above
     for master_sku, consumption in strip_rollup_inflow.items():

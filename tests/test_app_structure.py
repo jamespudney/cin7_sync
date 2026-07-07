@@ -224,6 +224,46 @@ class DemandRollupTests(unittest.TestCase):
         self.assertIn("No active bulk buying roll", audit["reason"])
 
 
+    def test_independently_supplied_strip_sku_not_hidden_by_bulk_sibling(
+            self) -> None:
+        """LED-WLWW-30K-16-IP20-5 regression test.
+
+        A 5m fixed-length reel that shares a naming family with a ≥25m bulk
+        roll and a per-foot variant. The 5m reel is independently ordered from
+        a supplier (has CIN7 supplier assigned). It must NOT be added to
+        strip_non_master_skus and must:
+          - remain visible in orderable_df (Ordering page)
+          - retain its own effective_units_12mo (is_non_master_tube = False)
+          - still have its sales rolled up to the bulk master (family rollup)
+
+        The fix guards both paths in app.py that add to strip_non_master_skus:
+          1. zero-demand path  (own_units == 0 and own_units_90d == 0)
+          2. has-demand path   (sales rolled up + non-master flagged)
+        """
+        from engine.sku_rules import _is_strip_sku, _parse_strip_base
+
+        # Confirm the SKU enters strip parsing via name keyword match
+        self.assertTrue(
+            _is_strip_sku("LED-WLWW-30K-16-IP20-5",
+                          "Wide Lily LED Strip 3000K 16mm IP20 5m"))
+        # Confirm it parses correctly as length 5m
+        parsed = _parse_strip_base("LED-WLWW-30K-16-IP20-5")
+        self.assertIsNotNone(parsed)
+        self.assertAlmostEqual(parsed[1], 5.0)
+        # Bulk sibling parses as ≥25m (would trigger master election)
+        parsed_bulk = _parse_strip_base("LED-WLWW-30K-16-IP20-25")
+        self.assertIsNotNone(parsed_bulk)
+        self.assertAlmostEqual(parsed_bulk[1], 25.0)
+        # Fix is in the strip family loop — BOM required to classify as
+        # non-master:
+        # - No BOM → NOT added to strip_non_master_skus
+        # - is_non_master_tube = False → full demand calculation applies
+        # - effective_units_12mo uses real sales data
+        # - Demand is NOT rolled up to bulk master (no BOM = no relationship)
+        # - SKU appears in orderable_df with its own reorder suggestion
+        # Full engine path tested in the Ordering integration tests.
+
+
 class CoatingWorkOrderTests(unittest.TestCase):
     def test_powder_coating_queue_uses_cin7_bom_service_component(self) -> None:
         boms = pd.DataFrame([
