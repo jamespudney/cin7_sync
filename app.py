@@ -20018,6 +20018,18 @@ elif page == "Monthly Metrics":
         _sales_hdr = _load_longest_sales()
         if not _sales_hdr.empty:
             _h = _sales_hdr.copy()
+            # Exclude voided/credited/cancelled headers. Without this, a
+            # revised/re-invoiced sale that CIN7 re-issues under a NEW
+            # SaleID (rather than a new InvoiceNumber on the same SaleID)
+            # survives the SaleID-keyed dedupe in _load_longest_sales as
+            # two separate rows — the original AND the reissue — and both
+            # InvoiceAmounts get summed into the same month's shipping
+            # delta, double-counting one real transaction.
+            if "Status" in _h.columns:
+                _h = _h[
+                    ~_h["Status"].astype(str).str.upper().isin(
+                        _BAD_SALE_STATUSES)
+                ]
             _h["InvoiceDate"] = pd.to_datetime(
                 _h.get("InvoiceDate"), errors="coerce", utc=True
             ).dt.tz_localize(None)
@@ -20026,10 +20038,22 @@ elif page == "Monthly Metrics":
                 _h.get("InvoiceAmount", 0)).fillna(0)
             _h["MonthKey"] = _h["InvoiceDate"].dt.to_period("M")
             # Per-SaleID product-line + tax totals from the *full*
-            # sale_lines (including voided etc. so header delta lines up)
+            # sale_lines (including voided etc. so header delta lines up).
+            # Must exclude shipping-charge lines themselves (same regex as
+            # is_shipping above) — otherwise InvoiceAmount already includes
+            # the shipping charge AND lines_total includes it again, so the
+            # delta double-subtracts shipping and clips to ~0 for any order
+            # where CIN7 itemizes shipping as its own line.
             sl_full = sale_lines.copy()
             sl_full["Total"] = _to_num(sl_full["Total"]).fillna(0)
             sl_full["Tax"]   = _to_num(sl_full["Tax"]).fillna(0)
+            _full_is_shipping = (
+                sl_full["SKU"].astype(str).str.match(
+                    r"(?i)^(shipping|freight|handling|delivery)", na=False)
+                | sl_full["Name"].astype(str).str.match(
+                    r"(?i)^(shipping|freight|handling|delivery)", na=False)
+            )
+            sl_full = sl_full[~_full_is_shipping]
             _per_sale_base = sl_full.groupby("SaleID").agg(
                 lines_total=("Total", "sum"),
                 lines_tax=("Tax", "sum"),
