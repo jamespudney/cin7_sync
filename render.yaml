@@ -48,6 +48,27 @@
 
 services:
   - type: web
+    name: cin7-query-api
+    runtime: python
+    plan: starter           # Minimal plan — just serves API requests.
+    region: ohio
+    branch: main
+    autoDeploy: false
+    rootDir: .
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python3 api_query.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: TZ
+        value: America/New_York
+      - key: QUERY_API_PORT
+        value: "8502"
+      - key: QUERY_API_KEY
+        sync: false         # Set in Render UI — keep secret
+    envVarGroups:
+      - cin7-shared         # Pulls DATABASE_URL from shared group
+
+  - type: web
     name: wired4signs-app
     runtime: python
     plan: pro               # 4GB RAM — needed for Streamlit + sync loop.
