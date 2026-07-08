@@ -20051,6 +20051,17 @@ elif page == "Monthly Metrics":
 
         ship_charged_per_month = {m: _ship_for_month(m) for m in months}
 
+        # v2.67.374 — keep invoice-level shipping data for the drilldown
+        # expander. _h has: SaleID, MonthKey, InvoiceAmount, lines_total,
+        # lines_tax, Shipping — one row per invoice.
+        _ship_invoice_detail = (
+            _h[["SaleID", "MonthKey", "InvoiceAmount",
+                "lines_total", "lines_tax", "Shipping"]]
+            .copy()
+            if "_h" in dir() and not _h.empty
+            else pd.DataFrame()
+        )
+
         # Channel breakdown — count unique customers per month
         cust_first_seen = (
             sl.dropna(subset=["CustomerID"])
@@ -20833,6 +20844,77 @@ elif page == "Monthly Metrics":
                 width="stretch",
                 height=38 * (len(sect_df) + 1) + 10,
             )
+
+            # v2.67.374 — Shipping Charged drilldown expander.
+            # Appears directly under section 2 so buyers can
+            # investigate any month that looks anomalous.
+            if (section == "2. Margins & Purchasing [App]"
+                    and not _ship_invoice_detail.empty):
+                with st.expander(
+                        "🔍 Shipping Charged — invoice drilldown",
+                        expanded=False):
+                    st.caption(
+                        "Shows every invoice contributing to Shipping "
+                        "Charged for a selected month. Shipping = "
+                        "InvoiceAmount − line totals − tax. Large "
+                        "values may indicate missing sale lines for "
+                        "that invoice (delta inflated) or a genuine "
+                        "high-freight order.")
+                    _dd_month_opts = [
+                        lbl for lbl in month_labels
+                        if lbl in [
+                            str(mk) for mk in
+                            _ship_invoice_detail["MonthKey"].unique()]]
+                    if _dd_month_opts:
+                        _dd_sel = st.selectbox(
+                            "Month to inspect",
+                            _dd_month_opts,
+                            index=len(_dd_month_opts) - 1,
+                            key="ship_drill_month",
+                        )
+                        _dd_df = _ship_invoice_detail[
+                            _ship_invoice_detail["MonthKey"].astype(str)
+                            == _dd_sel
+                        ].copy()
+                        _dd_df = _dd_df[_dd_df["Shipping"] > 0].copy()
+                        _dd_df = _dd_df.sort_values(
+                            "Shipping", ascending=False)
+                        _dd_df["InvoiceAmount"] = _dd_df[
+                            "InvoiceAmount"].apply(
+                            lambda v: f"${v:,.2f}")
+                        _dd_df["lines_total"] = _dd_df[
+                            "lines_total"].apply(
+                            lambda v: f"${v:,.2f}")
+                        _dd_df["lines_tax"] = _dd_df[
+                            "lines_tax"].apply(
+                            lambda v: f"${v:,.2f}")
+                        _dd_df["Shipping"] = _dd_df[
+                            "Shipping"].apply(
+                            lambda v: f"${v:,.2f}")
+                        _dd_df = _dd_df.rename(columns={
+                            "SaleID": "Sale ID",
+                            "InvoiceAmount": "Invoice total",
+                            "lines_total": "Line items",
+                            "lines_tax": "Tax",
+                            "Shipping": "Shipping charged",
+                        }).drop(columns=["MonthKey"])
+                        total_ship = _ship_invoice_detail[
+                            _ship_invoice_detail["MonthKey"].astype(str)
+                            == _dd_sel]["Shipping"].sum()
+                        st.caption(
+                            f"**{len(_dd_df)} invoices** · "
+                            f"**Total: ${total_ship:,.0f}** · "
+                            f"Sorted highest shipping first.")
+                        st.dataframe(
+                            _dd_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.info(
+                            "No invoice-level detail available — "
+                            "sales headers not synced for this period.")
+
         # Catch-all: render any section not in the explicit order
         # (in call-order of first appearance), so a future code
         # change adding a section doesn't accidentally make rows
