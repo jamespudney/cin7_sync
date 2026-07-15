@@ -55,6 +55,7 @@ import pandas as pd
 
 from engine.sku_rules import _is_strip_sku, _parse_strip_base
 from engine.sku_rules import is_bulk_strip_roll_length
+from engine.sku_rules import parse_sourcing_rule
 from sales_exclusions import filter_excluded_sales_customers
 from storage_dimensions import ensure_storage_dim_column
 
@@ -228,6 +229,26 @@ def compute_engine_signals(products: pd.DataFrame,
     bom_assemblies = set()
     if boms is not None and not boms.empty and "AssemblySKU" in boms.columns:
         bom_assemblies = set(boms["AssemblySKU"].dropna().astype(str))
+
+    # v2.67.376 — require actual evidence of an assembly/cut relationship
+    # before a same-family SKU can be hidden as a "non-master" cut. Mirrors
+    # app.py's b0e8eb1 fix (v2.67.372): sharing a naming pattern with a
+    # bigger sibling is NOT proof of a master/cut relationship — e.g.
+    # LED-WLWW-30K-16-IP20-5 is an independently supplied 5m reel, not a
+    # cut of the 25m roll, despite matching the naming pattern. Without
+    # this guard the worker's PO commentary can zero out a real
+    # best-seller's demand and flag it dormant.
+    bom_flag_by_sku = {
+        str(row.get("SKU") or ""): (
+            str(row.get("BillOfMaterial")).lower() == "true")
+        for _, row in products.iterrows()
+    }
+    rule_by_sku = {
+        str(row.get("SKU") or ""): parse_sourcing_rule(
+            row.get("AdditionalAttribute1"))
+        for _, row in products.iterrows()
+    }
+
     strip_families: dict[str, list[tuple[str, float, str, str]]] = {}
     for _, row in products.iterrows():
         sku_s = str(row.get("SKU") or "").strip()
@@ -260,6 +281,20 @@ def compute_engine_signals(products: pd.DataFrame,
             continue
         for child_sku, child_len, _, _ in sorted_members:
             if child_sku == master_sku:
+                continue
+            # Only roll up (and hide) this SKU's own demand if there is
+            # explicit evidence it's cut/assembled from the bulk master:
+            # a CIN7 BOM, a BillOfMaterial=True flag, or a SourceFraction
+            # sourcing rule. Otherwise it's a standalone purchased
+            # product that only shares a naming pattern — leave its own
+            # effective_units_12mo/90d alone.
+            has_evidence = (
+                child_sku in bom_assemblies
+                or bom_flag_by_sku.get(child_sku, False)
+                or rule_by_sku.get(child_sku, {}).get(
+                    "SourceFraction") is not None
+            )
+            if not has_evidence:
                 continue
             u12 = float(eff_12mo_map.get(child_sku, 0))
             u90 = float(eff_90d_map.get(child_sku, 0))

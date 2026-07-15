@@ -2689,7 +2689,13 @@ class IncomingStockTests(unittest.TestCase):
 
         self.assertEqual(result.iloc[0].get("Bin", ""), "")
 
-    def test_worker_engine_rolls_strip_child_demand_to_active_master(self) -> None:
+    def test_worker_engine_does_not_hide_standalone_sibling_without_bom(
+            self) -> None:
+        """v2.67.376 — mirrors app.py's b0e8eb1 fix. LED-WLWW-30K-IP67-5
+        is an independently supplied 5m reel, not a cut of the 25m roll.
+        Sharing a naming pattern with a bigger sibling is NOT proof of a
+        master/cut relationship — without a BOM/BillOfMaterial/
+        SourceFraction, its own real sales must stay on its own row."""
         products = pd.DataFrame([
             {
                 "SKU": "LED-WLWW-30K-IP67-50",
@@ -2708,6 +2714,61 @@ class IncomingStockTests(unittest.TestCase):
                 "Name": "White Lily LED Strip 3000K 5m",
                 "Status": "Active",
                 "AverageCost": 10.0,
+            },
+        ])
+        stock = pd.DataFrame([
+            {"SKU": "LED-WLWW-30K-IP67-25", "OnHand": 0},
+            {"SKU": "LED-WLWW-30K-IP67-5", "OnHand": 0},
+        ])
+        sale_lines = pd.DataFrame([{
+            "SKU": "LED-WLWW-30K-IP67-5",
+            "InvoiceDate": "2026-07-01",
+            "Quantity": 5,
+            "Customer": "Regular LED Customer",
+        }])
+
+        result = worker_engine.compute_engine_signals(
+            products, stock, sale_lines)
+        by_sku = result.set_index("SKU")
+
+        self.assertFalse(
+            bool(by_sku.loc["LED-WLWW-30K-IP67-5", "is_non_master_tube"])
+        )
+        self.assertEqual(
+            by_sku.loc["LED-WLWW-30K-IP67-5",
+                       "effective_units_12mo"],
+            5.0,
+        )
+        self.assertEqual(
+            by_sku.loc["LED-WLWW-30K-IP67-25",
+                       "effective_units_12mo"],
+            0.0,
+        )
+
+    def test_worker_engine_rolls_strip_child_demand_when_bom_confirms_cut(
+            self) -> None:
+        """Same naming family as above, but this time a real CIN7 BOM
+        says the 5m SKU is assembled/cut from the 25m roll — so the
+        rollup (and hiding the child's own demand) is correct."""
+        products = pd.DataFrame([
+            {
+                "SKU": "LED-WLWW-30K-IP67-50",
+                "Name": "[Discontinued] White Lily LED Strip 3000K 50m",
+                "Status": "Discontinued",
+                "AverageCost": 10.0,
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-25",
+                "Name": "White Lily LED Strip 3000K 25m",
+                "Status": "Active",
+                "AverageCost": 10.0,
+            },
+            {
+                "SKU": "LED-WLWW-30K-IP67-5",
+                "Name": "White Lily LED Strip 3000K 5m",
+                "Status": "Active",
+                "AverageCost": 10.0,
+                "BillOfMaterial": "True",
             },
         ])
         stock = pd.DataFrame([
