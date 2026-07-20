@@ -7423,10 +7423,21 @@ def _abc_engine(products: pd.DataFrame,
         # v2.67.351 — same tightening as in _is_dormant: A-class
         # grace also requires eff_90d > 0. Without recent activity
         # an A-class SKU isn't a steady mover; let dormancy fire.
+        # v2.67.xxx — ABC is a $-value Pareto rank, not a steadiness
+        # signal: a single big one-off sale to one buyer can push a
+        # SKU into A purely on dollar value. Require top_cust_pct_12mo
+        # < 0.5 so the grace only protects genuinely diversified-buyer
+        # A-class movers; a concentrated spike falls through to the
+        # normal thresholds below instead of getting blanket immunity.
+        # James 2026-07-16: LED-TSGW-300-24-VEG-5 — one 24-unit sale
+        # to a single customer, zero sales every other month, ABC=A
+        # purely from that sale's dollar value — was exempted here.
         abc_early = str(row.get("ABC") or "C").strip().upper()
         eff_12mo_early = float(row.get("effective_units_12mo") or 0)
         eff_90d_early = float(row.get("effective_units_90d") or 0)
-        if abc_early == "A" and eff_12mo_early > 0 and eff_90d_early > 0:
+        top_share_12mo_early = float(row.get("top_cust_pct_12mo") or 0)
+        if (abc_early == "A" and eff_12mo_early > 0 and eff_90d_early > 0
+                and top_share_12mo_early < 0.5):
             return False
         if bool(row.get("is_dormant", False)):
             return True  # already flagged by base rules
@@ -7613,7 +7624,19 @@ def _abc_engine(products: pd.DataFrame,
             # single residual sale 60 days ago, NOT ongoing demand.
             # Old gate (u90>0) preserved grace; new gate (u45>0) lets
             # the project paths below fire correctly.
-            if abc == "A" and u45 > 0:
+            # v2.67.xxx — ABC is a $-value Pareto rank, not a
+            # steadiness signal, so it shouldn't grant blanket immunity
+            # from the concentration check below. Require
+            # top_share_12mo < 0.5 so the grace only protects A-class
+            # SKUs whose recent activity isn't itself a single-buyer
+            # spike; a concentrated one falls through to the
+            # top_share_12mo >= 0.5 check just below, which is the
+            # correct "🎯 Project" path for it.
+            # James 2026-07-16: LED-TSGW-300-24-VEG-5 — one 24-unit
+            # sale to a single customer, otherwise zero all year, ABC=A
+            # purely from that sale's dollar value — was exempted here
+            # and stayed "Stable" instead of "🎯 Project".
+            if abc == "A" and u45 > 0 and top_share_12mo < 0.5:
                 return cur
             # v2.67.314 — sporadic / single-buyer case. The low-volume
             # threshold catches genuinely tiny SKUs but misses ones
