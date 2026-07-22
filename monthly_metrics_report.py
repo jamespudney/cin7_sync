@@ -218,30 +218,34 @@ def _channel_of_row(sc_val, sr_val) -> str:
     return "B2B / Direct"
 
 
-def _shopify_orders_lookup(shopify_orders) -> Dict[str, str]:
-    """{OrderNumber (normalised, no leading '#'): source_name}. Mirrors
-    app.py's _shopify_source_by_order exactly, same join James asked
-    for here too (Section 9 Order Counts, alongside Section 5 Revenue
-    by Channel)."""
-    if (shopify_orders is None or shopify_orders.empty
-            or "OrderNumber" not in shopify_orders.columns
-            or "SourceName" not in shopify_orders.columns):
-        return {}
-    so = shopify_orders.dropna(subset=["OrderNumber"])
-    return dict(zip(
-        so["OrderNumber"].astype(str).str.lstrip("#"),
-        so["SourceName"]))
+def _shopify_rev_and_cnt_by_source(shopify_orders):
+    """{(month_period, source_name): revenue} and {...: count}, from
+    Shopify's own order data directly (TotalPrice, CreatedAt,
+    SourceName) - NOT joined through CIN7.
 
-
-def _shopify_sub_channel(order_number, source_by_order: Dict[str, str]) -> str:
+    First attempt joined CIN7 sale_lines to shopify_orders by
+    OrderNumber - wrong key. Confirmed via a live CIN7 API pull
+    (2026-07-22): CIN7's own "OrderNumber" for a Shopify-channel sale
+    is CIN7's OWN internal reference (e.g. "SO-56363"), unrelated to
+    Shopify's order number. James's fix: don't round-trip through
+    CIN7 at all - Shopify's own order data already has everything
+    needed (TotalPrice + SourceName + CreatedAt per order)."""
     import pandas as pd
-    key = str(order_number).lstrip("#") if pd.notna(order_number) else ""
-    source = source_by_order.get(key)
-    if source == "web":
-        return "Shopify (Online Store)"
-    if source == "shopify_draft_order":
-        return "Shopify (Draft Orders)"
-    return "Shopify (Other/Unclassified)"
+
+    if (shopify_orders is None or shopify_orders.empty
+            or "CreatedAt" not in shopify_orders.columns
+            or "SourceName" not in shopify_orders.columns):
+        return pd.Series(dtype=float), pd.Series(dtype="int64")
+    so = shopify_orders.copy()
+    so["_dt"] = pd.to_datetime(
+        so["CreatedAt"], errors="coerce", utc=True).dt.tz_localize(None)
+    so = so.dropna(subset=["_dt"])
+    so["MonthKey"] = so["_dt"].dt.to_period("M")
+    so["TotalPrice"] = pd.to_numeric(
+        so.get("TotalPrice"), errors="coerce").fillna(0)
+    rev = so.groupby(["MonthKey", "SourceName"])["TotalPrice"].sum()
+    cnt = so.groupby(["MonthKey", "SourceName"]).size()
+    return rev, cnt
 
 
 # ---------------------------------------------------------------------------
@@ -497,25 +501,51 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
             axis=1)
     else:
         chan = pd.Series("B2B / Direct", index=prod.index)
-    # James: split "Shopify" into Online Store vs. Draft Orders here
-    # too (Section 9), same as the dashboard — joined via OrderNumber
-    # against the shopify_orders sync's source_name field.
-    _shopify_lookup = _shopify_orders_lookup(data.get("shopify_orders"))
-    if "OrderNumber" in prod.columns:
-        chan = pd.Series(
-            [_shopify_sub_channel(on, _shopify_lookup) if c == "Shopify"
-             else c
-             for c, on in zip(chan, prod["OrderNumber"])],
-            index=prod.index)
-    _channel_keys = (
-        "Shopify (Online Store)", "Shopify (Draft Orders)",
-        "Shopify (Other/Unclassified)", "Amazon", "eBay", "B2B / Direct")
-    chan_rev = prod.groupby(chan)["Total"].apply(
+    _base_rev = prod.groupby(chan)["Total"].apply(
         lambda s: float(_num(prod.loc[s.index], "Total").sum()))
-    chan_orders = prod.assign(_chan=chan).groupby("_chan")["SaleID"].nunique() \
+    _base_cnt = prod.assign(_chan=chan).groupby("_chan")["SaleID"].nunique() \
         if "SaleID" in prod.columns else pd.Series(dtype=int)
-    chan_rev = {c: float(chan_rev.get(c, 0.0)) for c in _channel_keys}
-    chan_ord = {c: int(chan_orders.get(c, 0)) for c in _channel_keys}
+
+    # James: split "Shopify" into Online Store vs. Draft Orders, here
+    # too (Section 9), same as the dashboard — sourced directly from
+    # Shopify's own order data (TotalPrice/SourceName/CreatedAt), NOT
+    # joined through CIN7 (CIN7's OrderNumber for a Shopify sale is
+    # its own internal reference, unrelated to Shopify's order
+    # number — confirmed via a live CIN7 API pull). "Other/
+    # Unclassified" is CIN7's total Shopify figure for the month minus
+    # what's directly attributed to the other two, floored at 0 — so
+    # the three always tie back to CIN7's own total regardless of any
+    # POS/mobile-app orders or reconciliation gap between the systems.
+    _shop_rev_by_src, _shop_cnt_by_src = _shopify_rev_and_cnt_by_source(
+        data.get("shopify_orders"))
+    _month_period = pd.Period(month, freq="M")
+    _cin7_shopify_rev = float(_base_rev.get("Shopify", 0.0))
+    _cin7_shopify_cnt = int(_base_cnt.get("Shopify", 0))
+    _online_rev = float(_shop_rev_by_src.get((_month_period, "web"), 0.0))
+    _draft_rev = float(_shop_rev_by_src.get(
+        (_month_period, "shopify_draft_order"), 0.0))
+    _other_rev = max(_cin7_shopify_rev - _online_rev - _draft_rev, 0.0)
+    _online_cnt = int(_shop_cnt_by_src.get((_month_period, "web"), 0))
+    _draft_cnt = int(_shop_cnt_by_src.get(
+        (_month_period, "shopify_draft_order"), 0))
+    _other_cnt = max(_cin7_shopify_cnt - _online_cnt - _draft_cnt, 0)
+
+    chan_rev = {
+        "Shopify (Online Store)": _online_rev,
+        "Shopify (Draft Orders)": _draft_rev,
+        "Shopify (Other/Unclassified)": _other_rev,
+        "Amazon": float(_base_rev.get("Amazon", 0.0)),
+        "eBay": float(_base_rev.get("eBay", 0.0)),
+        "B2B / Direct": float(_base_rev.get("B2B / Direct", 0.0)),
+    }
+    chan_ord = {
+        "Shopify (Online Store)": _online_cnt,
+        "Shopify (Draft Orders)": _draft_cnt,
+        "Shopify (Other/Unclassified)": _other_cnt,
+        "Amazon": int(_base_cnt.get("Amazon", 0)),
+        "eBay": int(_base_cnt.get("eBay", 0)),
+        "B2B / Direct": int(_base_cnt.get("B2B / Direct", 0)),
+    }
     out["5. Revenue by Channel [Cin7/DEAR]"] = {
         "pie": chan_rev,
         "table": [(k, f"${v:,.0f}") for k, v in chan_rev.items()],

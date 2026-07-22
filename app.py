@@ -20405,39 +20405,56 @@ elif page == "Monthly Metrics":
         # (a customer checking out themselves) vs. Draft Orders (the
         # sales team drew up a quote in Shopify that later got paid/
         # converted) — James wants this distinction, matching what
-        # Shopify's own Analytics shows. CIN7 doesn't carry this
-        # (its SourceChannel/SalesRepresentative are the same for
-        # both cases), but the separately-synced `shopify_orders`
-        # dataset (shopify_sync.py, already loaded at module scope
-        # for the AI Assistant's get_shopify_order tool) has Shopify's
-        # own `source_name` field per order: "web" for a normal
-        # checkout, "shopify_draft_order" for a converted draft order.
-        # Joined via OrderNumber, same normalisation convention
-        # get_shopify_order already uses (strip a leading "#", compare
-        # as strings) so this doesn't drift from that tool's matching.
-        _shopify_source_by_order: dict = {}
+        # Shopify's own Analytics shows.
+        #
+        # First attempt joined CIN7 sale_lines to the shopify_orders
+        # dataset by OrderNumber — wrong key. Confirmed via a live
+        # CIN7 API pull (2026-07-22): CIN7's own "OrderNumber" for a
+        # Shopify-channel sale is CIN7's OWN internal reference
+        # (e.g. "SO-56363"), unrelated to Shopify's order number.
+        # The actual Shopify order reference CIN7 exposes turned up
+        # in "CustomerReference" (e.g. "#42668") — but James pointed
+        # out the simpler, more robust fix: don't round-trip through
+        # CIN7 at all for this split. Shopify's own order data
+        # (already synced) already has TotalPrice + SourceName per
+        # order — compute Online Store / Draft Orders revenue and
+        # counts DIRECTLY from that, and only fall back to CIN7's
+        # total Shopify figure (via _channel_of_row, unchanged) for
+        # whatever's left over (POS/mobile-app orders, or any
+        # reconciliation gap between the two systems) — so the
+        # section's total still ties to the rest of the report,
+        # which is anchored on CIN7.
+        _shop_rev_by_month_source = pd.Series(dtype=float)
+        _shop_cnt_by_month_source = pd.Series(dtype="int64")
         if (not shopify_orders.empty
-                and "OrderNumber" in shopify_orders.columns
+                and "CreatedAt" in shopify_orders.columns
                 and "SourceName" in shopify_orders.columns):
-            _so = shopify_orders.dropna(subset=["OrderNumber"])
-            _shopify_source_by_order = dict(zip(
-                _so["OrderNumber"].astype(str).str.lstrip("#"),
-                _so["SourceName"]))
+            _so = shopify_orders.copy()
+            _so["_dt"] = pd.to_datetime(
+                _so["CreatedAt"], errors="coerce", utc=True
+            ).dt.tz_localize(None)
+            _so = _so.dropna(subset=["_dt"])
+            _so["MonthKey"] = _so["_dt"].dt.to_period("M")
+            _so["TotalPrice"] = pd.to_numeric(
+                _so.get("TotalPrice"), errors="coerce").fillna(0)
+            _shop_rev_by_month_source = _so.groupby(
+                ["MonthKey", "SourceName"])["TotalPrice"].sum()
+            _shop_cnt_by_month_source = _so.groupby(
+                ["MonthKey", "SourceName"]).size()
 
-        def _shopify_sub_channel(order_number) -> str:
-            key = str(order_number).lstrip("#") if pd.notna(
-                order_number) else ""
-            source = _shopify_source_by_order.get(key)
-            if source == "web":
-                return "Shopify (Online Store)"
-            if source == "shopify_draft_order":
-                return "Shopify (Draft Orders)"
-            # Covers POS/mobile-app orders and cases where no
-            # matching Shopify order was found (e.g. older orders
-            # from before the shopify_orders sync started) — bucketed
-            # separately rather than silently folded into either of
-            # the two categories James actually asked to distinguish.
-            return "Shopify (Other/Unclassified)"
+        def _shopify_split_rev(m, cin7_shopify_total: float):
+            online = float(_shop_rev_by_month_source.get((m, "web"), 0.0))
+            draft = float(_shop_rev_by_month_source.get(
+                (m, "shopify_draft_order"), 0.0))
+            other = max(cin7_shopify_total - online - draft, 0.0)
+            return online, draft, other
+
+        def _shopify_split_cnt(m, cin7_shopify_total: int):
+            online = int(_shop_cnt_by_month_source.get((m, "web"), 0))
+            draft = int(_shop_cnt_by_month_source.get(
+                (m, "shopify_draft_order"), 0))
+            other = max(cin7_shopify_total - online - draft, 0)
+            return online, draft, other
 
         _has_sc = "SourceChannel" in sl_prod.columns
         _has_sr = "SalesRepresentative" in sl_prod.columns
@@ -20448,18 +20465,9 @@ elif page == "Monthly Metrics":
             _sr_col = (sl_prod["SalesRepresentative"] if _has_sr
                        else pd.Series([""] * len(sl_prod),
                                        index=sl_prod.index))
-            _base_chans = pd.Series(
+            _chans = pd.Series(
                 [_channel_of_row(sc, sr)
                  for sc, sr in zip(_sc_col, _sr_col)],
-                index=sl_prod.index)
-            if "OrderNumber" in sl_prod.columns:
-                _order_no_col = sl_prod["OrderNumber"]
-            else:
-                _order_no_col = pd.Series([None] * len(sl_prod),
-                                            index=sl_prod.index)
-            _chans = pd.Series(
-                [_shopify_sub_channel(on) if base == "Shopify" else base
-                 for base, on in zip(_base_chans, _order_no_col)],
                 index=sl_prod.index)
             _slp_rev = sl_prod.assign(_chan=_chans)
             _rev_by_chan_month = _slp_rev.groupby(
@@ -20467,11 +20475,19 @@ elif page == "Monthly Metrics":
             _orders_by_chan_month = _slp_rev.groupby(
                 ["MonthKey", "_chan"])["SaleID"].nunique()
 
-            _channels_in_order = [
+            _other_channels = ["B2B / Direct", "Amazon", "eBay"]
+            _shopify_sub_labels = [
                 "Shopify (Online Store)", "Shopify (Draft Orders)",
-                "Shopify (Other/Unclassified)",
-                "B2B / Direct", "Amazon", "eBay"]
-            for _chan in _channels_in_order:
+                "Shopify (Other/Unclassified)"]
+            _channels_in_order = _shopify_sub_labels + _other_channels
+
+            for _chan in _shopify_sub_labels:
+                _idx = _shopify_sub_labels.index(_chan)
+                _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
+                     _per_month(lambda m, i=_idx: _shopify_split_rev(
+                         m, float(_rev_by_chan_month.get(
+                             (m, "Shopify"), 0) or 0))[i]))
+            for _chan in _other_channels:
                 _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
                      _per_month(
                          lambda m, c=_chan: float(
@@ -20482,20 +20498,24 @@ elif page == "Monthly Metrics":
                  _per_month(
                      lambda m: float(sum(
                          _rev_by_chan_month.get((m, c), 0) or 0
-                         for c in _channels_in_order))))
+                         for c in ["Shopify"] + _other_channels))))
             if _qb_has_data("sales"):
                 _row("5. Revenue by Channel [Cin7/DEAR]",
                      "Net Sales (QB 400)",
                      _per_month(lambda m: _qb(m, "sales")))
 
-            for _chan in _channels_in_order:
-                # "Shopify (Draft Orders) Orders" reads badly — the
-                # channel name already ends in "Order(s)", so use
-                # "Count" instead of appending "Orders" again.
+            for _chan in _shopify_sub_labels:
+                _idx = _shopify_sub_labels.index(_chan)
                 _cnt_label = (f"{_chan} Count" if "Order" in _chan
                                else f"{_chan} Orders")
+                _row("9. Order Counts [Cin7/DEAR]", _cnt_label,
+                     _per_month(lambda m, i=_idx: _shopify_split_cnt(
+                         m, int(_orders_by_chan_month.get(
+                             (m, "Shopify"), 0) or 0))[i]),
+                     fmt="int")
+            for _chan in _other_channels:
                 _row("9. Order Counts [Cin7/DEAR]",
-                     _cnt_label,
+                     f"{_chan} Orders",
                      _per_month(
                          lambda m, c=_chan: int(
                              _orders_by_chan_month.get((m, c), 0)
@@ -20505,7 +20525,7 @@ elif page == "Monthly Metrics":
                  _per_month(
                      lambda m: int(sum(
                          _orders_by_chan_month.get((m, c), 0) or 0
-                         for c in _channels_in_order))),
+                         for c in ["Shopify"] + _other_channels))),
                  fmt="int")
 
         # v2.67.298 — AOV, # of Purchases, Purchase $ all moved
@@ -20833,21 +20853,24 @@ elif page == "Monthly Metrics":
                 "live engine calculation).",
             ("5. Revenue by Channel [Cin7/DEAR]",
              "Shopify (Online Store)"):
-                "Shopify-channel CIN7 sales (via SourceChannel/"
-                "SalesRepresentative) joined to the Shopify orders "
-                "sync by OrderNumber, where Shopify's own source_name "
-                "= \"web\" — a normal customer self-checkout.",
+                "Sum of Shopify's own order TotalPrice, by month, "
+                "where Shopify's source_name = \"web\" — a normal "
+                "customer self-checkout. Sourced directly from the "
+                "Shopify orders sync, not CIN7 (CIN7 doesn't carry "
+                "this distinction).",
             ("5. Revenue by Channel [Cin7/DEAR]",
              "Shopify (Draft Orders)"):
-                "Same join, where Shopify's source_name = "
+                "Same source, where Shopify's source_name = "
                 "\"shopify_draft_order\" — a quote the sales team "
                 "created in Shopify that the customer later paid/"
                 "converted.",
             ("5. Revenue by Channel [Cin7/DEAR]",
              "Shopify (Other/Unclassified)"):
-                "Shopify-channel sales that are POS/mobile-app "
-                "orders, or where no matching order was found in the "
-                "Shopify orders sync (e.g. it predates that sync).",
+                "CIN7's total Shopify-channel revenue for the month, "
+                "minus the Online Store + Draft Orders amounts above "
+                "— covers POS/mobile-app orders and any reconciliation "
+                "gap between CIN7's and Shopify's own totals. Floored "
+                "at $0 (never shown negative).",
             ("5. Revenue by Channel [Cin7/DEAR]", "B2B / Direct"):
                 "Sum of CIN7 product-line Total for sales not "
                 "matching a Shopify/Amazon/eBay signal — phone, "
@@ -20949,18 +20972,21 @@ elif page == "Monthly Metrics":
                 "Shipping Margin [QB] ÷ Shipping Charged (QB 405) as "
                 "a percentage.",
             ("9. Order Counts [Cin7/DEAR]", "Shopify (Online Store) Orders"):
-                "Count of distinct CIN7 SaleIDs for Shopify orders "
-                "whose Shopify source_name = \"web\" (normal "
-                "customer self-checkout).",
+                "Count of Shopify's own orders for the month whose "
+                "source_name = \"web\" (normal customer self-"
+                "checkout) — sourced directly from the Shopify "
+                "orders sync, not CIN7.",
             ("9. Order Counts [Cin7/DEAR]", "Shopify (Draft Orders) Count"):
-                "Count of distinct CIN7 SaleIDs for Shopify orders "
-                "whose Shopify source_name = \"shopify_draft_order\" "
-                "(a sales-team quote that got converted/paid).",
+                "Same source, where source_name = "
+                "\"shopify_draft_order\" — a sales-team quote that "
+                "got converted/paid.",
             ("9. Order Counts [Cin7/DEAR]",
              "Shopify (Other/Unclassified) Orders"):
-                "Count of distinct CIN7 SaleIDs for Shopify orders "
-                "that are POS/mobile-app, or have no match in the "
-                "Shopify orders sync.",
+                "CIN7's total Shopify-channel order count for the "
+                "month, minus the Online Store + Draft Orders counts "
+                "above — covers POS/mobile-app orders and any "
+                "reconciliation gap between the two systems. Floored "
+                "at 0.",
             ("9. Order Counts [Cin7/DEAR]", "B2B / Direct Orders"):
                 "Count of distinct CIN7 SaleIDs (product lines) in "
                 "the month not matching a Shopify/Amazon/eBay signal.",
