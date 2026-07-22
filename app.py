@@ -20113,6 +20113,25 @@ elif page == "Monthly Metrics":
         def _per_month(fn):
             return [fn(m) for m in months]
 
+        # v2.67.xxx — Discounts source-of-truth, shared by Section 1
+        # and Section 6 below. CIN7's sale_lines.Discount line-item
+        # proxy undercounts true Shopify discounts by 60-70% (Viktor
+        # audit, v2.67.303) — prefer the Shopify Admin API's own
+        # discount total once `shopify_discounts.py sync` has
+        # populated it, falling back to the CIN7 proxy until then.
+        try:
+            _shopify_disc = db.all_shopify_monthly_discounts() or {}
+        except Exception:  # noqa: BLE001
+            _shopify_disc = {}
+
+        def _discounts_for(m):
+            """Shopify API value if we have it; CIN7 proxy if not."""
+            k = str(m)
+            v = _shopify_disc.get(k)
+            if v is not None and float(v) > 0:
+                return float(v)
+            return abs(_get(discount_per_month, m))
+
         # v2.67.298 — Adopted Viktor's PDF report layout (Wired4Signs
         # USA — Monthly Financial Report). Page-1 sections (App
         # data) come first, then page-2 canonical financials
@@ -20137,7 +20156,7 @@ elif page == "Monthly Metrics":
         _row("1. Sales Overview [App]", "COGS",
              _per_month(lambda m: _get(cogs_per_month, m)))
         _row("1. Sales Overview [App]", "Discounts",
-             _per_month(lambda m: -abs(_get(discount_per_month, m))))
+             _per_month(lambda m: -_discounts_for(m)))
         _row("1. Sales Overview [App]", "Tax $",
              _per_month(lambda m: _get(tax_per_month, m)))
         _row("1. Sales Overview [App]", "Gross Profit",
@@ -20235,25 +20254,13 @@ elif page == "Monthly Metrics":
         #   = Net Sales (QB 400)
         #   + Shipping Income (QB 405)
         #   = Total Revenue (QB Total Income)
-        # v2.67.303 — Discounts row now sources from Shopify
-        # Admin API (`shopify_monthly_discounts` table) when
-        # populated. Pre-fix it used the CIN7 line-discount proxy
-        # which undercounted by 60-70% (audit). Run
-        # `python shopify_discounts.py sync` to populate; the row
+        # v2.67.303 — Discounts row sources from Shopify Admin API
+        # (`shopify_monthly_discounts` table) when populated, same
+        # `_discounts_for` shared with Section 1's Discounts row
+        # above. Pre-fix it used the CIN7 line-discount proxy which
+        # undercounted by 60-70% (audit). Run `python
+        # shopify_discounts.py sync` to populate; the row
         # auto-switches sources once data lands.
-        try:
-            _shopify_disc = db.all_shopify_monthly_discounts() or {}
-        except Exception:  # noqa: BLE001
-            _shopify_disc = {}
-
-        def _discounts_for(m):
-            """Shopify API value if we have it; CIN7 proxy if not."""
-            k = str(m)
-            v = _shopify_disc.get(k)
-            if v is not None and float(v) > 0:
-                return float(v)
-            return abs(_get(discount_per_month, m))
-
         _disc_label = (
             "Less: Discounts (Shopify Admin API)"
             if _shopify_disc
@@ -20417,15 +20424,25 @@ elif page == "Monthly Metrics":
         # out the simpler, more robust fix: don't round-trip through
         # CIN7 at all for this split. Shopify's own order data
         # (already synced) already has TotalPrice + SourceName per
-        # order — compute Online Store / Draft Orders revenue and
-        # counts DIRECTLY from that, and only fall back to CIN7's
-        # total Shopify figure (via _channel_of_row, unchanged) for
-        # whatever's left over (POS/mobile-app orders, or any
-        # reconciliation gap between the two systems) — so the
-        # section's total still ties to the rest of the report,
-        # which is anchored on CIN7.
+        # order — compute Online Store / Draft Orders / Other (every
+        # other source_name — POS, the Shop app, mobile app, etc.,
+        # combined) revenue and counts DIRECTLY from that, all on the
+        # same Shopify-native basis. "Other" is a real sum of actual
+        # orders, not a leftover against CIN7's total — CIN7's
+        # sale_lines.Total is product-line-only (excludes shipping/
+        # tax) while Shopify's TotalPrice is the full order value, so
+        # the two totals are never expected to match exactly; using
+        # CIN7's total as the "other" residual was producing
+        # "Shopify Total" figures smaller than Online + Draft alone
+        # whenever Shopify's own total ran ahead of CIN7's for the
+        # month. "Total (CIN7)" below stays anchored on CIN7 (still
+        # ties to Section 1); "Shopify Total" here is Shopify's own
+        # rollup and will legitimately differ from CIN7's Shopify
+        # figure.
         _shop_rev_by_month_source = pd.Series(dtype=float)
         _shop_cnt_by_month_source = pd.Series(dtype="int64")
+        _shop_rev_by_month_total = pd.Series(dtype=float)
+        _shop_cnt_by_month_total = pd.Series(dtype="int64")
         if (not shopify_orders.empty
                 and "CreatedAt" in shopify_orders.columns
                 and "SourceName" in shopify_orders.columns):
@@ -20441,19 +20458,24 @@ elif page == "Monthly Metrics":
                 ["MonthKey", "SourceName"])["TotalPrice"].sum()
             _shop_cnt_by_month_source = _so.groupby(
                 ["MonthKey", "SourceName"]).size()
+            _shop_rev_by_month_total = _so.groupby(
+                "MonthKey")["TotalPrice"].sum()
+            _shop_cnt_by_month_total = _so.groupby("MonthKey").size()
 
-        def _shopify_split_rev(m, cin7_shopify_total: float):
+        def _shopify_split_rev(m):
             online = float(_shop_rev_by_month_source.get((m, "web"), 0.0))
             draft = float(_shop_rev_by_month_source.get(
                 (m, "shopify_draft_order"), 0.0))
-            other = max(cin7_shopify_total - online - draft, 0.0)
+            total = float(_shop_rev_by_month_total.get(m, 0.0))
+            other = max(total - online - draft, 0.0)
             return online, draft, other
 
-        def _shopify_split_cnt(m, cin7_shopify_total: int):
+        def _shopify_split_cnt(m):
             online = int(_shop_cnt_by_month_source.get((m, "web"), 0))
             draft = int(_shop_cnt_by_month_source.get(
                 (m, "shopify_draft_order"), 0))
-            other = max(cin7_shopify_total - online - draft, 0)
+            total = int(_shop_cnt_by_month_total.get(m, 0))
+            other = max(total - online - draft, 0)
             return online, draft, other
 
         _has_sc = "SourceChannel" in sl_prod.columns
@@ -20484,15 +20506,14 @@ elif page == "Monthly Metrics":
             for _chan in _shopify_sub_labels:
                 _idx = _shopify_sub_labels.index(_chan)
                 _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
-                     _per_month(lambda m, i=_idx: _shopify_split_rev(
-                         m, float(_rev_by_chan_month.get(
-                             (m, "Shopify"), 0) or 0))[i]))
-            # James: a quick-glance rollup of just the 3 Shopify rows
-            # above, distinct from "Total (CIN7)" below (which
-            # includes every channel).
+                     _per_month(lambda m, i=_idx:
+                                 _shopify_split_rev(m)[i]))
+            # James: Shopify's own total (Online + Draft + Other) —
+            # will legitimately differ from "Total (CIN7)" below
+            # since Shopify's TotalPrice includes shipping/tax that
+            # CIN7's product-line Total excludes.
             _row("5. Revenue by Channel [Cin7/DEAR]", "Shopify Total",
-                 _per_month(lambda m: float(
-                     _rev_by_chan_month.get((m, "Shopify"), 0) or 0)))
+                 _per_month(lambda m: sum(_shopify_split_rev(m))))
             for _chan in _other_channels:
                 _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
                      _per_month(
@@ -20515,13 +20536,11 @@ elif page == "Monthly Metrics":
                 _cnt_label = (f"{_chan} Count" if "Order" in _chan
                                else f"{_chan} Orders")
                 _row("9. Order Counts [Cin7/DEAR]", _cnt_label,
-                     _per_month(lambda m, i=_idx: _shopify_split_cnt(
-                         m, int(_orders_by_chan_month.get(
-                             (m, "Shopify"), 0) or 0))[i]),
+                     _per_month(lambda m, i=_idx:
+                                 _shopify_split_cnt(m)[i]),
                      fmt="int")
             _row("9. Order Counts [Cin7/DEAR]", "Shopify Total Orders",
-                 _per_month(lambda m: int(
-                     _orders_by_chan_month.get((m, "Shopify"), 0) or 0)),
+                 _per_month(lambda m: sum(_shopify_split_cnt(m))),
                  fmt="int")
             for _chan in _other_channels:
                 _row("9. Order Counts [Cin7/DEAR]",
@@ -20808,9 +20827,12 @@ elif page == "Monthly Metrics":
                 "lines — CIN7's per-line moving-average cost at time "
                 "of sale.",
             ("1. Sales Overview [App]", "Discounts"):
-                "Sum of CIN7's line-level Discount field on product "
-                "sales, shown negative. Known to undercount true "
-                "Shopify discounts.",
+                "Shopify Admin API's own discount total for the "
+                "month when synced (shown negative) — same figure "
+                "and same source as Section 6's discount row. Falls "
+                "back to CIN7's line-level Discount field (known to "
+                "undercount true Shopify discounts by 60-70%) until "
+                "`python shopify_discounts.py sync` has run.",
             ("1. Sales Overview [App]", "Tax $"):
                 "Sum of the Tax field on CIN7 product sale lines for "
                 "the month.",
@@ -20876,15 +20898,19 @@ elif page == "Monthly Metrics":
                 "converted.",
             ("5. Revenue by Channel [Cin7/DEAR]",
              "Shopify (Other/Unclassified)"):
-                "CIN7's total Shopify-channel revenue for the month, "
-                "minus the Online Store + Draft Orders amounts above "
-                "— covers POS/mobile-app orders and any reconciliation "
-                "gap between CIN7's and Shopify's own totals. Floored "
-                "at $0 (never shown negative).",
+                "Shopify's own order total for the month, minus the "
+                "Online Store + Draft Orders amounts above — every "
+                "other source_name combined (POS, the Shop app, "
+                "mobile app, etc.). A real sum of actual orders, not "
+                "a leftover against CIN7's figure.",
             ("5. Revenue by Channel [Cin7/DEAR]", "Shopify Total"):
-                "Sum of the 3 Shopify rows above (Online Store + "
-                "Draft Orders + Other/Unclassified) — equals CIN7's "
-                "total Shopify-channel revenue for the month.",
+                "Sum of the 3 Shopify rows above — Shopify's own "
+                "total order revenue for the month (TotalPrice, "
+                "including shipping/tax). Will differ from CIN7's "
+                "Shopify figure in \"Total (CIN7)\" below, since "
+                "CIN7's sale_lines.Total is product-line-only and "
+                "excludes shipping/tax — that's expected, not a "
+                "reconciliation error.",
             ("5. Revenue by Channel [Cin7/DEAR]", "B2B / Direct"):
                 "Sum of CIN7 product-line Total for sales not "
                 "matching a Shopify/Amazon/eBay signal — phone, "
@@ -20996,15 +21022,15 @@ elif page == "Monthly Metrics":
                 "got converted/paid.",
             ("9. Order Counts [Cin7/DEAR]",
              "Shopify (Other/Unclassified) Orders"):
-                "CIN7's total Shopify-channel order count for the "
-                "month, minus the Online Store + Draft Orders counts "
-                "above — covers POS/mobile-app orders and any "
-                "reconciliation gap between the two systems. Floored "
-                "at 0.",
+                "Shopify's own order count for the month, minus the "
+                "Online Store + Draft Orders counts above — every "
+                "other source_name combined (POS, the Shop app, "
+                "mobile app, etc.).",
             ("9. Order Counts [Cin7/DEAR]", "Shopify Total Orders"):
-                "Sum of the 3 Shopify rows above (Online Store + "
-                "Draft Orders + Other/Unclassified) — equals CIN7's "
-                "total Shopify-channel order count for the month.",
+                "Sum of the 3 Shopify rows above — Shopify's own "
+                "total order count for the month. Will differ from "
+                "CIN7's Shopify count in \"Total Orders\" below when "
+                "the two systems' records don't line up 1:1.",
             ("9. Order Counts [Cin7/DEAR]", "B2B / Direct Orders"):
                 "Count of distinct CIN7 SaleIDs (product lines) in "
                 "the month not matching a Shopify/Amazon/eBay signal.",
@@ -21088,15 +21114,20 @@ elif page == "Monthly Metrics":
         # rendering code itself (matplotlib pie + legend styling) —
         # revisit if it drifts.
         #
-        # Uses the latest CLOSED month (current_month - 1), not
-        # whatever the rightmost column of the table is — the current,
-        # still-in-progress month is what all the "partial month"
-        # findings in this file's methodology notes are about, and a
-        # pie built from a half-finished month would be misleading.
+        # James: shows the calendar-year-to-date total (the table's
+        # own "YTD" column — Jan through the latest month on the
+        # page, partial current month included) rather than a single
+        # month, so one unusually big/small month doesn't dominate
+        # the slice proportions. Falls back to the latest CLOSED
+        # month (current_month - 1) if the YTD column isn't present
+        # (the "Show YTD + Avg" toggle is off) — the still-in-
+        # progress current month alone would be misleading, per this
+        # file's "partial month" methodology notes.
         _pie_closed_month = str(current_month - 1)
         _pie_month_label = (
             _pie_closed_month if _pie_closed_month in month_labels
             else (month_labels[-1] if month_labels else None))
+        _pie_has_ytd = "YTD" in table_df.columns
 
         def _pie_raw(section: str, metric: str) -> float:
             if _pie_month_label is None:
@@ -21105,8 +21136,9 @@ elif page == "Monthly Metrics":
                               & (table_df["Metric"] == metric)]
             if match.empty:
                 return 0.0
+            col = "YTD" if _pie_has_ytd else _pie_month_label
             try:
-                v = float(match.iloc[0][_pie_month_label])
+                v = float(match.iloc[0][col])
             except (KeyError, TypeError, ValueError):
                 return 0.0
             return 0.0 if pd.isna(v) else v
@@ -21220,11 +21252,14 @@ elif page == "Monthly Metrics":
             fig.update_layout(
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="top", y=-0.08,
-                             xanchor="center", x=0.5, font=dict(size=10)),
+                             xanchor="center", x=0.5, font=dict(size=11)),
                 margin=dict(l=8, r=8, t=8, b=8),
-                height=210, width=260,
+                height=280, width=340,
             )
-            st.caption(f"{_pie_month_label} breakdown")
+            _pie_caption = (f"{current_month.year} year-to-date breakdown"
+                             if _pie_has_ytd
+                             else f"{_pie_month_label} breakdown")
+            st.caption(_pie_caption)
             st.plotly_chart(fig, use_container_width=False,
                               config={"displayModeBar": False})
 
@@ -21246,7 +21281,7 @@ elif page == "Monthly Metrics":
 
             net_sales = [_get(sales_per_month, m) for m in months]
             cogs_vals = [_get(cogs_per_month, m) for m in months]
-            disc_vals = [_get(discount_per_month, m) for m in months]
+            disc_vals = [-_discounts_for(m) for m in months]
             gp_vals = [ns - c for ns, c in zip(net_sales, cogs_vals)]
             series = [
                 ("Net Sales", net_sales, "#2f6fed"),
