@@ -407,7 +407,19 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
 
     sales = float(_num(prod, "Total").sum())
     cogs = float((_num(prod, "Quantity") * _num(prod, "AverageCost")).sum())
-    discounts = float(_num(prod, "Discount").sum())
+    # James: prefer the Shopify Admin API's own discount total (same
+    # source/table the dashboard's Section 1 + Section 6 both use)
+    # over CIN7's line-level Discount proxy, which undercounts true
+    # Shopify discounts by 60-70% (Viktor audit).
+    try:
+        _shopify_disc_month = (data["db"].all_shopify_monthly_discounts()
+                                 or {}).get(month)
+    except Exception:  # noqa: BLE001
+        _shopify_disc_month = None
+    if _shopify_disc_month is not None and float(_shopify_disc_month) > 0:
+        discounts = float(_shopify_disc_month)
+    else:
+        discounts = abs(float(_num(prod, "Discount").sum()))
     gp = sales - cogs
 
     out: Dict[str, Any] = {}
