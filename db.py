@@ -5191,9 +5191,18 @@ _DEFAULT_QBO_MAPPINGS = {
         "QB's own 'Total Income' summary row. Sales + shipping "
         "income + sundry / billable expense income."),
     "total_cogs": (
-        ["500", "502", "550"], ["Total Cost of Goods Sold"],
-        "QB's 'Total COGS' (acc 500 + 502 Amazon fees + 550 "
-        "inventory adjustments). Matches QB's GP calculation."),
+        [], ["Total Cost of Goods Sold"],
+        "QB's own 'Total Cost of Goods Sold' summary row (acc 500 "
+        "+ 502 Amazon fees + 550 inventory adjustments, as QB "
+        "computes it). Matches QB's GP calculation. v2.67.xxx: "
+        "previously ALSO matched account_numbers ['500','502','550'] "
+        "in addition to this name — since qbo_monthly_pl stores both "
+        "the leaf accounts AND this section's own summary row, "
+        "qbo_monthly_pl_summary_by_category's OR-match summed both, "
+        "double-counting (Total COGS displayed as exactly 2x the sum "
+        "of the three leaf accounts every month). Name-only match is "
+        "sufficient and correct; the three leaf accounts already have "
+        "their own dedicated categories above."),
     "qb_gross_profit": (
         [], ["Gross Profit"],
         "QB's own 'Gross Profit' summary row (Total Income − "
