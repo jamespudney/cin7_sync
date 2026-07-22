@@ -185,13 +185,11 @@ services:
       # UPS shipment notifications so the bot can parse and write to CIN7.
       - key: SLACK_DROPSHIP_TRACKING_CHANNEL_ID
         value: "C0B3KD6GBM3"
-      # Monthly Metrics executive-summary PDF — channel it gets posted
-      # to (monthly_metrics_report.py, fired from sync_loop.sh on the
-      # 10th of each month). Fill in the real channel ID; the job
-      # skips the Slack post (but still writes the PDF to
-      # /data/output/) if this is left blank.
+      # Monthly Metrics executive-summary PDF — "management chat"
+      # channel it gets posted to (monthly_metrics_report.py, fired
+      # from sync_loop.sh on the 10th of each month).
       - key: SLACK_MONTHLY_REPORT_CHANNEL_ID
-        value: ""
+        value: "C08KKUQMGDA"
       # SLACK_BOT_TOKEN itself is expected via the cin7-shared env
       # group (used by cin7-sync-slack-bot too) — verify it's actually
       # linked to THIS service as well; monthly_metrics_report.py runs
