@@ -21114,15 +21114,20 @@ elif page == "Monthly Metrics":
         # rendering code itself (matplotlib pie + legend styling) —
         # revisit if it drifts.
         #
-        # Uses the latest CLOSED month (current_month - 1), not
-        # whatever the rightmost column of the table is — the current,
-        # still-in-progress month is what all the "partial month"
-        # findings in this file's methodology notes are about, and a
-        # pie built from a half-finished month would be misleading.
+        # James: shows the calendar-year-to-date total (the table's
+        # own "YTD" column — Jan through the latest month on the
+        # page, partial current month included) rather than a single
+        # month, so one unusually big/small month doesn't dominate
+        # the slice proportions. Falls back to the latest CLOSED
+        # month (current_month - 1) if the YTD column isn't present
+        # (the "Show YTD + Avg" toggle is off) — the still-in-
+        # progress current month alone would be misleading, per this
+        # file's "partial month" methodology notes.
         _pie_closed_month = str(current_month - 1)
         _pie_month_label = (
             _pie_closed_month if _pie_closed_month in month_labels
             else (month_labels[-1] if month_labels else None))
+        _pie_has_ytd = "YTD" in table_df.columns
 
         def _pie_raw(section: str, metric: str) -> float:
             if _pie_month_label is None:
@@ -21131,8 +21136,9 @@ elif page == "Monthly Metrics":
                               & (table_df["Metric"] == metric)]
             if match.empty:
                 return 0.0
+            col = "YTD" if _pie_has_ytd else _pie_month_label
             try:
-                v = float(match.iloc[0][_pie_month_label])
+                v = float(match.iloc[0][col])
             except (KeyError, TypeError, ValueError):
                 return 0.0
             return 0.0 if pd.isna(v) else v
@@ -21246,11 +21252,14 @@ elif page == "Monthly Metrics":
             fig.update_layout(
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="top", y=-0.08,
-                             xanchor="center", x=0.5, font=dict(size=10)),
+                             xanchor="center", x=0.5, font=dict(size=11)),
                 margin=dict(l=8, r=8, t=8, b=8),
-                height=210, width=260,
+                height=280, width=340,
             )
-            st.caption(f"{_pie_month_label} breakdown")
+            _pie_caption = (f"{current_month.year} year-to-date breakdown"
+                             if _pie_has_ytd
+                             else f"{_pie_month_label} breakdown")
+            st.caption(_pie_caption)
             st.plotly_chart(fig, use_container_width=False,
                               config={"displayModeBar": False})
 
