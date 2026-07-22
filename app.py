@@ -21054,6 +21054,11 @@ elif page == "Monthly Metrics":
                     return None
             return vals
 
+        # Sections whose slices are counts, not dollars — controls
+        # hover-value formatting below (everything else is money).
+        _PIE_COUNT_SECTIONS = {
+            "3. Customer Metrics [App]", "9. Order Counts [Cin7/DEAR]"}
+
         def _render_section_pie(section: str) -> None:
             if _pie_month_label is None:
                 return
@@ -21064,27 +21069,38 @@ elif page == "Monthly Metrics":
             values = [v for v in pie.values() if v and v > 0]
             if not values or sum(values) <= 0:
                 return
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
+            # v2.67.xxx — switched from a static matplotlib PNG to a
+            # Plotly donut: smaller footprint and genuinely
+            # interactive (hover a wedge for its exact $/count and
+            # share of the whole), matching what st.plotly_chart
+            # already gives every other chart in this app. plotly is
+            # already a project dependency — nothing new to install.
+            import plotly.graph_objects as go
 
-            fig, ax = plt.subplots(figsize=(2.6, 2.9), dpi=150)
-            total = sum(values)
-            wedges, _ = ax.pie(
-                values, startangle=90,
-                colors=_PIE_COLORS[:len(values)])
-            legend_labels = [f"{lbl} ({v / total * 100:.0f}%)"
-                              for lbl, v in zip(labels, values)]
-            ax.legend(
-                wedges, legend_labels, loc="upper center",
-                bbox_to_anchor=(0.5, -0.02), frameon=False,
-                fontsize=7, handlelength=1.0, handletextpad=0.5,
-                labelspacing=0.3)
-            ax.axis("equal")
-            fig.tight_layout()
+            is_count = section in _PIE_COUNT_SECTIONS
+            value_fmt = "%{value:,.0f}" if is_count else "$%{value:,.0f}"
+            fig = go.Figure(data=[go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.35,
+                sort=False,
+                marker=dict(colors=_PIE_COLORS[:len(values)],
+                            line=dict(color="rgba(0,0,0,0.15)", width=1)),
+                textinfo="percent",
+                textposition="inside",
+                hovertemplate=(f"%{{label}}: {value_fmt} "
+                                "(%{percent})<extra></extra>"),
+            )])
+            fig.update_layout(
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="top", y=-0.08,
+                             xanchor="center", x=0.5, font=dict(size=10)),
+                margin=dict(l=8, r=8, t=8, b=8),
+                height=210, width=260,
+            )
             st.caption(f"{_pie_month_label} breakdown")
-            st.pyplot(fig, use_container_width=False)
-            plt.close(fig)
+            st.plotly_chart(fig, use_container_width=False,
+                              config={"displayModeBar": False})
 
         # --- Render per-section ------------------------------------
         # v2.67.297 — explicit section ordering puts QB-canonical
