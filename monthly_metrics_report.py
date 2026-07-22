@@ -12,18 +12,20 @@ month on day 1 would inherit the inflated-GP%/incomplete-COGS
 distortion documented in app.py's Monthly Metrics methodology notes.
 
 This is deliberately a LIGHTER-WEIGHT companion to the full Monthly
-Metrics page, not a byte-for-byte port of it — two figures are
-simplified on purpose, and are labelled as such in the PDF:
-  - "Shipping Charged" here is the sum of CIN7 sale lines matched by
-    the simple is-shipping regex (no header-delta/reissue-dedup
-    refinement, no LTL-freight recovery). Runs slightly lower than the
-    dashboard's fuller figure — see app.py's Shipping Charged
-    methodology notes.
+Metrics page, not a byte-for-byte port of it — one figure is
+simplified on purpose, and is labelled as such in the PDF:
   - "Inventory" here is a CURRENT stock-value snapshot (slow-moving vs
     the rest), not the dashboard's modelled month-average walk-back.
 Everything else (Sales $, COGS, Discounts, channel/order breakdowns,
 customer counts, all QuickBooks-sourced figures) uses the exact same
 formulas and data sources as the dashboard.
+
+Section 2 ("Margins & Purchasing") deliberately shows no shipping
+figures — App-side Shipping Charged/Cost/Margin were removed here
+(2026-07, James) for the same reason they were removed from the
+dashboard: QuickBooks' Section 8 (accounts 405/694) is the one
+canonical shipping-margin figure shown to management, rather than
+two structurally different numbers that disagreed every month.
 
 Configuration via environment variables:
     SLACK_BOT_TOKEN                  Wired4Signs Slack bot token (xoxb-...)
@@ -329,13 +331,12 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
     db = data["db"]
 
     sl_month = _month_lines(sale_lines, month)
-    prod, ship = _split_product_shipping(sl_month)
+    prod, _ = _split_product_shipping(sl_month)
 
     sales = float(_num(prod, "Total").sum())
     cogs = float((_num(prod, "Quantity") * _num(prod, "AverageCost")).sum())
     discounts = float(_num(prod, "Discount").sum())
     gp = sales - cogs
-    shipping_charged = float(_num(ship, "Total").sum())
 
     out: Dict[str, Any] = {}
 
@@ -352,17 +353,13 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
         ],
     }
 
-    # ---- 2. Margins & Purchasing (simplified Shipping Charged) ------
-    out["2. Margins & Purchasing [App]"] = {
-        "pie": {"Shipping Cost": None, "Shipping Margin": None},
-        "table": [("Shipping Charged (simplified)",
-                    f"${shipping_charged:,.0f}")],
-        "note": ("Simplified: sum of CIN7 lines matched by name "
-                 "(shipping/freight/handling/delivery), not the "
-                 "dashboard's full header-delta calc — runs lower, "
-                 "especially where LTL freight isn't itemised."),
-        "skip_pie": True,
-    }
+    # Section 2 ("Margins & Purchasing") used to show a simplified
+    # App-side Shipping Charged estimate here — removed 2026-07
+    # (James): QuickBooks' Section 8 (accounts 405/694) is the one
+    # canonical shipping-margin figure shown to management, rather
+    # than a second, structurally different number. Nothing else was
+    # ever shown in this section, so it's dropped entirely rather
+    # than left as an empty block — see _SECTION_ORDER below.
 
     # ---- 3. Customer Metrics ----------------------------------------
     sl_all = sale_lines.copy()
@@ -566,7 +563,6 @@ def _render_pie(pie: Dict[str, float], title: str) -> Optional[bytes]:
 # ---------------------------------------------------------------------------
 _SECTION_ORDER = [
     "1. Sales Overview [App]",
-    "2. Margins & Purchasing [App]",
     "3. Customer Metrics [App]",
     "4. Inventory [App]",
     "5. Revenue by Channel [Cin7/DEAR]",
