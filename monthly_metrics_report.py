@@ -65,6 +65,15 @@ def _target_month(today: Optional[date] = None) -> str:
     return f"{year}-{month - 1:02d}"
 
 
+def _current_partial_month(today: Optional[date] = None) -> str:
+    """The in-progress calendar month, as 'YYYY-MM'. James wants this
+    included in the report (not just the closed month) as long as
+    it's clearly marked partial — see build_pdf's partial-month
+    callout under each section."""
+    today = today or date.today()
+    return f"{today.year}-{today.month:02d}"
+
+
 # ---------------------------------------------------------------------------
 # Data loading — CIN7 CSVs (same conventions as weekly_slow_movers_email.py)
 # ---------------------------------------------------------------------------
@@ -431,7 +440,16 @@ _C_ZEBRA = "#f3f5f8"
 
 
 def build_pdf(sections: Dict[str, Any], month: str,
+               partial_sections: Optional[Dict[str, Any]] = None,
+               partial_month: Optional[str] = None,
+               commentary: Optional[str] = None,
                company: str = "Wired4Signs USA") -> bytes:
+    """`partial_sections`/`partial_month` are the CURRENT, still-in-
+    progress month — James wants this included (not just the closed
+    month), clearly marked as partial so nobody mistakes it for final
+    numbers. Rendered as an amber-highlighted callout under each
+    section's closed-month block, not a second full pie (keeps the
+    page count sane while still surfacing the same figures)."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -444,6 +462,8 @@ def build_pdf(sections: Dict[str, Any], month: str,
     c_sub = colors.HexColor(_C_SUB)
     c_border = colors.HexColor(_C_BORDER)
     c_zebra = colors.HexColor(_C_ZEBRA)
+    c_partial = colors.HexColor("#b0570f")   # amber/warning — matches
+                                              # po_pdf.py's C_WARN
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -466,6 +486,12 @@ def build_pdf(sections: Dict[str, Any], month: str,
     note_style = ParagraphStyle(
         "NoteW4S", parent=styles["Normal"], fontSize=7, leading=9,
         textColor=c_sub)
+    partial_label_style = ParagraphStyle(
+        "PartialLabelW4S", parent=styles["Normal"], fontSize=7.5,
+        leading=10, textColor=c_partial, spaceBefore=4)
+    commentary_style = ParagraphStyle(
+        "CommentaryW4S", parent=styles["Normal"], fontSize=9.5,
+        leading=13, textColor=c_head)
 
     story: List = []
     story.append(Paragraph(
@@ -475,9 +501,15 @@ def build_pdf(sections: Dict[str, Any], month: str,
         f"<b>Reporting month:</b> {month} &nbsp;·&nbsp; "
         f"<b>Generated:</b> {datetime.now():%Y-%m-%d %H:%M}",
         sub_style))
-    story.append(Spacer(1, 10))
+    story.append(Spacer(1, 8))
+    if commentary:
+        story.append(Paragraph(commentary, commentary_style))
+        story.append(Spacer(1, 10))
+    else:
+        story.append(Spacer(1, 2))
 
-    def _block(section: str, payload: Dict[str, Any]):
+    def _block(section: str, payload: Dict[str, Any],
+               partial_payload: Optional[Dict[str, Any]] = None):
         cell_story: List = []
         cell_story.append(Paragraph(section, section_style))
         png = None
@@ -491,7 +523,7 @@ def build_pdf(sections: Dict[str, Any], month: str,
             cell_story.append(img)
         rows = payload.get("table") or []
         if rows:
-            t = Table(rows, colWidths=[1.55 * inch, 0.95 * inch])
+            t = Table(rows, colWidths=[1.5 * inch, 0.65 * inch])
             t.setStyle(TableStyle([
                 ("FONTSIZE", (0, 0), (-1, -1), 7.5),
                 ("ALIGN", (1, 0), (1, -1), "RIGHT"),
@@ -505,6 +537,21 @@ def build_pdf(sections: Dict[str, Any], month: str,
             cell_story.append(Spacer(1, 2))
             cell_story.append(Paragraph(f"<i>{payload['note']}</i>",
                                           note_style))
+        if partial_payload and partial_payload.get("table"):
+            cell_story.append(Paragraph(
+                f"⚠ THIS MONTH SO FAR — PARTIAL, THRU "
+                f"{date.today():%b %d}", partial_label_style))
+            pt = Table(partial_payload["table"],
+                       colWidths=[1.5 * inch, 0.65 * inch])
+            pt.setStyle(TableStyle([
+                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                ("TEXTCOLOR", (0, 0), (-1, -1), c_partial),
+                ("BOX", (0, 0), (-1, -1), 0.5, c_partial),
+                ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+            ]))
+            cell_story.append(pt)
         return cell_story
 
     # 3-column grid of section blocks. Each row is its own small Table
@@ -519,7 +566,8 @@ def build_pdf(sections: Dict[str, Any], month: str,
     col_w = 2.35 * inch
     for i in range(0, len(ordered), 3):
         row_sections = ordered[i:i + 3]
-        row_cells = [_block(s, p) for s, p in row_sections]
+        row_cells = [_block(s, p, (partial_sections or {}).get(s))
+                     for s, p in row_sections]
         while len(row_cells) < 3:
             row_cells.append("")
         grid = Table([row_cells], colWidths=[col_w] * 3)
@@ -616,7 +664,8 @@ def post_pdf_to_slack(pdf_bytes: bytes, month: str) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 def main() -> int:
     month = _target_month()
-    _emit(f"building report for {month}")
+    partial_month = _current_partial_month()
+    _emit(f"building report for {month} (+ partial {partial_month})")
 
     try:
         cin7_data = _load_cin7_data()
@@ -630,8 +679,21 @@ def main() -> int:
         _emit(f"section computation failed: {exc!r}", level="error")
         return 3
 
+    # Partial (current, in-progress) month — James wants this shown
+    # too, clearly marked. Best-effort: if this fails for any reason,
+    # log it and still send the closed-month report rather than
+    # blocking the whole run on a "nice to have" addition.
     try:
-        pdf_bytes = build_pdf(sections, month)
+        partial_sections = compute_sections(cin7_data, partial_month)
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"partial-month computation failed (continuing without "
+              f"it): {exc!r}", level="warn")
+        partial_sections = {}
+
+    try:
+        pdf_bytes = build_pdf(sections, month,
+                               partial_sections=partial_sections,
+                               partial_month=partial_month)
     except Exception as exc:  # noqa: BLE001
         _emit(f"PDF build failed: {exc!r}", level="error")
         return 4
