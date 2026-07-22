@@ -118,12 +118,54 @@ def _load_cin7_data() -> Dict[str, Any]:
     purchase_lines = (
         pd.read_csv(purchase_lines_csv, low_memory=False)
         if purchase_lines_csv is not None else pd.DataFrame())
+    shopify_orders = _load_shopify_orders(OUTPUT_DIR, pd)
 
     return {
         "products": products, "stock": stock,
         "sale_lines": sale_lines, "purchase_lines": purchase_lines,
-        "db": db,
+        "shopify_orders": shopify_orders, "db": db,
     }
+
+
+def _load_shopify_orders(output_dir, pd):
+    """Same union-of-full-plus-rolling-window + dedupe convention as
+    app.py's _load_longest_shopify_orders_cached. Optional: if the
+    sync hasn't run (older setups, or it's simply not been enabled),
+    returns an empty frame and the Shopify channel split below falls
+    back to "Other/Unclassified" for everything rather than erroring."""
+    import re as _re
+
+    files = []
+    full_path = output_dir / "shopify_orders_full.csv"
+    if full_path.exists():
+        files.append(("full", full_path.stat().st_mtime, full_path))
+    for p in output_dir.glob("shopify_orders_last_*d_*.csv"):
+        m = _re.match(r"shopify_orders_last_(\d+)d_", p.name)
+        if m:
+            files.append((int(m.group(1)), p.stat().st_mtime, p))
+    if not files:
+        return pd.DataFrame(columns=["OrderNumber", "SourceName"])
+
+    def _sort_key(item):
+        days, mtime, _p = item
+        return (-10**9, -mtime) if days == "full" else (-days, -mtime)
+
+    files.sort(key=_sort_key)
+    base = pd.DataFrame()
+    base_mtime = 0.0
+    for _days, mtime, p in files:
+        try:
+            chunk = pd.read_csv(p, low_memory=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if base.empty:
+            base, base_mtime = chunk, mtime
+            continue
+        if mtime > base_mtime:
+            base = pd.concat([base, chunk], ignore_index=True)
+    if "ShopifyOrderID" in base.columns:
+        base = base.drop_duplicates(subset=["ShopifyOrderID"], keep="last")
+    return base.reset_index(drop=True)
 
 
 _BAD_STATUSES = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
@@ -174,6 +216,32 @@ def _channel_of_row(sc_val, sr_val) -> str:
     if sr == "SHOPIFY":
         return "Shopify"
     return "B2B / Direct"
+
+
+def _shopify_orders_lookup(shopify_orders) -> Dict[str, str]:
+    """{OrderNumber (normalised, no leading '#'): source_name}. Mirrors
+    app.py's _shopify_source_by_order exactly, same join James asked
+    for here too (Section 9 Order Counts, alongside Section 5 Revenue
+    by Channel)."""
+    if (shopify_orders is None or shopify_orders.empty
+            or "OrderNumber" not in shopify_orders.columns
+            or "SourceName" not in shopify_orders.columns):
+        return {}
+    so = shopify_orders.dropna(subset=["OrderNumber"])
+    return dict(zip(
+        so["OrderNumber"].astype(str).str.lstrip("#"),
+        so["SourceName"]))
+
+
+def _shopify_sub_channel(order_number, source_by_order: Dict[str, str]) -> str:
+    import pandas as pd
+    key = str(order_number).lstrip("#") if pd.notna(order_number) else ""
+    source = source_by_order.get(key)
+    if source == "web":
+        return "Shopify (Online Store)"
+    if source == "shopify_draft_order":
+        return "Shopify (Draft Orders)"
+    return "Shopify (Other/Unclassified)"
 
 
 # ---------------------------------------------------------------------------
@@ -429,16 +497,25 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
             axis=1)
     else:
         chan = pd.Series("B2B / Direct", index=prod.index)
+    # James: split "Shopify" into Online Store vs. Draft Orders here
+    # too (Section 9), same as the dashboard — joined via OrderNumber
+    # against the shopify_orders sync's source_name field.
+    _shopify_lookup = _shopify_orders_lookup(data.get("shopify_orders"))
+    if "OrderNumber" in prod.columns:
+        chan = pd.Series(
+            [_shopify_sub_channel(on, _shopify_lookup) if c == "Shopify"
+             else c
+             for c, on in zip(chan, prod["OrderNumber"])],
+            index=prod.index)
+    _channel_keys = (
+        "Shopify (Online Store)", "Shopify (Draft Orders)",
+        "Shopify (Other/Unclassified)", "Amazon", "eBay", "B2B / Direct")
     chan_rev = prod.groupby(chan)["Total"].apply(
         lambda s: float(_num(prod.loc[s.index], "Total").sum()))
     chan_orders = prod.assign(_chan=chan).groupby("_chan")["SaleID"].nunique() \
         if "SaleID" in prod.columns else pd.Series(dtype=int)
-    for c in ("Shopify", "Amazon", "eBay", "B2B / Direct"):
-        chan_rev.setdefault(c, 0.0) if hasattr(chan_rev, "setdefault") else None
-    chan_rev = {c: float(chan_rev.get(c, 0.0)) for c in
-                ("Shopify", "Amazon", "eBay", "B2B / Direct")}
-    chan_ord = {c: int(chan_orders.get(c, 0)) for c in
-                ("Shopify", "Amazon", "eBay", "B2B / Direct")}
+    chan_rev = {c: float(chan_rev.get(c, 0.0)) for c in _channel_keys}
+    chan_ord = {c: int(chan_orders.get(c, 0)) for c in _channel_keys}
     out["5. Revenue by Channel [Cin7/DEAR]"] = {
         "pie": chan_rev,
         "table": [(k, f"${v:,.0f}") for k, v in chan_rev.items()],
