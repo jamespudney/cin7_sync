@@ -228,14 +228,14 @@ while true; do
     fi
 
     # v2.67.xxx — monthly executive-summary PDF, posted to Slack.
-    # Fires once, on the 10th of each month (James: gives QuickBooks
-    # bookkeeping time to mostly catch up on the prior month's
-    # COGS/fees before reporting on it — see the Monthly Metrics
-    # partial-month notes).
+    # Fires once, on the 15th of each month (James: half a month under
+    # the belt gives a more meaningful current-month-to-date read,
+    # beyond just letting QuickBooks bookkeeping catch up on the prior
+    # month's COGS/fees — see the Monthly Metrics partial-month notes).
     #
     # Restart-safe "once per month" guard: a YYYY-MM marker persisted
     # to /data (same pattern slack_loop.sh uses for its once-per-day
-    # jobs) so a Render restart/redeploy on the 10th doesn't cause a
+    # jobs) so a Render restart/redeploy on the 15th doesn't cause a
     # repeat post. Written before the run (not after success), matching
     # the accepted tradeoff elsewhere in this codebase: a mid-run
     # crash waits for next month rather than retrying.
@@ -251,7 +251,7 @@ while true; do
     if [ -f "$monthly_report_marker" ]; then
         last_monthly_report_month="$(cat "$monthly_report_marker" 2>/dev/null)"
     fi
-    if [ "$day_of_month" -eq 10 ] \
+    if [ "$day_of_month" -eq 15 ] \
             && [ "$this_month" != "$last_monthly_report_month" ]; then
         echo "$this_month" > "$monthly_report_marker"
         echo "[$(stamp)] day $day_of_month of $this_month — building " \

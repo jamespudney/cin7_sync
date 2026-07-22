@@ -127,10 +127,14 @@ def _load_cin7_data() -> Dict[str, Any]:
 _BAD_STATUSES = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
 
 
-def _month_lines(sale_lines, month: str):
+def _month_lines(sale_lines, month: str, max_day: Optional[int] = None):
     """Sale lines with a valid InvoiceDate inside `month` ('YYYY-MM'),
     excluding voided/credited/cancelled — same net-demand convention
-    the dashboard uses."""
+    the dashboard uses. `max_day`, if given, additionally requires
+    day-of-month <= max_day — used for the year-over-year
+    month-to-date commentary, so this year's partial month compares
+    against the SAME number of days last year rather than the whole
+    of last year's month."""
     import pandas as pd
 
     sl = sale_lines.copy()
@@ -139,7 +143,10 @@ def _month_lines(sale_lines, month: str):
     if "Status" in sl.columns:
         sl = sl[~sl["Status"].astype(str).str.upper().isin(_BAD_STATUSES)]
     period = sl["InvoiceDate"].dt.to_period("M").astype(str)
-    return sl[period == month].copy()
+    sl = sl[period == month]
+    if max_day is not None:
+        sl = sl[sl["InvoiceDate"].dt.day <= max_day]
+    return sl.copy()
 
 
 _IS_SHIPPING_RE = r"^(shipping|freight|handling|delivery)"
@@ -165,6 +172,143 @@ def _channel_of_row(sc_val, sr_val) -> str:
     if sr == "SHOPIFY":
         return "Shopify"
     return "B2B / Direct"
+
+
+# ---------------------------------------------------------------------------
+# Year-over-year commentary
+# ---------------------------------------------------------------------------
+def _yoy_month(month: str) -> str:
+    """Same calendar month, one year earlier ('2026-06' -> '2025-06')."""
+    year, mon = month.split("-")
+    return f"{int(year) - 1}-{mon}"
+
+
+def _headline_cin7_metrics(sale_lines, month: str,
+                            max_day: Optional[int] = None) -> Dict[str, float]:
+    """A handful of top-line CIN7 figures for one month (optionally
+    cut off at max_day, for a like-for-like partial-period YoY
+    comparison) — enough for the commentary without recomputing all
+    9 sections twice more for two more months."""
+    sl = _month_lines(sale_lines, month, max_day=max_day)
+    prod, _ = _split_product_shipping(sl)
+    sales = float(_num(prod, "Total").sum())
+    cogs = float((_num(prod, "Quantity") * _num(prod, "AverageCost")).sum())
+    gp = sales - cogs
+    orders = (int(prod["SaleID"].nunique())
+              if "SaleID" in prod.columns else 0)
+    return {
+        "sales": sales, "cogs": cogs, "gp": gp,
+        "gp_pct": (gp / sales * 100.0 if sales else 0.0),
+        "orders": float(orders),
+    }
+
+
+def _headline_qb_metrics(db_module, month: str) -> Dict[str, float]:
+    """QuickBooks is only ever available at whole-month granularity
+    (qbo_monthly_pl has no daily breakdown), so there's no partial-
+    period version of this — only used for the closed-month YoY
+    comparison, never the month-to-date one."""
+    mappings = db_module.get_qbo_account_mappings()
+    qb_by_month = db_module.qbo_monthly_pl_summary_by_category(mappings)
+    qb = qb_by_month.get(month) or {}
+    return {
+        "net_sales": qb.get("sales", 0.0),
+        "total_revenue": qb.get("total_income", 0.0),
+        "net_income": qb.get("qb_net_income", 0.0),
+    }
+
+
+def _pct_delta(cur: float, prior: float) -> Optional[float]:
+    if not prior:
+        return None
+    return (cur - prior) / abs(prior) * 100.0
+
+
+def _fmt_delta_pct(cur: float, prior: float) -> str:
+    d = _pct_delta(cur, prior)
+    if d is None:
+        return "n/a (no prior-year baseline)"
+    arrow = "▲" if d >= 0 else "▼"
+    return f"{arrow} {abs(d):.0f}%"
+
+
+def build_commentary(data: Dict[str, Any], month: str,
+                      partial_month: str,
+                      today: Optional[date] = None) -> Dict[str, str]:
+    """James: month-on-month... compared to the previous year month —
+    i.e. this report's closed month (e.g. June 2026) vs the SAME month
+    last year (June 2025), PLUS this month-to-date (partial, however
+    many days in) vs the SAME number of days in that same month last
+    year — not a plain sequential month-over-month comparison.
+
+    Returns {"html": ..., "slack": ...} — same underlying numbers,
+    formatted for reportlab's Paragraph markup and Slack's mrkdwn
+    respectively."""
+    today = today or date.today()
+    sale_lines = data["sale_lines"]
+    db_module = data["db"]
+
+    yoy_month = _yoy_month(month)
+    yoy_partial_month = _yoy_month(partial_month)
+    day_cutoff = today.day
+
+    cur_closed = _headline_cin7_metrics(sale_lines, month)
+    yoy_closed = _headline_cin7_metrics(sale_lines, yoy_month)
+    cur_partial = _headline_cin7_metrics(
+        sale_lines, partial_month, max_day=day_cutoff)
+    yoy_partial = _headline_cin7_metrics(
+        sale_lines, yoy_partial_month, max_day=day_cutoff)
+
+    qb_cur_closed = _headline_qb_metrics(db_module, month)
+    qb_yoy_closed = _headline_qb_metrics(db_module, yoy_month)
+
+    def _row_html(label, cur, prior, fmt):
+        return (f"{label}: {fmt(cur)} vs {fmt(prior)} last year "
+                f"({_fmt_delta_pct(cur, prior)})")
+
+    def _money(v):
+        return f"${v:,.0f}"
+
+    def _pct(v):
+        return f"{v:.1f}%"
+
+    def _num_fmt(v):
+        return f"{v:,.0f}"
+
+    closed_lines = [
+        _row_html("Sales $", cur_closed["sales"], yoy_closed["sales"], _money),
+        _row_html("Gross Profit", cur_closed["gp"], yoy_closed["gp"], _money),
+        _row_html("GP %", cur_closed["gp_pct"], yoy_closed["gp_pct"], _pct),
+        _row_html("Orders", cur_closed["orders"], yoy_closed["orders"], _num_fmt),
+        _row_html("QB Net Income", qb_cur_closed["net_income"],
+                   qb_yoy_closed["net_income"], _money),
+    ]
+    partial_lines = [
+        _row_html("Sales $", cur_partial["sales"], yoy_partial["sales"], _money),
+        _row_html("Gross Profit", cur_partial["gp"], yoy_partial["gp"], _money),
+        _row_html("Orders", cur_partial["orders"], yoy_partial["orders"], _num_fmt),
+    ]
+
+    html = (
+        f"<b>{month} vs {yoy_month} (same month last year):</b><br/>"
+        + "<br/>".join(closed_lines)
+        + f"<br/><br/><b>{partial_month} month-to-date (thru "
+          f"{today:%b %d}) vs the same {day_cutoff} days in "
+          f"{yoy_partial_month} last year:</b><br/>"
+        + "<br/>".join(partial_lines)
+        + "<br/><br/><i>QuickBooks figures (Net Income) are only "
+          "available at whole-month granularity, so no month-to-date "
+          "version is shown for that line.</i>"
+    )
+    slack = (
+        f"*{month} vs {yoy_month} (same month last year):*\n"
+        + "\n".join(f"• {l}" for l in closed_lines)
+        + f"\n\n*{partial_month} month-to-date (thru {today:%b %d}) "
+          f"vs the same {day_cutoff} days in {yoy_partial_month} last "
+          f"year:*\n"
+        + "\n".join(f"• {l}" for l in partial_lines)
+    )
+    return {"html": html, "slack": slack}
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +743,9 @@ def build_pdf(sections: Dict[str, Any], month: str,
 # ---------------------------------------------------------------------------
 # Slack delivery
 # ---------------------------------------------------------------------------
-def post_pdf_to_slack(pdf_bytes: bytes, month: str) -> Tuple[bool, str]:
+def post_pdf_to_slack(pdf_bytes: bytes, month: str,
+                        commentary_slack: Optional[str] = None
+                        ) -> Tuple[bool, str]:
     """Upload the PDF to Slack via files.getUploadURLExternal ->
     (presigned PUT) -> files.completeUploadExternal, matching the
     existing bot-token session pattern in slack_sync.py. Returns
@@ -645,14 +791,18 @@ def post_pdf_to_slack(pdf_bytes: bytes, month: str) -> Tuple[bool, str]:
     put_resp.raise_for_status()
 
     # Step 3: complete the upload, sharing it to the target channel
-    # with a short message.
+    # with a short message + the YoY commentary underneath.
+    comment = (
+        f"📊 Monthly Metrics executive summary for *{month}* is ready "
+        f"— see the attached PDF."
+    )
+    if commentary_slack:
+        comment += f"\n\n{commentary_slack}"
     complete_body = slack_sync._slack_post(
         session, "files.completeUploadExternal", {
             "files": [{"id": file_id, "title": f"Monthly Metrics {month}"}],
             "channel_id": channel,
-            "initial_comment": (
-                f"📊 Monthly Metrics executive summary for *{month}* is "
-                f"ready — see the attached PDF."),
+            "initial_comment": comment,
         })
     if not complete_body.get("ok"):
         return False, f"files.completeUploadExternal failed: {complete_body}"
@@ -690,10 +840,22 @@ def main() -> int:
               f"it): {exc!r}", level="warn")
         partial_sections = {}
 
+    # Year-over-year commentary (closed month vs same month last year,
+    # + month-to-date vs the same number of days last year). Also
+    # best-effort — a commentary failure shouldn't block the PDF/Slack
+    # post going out.
+    try:
+        commentary = build_commentary(cin7_data, month, partial_month)
+    except Exception as exc:  # noqa: BLE001
+        _emit(f"commentary build failed (continuing without it): "
+              f"{exc!r}", level="warn")
+        commentary = {"html": None, "slack": None}
+
     try:
         pdf_bytes = build_pdf(sections, month,
                                partial_sections=partial_sections,
-                               partial_month=partial_month)
+                               partial_month=partial_month,
+                               commentary=commentary.get("html"))
     except Exception as exc:  # noqa: BLE001
         _emit(f"PDF build failed: {exc!r}", level="error")
         return 4
@@ -703,7 +865,8 @@ def main() -> int:
     out_path.write_bytes(pdf_bytes)
     _emit(f"wrote {out_path} ({len(pdf_bytes):,} bytes)")
 
-    ok, msg = post_pdf_to_slack(pdf_bytes, month)
+    ok, msg = post_pdf_to_slack(pdf_bytes, month,
+                                 commentary_slack=commentary.get("slack"))
     if ok:
         _emit(f"Slack: {msg}")
     else:

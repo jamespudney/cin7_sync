@@ -187,7 +187,7 @@ services:
         value: "C0B3KD6GBM3"
       # Monthly Metrics executive-summary PDF — "management chat"
       # channel it gets posted to (monthly_metrics_report.py, fired
-      # from sync_loop.sh on the 10th of each month).
+      # from sync_loop.sh on the 15th of each month).
       - key: SLACK_MONTHLY_REPORT_CHANNEL_ID
         value: "C08KKUQMGDA"
       # SLACK_BOT_TOKEN itself is expected via the cin7-shared env
