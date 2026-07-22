@@ -260,4 +260,35 @@ while true; do
           echo "[$(stamp)] monthly_metrics_report.py exited non-zero" \
             | tee -a "$LOG"
     fi
+
+    # v2.67.xxx — monthly Shopify orders full re-backfill.
+    # Why: shopify_orders_last_1d_*.csv / _last_7d_*.csv (nearsync.sh /
+    # daily_sync.sh) only cover a short rolling window and are pruned
+    # to OUTPUT_SNAPSHOTS_KEEP copies each — fine for keeping "now"
+    # covered, but nothing re-derives shopify_orders_full.csv on its
+    # own. If the sync loop is ever down longer than that rolling
+    # window (deploy issues, an interrupted run — this is exactly how
+    # the Online Store/Draft Orders channel split silently lost its
+    # source_name history back to a stale May run), the gap only shows
+    # up later as an "Other/Unclassified" spike on the dashboard. This
+    # re-runs the full backfill monthly so that can't quietly regress.
+    # 730 days (~2yr) comfortably covers the dashboard's lookback +
+    # YoY comparisons without the multi-hour runtime of the 5yr
+    # default — same window used for the one-off manual fix.
+    # Separate marker/day from the PDF report above so the two heavier
+    # jobs don't land in the same run.
+    shopify_backfill_marker="/data/.last_shopify_full_backfill_month"
+    last_shopify_backfill_month=""
+    if [ -f "$shopify_backfill_marker" ]; then
+        last_shopify_backfill_month="$(cat "$shopify_backfill_marker" 2>/dev/null)"
+    fi
+    if [ "$day_of_month" -eq 1 ] \
+            && [ "$this_month" != "$last_shopify_backfill_month" ]; then
+        echo "$this_month" > "$shopify_backfill_marker"
+        echo "[$(stamp)] day $day_of_month of $this_month — Shopify " \
+             "orders full re-backfill (730d)" | tee -a "$LOG"
+        python shopify_sync.py --orders-full 730 2>&1 | tee -a "$LOG" || \
+          echo "[$(stamp)] shopify_sync --orders-full exited non-zero" \
+            | tee -a "$LOG"
+    fi
 done
