@@ -20401,6 +20401,44 @@ elif page == "Monthly Metrics":
             # marketplace SalesRep) = direct entry / phone / B2B.
             return "B2B / Direct"
 
+        # v2.67.xxx — split the "Shopify" bucket into Online Store
+        # (a customer checking out themselves) vs. Draft Orders (the
+        # sales team drew up a quote in Shopify that later got paid/
+        # converted) — James wants this distinction, matching what
+        # Shopify's own Analytics shows. CIN7 doesn't carry this
+        # (its SourceChannel/SalesRepresentative are the same for
+        # both cases), but the separately-synced `shopify_orders`
+        # dataset (shopify_sync.py, already loaded at module scope
+        # for the AI Assistant's get_shopify_order tool) has Shopify's
+        # own `source_name` field per order: "web" for a normal
+        # checkout, "shopify_draft_order" for a converted draft order.
+        # Joined via OrderNumber, same normalisation convention
+        # get_shopify_order already uses (strip a leading "#", compare
+        # as strings) so this doesn't drift from that tool's matching.
+        _shopify_source_by_order: dict = {}
+        if (not shopify_orders.empty
+                and "OrderNumber" in shopify_orders.columns
+                and "SourceName" in shopify_orders.columns):
+            _so = shopify_orders.dropna(subset=["OrderNumber"])
+            _shopify_source_by_order = dict(zip(
+                _so["OrderNumber"].astype(str).str.lstrip("#"),
+                _so["SourceName"]))
+
+        def _shopify_sub_channel(order_number) -> str:
+            key = str(order_number).lstrip("#") if pd.notna(
+                order_number) else ""
+            source = _shopify_source_by_order.get(key)
+            if source == "web":
+                return "Shopify (Online Store)"
+            if source == "shopify_draft_order":
+                return "Shopify (Draft Orders)"
+            # Covers POS/mobile-app orders and cases where no
+            # matching Shopify order was found (e.g. older orders
+            # from before the shopify_orders sync started) — bucketed
+            # separately rather than silently folded into either of
+            # the two categories James actually asked to distinguish.
+            return "Shopify (Other/Unclassified)"
+
         _has_sc = "SourceChannel" in sl_prod.columns
         _has_sr = "SalesRepresentative" in sl_prod.columns
         if _has_sc or _has_sr:
@@ -20410,9 +20448,18 @@ elif page == "Monthly Metrics":
             _sr_col = (sl_prod["SalesRepresentative"] if _has_sr
                        else pd.Series([""] * len(sl_prod),
                                        index=sl_prod.index))
-            _chans = pd.Series(
+            _base_chans = pd.Series(
                 [_channel_of_row(sc, sr)
                  for sc, sr in zip(_sc_col, _sr_col)],
+                index=sl_prod.index)
+            if "OrderNumber" in sl_prod.columns:
+                _order_no_col = sl_prod["OrderNumber"]
+            else:
+                _order_no_col = pd.Series([None] * len(sl_prod),
+                                            index=sl_prod.index)
+            _chans = pd.Series(
+                [_shopify_sub_channel(on) if base == "Shopify" else base
+                 for base, on in zip(_base_chans, _order_no_col)],
                 index=sl_prod.index)
             _slp_rev = sl_prod.assign(_chan=_chans)
             _rev_by_chan_month = _slp_rev.groupby(
@@ -20421,7 +20468,9 @@ elif page == "Monthly Metrics":
                 ["MonthKey", "_chan"])["SaleID"].nunique()
 
             _channels_in_order = [
-                "Shopify", "B2B / Direct", "Amazon", "eBay"]
+                "Shopify (Online Store)", "Shopify (Draft Orders)",
+                "Shopify (Other/Unclassified)",
+                "B2B / Direct", "Amazon", "eBay"]
             for _chan in _channels_in_order:
                 _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
                      _per_month(
@@ -20440,8 +20489,13 @@ elif page == "Monthly Metrics":
                      _per_month(lambda m: _qb(m, "sales")))
 
             for _chan in _channels_in_order:
+                # "Shopify (Draft Orders) Orders" reads badly — the
+                # channel name already ends in "Order(s)", so use
+                # "Count" instead of appending "Orders" again.
+                _cnt_label = (f"{_chan} Count" if "Order" in _chan
+                               else f"{_chan} Orders")
                 _row("9. Order Counts [Cin7/DEAR]",
-                     f"{_chan} Orders",
+                     _cnt_label,
                      _per_month(
                          lambda m, c=_chan: int(
                              _orders_by_chan_month.get((m, c), 0)
@@ -20777,10 +20831,23 @@ elif page == "Monthly Metrics":
                 "End-of-month $ value of slow-moving stock still on "
                 "shelf, from saved snapshots (current month uses the "
                 "live engine calculation).",
-            ("5. Revenue by Channel [Cin7/DEAR]", "Shopify"):
-                "Sum of CIN7 product-line Total for sales identified "
-                "as Shopify via SourceChannel/SalesRepresentative, by "
-                "month.",
+            ("5. Revenue by Channel [Cin7/DEAR]",
+             "Shopify (Online Store)"):
+                "Shopify-channel CIN7 sales (via SourceChannel/"
+                "SalesRepresentative) joined to the Shopify orders "
+                "sync by OrderNumber, where Shopify's own source_name "
+                "= \"web\" — a normal customer self-checkout.",
+            ("5. Revenue by Channel [Cin7/DEAR]",
+             "Shopify (Draft Orders)"):
+                "Same join, where Shopify's source_name = "
+                "\"shopify_draft_order\" — a quote the sales team "
+                "created in Shopify that the customer later paid/"
+                "converted.",
+            ("5. Revenue by Channel [Cin7/DEAR]",
+             "Shopify (Other/Unclassified)"):
+                "Shopify-channel sales that are POS/mobile-app "
+                "orders, or where no matching order was found in the "
+                "Shopify orders sync (e.g. it predates that sync).",
             ("5. Revenue by Channel [Cin7/DEAR]", "B2B / Direct"):
                 "Sum of CIN7 product-line Total for sales not "
                 "matching a Shopify/Amazon/eBay signal — phone, "
@@ -20881,10 +20948,19 @@ elif page == "Monthly Metrics":
             ("8. Shipping Detail [QuickBooks]", "Margin %"):
                 "Shipping Margin [QB] ÷ Shipping Charged (QB 405) as "
                 "a percentage.",
-            ("9. Order Counts [Cin7/DEAR]", "Shopify Orders"):
-                "Count of distinct CIN7 SaleIDs (product lines) in "
-                "the month flagged Shopify via SourceChannel/"
-                "SalesRepresentative.",
+            ("9. Order Counts [Cin7/DEAR]", "Shopify (Online Store) Orders"):
+                "Count of distinct CIN7 SaleIDs for Shopify orders "
+                "whose Shopify source_name = \"web\" (normal "
+                "customer self-checkout).",
+            ("9. Order Counts [Cin7/DEAR]", "Shopify (Draft Orders) Count"):
+                "Count of distinct CIN7 SaleIDs for Shopify orders "
+                "whose Shopify source_name = \"shopify_draft_order\" "
+                "(a sales-team quote that got converted/paid).",
+            ("9. Order Counts [Cin7/DEAR]",
+             "Shopify (Other/Unclassified) Orders"):
+                "Count of distinct CIN7 SaleIDs for Shopify orders "
+                "that are POS/mobile-app, or have no match in the "
+                "Shopify orders sync.",
             ("9. Order Counts [Cin7/DEAR]", "B2B / Direct Orders"):
                 "Count of distinct CIN7 SaleIDs (product lines) in "
                 "the month not matching a Shopify/Amazon/eBay signal.",
@@ -21005,8 +21081,11 @@ elif page == "Monthly Metrics":
                 ("New Customers", "New Customers"),
                 ("Lost Customers (3mo)", "Lost Customers (3mo)")],
             "5. Revenue by Channel [Cin7/DEAR]": [
-                ("Shopify", "Shopify"), ("Amazon", "Amazon"),
-                ("eBay", "eBay"), ("B2B / Direct", "B2B / Direct")],
+                ("Shopify Online", "Shopify (Online Store)"),
+                ("Shopify Draft Orders", "Shopify (Draft Orders)"),
+                ("Shopify Other", "Shopify (Other/Unclassified)"),
+                ("Amazon", "Amazon"), ("eBay", "eBay"),
+                ("B2B / Direct", "B2B / Direct")],
             "7. Cost & Profitability [QuickBooks]": [
                 ("Product COGS", "Product COGS (QB 500)"),
                 ("Amazon Fees", "Amazon Fees (QB 502)"),
@@ -21015,12 +21094,15 @@ elif page == "Monthly Metrics":
                 ("Shipping-Out Cost", "Shipping-Out Cost (QB 694)"),
                 ("Shipping Margin", "Shipping Margin")],
             "9. Order Counts [Cin7/DEAR]": [
-                ("Shopify", "Shopify Orders"),
+                ("Shopify Online", "Shopify (Online Store) Orders"),
+                ("Shopify Draft Orders", "Shopify (Draft Orders) Count"),
+                ("Shopify Other",
+                 "Shopify (Other/Unclassified) Orders"),
                 ("Amazon", "Amazon Orders"), ("eBay", "eBay Orders"),
                 ("B2B / Direct", "B2B / Direct Orders")],
         }
         _PIE_COLORS = ["#2f6fed", "#e8833a", "#3aa76d", "#c94f4f",
-                        "#8e6fce"]
+                        "#8e6fce", "#5aa9a3"]
 
         def _pie_dict_for_section(section: str) -> Optional[dict]:
             if section == "4. Inventory [App]":
