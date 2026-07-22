@@ -20487,6 +20487,12 @@ elif page == "Monthly Metrics":
                      _per_month(lambda m, i=_idx: _shopify_split_rev(
                          m, float(_rev_by_chan_month.get(
                              (m, "Shopify"), 0) or 0))[i]))
+            # James: a quick-glance rollup of just the 3 Shopify rows
+            # above, distinct from "Total (CIN7)" below (which
+            # includes every channel).
+            _row("5. Revenue by Channel [Cin7/DEAR]", "Shopify Total",
+                 _per_month(lambda m: float(
+                     _rev_by_chan_month.get((m, "Shopify"), 0) or 0)))
             for _chan in _other_channels:
                 _row("5. Revenue by Channel [Cin7/DEAR]", _chan,
                      _per_month(
@@ -20513,6 +20519,10 @@ elif page == "Monthly Metrics":
                          m, int(_orders_by_chan_month.get(
                              (m, "Shopify"), 0) or 0))[i]),
                      fmt="int")
+            _row("9. Order Counts [Cin7/DEAR]", "Shopify Total Orders",
+                 _per_month(lambda m: int(
+                     _orders_by_chan_month.get((m, "Shopify"), 0) or 0)),
+                 fmt="int")
             for _chan in _other_channels:
                 _row("9. Order Counts [Cin7/DEAR]",
                      f"{_chan} Orders",
@@ -20871,6 +20881,10 @@ elif page == "Monthly Metrics":
                 "— covers POS/mobile-app orders and any reconciliation "
                 "gap between CIN7's and Shopify's own totals. Floored "
                 "at $0 (never shown negative).",
+            ("5. Revenue by Channel [Cin7/DEAR]", "Shopify Total"):
+                "Sum of the 3 Shopify rows above (Online Store + "
+                "Draft Orders + Other/Unclassified) — equals CIN7's "
+                "total Shopify-channel revenue for the month.",
             ("5. Revenue by Channel [Cin7/DEAR]", "B2B / Direct"):
                 "Sum of CIN7 product-line Total for sales not "
                 "matching a Shopify/Amazon/eBay signal — phone, "
@@ -20987,6 +21001,10 @@ elif page == "Monthly Metrics":
                 "above — covers POS/mobile-app orders and any "
                 "reconciliation gap between the two systems. Floored "
                 "at 0.",
+            ("9. Order Counts [Cin7/DEAR]", "Shopify Total Orders"):
+                "Sum of the 3 Shopify rows above (Online Store + "
+                "Draft Orders + Other/Unclassified) — equals CIN7's "
+                "total Shopify-channel order count for the month.",
             ("9. Order Counts [Cin7/DEAR]", "B2B / Direct Orders"):
                 "Count of distinct CIN7 SaleIDs (product lines) in "
                 "the month not matching a Shopify/Amazon/eBay signal.",
@@ -21209,6 +21227,58 @@ elif page == "Monthly Metrics":
             st.caption(f"{_pie_month_label} breakdown")
             st.plotly_chart(fig, use_container_width=False,
                               config={"displayModeBar": False})
+
+        # --- Sales trend overview chart -----------------------------
+        # James: an interactive filled-line chart above Section 1,
+        # covering whatever range "Months to show" is currently set
+        # to (reuses the same `months`/`month_labels` this whole page
+        # already computed — no separate control). Click a legend
+        # entry to hide/isolate a series (native Plotly behaviour) —
+        # this is what covers "switch off any of those to view one
+        # at a time".
+        def _render_sales_trend_chart() -> None:
+            import plotly.graph_objects as go
+
+            def _rgba(hex_color: str, alpha: float) -> str:
+                h = hex_color.lstrip("#")
+                r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+                return f"rgba({r},{g},{b},{alpha})"
+
+            net_sales = [_get(sales_per_month, m) for m in months]
+            cogs_vals = [_get(cogs_per_month, m) for m in months]
+            disc_vals = [_get(discount_per_month, m) for m in months]
+            gp_vals = [ns - c for ns, c in zip(net_sales, cogs_vals)]
+            series = [
+                ("Net Sales", net_sales, "#2f6fed"),
+                ("COGS", cogs_vals, "#e8833a"),
+                ("Discounts", disc_vals, "#c94f4f"),
+                ("Gross Profit", gp_vals, "#3aa76d"),
+            ]
+            fig = go.Figure()
+            for name, values, color in series:
+                fig.add_trace(go.Scatter(
+                    x=month_labels, y=values, name=name, mode="lines",
+                    line=dict(color=color, width=2.5),
+                    fill="tozeroy", fillcolor=_rgba(color, 0.12),
+                    hovertemplate=f"{name}: $%{{y:,.0f}}<extra></extra>",
+                ))
+            fig.update_layout(
+                height=340,
+                margin=dict(l=10, r=10, t=10, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                             xanchor="center", x=0.5),
+                hovermode="x unified",
+                yaxis=dict(tickprefix="$", separatethousands=True),
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig, use_container_width=True,
+                              config={"displayModeBar": False})
+
+        st.subheader("📈 Sales Trend")
+        st.caption("Click a legend entry to hide it, or double-click "
+                   "to isolate just that one.")
+        _render_sales_trend_chart()
 
         # --- Render per-section ------------------------------------
         # v2.67.297 — explicit section ordering puts QB-canonical

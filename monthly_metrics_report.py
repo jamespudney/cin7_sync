@@ -546,13 +546,22 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
         "eBay": int(_base_cnt.get("eBay", 0)),
         "B2B / Direct": int(_base_cnt.get("B2B / Direct", 0)),
     }
+    # James: "Shopify Total" is a table-only rollup of the 3 Shopify
+    # rows (quick-glance sanity check) — kept out of the pie dict so
+    # it doesn't show up as a redundant slice alongside its own parts.
+    _shopify_total_rev = _online_rev + _draft_rev + _other_rev
+    _shopify_total_cnt = _online_cnt + _draft_cnt + _other_cnt
+    _rev_table = list(chan_rev.items())
+    _rev_table.insert(3, ("Shopify Total", _shopify_total_rev))
+    _ord_table = list(chan_ord.items())
+    _ord_table.insert(3, ("Shopify Total Orders", _shopify_total_cnt))
     out["5. Revenue by Channel [Cin7/DEAR]"] = {
         "pie": chan_rev,
-        "table": [(k, f"${v:,.0f}") for k, v in chan_rev.items()],
+        "table": [(k, f"${v:,.0f}") for k, v in _rev_table],
     }
     out["9. Order Counts [Cin7/DEAR]"] = {
         "pie": chan_ord,
-        "table": [(k, f"{v:,}") for k, v in chan_ord.items()],
+        "table": [(k, f"{v:,}") for k, v in _ord_table],
     }
 
     # ---- 6/7/8. QuickBooks-sourced sections --------------------------
