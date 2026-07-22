@@ -403,10 +403,11 @@ ShipStation shipment data feeds two places:
   service, tracking number, ship-to address, shipment cost,
   weight, item summary, customer/internal notes. Voided shipments
   are flagged explicitly.
-- **Monthly Metrics** — the "Shipping Cost" row in the Margins
-  block aggregates `shipmentCost` per month (excluding voided
-  shipments). Pre-ShipStation months show 0; post-integration
-  months show real freight spend.
+- **Monthly Metrics** — no longer shown here (the App-side Shipping
+  Charged/Cost/Margin rows in section 2 were removed; QuickBooks'
+  section 8, accounts 405/694, is now the one canonical shipping-
+  margin figure on this page). `shipmentCost` is still available via
+  `get_shipping_details` above.
 
 Setup:
 1. Set `SHIPSTATION_API_KEY` + `SHIPSTATION_API_SECRET` in env.
@@ -19731,21 +19732,14 @@ elif page == "Monthly Metrics":
             "`SaleID` across all lines on the invoice. Voided / "
             "credited orders are excluded — this is why AOV is "
             "higher than Easy Insight, which counted those.\n\n"
-            "**Shipping Charged** = header-delta method: "
-            "`InvoiceAmount − product line totals − Tax`, "
-            "clipped ≥0. Captures **every dollar of non-product "
-            "freight income** — parcel, LTL, handling, fuel "
-            "surcharges, anything on the invoice.\n\n"
-            "**Shipping Cost (ShipStation parcel only)** = "
-            "`ShipmentCost` from ShipStation labels, summed by "
-            "month. ⚠️ **Asymmetric vs Shipping Charged**: this "
-            "captures ONLY carrier-billed parcel labels "
-            "(UPS / FedEx / USPS). **LTL and freight-truck "
-            "shipments are NOT in this number**, but their charged "
-            "side IS in Shipping Charged via the header delta. "
-            "So Shipping Margin is over-stated for any month with "
-            "LTL activity. Do not commission on shipping margin "
-            "until this is reconciled.\n\n"
+            "**Shipping Charged / Cost / Margin** — removed from "
+            "this section (James, 2026-07). QuickBooks' Shipping "
+            "Detail section below (accounts 405/694) is now the one "
+            "canonical shipping-margin figure shown on this page, "
+            "rather than showing this App-side operational estimate "
+            "and QuickBooks' figure side by side when they disagreed "
+            "every month and confused the management team about "
+            "which to trust.\n\n"
             "**Cumulative Customers (ever bought)** = distinct "
             "`CustomerID` count of everyone whose first purchase "
             "is on/before the month. Monotonic — only grows. "
@@ -19869,15 +19863,17 @@ elif page == "Monthly Metrics":
             "snapshot project will freeze the figure to remove "
             "this drift class.\n\n"
             "### 4. Freight normalisation\n"
-            "- **Section 8 (QB Shipping Detail)** is the "
-            "canonical view — acc 405 (charged) vs acc 694 "
-            "(out), symmetric.\n"
-            "- **Section 2 (Margins & Purchasing [App])** is "
-            "the operational view — CIN7 header-delta + "
-            "ShipStation parcel. ⚠️ The CIN7 Charged side "
-            "includes LTL via header-delta, but the ShipStation "
-            "Cost side is parcel-only, so the App Shipping "
-            "Margin row over-states by ~$3-34k/mo.\n"
+            "- **Section 8 (QB Shipping Detail)** is the one "
+            "shipping-margin view shown on this page — acc 405 "
+            "(charged) vs acc 694 (out), symmetric.\n"
+            "- Section 2 (Margins & Purchasing [App]) used to "
+            "show a second, CIN7-header-delta + ShipStation-"
+            "parcel operational view of the same thing — removed "
+            "2026-07 (James) since its Charged side included LTL "
+            "via header-delta while its Cost side was parcel-only, "
+            "so it over-stated margin by ~$3-34k/mo vs. Section 8, "
+            "and showing both confused the management team about "
+            "which to trust.\n"
             "- **Mar 2026 anomaly**: QB Shipping-Out had a "
             "duplicate UPS bill (~$2,293) + double-counted ACH "
             "(~$26,606). Corrected estimate ~$49,851 used in "
@@ -20010,7 +20006,6 @@ elif page == "Monthly Metrics":
         _ship_names = sl["Name"].astype(str).str.match(
             r"(?i)^(shipping|freight|handling|delivery)", na=False)
         is_shipping = _ship_skus | _ship_names
-        sl_ship = sl[is_shipping].copy()
         sl_prod = sl[~is_shipping].copy()
 
         # --- Aggregate sale_lines monthly ------------------------------
@@ -20025,78 +20020,17 @@ elif page == "Monthly Metrics":
         # Orders: count across BOTH product and shipping lines (one SaleID
         # may have multiple lines including shipping).
         orders_per_month   = sl.groupby("MonthKey")["SaleID"].nunique()
-        # Shipping charged to customers, per month. Two sources combined:
-        # 1) Regex match on "Shipping -" line items in sale_lines (partial —
-        #    CIN7's list endpoint doesn't consistently include shipping
-        #    as a separate line).
-        # 2) Header-delta method using the sales HEADERS CSV:
-        #    shipping ≈ InvoiceAmount − sum(line totals) − tax
-        #    This is only available for the period of sales headers we've
-        #    synced (usually 30 days; weekend sync extends to 5 years).
-        # When both are available for a month, we use the header-delta
-        # value because it's more complete.
-        ship_charged_regex = sl_ship.groupby("MonthKey")["Total"].sum()
-
-        _ship_header_delta = pd.Series(dtype=float)
+        # v2.67.xxx — the App-side Shipping Charged/Cost/Margin header-
+        # delta computation that used to live here was removed along
+        # with Section 2's three shipping rows (see below) — James
+        # decided QuickBooks (Section 8, accounts 405/694) should be
+        # the one canonical shipping-margin figure shown on this page,
+        # rather than showing two structurally different numbers
+        # (this App-side calc excluded LTL freight cost) and confusing
+        # the management team about which to trust.
+        # `_sales_hdr` is still needed below (channel/SalesRepresentative
+        # mapping), independent of the removed shipping calc.
         _sales_hdr = _load_longest_sales()
-        if not _sales_hdr.empty:
-            _h = _sales_hdr.copy()
-            # Exclude voided/credited/cancelled headers. Without this, a
-            # revised/re-invoiced sale that CIN7 re-issues under a NEW
-            # SaleID (rather than a new InvoiceNumber on the same SaleID)
-            # survives the SaleID-keyed dedupe in _load_longest_sales as
-            # two separate rows — the original AND the reissue — and both
-            # InvoiceAmounts get summed into the same month's shipping
-            # delta, double-counting one real transaction.
-            if "Status" in _h.columns:
-                _h = _h[
-                    ~_h["Status"].astype(str).str.upper().isin(
-                        _BAD_SALE_STATUSES)
-                ]
-            _h["InvoiceDate"] = pd.to_datetime(
-                _h.get("InvoiceDate"), errors="coerce", utc=True
-            ).dt.tz_localize(None)
-            _h = _h.dropna(subset=["InvoiceDate"])
-            _h["InvoiceAmount"] = _to_num(
-                _h.get("InvoiceAmount", 0)).fillna(0)
-            _h["MonthKey"] = _h["InvoiceDate"].dt.to_period("M")
-            # Per-SaleID product-line + tax totals from the *full*
-            # sale_lines (including voided etc. so header delta lines up).
-            # Must exclude shipping-charge lines themselves (same regex as
-            # is_shipping above) — otherwise InvoiceAmount already includes
-            # the shipping charge AND lines_total includes it again, so the
-            # delta double-subtracts shipping and clips to ~0 for any order
-            # where CIN7 itemizes shipping as its own line.
-            sl_full = sale_lines.copy()
-            sl_full["Total"] = _to_num(sl_full["Total"]).fillna(0)
-            sl_full["Tax"]   = _to_num(sl_full["Tax"]).fillna(0)
-            _full_is_shipping = (
-                sl_full["SKU"].astype(str).str.match(
-                    r"(?i)^(shipping|freight|handling|delivery)", na=False)
-                | sl_full["Name"].astype(str).str.match(
-                    r"(?i)^(shipping|freight|handling|delivery)", na=False)
-            )
-            sl_full = sl_full[~_full_is_shipping]
-            _per_sale_base = sl_full.groupby("SaleID").agg(
-                lines_total=("Total", "sum"),
-                lines_tax=("Tax", "sum"),
-            ).reset_index()
-            _h = _h.merge(_per_sale_base, on="SaleID", how="left")
-            _h["lines_total"] = _h["lines_total"].fillna(0)
-            _h["lines_tax"]   = _h["lines_tax"].fillna(0)
-            # Shipping ≈ InvoiceAmount − product lines − tax (clipped ≥0)
-            _h["Shipping"] = (_h["InvoiceAmount"]
-                              - _h["lines_total"]
-                              - _h["lines_tax"]).clip(lower=0)
-            _ship_header_delta = _h.groupby("MonthKey")["Shipping"].sum()
-
-        def _ship_for_month(m):
-            v = _ship_header_delta.get(m)
-            if v is not None and pd.notna(v) and float(v) > 0:
-                return float(v)
-            return float(ship_charged_regex.get(m, 0) or 0)
-
-        ship_charged_per_month = {m: _ship_for_month(m) for m in months}
 
         # Channel breakdown — count unique customers per month
         cust_first_seen = (
@@ -20249,95 +20183,13 @@ elif page == "Monthly Metrics":
         # (section 1 above) unduplicated.
 
         # ===== 2 · Margins & Purchasing [App] =====================
-        # CIN7 + ShipStation operational P&L for shipping, plus AOV
-        # and purchase activity. QB-canonical shipping detail
-        # (acc 405 / 694) is in section 8.
-        _row("2. Margins & Purchasing [App]", "Shipping Charged",
-             _per_month(lambda m: float(
-                 ship_charged_per_month.get(m, 0) or 0)))
-        # v2.67.55c — populate the TRUE Shipping Cost row.
-        # In v2.67.54 we summed `ShipmentCost` from shipments, but
-        # that column actually held customer-charge (the v2 API's
-        # `shipping_paid.amount`) — the SO-55451 case study revealed
-        # the semantics bug. v2.67.55c corrected the column to be
-        # the actual carrier-billed cost (from label.shipment_cost),
-        # so this aggregation now reflects true cost. Pre-v2.67.55c
-        # CSVs that only have the customer-charge column get a
-        # stale-data label until they're re-synced.
-        _ship_cost_per_month = {}
-        _data_quality_stale = False
-        try:
-            if not shipments.empty and "ShipDate" in shipments.columns:
-                _sc_df = shipments.copy()
-                if "Voided" in _sc_df.columns:
-                    # v2.67.83 — bug fix. Previous logic was
-                    #   ~Voided.fillna(False).astype(bool)
-                    # which is broken when Voided arrives as
-                    # CSV strings ('False'/'True') because Python's
-                    # bool('False') is True (non-empty string).
-                    # That filter was silently removing every
-                    # shipment, leaving zero rows and showing $0
-                    # for every month in Monthly Metrics despite
-                    # the loader reporting the data correctly.
-                    # New logic: explicit string normalisation.
-                    _voided = _sc_df["Voided"]
-                    if _voided.dtype == "bool":
-                        _voided_bool = _voided.fillna(False)
-                    else:
-                        _voided_bool = (_voided.astype(str)
-                                                .str.strip().str.lower()
-                                                .isin(["true", "1",
-                                                        "yes", "t"]))
-                    _sc_df = _sc_df[~_voided_bool]
-                _sc_df["_dt"] = pd.to_datetime(
-                    _sc_df["ShipDate"], errors="coerce", utc=True)
-                _sc_df = _sc_df.dropna(subset=["_dt"])
-                _sc_df["_month"] = (_sc_df["_dt"].dt.tz_convert(None)
-                                                  .dt.strftime("%Y-%m"))
-                # If we have the proper cost column (v2.67.55c+),
-                # use it; otherwise fall back to the legacy
-                # ShipmentCost field with a stale-data warning.
-                if "ShipmentCost" in _sc_df.columns and (
-                        "CustomerShippingCharge" in _sc_df.columns):
-                    _sc_df["_cost"] = pd.to_numeric(
-                        _sc_df["ShipmentCost"], errors="coerce").fillna(0)
-                else:
-                    _data_quality_stale = True
-                    _sc_df["_cost"] = pd.to_numeric(
-                        _sc_df.get("ShipmentCost",
-                                      pd.Series(dtype=float)),
-                        errors="coerce").fillna(0)
-                _ship_cost_per_month = (
-                    _sc_df.groupby("_month")["_cost"].sum().to_dict())
-        except Exception:
-            _ship_cost_per_month = {}
-        if _data_quality_stale:
-            _ship_cost_label = (
-                "Shipping Cost (⚠️ stale CSV — re-sync needed)")
-        elif _ship_cost_per_month:
-            # v2.67.290 — make it explicit the cost side is parcel
-            # only. Shipping Charged uses the header-delta and
-            # captures LTL too, so the margin row is asymmetric.
-            _ship_cost_label = (
-                "Shipping Cost (ShipStation parcel only — "
-                "⚠️ LTL not included)")
-        else:
-            _ship_cost_label = (
-                "Shipping Cost (ShipStation pending — set "
-                "SHIPSTATION_API_KEY)")
-        # v2.67.89 — bugfix. _ship_cost_per_month is keyed by string
-        # 'YYYY-MM' (built via .strftime above), but `_per_month`
-        # passes pd.Period objects from `months`. Lookup never
-        # matched → every month showed $0 even after the data was
-        # correct. str(period) -> 'YYYY-MM' converts safely.
-        _row("2. Margins & Purchasing [App]", "Shipping Cost",
-             _per_month(lambda m: float(
-                 _ship_cost_per_month.get(str(m), 0) or 0)))
-        _row("2. Margins & Purchasing [App]", "Shipping Margin",
-             _per_month(lambda m: (
-                 float(ship_charged_per_month.get(m, 0) or 0)
-                 - float(_ship_cost_per_month.get(str(m), 0)
-                          or 0))))
+        # AOV and purchase activity. Shipping Charged/Cost/Margin used
+        # to be shown here too (CIN7 + ShipStation operational P&L),
+        # but were removed — James decided QuickBooks (section 8,
+        # accounts 405/694) should be the one shipping-margin figure
+        # shown, rather than this App-side calc (which excluded LTL
+        # freight cost) and section 8's figure disagreeing every month
+        # and confusing the management team about which to trust.
         _row("2. Margins & Purchasing [App]", "Avg Order Value",
              _per_month(lambda m: (
                  _get(sales_per_month, m) / _get(orders_per_month, m)
@@ -20886,18 +20738,6 @@ elif page == "Monthly Metrics":
                 "Gross Profit [App] ÷ Sales $ [App] as a percentage — "
                 "operational margin used for buyer/commission "
                 "reporting.",
-            ("2. Margins & Purchasing [App]", "Shipping Charged"):
-                "Freight billed to customers: InvoiceAmount − "
-                "product-line totals − Tax per order, summed by "
-                "month; captures parcel + LTL.",
-            ("2. Margins & Purchasing [App]", "Shipping Cost"):
-                "Sum of ShipStation's carrier-billed cost for parcel "
-                "labels shipped that month, excl. voided shipments. "
-                "Parcel only — no LTL.",
-            ("2. Margins & Purchasing [App]", "Shipping Margin"):
-                "Shipping Charged [App] minus Shipping Cost [App, "
-                "parcel only]. Overstated when LTL activity exists, "
-                "since cost side excludes LTL.",
             ("2. Margins & Purchasing [App]", "Avg Order Value"):
                 "Sales $ [App] ÷ # Orders [App] for the month — "
                 "average product-sales value per order, voided/"
@@ -21161,9 +21001,6 @@ elif page == "Monthly Metrics":
             "1. Sales Overview [App]": [
                 ("COGS", "COGS"), ("Discounts", "Discounts"),
                 ("Gross Profit", "Gross Profit")],
-            "2. Margins & Purchasing [App]": [
-                ("Shipping Cost", "Shipping Cost"),
-                ("Shipping Margin", "Shipping Margin")],
             "3. Customer Metrics [App]": [
                 ("New Customers", "New Customers"),
                 ("Lost Customers (3mo)", "Lost Customers (3mo)")],
@@ -21211,8 +21048,7 @@ elif page == "Monthly Metrics":
             # Section 8's margin can be (and per our own audit, usually
             # is) negative — a negative slice can't be shown in a pie,
             # so skip rather than show a misleading all-cost pie.
-            if section in ("2. Margins & Purchasing [App]",
-                             "8. Shipping Detail [QuickBooks]"):
+            if section == "8. Shipping Detail [QuickBooks]":
                 raw_margin = _pie_raw(section, "Shipping Margin")
                 if raw_margin < 0:
                     return None
