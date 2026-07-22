@@ -21113,6 +21113,143 @@ elif page == "Monthly Metrics":
             )
             st.markdown(html_table, unsafe_allow_html=True)
 
+        # --- Per-section pie chart (live dashboard) ------------------
+        # James asked to have the same style of pie-per-section used in
+        # the monthly PDF report (monthly_metrics_report.py) shown here
+        # too. Deliberately a SEPARATE, self-contained implementation
+        # rather than importing from that script: this reads straight
+        # out of `table_df` (the already-computed, unformatted monthly
+        # figures for this exact page), rather than re-deriving numbers
+        # from raw CIN7/QuickBooks data a second time — the two
+        # scripts' pie *inputs* differ slightly as a result (e.g. this
+        # version gets a real EOM slow-stock value for Section 4 for
+        # free, where the standalone report has to approximate with a
+        # current snapshot). Known, accepted duplication of the
+        # rendering code itself (matplotlib pie + legend styling) —
+        # revisit if it drifts.
+        #
+        # Uses the latest CLOSED month (current_month - 1), not
+        # whatever the rightmost column of the table is — the current,
+        # still-in-progress month is what all the "partial month"
+        # findings in this file's methodology notes are about, and a
+        # pie built from a half-finished month would be misleading.
+        _pie_closed_month = str(current_month - 1)
+        _pie_month_label = (
+            _pie_closed_month if _pie_closed_month in month_labels
+            else (month_labels[-1] if month_labels else None))
+
+        def _pie_raw(section: str, metric: str) -> float:
+            if _pie_month_label is None:
+                return 0.0
+            match = table_df[(table_df["Section"] == section)
+                              & (table_df["Metric"] == metric)]
+            if match.empty:
+                return 0.0
+            try:
+                v = float(match.iloc[0][_pie_month_label])
+            except (KeyError, TypeError, ValueError):
+                return 0.0
+            return 0.0 if pd.isna(v) else v
+
+        # {section: [(pie slice label, metric row to pull), ...]}.
+        # Every entry here is an EXISTING row already shown in that
+        # section's table — no new computation, just visualising
+        # numbers already on the page. Two exceptions use simple
+        # arithmetic on existing rows (noted inline) rather than a
+        # dedicated metric row.
+        _PIE_SECTION_METRICS = {
+            "1. Sales Overview [App]": [
+                ("COGS", "COGS"), ("Discounts", "Discounts"),
+                ("Gross Profit", "Gross Profit")],
+            "2. Margins & Purchasing [App]": [
+                ("Shipping Cost", "Shipping Cost"),
+                ("Shipping Margin", "Shipping Margin")],
+            "3. Customer Metrics [App]": [
+                ("New Customers", "New Customers"),
+                ("Lost Customers (3mo)", "Lost Customers (3mo)")],
+            "5. Revenue by Channel [Cin7/DEAR]": [
+                ("Shopify", "Shopify"), ("Amazon", "Amazon"),
+                ("eBay", "eBay"), ("B2B / Direct", "B2B / Direct")],
+            "7. Cost & Profitability [QuickBooks]": [
+                ("Product COGS", "Product COGS (QB 500)"),
+                ("Amazon Fees", "Amazon Fees (QB 502)"),
+                ("Inventory Adj", "Inventory Adj (QB 550)")],
+            "8. Shipping Detail [QuickBooks]": [
+                ("Shipping-Out Cost", "Shipping-Out Cost (QB 694)"),
+                ("Shipping Margin", "Shipping Margin")],
+            "9. Order Counts [Cin7/DEAR]": [
+                ("Shopify", "Shopify Orders"),
+                ("Amazon", "Amazon Orders"), ("eBay", "eBay Orders"),
+                ("B2B / Direct", "B2B / Direct Orders")],
+        }
+        _PIE_COLORS = ["#2f6fed", "#e8833a", "#3aa76d", "#c94f4f",
+                        "#8e6fce"]
+
+        def _pie_dict_for_section(section: str) -> Optional[dict]:
+            if section == "4. Inventory [App]":
+                # Slow-moving vs. the rest of that month's average
+                # inventory value — both already-computed rows.
+                slow = abs(_pie_raw(section, "Slow Stock Value (EOM)"))
+                total = abs(_pie_raw(section, "Avg Inventory Value"))
+                return {"Slow-Moving": slow,
+                        "Other Stock Value": max(total - slow, 0.0)}
+            if section == "6. Sales & Adjustments [QuickBooks]":
+                net_sales = _pie_raw(section, "Net Sales (QB 400)")
+                ship_income = _pie_raw(
+                    section, "Shipping Income (QB 405)")
+                total_rev = _pie_raw(
+                    section, "Total Revenue (QB Total Income)")
+                sundry = max(total_rev - net_sales - ship_income, 0.0)
+                return {"Net Sales": max(net_sales, 0.0),
+                        "Shipping Income": max(ship_income, 0.0),
+                        "Sundry Income": sundry}
+            cfg = _PIE_SECTION_METRICS.get(section)
+            if not cfg:
+                return None
+            vals = {label: abs(_pie_raw(section, metric))
+                     for label, metric in cfg}
+            # Section 8's margin can be (and per our own audit, usually
+            # is) negative — a negative slice can't be shown in a pie,
+            # so skip rather than show a misleading all-cost pie.
+            if section in ("2. Margins & Purchasing [App]",
+                             "8. Shipping Detail [QuickBooks]"):
+                raw_margin = _pie_raw(section, "Shipping Margin")
+                if raw_margin < 0:
+                    return None
+            return vals
+
+        def _render_section_pie(section: str) -> None:
+            if _pie_month_label is None:
+                return
+            pie = _pie_dict_for_section(section)
+            if not pie:
+                return
+            labels = [k for k, v in pie.items() if v and v > 0]
+            values = [v for v in pie.values() if v and v > 0]
+            if not values or sum(values) <= 0:
+                return
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(2.6, 2.9), dpi=150)
+            total = sum(values)
+            wedges, _ = ax.pie(
+                values, startangle=90,
+                colors=_PIE_COLORS[:len(values)])
+            legend_labels = [f"{lbl} ({v / total * 100:.0f}%)"
+                              for lbl, v in zip(labels, values)]
+            ax.legend(
+                wedges, legend_labels, loc="upper center",
+                bbox_to_anchor=(0.5, -0.02), frameon=False,
+                fontsize=7, handlelength=1.0, handletextpad=0.5,
+                labelspacing=0.3)
+            ax.axis("equal")
+            fig.tight_layout()
+            st.caption(f"{_pie_month_label} breakdown")
+            st.pyplot(fig, use_container_width=False)
+            plt.close(fig)
+
         # --- Render per-section ------------------------------------
         # v2.67.297 — explicit section ordering puts QB-canonical
         # views at the top, drill-downs in the middle, and the
@@ -21145,6 +21282,7 @@ elif page == "Monthly Metrics":
             _seen_sections.append(section)
             st.subheader(f"🔹 {section}")
             _render_metrics_table_html(sect_df)
+            _render_section_pie(section)
         # Catch-all: render any section not in the explicit order
         # (in call-order of first appearance), so a future code
         # change adding a section doesn't accidentally make rows
@@ -21158,6 +21296,7 @@ elif page == "Monthly Metrics":
                 continue
             st.subheader(f"🔹 {section}")
             _render_metrics_table_html(sect_df)
+            _render_section_pie(section)
 
         # --- Exports -------------------------------------------------
         st.subheader("📤 Exports")
