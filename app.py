@@ -20844,6 +20844,275 @@ elif page == "Monthly Metrics":
                     display_table.at[idx, lbl] = _fmt_cell(
                         display_table.at[idx, lbl], r["Format"])
 
+        # --- Per-metric tooltip definitions (source + formula) --------
+        # v2.67.xxx — hover-help so buyers/bookkeepers can see exactly
+        # where each figure comes from without leaving the page. Some
+        # labels (Shipping Margin, Gross Profit, GP %, Net Sales (QB
+        # 400)) repeat across sections with genuinely different
+        # sources/formulas, so this is keyed by (Section, Metric), not
+        # Metric alone.
+        _METRIC_TOOLTIPS = {
+            ("1. Sales Overview [App]", "Sales $"):
+                "Sum of product sale-line Total (ex-tax, ex-shipping) "
+                "from CIN7 sale_lines; voided/credited/cancelled sales "
+                "excluded.",
+            ("1. Sales Overview [App]", "Sales $ with Tax"):
+                "Sales $ [App] plus Tax $ [App] for the month — "
+                "product sales including sales tax collected, from "
+                "CIN7 sale_lines.",
+            ("1. Sales Overview [App]", "# Orders"):
+                "Distinct CIN7 SaleIDs in the month, counted across "
+                "both product and shipping lines; voided/credited/"
+                "cancelled excluded.",
+            ("1. Sales Overview [App]", "Quantity Sold"):
+                "Sum of Quantity on CIN7 product sale lines for the "
+                "month (shipping-charge line items excluded).",
+            ("1. Sales Overview [App]", "COGS"):
+                "Sum of Quantity × AverageCost on CIN7 product sale "
+                "lines — CIN7's per-line moving-average cost at time "
+                "of sale.",
+            ("1. Sales Overview [App]", "Discounts"):
+                "Sum of CIN7's line-level Discount field on product "
+                "sales, shown negative. Known to undercount true "
+                "Shopify discounts.",
+            ("1. Sales Overview [App]", "Tax $"):
+                "Sum of the Tax field on CIN7 product sale lines for "
+                "the month.",
+            ("1. Sales Overview [App]", "Gross Profit"):
+                "Sales $ [App] minus COGS [App] for the month — "
+                "CIN7-sourced operational gross profit, the "
+                "commission base.",
+            ("1. Sales Overview [App]", "GP %"):
+                "Gross Profit [App] ÷ Sales $ [App] as a percentage — "
+                "operational margin used for buyer/commission "
+                "reporting.",
+            ("2. Margins & Purchasing [App]", "Shipping Charged"):
+                "Freight billed to customers: InvoiceAmount − "
+                "product-line totals − Tax per order, summed by "
+                "month; captures parcel + LTL.",
+            ("2. Margins & Purchasing [App]", "Shipping Cost"):
+                "Sum of ShipStation's carrier-billed cost for parcel "
+                "labels shipped that month, excl. voided shipments. "
+                "Parcel only — no LTL.",
+            ("2. Margins & Purchasing [App]", "Shipping Margin"):
+                "Shipping Charged [App] minus Shipping Cost [App, "
+                "parcel only]. Overstated when LTL activity exists, "
+                "since cost side excludes LTL.",
+            ("2. Margins & Purchasing [App]", "Avg Order Value"):
+                "Sales $ [App] ÷ # Orders [App] for the month — "
+                "average product-sales value per order, voided/"
+                "credited orders excluded.",
+            ("2. Margins & Purchasing [App]", "# of Purchases"):
+                "Count of distinct CIN7 PurchaseIDs (purchase orders) "
+                "placed in the month, from purchase_lines.",
+            ("2. Margins & Purchasing [App]", "Purchase $"):
+                "Sum of the Total field on CIN7 purchase_lines for "
+                "POs placed in the month — supplier spend.",
+            ("3. Customer Metrics [App]", "New Customers"):
+                "Count of distinct CustomerIDs whose first-ever CIN7 "
+                "purchase falls in this month.",
+            ("3. Customer Metrics [App]", "Running Customer Count"):
+                "Cumulative count of every customer whose first "
+                "purchase is on/before this month — \"ever bought,\" "
+                "not \"currently active.\"",
+            ("3. Customer Metrics [App]", "Lost Customers (3mo)"):
+                "Customers whose most recent CIN7 purchase was "
+                "exactly 3 months before this month (gone quiet for "
+                "3 months).",
+            ("3. Customer Metrics [App]", "Repeat Customer %"):
+                "Of distinct customers who bought in this month, the "
+                "% who also had a purchase in any earlier month.",
+            ("4. Inventory [App]", "Avg Inventory Value"):
+                "Modelled average of month-start/end stock value, "
+                "estimated by walking back from today's live stock "
+                "using COGS & Purchase $; not a measured snapshot.",
+            ("4. Inventory [App]", "Stock Turn (annualised)"):
+                "(COGS for the month × 12) ÷ Avg Inventory Value for "
+                "the month — annualised inventory turnover rate.",
+            ("4. Inventory [App]", "Slow Stock Cleared"):
+                "Quantity × AverageCost, by month, for SKUs currently "
+                "flagged as slow-moving — $ of slow stock sold (uses "
+                "today's flag list, not as-of-month).",
+            ("4. Inventory [App]", "Slow Stock Value (EOM)"):
+                "End-of-month $ value of slow-moving stock still on "
+                "shelf, from saved snapshots (current month uses the "
+                "live engine calculation).",
+            ("5. Revenue by Channel [Cin7/DEAR]", "Shopify"):
+                "Sum of CIN7 product-line Total for sales identified "
+                "as Shopify via SourceChannel/SalesRepresentative, by "
+                "month.",
+            ("5. Revenue by Channel [Cin7/DEAR]", "B2B / Direct"):
+                "Sum of CIN7 product-line Total for sales not "
+                "matching a Shopify/Amazon/eBay signal — phone, "
+                "direct-entry, and B2B orders.",
+            ("5. Revenue by Channel [Cin7/DEAR]", "Amazon"):
+                "Sum of CIN7 product-line Total for sales flagged "
+                "Amazon via SourceChannel or SalesRepresentative = "
+                "\"AMAZON\".",
+            ("5. Revenue by Channel [Cin7/DEAR]", "eBay"):
+                "Sum of CIN7 product-line Total for sales flagged "
+                "eBay via SourceChannel or SalesRepresentative = "
+                "\"EBAY\".",
+            ("5. Revenue by Channel [Cin7/DEAR]", "Total (CIN7)"):
+                "Sum of the 4 channel rows above (Shopify + B2B/"
+                "Direct + Amazon + eBay) for the month — equals "
+                "Sales $ [App] in Section 1.",
+            ("5. Revenue by Channel [Cin7/DEAR]", "Net Sales (QB 400)"):
+                "QuickBooks P&L account 400 (Sales) for the month, "
+                "shown here to compare/reconcile against the CIN7 "
+                "channel total above.",
+            ("6. Sales & Adjustments [QuickBooks]", "Gross Sales (est.)"):
+                "Net Sales (QB 400) plus the Discounts row below — an "
+                "estimated pre-discount gross revenue figure for the "
+                "month.",
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Less: Discounts (Shopify Admin API)"):
+                "Total Shopify discounts (coupons/promos/markdowns) "
+                "from the Shopify Admin API for the month; falls back "
+                "to the CIN7 line-discount proxy if not yet synced.",
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Less: Discounts (CIN7 — proxy until Shopify sync runs)"):
+                "CIN7 line-discount proxy (undercounts true Shopify "
+                "discounts) — shown only until the Shopify Admin API "
+                "discount sync has run at least once.",
+            ("6. Sales & Adjustments [QuickBooks]", "Net Sales (QB 400)"):
+                "QuickBooks P&L account 400 (Sales) for the month — "
+                "the accounting-canonical revenue figure; same "
+                "account 400 value as in Section 5.",
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Shipping Income (QB 405)"):
+                "QuickBooks P&L account 405 (Sales - Shipping) for "
+                "the month — freight income booked in the ledger.",
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Total Revenue (QB Total Income)"):
+                "QuickBooks's own \"Total Income\" P&L summary row for "
+                "the month (sales + shipping + sundry/billable-"
+                "expense income).",
+            ("7. Cost & Profitability [QuickBooks]",
+             "Product COGS (QB 500)"):
+                "QuickBooks P&L account 500 (Cost of Goods Sold) for "
+                "the month — product cost only, excludes Amazon fees "
+                "& inventory adjustments.",
+            ("7. Cost & Profitability [QuickBooks]", "Amazon Fees (QB 502)"):
+                "QuickBooks P&L account 502 (COGS - Amazon Fees) for "
+                "the month — marketplace fees booked as cost of "
+                "goods sold.",
+            ("7. Cost & Profitability [QuickBooks]", "Inventory Adj (QB 550)"):
+                "QuickBooks P&L account 550 (Inventory Adjustment) "
+                "for the month — stock write-offs/write-ons booked "
+                "as COGS.",
+            ("7. Cost & Profitability [QuickBooks]", "Total COGS"):
+                "QuickBooks's own \"Total Cost of Goods Sold\" P&L "
+                "summary row for the month (accounts 500 + 502 + 550 "
+                "combined).",
+            ("7. Cost & Profitability [QuickBooks]", "Gross Profit"):
+                "QuickBooks's own \"Gross Profit\" P&L summary row for "
+                "the month (Total Income − Total COGS) — accounting-"
+                "canonical GP, distinct from Section 1's App GP.",
+            ("7. Cost & Profitability [QuickBooks]", "GP %"):
+                "Gross Profit [QB] ÷ Total Revenue (QB Total Income) "
+                "as a percentage — accounting-canonical margin, for "
+                "P&L reporting.",
+            ("7. Cost & Profitability [QuickBooks]", "Total OpEx"):
+                "QuickBooks's \"Total Expenses\" P&L summary row for "
+                "the month — all operating expenses, excluding COGS.",
+            ("7. Cost & Profitability [QuickBooks]", "Operating Profit"):
+                "QuickBooks's \"Net Operating Income\" P&L summary row "
+                "for the month (Gross Profit − Total Expenses).",
+            ("7. Cost & Profitability [QuickBooks]", "Op Margin %"):
+                "Operating Profit [QB] ÷ Total Revenue (QB Total "
+                "Income) as a percentage.",
+            ("7. Cost & Profitability [QuickBooks]", "Net Income (QB)"):
+                "QuickBooks's bottom-line \"Net Income\" P&L summary "
+                "row for the month.",
+            ("8. Shipping Detail [QuickBooks]",
+             "Shipping Charged (QB 405)"):
+                "QuickBooks P&L account 405 (Sales - Shipping) for "
+                "the month — same account as Section 6's Shipping "
+                "Income row.",
+            ("8. Shipping Detail [QuickBooks]",
+             "Shipping-Out Cost (QB 694)"):
+                "QuickBooks P&L account 694 (Shipping-Out) for the "
+                "month — carrier/freight cost booked in the ledger.",
+            ("8. Shipping Detail [QuickBooks]", "Shipping Margin"):
+                "Shipping Charged (QB 405) minus Shipping-Out Cost "
+                "(QB 694) for the month — symmetric QB margin, no "
+                "LTL gap (unlike Section 2's App figure).",
+            ("8. Shipping Detail [QuickBooks]", "Margin %"):
+                "Shipping Margin [QB] ÷ Shipping Charged (QB 405) as "
+                "a percentage.",
+            ("9. Order Counts [Cin7/DEAR]", "Shopify Orders"):
+                "Count of distinct CIN7 SaleIDs (product lines) in "
+                "the month flagged Shopify via SourceChannel/"
+                "SalesRepresentative.",
+            ("9. Order Counts [Cin7/DEAR]", "B2B / Direct Orders"):
+                "Count of distinct CIN7 SaleIDs (product lines) in "
+                "the month not matching a Shopify/Amazon/eBay signal.",
+            ("9. Order Counts [Cin7/DEAR]", "Amazon Orders"):
+                "Count of distinct CIN7 SaleIDs (product lines) in "
+                "the month flagged Amazon via SourceChannel or "
+                "SalesRep = \"AMAZON\".",
+            ("9. Order Counts [Cin7/DEAR]", "eBay Orders"):
+                "Count of distinct CIN7 SaleIDs (product lines) in "
+                "the month flagged eBay via SourceChannel or "
+                "SalesRep = \"EBAY\".",
+            ("9. Order Counts [Cin7/DEAR]", "Total Orders"):
+                "Sum of the 4 channel order counts above "
+                "(product-line SaleIDs only) — may differ slightly "
+                "from Section 1's # Orders.",
+        }
+
+        def _render_metrics_table_html(sect_df: "pd.DataFrame") -> None:
+            """Render one section's table as a plain HTML table instead
+            of st.dataframe, so each metric name gets a real browser
+            hover tooltip (native title= attribute) showing its source
+            and formula. st.dataframe only supports one help string
+            per COLUMN (shown on the header), not one per ROW, so it
+            can't express a different tooltip for each metric."""
+            import html as _html
+            section = sect_df["Section"].iloc[0] if not sect_df.empty else ""
+            cols = [c for c in sect_df.columns
+                    if c not in ("Section", "Metric")]
+            header_cells = "".join(
+                f"<th style='text-align:right;padding:4px 10px;"
+                f"border-bottom:1px solid rgba(128,128,128,0.4);'>"
+                f"{_html.escape(str(c))}</th>"
+                for c in cols)
+            body_rows = []
+            for _, r in sect_df.iterrows():
+                metric = str(r["Metric"])
+                tip = _METRIC_TOOLTIPS.get((section, metric), "")
+                if tip:
+                    label = (
+                        f"<span title='{_html.escape(tip)}' "
+                        f"style='cursor:help;border-bottom:1px dotted "
+                        f"rgba(128,128,128,0.7);'>"
+                        f"{_html.escape(metric)} "
+                        f"<span style='opacity:0.55;font-size:0.85em;'>"
+                        f"ⓘ</span></span>"
+                    )
+                else:
+                    label = _html.escape(metric)
+                cells = "".join(
+                    f"<td style='text-align:right;padding:4px 10px;"
+                    f"border-bottom:1px solid rgba(128,128,128,0.15);'>"
+                    f"{_html.escape(str(r[c]))}</td>"
+                    for c in cols)
+                body_rows.append(
+                    f"<tr><td style='padding:4px 10px;"
+                    f"border-bottom:1px solid rgba(128,128,128,0.15);"
+                    f"white-space:nowrap;'>{label}</td>{cells}</tr>")
+            html_table = (
+                "<div style='overflow-x:auto;'>"
+                "<table style='border-collapse:collapse;"
+                "font-size:0.85rem;width:100%;'>"
+                "<thead><tr><th style='text-align:left;padding:4px "
+                "10px;border-bottom:1px solid rgba(128,128,128,0.4);'>"
+                f"Metric</th>{header_cells}</tr></thead>"
+                f"<tbody>{''.join(body_rows)}</tbody></table></div>"
+            )
+            st.markdown(html_table, unsafe_allow_html=True)
+
         # --- Render per-section ------------------------------------
         # v2.67.297 — explicit section ordering puts QB-canonical
         # views at the top, drill-downs in the middle, and the
@@ -20875,11 +21144,7 @@ elif page == "Monthly Metrics":
                 continue
             _seen_sections.append(section)
             st.subheader(f"🔹 {section}")
-            st.dataframe(
-                sect_df.drop(columns=["Section"]).set_index("Metric"),
-                width="stretch",
-                height=38 * (len(sect_df) + 1) + 10,
-            )
+            _render_metrics_table_html(sect_df)
         # Catch-all: render any section not in the explicit order
         # (in call-order of first appearance), so a future code
         # change adding a section doesn't accidentally make rows
@@ -20892,11 +21157,7 @@ elif page == "Monthly Metrics":
             if sect_df.empty:
                 continue
             st.subheader(f"🔹 {section}")
-            st.dataframe(
-                sect_df.drop(columns=["Section"]).set_index("Metric"),
-                width="stretch",
-                height=38 * (len(sect_df) + 1) + 10,
-            )
+            _render_metrics_table_html(sect_df)
 
         # --- Exports -------------------------------------------------
         st.subheader("📤 Exports")
