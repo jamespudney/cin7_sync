@@ -228,19 +228,17 @@ while true; do
     fi
 
     # v2.67.xxx — monthly executive-summary PDF, posted to Slack.
-    # Fires once, on days 3-5 of each month (gives QuickBooks
-    # bookkeeping a few days to mostly catch up on the prior month's
+    # Fires once, on the 10th of each month (James: gives QuickBooks
+    # bookkeeping time to mostly catch up on the prior month's
     # COGS/fees before reporting on it — see the Monthly Metrics
-    # partial-month notes). Day-of-month range rather than a single
-    # day so a missed/failed run on day 3 still gets a couple more
-    # chances that same month.
+    # partial-month notes).
     #
     # Restart-safe "once per month" guard: a YYYY-MM marker persisted
     # to /data (same pattern slack_loop.sh uses for its once-per-day
-    # jobs) so a Render restart/redeploy inside the 3-5 window doesn't
-    # cause a repeat post. Written before the run (not after success),
-    # matching the accepted tradeoff elsewhere in this codebase: a
-    # mid-run crash waits for next month rather than retrying.
+    # jobs) so a Render restart/redeploy on the 10th doesn't cause a
+    # repeat post. Written before the run (not after success), matching
+    # the accepted tradeoff elsewhere in this codebase: a mid-run
+    # crash waits for next month rather than retrying.
     # %d is always 2 digits (e.g. "03") — strip a leading zero before
     # the numeric comparison below, same convention slack_loop.sh uses
     # for its hour checks (a literal "08"/"09" would otherwise be
@@ -253,7 +251,7 @@ while true; do
     if [ -f "$monthly_report_marker" ]; then
         last_monthly_report_month="$(cat "$monthly_report_marker" 2>/dev/null)"
     fi
-    if [ "$day_of_month" -ge 3 ] && [ "$day_of_month" -le 5 ] \
+    if [ "$day_of_month" -eq 10 ] \
             && [ "$this_month" != "$last_monthly_report_month" ]; then
         echo "$this_month" > "$monthly_report_marker"
         echo "[$(stamp)] day $day_of_month of $this_month — building " \
