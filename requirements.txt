@@ -22,6 +22,6 @@ cryptography>=42.0.0
 # precompiled libpq so no system-level apt install is needed.
 psycopg[binary]>=3.1.0
 # v2.67.xxx — chart generation for the Monthly Metrics per-section pie
-# charts (dashboard) and monthly_metrics_report.py's PDF. Headless
-# (Agg backend), no system binaries needed.
+# charts (both the live dashboard and monthly_metrics_report.py's
+# PDF). Headless (Agg backend), no system binaries needed.
 matplotlib>=3.8.0

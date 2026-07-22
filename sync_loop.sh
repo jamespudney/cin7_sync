@@ -226,4 +226,38 @@ while true; do
           echo "[$(stamp)] weekly_slow_movers_email.py exited non-zero" \
             | tee -a "$LOG"
     fi
+
+    # v2.67.xxx — monthly executive-summary PDF, posted to Slack.
+    # Fires once, on the 15th of each month (James: half a month under
+    # the belt gives a more meaningful current-month-to-date read,
+    # beyond just letting QuickBooks bookkeeping catch up on the prior
+    # month's COGS/fees — see the Monthly Metrics partial-month notes).
+    #
+    # Restart-safe "once per month" guard: a YYYY-MM marker persisted
+    # to /data (same pattern slack_loop.sh uses for its once-per-day
+    # jobs) so a Render restart/redeploy on the 15th doesn't cause a
+    # repeat post. Written before the run (not after success), matching
+    # the accepted tradeoff elsewhere in this codebase: a mid-run
+    # crash waits for next month rather than retrying.
+    # %d is always 2 digits (e.g. "03") — strip a leading zero before
+    # the numeric comparison below, same convention slack_loop.sh uses
+    # for its hour checks (a literal "08"/"09" would otherwise be
+    # misread as an invalid octal literal by some shells' arithmetic).
+    day_of_month="$(date -u +%d)"
+    day_of_month="${day_of_month#0}"
+    this_month="$(date -u +%Y-%m)"
+    monthly_report_marker="/data/.last_monthly_report_month"
+    last_monthly_report_month=""
+    if [ -f "$monthly_report_marker" ]; then
+        last_monthly_report_month="$(cat "$monthly_report_marker" 2>/dev/null)"
+    fi
+    if [ "$day_of_month" -eq 15 ] \
+            && [ "$this_month" != "$last_monthly_report_month" ]; then
+        echo "$this_month" > "$monthly_report_marker"
+        echo "[$(stamp)] day $day_of_month of $this_month — building " \
+             "monthly metrics PDF report" | tee -a "$LOG"
+        python monthly_metrics_report.py 2>&1 | tee -a "$LOG" || \
+          echo "[$(stamp)] monthly_metrics_report.py exited non-zero" \
+            | tee -a "$LOG"
+    fi
 done
