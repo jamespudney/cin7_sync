@@ -589,6 +589,7 @@ _SECTION_ORDER = [
     "1. Sales Overview [App]",
     "2. Margins & Purchasing [App]",
     "3. Customer Metrics [App]",
+    "4. Inventory [App]",
     "5. Revenue by Channel [Cin7/DEAR]",
     "6. Sales & Adjustments [QuickBooks]",
     "7. Cost & Profitability [QuickBooks]",
@@ -1141,64 +1142,77 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
         return Image(io.BytesIO(png), width=2.6 * inch,
                      height=2.6 * inch * (4.1 / 3.6))
 
-    sections_to_render = [s for s in _SECTION_ORDER if s in _SECTION_ROWS]
-    for i, section in enumerate(sections_to_render):
-        block = [Paragraph(section, section_style),
-                 _section_table(section)]
-        pie = _pie_dict_for_section(section, tables, months, ytd_year)
-        img = _pie_image(pie)
+    def _inventory_block() -> List:
+        # Section 4 — current snapshot only (see module docstring for
+        # why it isn't a per-month trend row like the others).
+        inv_rows = [
+            ["Metric", "Value"],
+            ["Total Stock Value (current)",
+             _fmt_value(inventory_snapshot.get(
+                 "Total Stock Value (current)", 0.0), "money")],
+            ["Slow-Moving Stock Value (current)",
+             _fmt_value(inventory_snapshot.get(
+                 "Slow-Moving Stock Value (current)", 0.0), "money")],
+        ]
+        inv_table = Table(inv_rows, colWidths=[2.4 * inch, 1.3 * inch])
+        inv_table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 0), (-1, 0), c_head),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+            ("BOX", (0, 0), (-1, -1), 0.4, c_border),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, c_border),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ]))
+        inv_pie = {
+            "Slow-Moving Stock Value": max(
+                inventory_snapshot.get(
+                    "Slow-Moving Stock Value (current)", 0.0), 0.0),
+            "Other Stock Value": max(
+                inventory_snapshot.get(
+                    "Total Stock Value (current)", 0.0)
+                - inventory_snapshot.get(
+                    "Slow-Moving Stock Value (current)", 0.0), 0.0),
+        }
+        block: List = [
+            Paragraph("4. Inventory [App]", section_style),
+            inv_table,
+            Spacer(1, 2),
+            Paragraph(
+                "<i>Simplified: a CURRENT stock-value snapshot at "
+                "report time (not a per-month figure) — the "
+                "dashboard's modelled month-average walk-back isn't "
+                "reproduced here.</i>",
+                note_style),
+        ]
+        img = _pie_image(inv_pie)
         if img:
             block.append(Spacer(1, 10))
             block.append(img)
-        story.append(KeepTogether(block))
-        story.append(PageBreak())
+        return block
 
-    # Section 4 — current snapshot only (see module docstring for why
-    # it isn't a per-month trend row like the others).
-    inv_rows = [
-        ["Metric", "Value"],
-        ["Total Stock Value (current)",
-         _fmt_value(inventory_snapshot.get(
-             "Total Stock Value (current)", 0.0), "money")],
-        ["Slow-Moving Stock Value (current)",
-         _fmt_value(inventory_snapshot.get(
-             "Slow-Moving Stock Value (current)", 0.0), "money")],
-    ]
-    inv_table = Table(inv_rows, colWidths=[2.4 * inch, 1.3 * inch])
-    inv_table.setStyle(TableStyle([
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("BACKGROUND", (0, 0), (-1, 0), c_head),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("BOX", (0, 0), (-1, -1), 0.4, c_border),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, c_border),
-        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-    ]))
-    inv_pie = {"Slow-Moving Stock Value": max(
-                   inventory_snapshot.get(
-                       "Slow-Moving Stock Value (current)", 0.0), 0.0),
-               "Other Stock Value": max(
-                   inventory_snapshot.get(
-                       "Total Stock Value (current)", 0.0)
-                   - inventory_snapshot.get(
-                       "Slow-Moving Stock Value (current)", 0.0), 0.0)}
-    inv_block = [
-        Paragraph("4. Inventory [App]", section_style),
-        inv_table,
-        Spacer(1, 2),
-        Paragraph(
-            "<i>Simplified: a CURRENT stock-value snapshot at report "
-            "time (not a per-month figure) — the dashboard's modelled "
-            "month-average walk-back isn't reproduced here.</i>",
-            note_style),
-    ]
-    inv_img = _pie_image(inv_pie)
-    if inv_img:
-        inv_block.append(Spacer(1, 10))
-        inv_block.append(inv_img)
-    story.append(KeepTogether(inv_block))
+    # Render every section in its natural numeric order (James,
+    # 2026-07-23: Section 4 had been tacked on at the very end —
+    # moved back into its normal 1,2,3,4,5... position).
+    sections_to_render = [
+        s for s in _SECTION_ORDER
+        if s in _SECTION_ROWS or s == "4. Inventory [App]"]
+    for i, section in enumerate(sections_to_render):
+        if section == "4. Inventory [App]":
+            block = _inventory_block()
+        else:
+            block = [Paragraph(section, section_style),
+                     _section_table(section)]
+            pie = _pie_dict_for_section(section, tables, months, ytd_year)
+            img = _pie_image(pie)
+            if img:
+                block.append(Spacer(1, 10))
+                block.append(img)
+        story.append(KeepTogether(block))
+        if i < len(sections_to_render) - 1:
+            story.append(PageBreak())
 
     def _footer(canvas, doc_):
         canvas.saveState()
