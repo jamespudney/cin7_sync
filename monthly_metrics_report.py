@@ -978,17 +978,19 @@ def _render_pie(pie: Dict[str, float], title: str = "") -> Optional[bytes]:
     return buf.getvalue()
 
 
-def _prior_year_stretch(current_month: str) -> List[str]:
-    """Jan through the same month number, one year before
-    current_month — e.g. current_month='2026-07' -> Jan-Jul 2025.
-    Same "same stretch, last year" comparison as the dashboard's
-    prior-year pie."""
+def _prior_full_year(current_month: str) -> List[str]:
+    """The FULL prior calendar year (Jan-Dec), one year before
+    current_month — e.g. current_month='2026-07' -> all of 2025.
+    James, 2026-07-23: deliberately the whole year, not just the
+    same Jan-<month> stretch — showing this year's partial
+    year-to-date against last year's complete picture is what lets
+    you see how far through the year's likely total you already
+    are, not just a like-for-like same-period comparison."""
     import pandas as pd
     cm = pd.Period(current_month, freq="M")
     py_year = cm.year - 1
     return [str(p) for p in
-             pd.period_range(start=f"{py_year}-01", periods=cm.month,
-                              freq="M")]
+             pd.period_range(start=f"{py_year}-01", periods=12, freq="M")]
 
 
 def _pie_dict_from_months(section: str,
@@ -996,8 +998,8 @@ def _pie_dict_from_months(section: str,
                            sum_months: List[str]) -> Optional[dict]:
     """Sums each pie slice's metric over `sum_months`. Used for both
     the current year-to-date pie (pass this year's YTD months) and
-    the prior-year comparison pie (pass _prior_year_stretch's
-    months) — same category breakdown either way."""
+    the prior-year comparison pie (pass _prior_full_year's months)
+    — same category breakdown either way."""
     section_data = tables.get(section, {})
 
     def _sum(label: str) -> float:
@@ -1034,12 +1036,12 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
     the dashboard, with a note at the top rather than a separate
     callout box.
 
-    `py_months` (James, 2026-07-23) is the "same stretch, last
-    year" comparison range (see _prior_year_stretch) — `tables` must
-    already have data for these months too (the caller widens the
-    range passed to compute_monthly_tables to cover them), since
-    they usually fall outside `months`' own 14-month window. Each
-    section then renders TWO pies side by side: this year's YTD
+    `py_months` (James, 2026-07-23) is the FULL prior calendar year
+    (see _prior_full_year) — `tables` must already have data for
+    these months too (the caller widens the range passed to
+    compute_monthly_tables to cover them), since they usually fall
+    outside `months`' own 14-month window. Each section then renders
+    TWO pies side by side: this year's YTD
     (left) and the prior-year comparison (right) — same layout the
     dashboard uses. QBO-sourced sections (6/7/8) only get the
     comparison pie if qbo_monthly_pl actually has data that far
@@ -1178,9 +1180,11 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
 
     # QBO sections' history is only as deep as the last
     # `qbo_monthly_pl.py sync --months N` run — check whether it
-    # actually reaches back to the prior-year stretch before
-    # offering a comparison pie for those sections (same guard the
-    # dashboard's prior-year pie uses).
+    # actually reaches back through the full prior year (Jan AND
+    # Dec, not just the start) before offering a comparison pie for
+    # those sections (same guard the dashboard's prior-year pie
+    # uses, extended to cover the whole 12 months since this pie now
+    # shows the complete prior year, not just a same-length stretch).
     _qbo_sections = {"6. Sales & Adjustments [QuickBooks]",
                       "7. Cost & Profitability [QuickBooks]",
                       "8. Shipping Detail [QuickBooks]"}
@@ -1189,12 +1193,17 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
         _rep = tables.get(
             "6. Sales & Adjustments [QuickBooks]", {}
         ).get("Net Sales (QB 400)", {})
-        _py_qbo_data_ok = bool(_rep.get(py_months[0], 0.0))
+        _py_qbo_data_ok = bool(_rep.get(py_months[0], 0.0)
+                                 and _rep.get(py_months[-1], 0.0))
 
     def _pies_block(section: str) -> Optional[List]:
         """Current year-to-date pie, and — where the underlying data
-        actually covers it — the prior-year "same stretch" comparison
-        pie beside it, matching the dashboard's two-pie layout."""
+        actually covers it — the FULL prior calendar year beside it,
+        matching the dashboard's two-pie layout. Deliberately the
+        whole prior year rather than a same-length stretch, so you
+        can see how far into the year's likely total this year's
+        partial figure already sits, not just a like-for-like
+        same-period comparison."""
         cur_months = [m for m in months
                        if int(m.split("-")[0]) == ytd_year]
         cur_pie = _pie_dict_from_months(section, tables, cur_months)
@@ -1210,7 +1219,8 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
             py_pie = _pie_dict_from_months(section, tables, py_months)
             py_img = _pie_image(py_pie, width=2.3 * inch)
         if py_img:
-            py_label = f"{py_months[0]} – {py_months[-1]} (last year)"
+            py_year = py_months[0].split("-")[0]
+            py_label = f"{py_year} full year (last year)"
             pair = Table(
                 [[[Paragraph(cur_label, note_style), Spacer(1, 3),
                    cur_img],
@@ -1227,7 +1237,8 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
         if section in _qbo_sections and py_months and not _py_qbo_data_ok:
             block += [Spacer(1, 4), Paragraph(
                 f"<i>No prior-year comparison — QuickBooks history "
-                f"doesn't reach back to {py_months[0]} yet.</i>",
+                f"doesn't cover all of {py_months[0].split('-')[0]} "
+                f"yet.</i>",
                 note_style)]
         return block
 
@@ -1403,7 +1414,7 @@ def main() -> int:
     month = _target_month()
     current_month = _current_partial_month()
     months = _report_months(current_month, lookback=14)
-    py_months = _prior_year_stretch(current_month)
+    py_months = _prior_full_year(current_month)
     _emit(f"building report for {months[0]}..{months[-1]} "
           f"(rightmost column partial)")
 
