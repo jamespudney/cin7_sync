@@ -282,6 +282,26 @@ CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_month
 CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_acctnum
     ON qbo_monthly_pl(account_number);
 
+-- v2.67.xxx — per-(month, account) amounts attributable to a
+-- customer we exclude from company reporting (Altar'd State — see
+-- sales_exclusions.py; that filter only touches CIN7 sale_lines, not
+-- this QBO-sourced table). qbo_monthly_pl_summary_by_category nets
+-- these off the matching qbo_monthly_pl row before categorising, so
+-- Sections 6/7/8 line up with the already-excluded CIN7 sections.
+CREATE TABLE IF NOT EXISTS qbo_monthly_pl_exclusions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    month           TEXT NOT NULL,
+    account_id      TEXT,
+    account_number  TEXT,
+    account_name    TEXT NOT NULL,
+    customer_name   TEXT NOT NULL,
+    amount          REAL NOT NULL,
+    synced_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(month, account_id, account_name, customer_name)
+);
+CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_excl_month
+    ON qbo_monthly_pl_exclusions(month);
+
 -- v2.67.292 — canonical mapping from a Monthly Metrics "category"
 -- (sales / cogs / shipping_charged / shipping_cost / etc.) to one
 -- or more QBO accounts. Pre-seeded with W4S's chart of accounts
@@ -3898,6 +3918,28 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_acctnum
           ON qbo_monthly_pl(account_number);
       """),
+    # v2.67.xxx — see qbo_monthly_pl_exclusions comment in the SQLite
+    # schema above; nets excluded-customer amounts (Altar'd State)
+    # out of the QBO-sourced Monthly Metrics sections.
+    ("qbo_monthly_pl_exclusions_table",
+      """
+      CREATE TABLE IF NOT EXISTS qbo_monthly_pl_exclusions (
+          id              SERIAL PRIMARY KEY,
+          month           TEXT NOT NULL,
+          account_id      TEXT,
+          account_number  TEXT,
+          account_name    TEXT NOT NULL,
+          customer_name   TEXT NOT NULL,
+          amount          DOUBLE PRECISION NOT NULL,
+          synced_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(month, account_id, account_name, customer_name)
+      );
+      """),
+    ("qbo_monthly_pl_exclusions_month_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_excl_month
+          ON qbo_monthly_pl_exclusions(month);
+      """),
     ("qbo_account_mappings_table",
       """
       CREATE TABLE IF NOT EXISTS qbo_account_mappings (
@@ -5043,6 +5085,44 @@ def batch_upsert_qbo_monthly_pl(rows: list) -> int:
     return n
 
 
+def batch_upsert_qbo_monthly_pl_exclusion(rows: list) -> int:
+    """Bulk upsert for qbo_monthly_pl_exclusions — same pattern as
+    batch_upsert_qbo_monthly_pl above. `rows` is a list of dicts with
+    keys: month, account_id, account_number, account_name,
+    customer_name, amount. Returns rows actually written."""
+    if not rows:
+        return 0
+    sql = (
+        "INSERT INTO qbo_monthly_pl_exclusions "
+        "(month, account_id, account_number, account_name, "
+        " customer_name, amount, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(month, account_id, account_name, customer_name) "
+        "DO UPDATE SET account_number = excluded.account_number, "
+        "    amount = excluded.amount, "
+        "    synced_at = datetime('now')")
+    n = 0
+    with connect() as c:
+        for r in rows:
+            month = (r.get("month") or "").strip()
+            name = (r.get("account_name") or "").strip()
+            cust = (r.get("customer_name") or "").strip()
+            if not month or not name or not cust:
+                continue
+            try:
+                c.execute(sql, (
+                    month,
+                    r.get("account_id") or "",
+                    r.get("account_number"),
+                    name,
+                    cust,
+                    float(r.get("amount") or 0)))
+                n += 1
+            except Exception:  # noqa: BLE001
+                continue
+    return n
+
+
 def get_qbo_monthly_pl(start_month: Optional[str] = None,
                        end_month: Optional[str] = None) -> list:
     """Return all qbo_monthly_pl rows, optionally bounded by month
@@ -5102,14 +5182,35 @@ def qbo_monthly_pl_summary_by_category(
         rows = c.execute(
             "SELECT month, account_number, account_name, amount "
             "FROM qbo_monthly_pl").fetchall()
+        excl_rows = c.execute(
+            "SELECT month, account_number, account_name, "
+            "SUM(amount) AS amount "
+            "FROM qbo_monthly_pl_exclusions "
+            "GROUP BY month, account_number, account_name").fetchall()
+    # v2.67.xxx — net out amounts attributable to excluded customers
+    # (Altar'd State) before categorising, so these QBO-sourced
+    # sections agree with the CIN7-sourced sections next to them,
+    # which already exclude the same customer at load time (see
+    # sales_exclusions.py). Keyed the same way qbo_monthly_pl itself
+    # is keyed — (month, account_number, account_name) — since the
+    # exclusion rows come from parsing a customer-scoped QBO P&L
+    # report with the exact same parse_pnl() used for the main pull.
+    excl_by_key: dict = {}
+    for r in excl_rows:
+        d = dict(r)
+        key = (d.get("month") or "",
+               str(d.get("account_number") or "").strip(),
+               str(d.get("account_name") or "").strip().lower())
+        excl_by_key[key] = float(d.get("amount") or 0)
     for r in rows:
         d = dict(r)
         num = str(d.get("account_number") or "").strip()
         name = str(d.get("account_name") or "").strip().lower()
-        amount = float(d.get("amount") or 0)
         month = d.get("month") or ""
         if not month:
             continue
+        amount = float(d.get("amount") or 0)
+        amount -= excl_by_key.get((month, num, name), 0.0)
         for cat, (num_set, name_set) in cat_specs.items():
             if (num and num in num_set) or (name and name in name_set):
                 out.setdefault(month, {})
