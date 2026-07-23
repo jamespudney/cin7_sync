@@ -978,24 +978,36 @@ def _render_pie(pie: Dict[str, float], title: str = "") -> Optional[bytes]:
     return buf.getvalue()
 
 
-def _pie_dict_for_section(section: str,
+def _prior_year_stretch(current_month: str) -> List[str]:
+    """Jan through the same month number, one year before
+    current_month — e.g. current_month='2026-07' -> Jan-Jul 2025.
+    Same "same stretch, last year" comparison as the dashboard's
+    prior-year pie."""
+    import pandas as pd
+    cm = pd.Period(current_month, freq="M")
+    py_year = cm.year - 1
+    return [str(p) for p in
+             pd.period_range(start=f"{py_year}-01", periods=cm.month,
+                              freq="M")]
+
+
+def _pie_dict_from_months(section: str,
                            tables: Dict[str, Dict[str, Dict[str, float]]],
-                           months: List[str],
-                           ytd_year: int) -> Optional[dict]:
-    """Sums each pie slice's metric over the current calendar year's
-    months in the report range — same YTD basis as the dashboard's
-    own per-section pie."""
+                           sum_months: List[str]) -> Optional[dict]:
+    """Sums each pie slice's metric over `sum_months`. Used for both
+    the current year-to-date pie (pass this year's YTD months) and
+    the prior-year comparison pie (pass _prior_year_stretch's
+    months) — same category breakdown either way."""
     section_data = tables.get(section, {})
 
-    def _ytd_sum(label: str) -> float:
+    def _sum(label: str) -> float:
         per_month = section_data.get(label, {})
-        return sum(per_month.get(m, 0.0) for m in months
-                   if int(m.split("-")[0]) == ytd_year)
+        return sum(per_month.get(m, 0.0) for m in sum_months)
 
     if section == "6. Sales & Adjustments [QuickBooks]":
-        net_sales = _ytd_sum("Net Sales (QB 400)")
-        ship_income = _ytd_sum("Shipping Income (QB 405)")
-        total_rev = _ytd_sum("Total Revenue (QB Total Income)")
+        net_sales = _sum("Net Sales (QB 400)")
+        ship_income = _sum("Shipping Income (QB 405)")
+        total_rev = _sum("Total Revenue (QB Total Income)")
         sundry = max(total_rev - net_sales - ship_income, 0.0)
         return {"Net Sales": max(net_sales, 0.0),
                 "Shipping Income": max(ship_income, 0.0),
@@ -1003,7 +1015,7 @@ def _pie_dict_for_section(section: str,
     cfg = _PIE_SECTION_METRICS.get(section)
     if not cfg:
         return None
-    return {label: abs(_ytd_sum(metric)) for label, metric in cfg}
+    return {label: abs(_sum(metric)) for label, metric in cfg}
 
 
 def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
@@ -1012,14 +1024,27 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
               month: str,
               current_month: str,
               commentary: Optional[str] = None,
-              company: str = "Wired4Signs USA") -> bytes:
+              company: str = "Wired4Signs USA",
+              py_months: Optional[List[str]] = None) -> bytes:
     """Landscape, one wide table per section (Metric rows x month
     columns + YTD + Avg), matching the dashboard's own Monthly
     Metrics tables row-for-row. `months` is the full column range
     shown (oldest to newest); the last entry is `current_month`, the
     still-in-progress month — included as a normal column, same as
     the dashboard, with a note at the top rather than a separate
-    callout box."""
+    callout box.
+
+    `py_months` (James, 2026-07-23) is the "same stretch, last
+    year" comparison range (see _prior_year_stretch) — `tables` must
+    already have data for these months too (the caller widens the
+    range passed to compute_monthly_tables to cover them), since
+    they usually fall outside `months`' own 14-month window. Each
+    section then renders TWO pies side by side: this year's YTD
+    (left) and the prior-year comparison (right) — same layout the
+    dashboard uses. QBO-sourced sections (6/7/8) only get the
+    comparison pie if qbo_monthly_pl actually has data that far
+    back; otherwise a caption explains why, rather than showing a
+    misleadingly small pie."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1132,15 +1157,79 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
     # the wide table already uses the full landscape width, so the
     # pie goes below it rather than beside it, using whatever
     # vertical room the page has left.
-    def _pie_image(pie: Optional[dict]):
+    def _pie_image(pie: Optional[dict], width: float = 2.6 * inch):
         if not pie:
             return None
         png = _render_pie(pie)
         if not png:
             return None
-        # Matches _render_pie's figsize aspect ratio (3.6 x 4.1).
-        return Image(io.BytesIO(png), width=2.6 * inch,
-                     height=2.6 * inch * (4.1 / 3.6))
+        # James, 2026-07-23: don't assume _render_pie's declared
+        # figsize survives to the saved PNG — matplotlib's
+        # bbox_inches="tight" crops to content, so the actual pixel
+        # aspect ratio depends on how much legend/whitespace got
+        # trimmed, not the figsize. Read the real pixel dimensions
+        # and derive height from them, so the image is never
+        # stretched/squashed to a wrong ratio.
+        from PIL import Image as PILImage
+        pil_img = PILImage.open(io.BytesIO(png))
+        px_w, px_h = pil_img.size
+        height = width * (px_h / px_w) if px_w else width
+        return Image(io.BytesIO(png), width=width, height=height)
+
+    # QBO sections' history is only as deep as the last
+    # `qbo_monthly_pl.py sync --months N` run — check whether it
+    # actually reaches back to the prior-year stretch before
+    # offering a comparison pie for those sections (same guard the
+    # dashboard's prior-year pie uses).
+    _qbo_sections = {"6. Sales & Adjustments [QuickBooks]",
+                      "7. Cost & Profitability [QuickBooks]",
+                      "8. Shipping Detail [QuickBooks]"}
+    _py_qbo_data_ok = False
+    if py_months:
+        _rep = tables.get(
+            "6. Sales & Adjustments [QuickBooks]", {}
+        ).get("Net Sales (QB 400)", {})
+        _py_qbo_data_ok = bool(_rep.get(py_months[0], 0.0))
+
+    def _pies_block(section: str) -> Optional[List]:
+        """Current year-to-date pie, and — where the underlying data
+        actually covers it — the prior-year "same stretch" comparison
+        pie beside it, matching the dashboard's two-pie layout."""
+        cur_months = [m for m in months
+                       if int(m.split("-")[0]) == ytd_year]
+        cur_pie = _pie_dict_from_months(section, tables, cur_months)
+        cur_img = _pie_image(cur_pie, width=2.3 * inch)
+        if not cur_img:
+            return None
+        cur_label = f"{ytd_year} year-to-date"
+
+        py_ok = (bool(py_months)
+                  and (section not in _qbo_sections or _py_qbo_data_ok))
+        py_img = None
+        if py_ok:
+            py_pie = _pie_dict_from_months(section, tables, py_months)
+            py_img = _pie_image(py_pie, width=2.3 * inch)
+        if py_img:
+            py_label = f"{py_months[0]} – {py_months[-1]} (last year)"
+            pair = Table(
+                [[[Paragraph(cur_label, note_style), Spacer(1, 3),
+                   cur_img],
+                  [Paragraph(py_label, note_style), Spacer(1, 3),
+                   py_img]]],
+                colWidths=[2.9 * inch, 2.9 * inch])
+            pair.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 14),
+            ]))
+            return [pair]
+        block = [Paragraph(cur_label, note_style), Spacer(1, 3), cur_img]
+        if section in _qbo_sections and py_months and not _py_qbo_data_ok:
+            block += [Spacer(1, 4), Paragraph(
+                f"<i>No prior-year comparison — QuickBooks history "
+                f"doesn't reach back to {py_months[0]} yet.</i>",
+                note_style)]
+        return block
 
     def _inventory_block() -> List:
         # Section 4 — current snapshot only (see module docstring for
@@ -1187,10 +1276,18 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
                 "reproduced here.</i>",
                 note_style),
         ]
-        img = _pie_image(inv_pie)
+        img = _pie_image(inv_pie, width=2.3 * inch)
         if img:
             block.append(Spacer(1, 10))
             block.append(img)
+            block.append(Spacer(1, 4))
+            block.append(Paragraph(
+                "<i>No prior-year comparison — Avg Inventory Value is "
+                "a modelled walk-back from today's stock (see the "
+                "note above); doubling that walk-back another year "
+                "back would compound the drift rather than give a "
+                "trustworthy number.</i>",
+                note_style))
         return block
 
     # Render every section in its natural numeric order (James,
@@ -1205,11 +1302,10 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
         else:
             block = [Paragraph(section, section_style),
                      _section_table(section)]
-            pie = _pie_dict_for_section(section, tables, months, ytd_year)
-            img = _pie_image(pie)
-            if img:
+            pies = _pies_block(section)
+            if pies:
                 block.append(Spacer(1, 10))
-                block.append(img)
+                block.extend(pies)
         story.append(KeepTogether(block))
         if i < len(sections_to_render) - 1:
             story.append(PageBreak())
@@ -1307,6 +1403,7 @@ def main() -> int:
     month = _target_month()
     current_month = _current_partial_month()
     months = _report_months(current_month, lookback=14)
+    py_months = _prior_year_stretch(current_month)
     _emit(f"building report for {months[0]}..{months[-1]} "
           f"(rightmost column partial)")
 
@@ -1317,7 +1414,12 @@ def main() -> int:
         return 2
 
     try:
-        tables = compute_monthly_tables(cin7_data, months)
+        # James, 2026-07-23: also compute the prior-year "same
+        # stretch" months (e.g. Jan-Jul 2025) — usually outside
+        # `months`' own 14-month window — so each section's pie can
+        # show a year-over-year comparison, same as the dashboard.
+        all_months = sorted(set(months) | set(py_months))
+        tables = compute_monthly_tables(cin7_data, all_months)
         inventory_snapshot = compute_inventory_snapshot(cin7_data)
     except Exception as exc:  # noqa: BLE001
         _emit(f"section computation failed: {exc!r}", level="error")
@@ -1337,7 +1439,8 @@ def main() -> int:
     try:
         pdf_bytes = build_pdf(tables, months, inventory_snapshot, month,
                                current_month,
-                               commentary=commentary.get("html"))
+                               commentary=commentary.get("html"),
+                               py_months=py_months)
     except Exception as exc:  # noqa: BLE001
         _emit(f"PDF build failed: {exc!r}", level="error")
         return 4
