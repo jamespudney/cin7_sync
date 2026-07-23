@@ -21212,29 +21212,154 @@ elif page == "Monthly Metrics":
                     return None
             return vals
 
+        # James: side-by-side "same stretch, last year" comparison
+        # pie. Reuses the EXACT same per-metric formula each row
+        # already uses (copied here, not re-derived), evaluated over
+        # Jan-<same month>, previous year, instead of reading
+        # table_df's "YTD" column — table_df/month_labels are only
+        # as wide as "Months to show", which by default doesn't reach
+        # back far enough to cover a full prior-year YTD span, but
+        # the underlying per-month series (sale_lines-derived; all 5
+        # years of it) do.
+        _py_year = current_month.year - 1
+        _py_months = pd.period_range(
+            start=f"{_py_year}-01", periods=current_month.month,
+            freq="M")
+        _PIE_METRIC_FN = {
+            ("1. Sales Overview [App]", "COGS"):
+                lambda m: _get(cogs_per_month, m),
+            ("1. Sales Overview [App]", "Discounts"):
+                lambda m: _discounts_for(m),
+            ("1. Sales Overview [App]", "Gross Profit"):
+                lambda m: (_get(sales_per_month, m)
+                            - _get(cogs_per_month, m)),
+            ("3. Customer Metrics [App]", "New Customers"):
+                lambda m: int(new_customers.get(m, 0)),
+            ("3. Customer Metrics [App]", "Lost Customers (3mo)"):
+                _lost_customers,
+            ("5. Revenue by Channel [Cin7/DEAR]",
+             "Shopify (Online Store)"): lambda m: _shopify_split_rev(m)[0],
+            ("5. Revenue by Channel [Cin7/DEAR]",
+             "Shopify (Draft Orders)"): lambda m: _shopify_split_rev(m)[1],
+            ("5. Revenue by Channel [Cin7/DEAR]",
+             "Shopify (Other/Unclassified)"):
+                lambda m: _shopify_split_rev(m)[2],
+            ("5. Revenue by Channel [Cin7/DEAR]", "Amazon"):
+                lambda m: float(
+                    _rev_by_chan_month.get((m, "Amazon"), 0) or 0),
+            ("5. Revenue by Channel [Cin7/DEAR]", "eBay"):
+                lambda m: float(
+                    _rev_by_chan_month.get((m, "eBay"), 0) or 0),
+            ("5. Revenue by Channel [Cin7/DEAR]", "B2B / Direct"):
+                lambda m: float(
+                    _rev_by_chan_month.get((m, "B2B / Direct"), 0) or 0),
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Net Sales (QB 400)"): lambda m: _qb(m, "sales"),
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Shipping Income (QB 405)"):
+                lambda m: _qb(m, "shipping_charged"),
+            ("6. Sales & Adjustments [QuickBooks]",
+             "Total Revenue (QB Total Income)"):
+                lambda m: _qb(m, "total_income"),
+            ("7. Cost & Profitability [QuickBooks]",
+             "Product COGS (QB 500)"): lambda m: _qb(m, "cogs"),
+            ("7. Cost & Profitability [QuickBooks]",
+             "Amazon Fees (QB 502)"):
+                lambda m: _qb(m, "cogs_amazon_fees"),
+            ("7. Cost & Profitability [QuickBooks]",
+             "Inventory Adj (QB 550)"):
+                lambda m: _qb(m, "inventory_adjustment"),
+            ("8. Shipping Detail [QuickBooks]",
+             "Shipping-Out Cost (QB 694)"):
+                lambda m: _qb(m, "shipping_cost"),
+            ("8. Shipping Detail [QuickBooks]", "Shipping Margin"):
+                lambda m: (_qb(m, "shipping_charged")
+                            - _qb(m, "shipping_cost")),
+            ("9. Order Counts [Cin7/DEAR]",
+             "Shopify (Online Store) Orders"):
+                lambda m: _shopify_split_cnt(m)[0],
+            ("9. Order Counts [Cin7/DEAR]",
+             "Shopify (Draft Orders) Count"):
+                lambda m: _shopify_split_cnt(m)[1],
+            ("9. Order Counts [Cin7/DEAR]",
+             "Shopify (Other/Unclassified) Orders"):
+                lambda m: _shopify_split_cnt(m)[2],
+            ("9. Order Counts [Cin7/DEAR]", "Amazon Orders"):
+                lambda m: int(
+                    _orders_by_chan_month.get((m, "Amazon"), 0) or 0),
+            ("9. Order Counts [Cin7/DEAR]", "eBay Orders"):
+                lambda m: int(
+                    _orders_by_chan_month.get((m, "eBay"), 0) or 0),
+            ("9. Order Counts [Cin7/DEAR]", "B2B / Direct Orders"):
+                lambda m: int(
+                    _orders_by_chan_month.get(
+                        (m, "B2B / Direct"), 0) or 0),
+        }
+
+        def _pie_raw_py(section: str, metric: str) -> float:
+            fn = _PIE_METRIC_FN.get((section, metric))
+            if fn is None:
+                return 0.0
+            try:
+                return float(sum(fn(m) for m in _py_months))
+            except Exception:  # noqa: BLE001
+                return 0.0
+
+        # QBO sections' history is only as deep as the last
+        # `qbo_monthly_pl.py sync --months N` run (default 14) — no
+        # automatic backfill like sale_lines/shopify_orders have.
+        # Rather than silently show a too-small "prior year" total
+        # when Jan of that year was never synced, check for it and
+        # skip the second pie with an explanatory caption instead.
+        _qbo_sections = {"6. Sales & Adjustments [QuickBooks]",
+                          "7. Cost & Profitability [QuickBooks]",
+                          "8. Shipping Detail [QuickBooks]"}
+        _py_qbo_data_ok = str(_py_months[0]) in _qb_by_month
+
+        def _pie_dict_prior_year_for_section(
+                section: str) -> Optional[dict]:
+            if section == "4. Inventory [App]":
+                # Modelled walk-back only holds up over the current
+                # lookback window (see Section 4's own methodology
+                # note) — doubling it back another year compounds
+                # the drift, so skip rather than show a misleading
+                # number.
+                return None
+            if section in _qbo_sections and not _py_qbo_data_ok:
+                return None
+            if section == "6. Sales & Adjustments [QuickBooks]":
+                net_sales = _pie_raw_py(section, "Net Sales (QB 400)")
+                ship_income = _pie_raw_py(
+                    section, "Shipping Income (QB 405)")
+                total_rev = _pie_raw_py(
+                    section, "Total Revenue (QB Total Income)")
+                sundry = max(total_rev - net_sales - ship_income, 0.0)
+                return {"Net Sales": max(net_sales, 0.0),
+                        "Shipping Income": max(ship_income, 0.0),
+                        "Sundry Income": sundry}
+            cfg = _PIE_SECTION_METRICS.get(section)
+            if not cfg:
+                return None
+            vals = {label: abs(_pie_raw_py(section, metric))
+                     for label, metric in cfg}
+            if section == "8. Shipping Detail [QuickBooks]":
+                raw_margin = _pie_raw_py(section, "Shipping Margin")
+                if raw_margin < 0:
+                    return None
+            return vals
+
         # Sections whose slices are counts, not dollars — controls
         # hover-value formatting below (everything else is money).
         _PIE_COUNT_SECTIONS = {
             "3. Customer Metrics [App]", "9. Order Counts [Cin7/DEAR]"}
 
-        def _render_section_pie(section: str) -> None:
-            if _pie_month_label is None:
-                return
-            pie = _pie_dict_for_section(section)
-            if not pie:
-                return
+        def _build_pie_figure(section: str, pie: dict):
+            import plotly.graph_objects as go
+
             labels = [k for k, v in pie.items() if v and v > 0]
             values = [v for v in pie.values() if v and v > 0]
             if not values or sum(values) <= 0:
-                return
-            # v2.67.xxx — switched from a static matplotlib PNG to a
-            # Plotly donut: smaller footprint and genuinely
-            # interactive (hover a wedge for its exact $/count and
-            # share of the whole), matching what st.plotly_chart
-            # already gives every other chart in this app. plotly is
-            # already a project dependency — nothing new to install.
-            import plotly.graph_objects as go
-
+                return None
             is_count = section in _PIE_COUNT_SECTIONS
             value_fmt = "%{value:,.0f}" if is_count else "$%{value:,.0f}"
             fig = go.Figure(data=[go.Pie(
@@ -21256,12 +21381,56 @@ elif page == "Monthly Metrics":
                 margin=dict(l=8, r=8, t=8, b=8),
                 height=280, width=340,
             )
-            _pie_caption = (f"{current_month.year} year-to-date breakdown"
-                             if _pie_has_ytd
-                             else f"{_pie_month_label} breakdown")
-            st.caption(_pie_caption)
-            st.plotly_chart(fig, use_container_width=False,
-                              config={"displayModeBar": False})
+            return fig
+
+        def _render_section_pie(section: str) -> None:
+            if _pie_month_label is None:
+                return
+            pie = _pie_dict_for_section(section)
+            fig = _build_pie_figure(section, pie) if pie else None
+            if fig is None:
+                return
+            py_pie = _pie_dict_prior_year_for_section(section)
+            py_fig = (_build_pie_figure(section, py_pie)
+                       if py_pie else None)
+            _cur_caption = (
+                f"{current_month.year} year-to-date breakdown"
+                if _pie_has_ytd else f"{_pie_month_label} breakdown")
+            import calendar
+            _py_span = (f"Jan–{calendar.month_abbr[current_month.month]} "
+                         f"{_py_year}" if current_month.month > 1
+                         else f"{calendar.month_abbr[1]} {_py_year}")
+            if py_fig is not None:
+                col_cur, col_py = st.columns(2)
+                with col_cur:
+                    st.caption(_cur_caption)
+                    st.plotly_chart(fig, use_container_width=False,
+                                      config={"displayModeBar": False})
+                with col_py:
+                    st.caption(f"{_py_span} breakdown (same stretch, "
+                                "last year)")
+                    st.plotly_chart(py_fig, use_container_width=False,
+                                      config={"displayModeBar": False})
+            else:
+                st.caption(_cur_caption)
+                st.plotly_chart(fig, use_container_width=False,
+                                  config={"displayModeBar": False})
+                if section in _qbo_sections and not _py_qbo_data_ok:
+                    st.caption(
+                        f"⚠️ No prior-year comparison — QuickBooks "
+                        f"history doesn't reach back to "
+                        f"{_py_months[0]} yet. Run `python "
+                        f"qbo_monthly_pl.py sync --months "
+                        f"{(current_month.year - _py_year) * 12 + current_month.month}` "
+                        f"to backfill it.")
+                elif section == "4. Inventory [App]":
+                    st.caption(
+                        "No prior-year comparison — Avg Inventory "
+                        "Value is a modelled walk-back from today's "
+                        "stock (see the methodology note above); "
+                        "doubling that walk-back another year back "
+                        "would compound the drift rather than give "
+                        "a trustworthy number.")
 
         # --- Sales trend overview chart -----------------------------
         # James: an interactive filled-line chart above Section 1,
