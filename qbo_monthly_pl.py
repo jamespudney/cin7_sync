@@ -62,6 +62,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import db  # noqa: E402
 import qbo_client  # noqa: E402
+from sales_exclusions import (  # noqa: E402
+    EXCLUDED_SALES_CUSTOMERS, _normalise_customer_name)
 
 log = logging.getLogger("qbo_monthly_pl")
 
@@ -264,6 +266,92 @@ def _account_number_map() -> Dict[str, Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Excluded-customer netting (Altar'd State)
+# ---------------------------------------------------------------------------
+# sales_exclusions.py already strips this customer out of CIN7-
+# derived figures (sale_lines/sales headers), but this QBO pull is a
+# separate data source with no customer-level filter of its own — a
+# gap confirmed live 2026-07-23 (Altar'd State's own QBO customer
+# record shows $185,193.61 of Income across Jan-Sep 2025, $117,470 of
+# which falls inside the current 14-month reporting window). This
+# section nets that back out so Sections 6/7/8 agree with the
+# already-excluded CIN7 sections.
+def _find_excluded_customer_ids() -> Dict[str, str]:
+    """{qbo_display_name: qbo_customer_id} for every QBO customer
+    whose normalised name starts with an excluded customer's
+    normalised name — catches numbered duplicate/sub-customer QBO
+    records too (confirmed live: QBO has both "Altar'd State" and a
+    second, currently-inactive "Altar'd State 1" record), without
+    catching unrelated similarly-named customers (confirmed live:
+    "Altar Construction" does NOT match)."""
+    excluded_keys = [_normalise_customer_name(n)
+                      for n in EXCLUDED_SALES_CUSTOMERS]
+    out: Dict[str, str] = {}
+    for name in EXCLUDED_SALES_CUSTOMERS:
+        # A short, apostrophe-free prefix for QBO's LIKE match —
+        # the real filter is the normalised startswith check below,
+        # so differences in how QBO's LIKE handles the apostrophe
+        # don't matter here.
+        prefix = re.split(r"[’'`\s]", name)[0].strip()
+        if not prefix:
+            continue
+        try:
+            matches = qbo_client.query(
+                f"SELECT Id, DisplayName FROM Customer WHERE "
+                f"DisplayName LIKE '{prefix}%'")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("QBO customer lookup failed for %r: %s",
+                         name, exc)
+            continue
+        for m in matches:
+            disp = m.get("DisplayName") or ""
+            key = _normalise_customer_name(disp)
+            if any(key.startswith(ek) for ek in excluded_keys):
+                out[disp] = m.get("Id")
+    return out
+
+
+def sync_exclusions_for_customer(customer_id: str, customer_name: str,
+                                   start: date, end: date,
+                                   acct_meta: Dict[str, Dict[str, str]]
+                                   ) -> int:
+    """Pull the SAME ProfitAndLoss report, scoped to one customer's
+    own transactions via QBO's `customer` report filter, and store
+    into qbo_monthly_pl_exclusions. Reuses parse_pnl() unchanged —
+    QBO computes this customer's own Total Income/Total COGS/Net
+    Operating Income subtotals the same way it does for the full-
+    company report, so netting row-for-row (in
+    qbo_monthly_pl_summary_by_category) stays consistent at every
+    level, not just the leaf accounts."""
+    report = qbo_client.report("ProfitAndLoss", params={
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "summarize_column_by": "Month",
+        "accounting_method": "Accrual",
+        "customer": customer_id,
+    })
+    tuples = parse_pnl(report)
+    if not tuples:
+        log.info("No P&L rows for excluded customer %s (Id=%s).",
+                  customer_name, customer_id)
+        return 0
+    payload = []
+    for (month, acct_id, name, section, parent, amount) in tuples:
+        meta = acct_meta.get(acct_id or "") or {}
+        payload.append({
+            "month": month,
+            "account_id": acct_id,
+            "account_number": meta.get("number") or None,
+            "account_name": name,
+            "customer_name": customer_name,
+            "amount": amount,
+        })
+    n_ok = db.batch_upsert_qbo_monthly_pl_exclusion(payload)
+    log.info("Wrote %d exclusion row(s) for %s.", n_ok, customer_name)
+    return n_ok
+
+
+# ---------------------------------------------------------------------------
 # Sync command
 # ---------------------------------------------------------------------------
 def cmd_sync(args) -> int:
@@ -336,6 +424,30 @@ def cmd_sync(args) -> int:
     log.info("=" * 60)
     log.info("Wrote %d / %d row(s) to qbo_monthly_pl.",
               n_ok, len(payload))
+
+    # Net excluded-customer (Altar'd State) amounts back out — see
+    # the "Excluded-customer netting" section above. Best-effort:
+    # a failure here shouldn't fail the whole sync since the main
+    # P&L data above is already written.
+    try:
+        excluded = _find_excluded_customer_ids()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Excluded-customer lookup failed: %s", exc)
+        excluded = {}
+    if excluded:
+        log.info("Netting out %d excluded QBO customer record(s): %s",
+                  len(excluded), ", ".join(excluded))
+        for cust_name, cust_id in excluded.items():
+            try:
+                sync_exclusions_for_customer(
+                    cust_id, cust_name, start, end, acct_meta)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Exclusion sync failed for %s: %s",
+                             cust_name, exc)
+    else:
+        log.info("No excluded customers (%s) found in QBO — "
+                  "nothing to net out.",
+                  ", ".join(EXCLUDED_SALES_CUSTOMERS))
     return 0
 
 
