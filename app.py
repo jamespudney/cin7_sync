@@ -21167,8 +21167,8 @@ elif page == "Monthly Metrics":
                 ("Amazon Fees", "Amazon Fees (QB 502)"),
                 ("Inventory Adj", "Inventory Adj (QB 550)")],
             "8. Shipping Detail [QuickBooks]": [
-                ("Shipping-Out Cost", "Shipping-Out Cost (QB 694)"),
-                ("Shipping Margin", "Shipping Margin")],
+                ("Shipping Charged", "Shipping Charged (QB 405)"),
+                ("Shipping-Out Cost", "Shipping-Out Cost (QB 694)")],
             "9. Order Counts [Cin7/DEAR]": [
                 ("Shopify Online", "Shopify (Online Store) Orders"),
                 ("Shopify Draft Orders", "Shopify (Draft Orders) Count"),
@@ -21201,16 +21201,15 @@ elif page == "Monthly Metrics":
             cfg = _PIE_SECTION_METRICS.get(section)
             if not cfg:
                 return None
-            vals = {label: abs(_pie_raw(section, metric))
+            # James: Section 8 compares Shipping Charged vs Shipping-
+            # Out Cost directly — both always-nonnegative $ figures,
+            # so the pie always renders and visually shows whether
+            # cost is eating into (or exceeding) what was charged,
+            # rather than trying to force the signed net Margin
+            # (which per Viktor's audit usually runs negative) into
+            # a pie slice, which isn't a valid pie input at all.
+            return {label: abs(_pie_raw(section, metric))
                      for label, metric in cfg}
-            # Section 8's margin can be (and per our own audit, usually
-            # is) negative — a negative slice can't be shown in a pie,
-            # so skip rather than show a misleading all-cost pie.
-            if section == "8. Shipping Detail [QuickBooks]":
-                raw_margin = _pie_raw(section, "Shipping Margin")
-                if raw_margin < 0:
-                    return None
-            return vals
 
         # James: side-by-side "same stretch, last year" comparison
         # pie. Reuses the EXACT same per-metric formula each row
@@ -21270,11 +21269,11 @@ elif page == "Monthly Metrics":
              "Inventory Adj (QB 550)"):
                 lambda m: _qb(m, "inventory_adjustment"),
             ("8. Shipping Detail [QuickBooks]",
+             "Shipping Charged (QB 405)"):
+                lambda m: _qb(m, "shipping_charged"),
+            ("8. Shipping Detail [QuickBooks]",
              "Shipping-Out Cost (QB 694)"):
                 lambda m: _qb(m, "shipping_cost"),
-            ("8. Shipping Detail [QuickBooks]", "Shipping Margin"):
-                lambda m: (_qb(m, "shipping_charged")
-                            - _qb(m, "shipping_cost")),
             ("9. Order Counts [Cin7/DEAR]",
              "Shopify (Online Store) Orders"):
                 lambda m: _shopify_split_cnt(m)[0],
@@ -21340,13 +21339,8 @@ elif page == "Monthly Metrics":
             cfg = _PIE_SECTION_METRICS.get(section)
             if not cfg:
                 return None
-            vals = {label: abs(_pie_raw_py(section, metric))
+            return {label: abs(_pie_raw_py(section, metric))
                      for label, metric in cfg}
-            if section == "8. Shipping Detail [QuickBooks]":
-                raw_margin = _pie_raw_py(section, "Shipping Margin")
-                if raw_margin < 0:
-                    return None
-            return vals
 
         # Sections whose slices are counts, not dollars — controls
         # hover-value formatting below (everything else is money).
