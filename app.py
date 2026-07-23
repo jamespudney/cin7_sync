@@ -21211,19 +21211,24 @@ elif page == "Monthly Metrics":
             return {label: abs(_pie_raw(section, metric))
                      for label, metric in cfg}
 
-        # James: side-by-side "same stretch, last year" comparison
-        # pie. Reuses the EXACT same per-metric formula each row
+        # James: side-by-side "full prior year" comparison pie.
+        # Reuses the EXACT same per-metric formula each row
         # already uses (copied here, not re-derived), evaluated over
-        # Jan-<same month>, previous year, instead of reading
+        # the FULL prior calendar year (Jan-Dec), instead of reading
         # table_df's "YTD" column — table_df/month_labels are only
         # as wide as "Months to show", which by default doesn't reach
-        # back far enough to cover a full prior-year YTD span, but
-        # the underlying per-month series (sale_lines-derived; all 5
+        # back far enough to cover a full prior year, but the
+        # underlying per-month series (sale_lines-derived; all 5
         # years of it) do.
+        # James, 2026-07-23: deliberately the WHOLE prior year, not
+        # just a same-length Jan-<current month> stretch — showing
+        # this year's partial year-to-date against last year's
+        # complete picture is what lets you see how far through the
+        # year's likely total you already are, not just a
+        # like-for-like same-period comparison.
         _py_year = current_month.year - 1
         _py_months = pd.period_range(
-            start=f"{_py_year}-01", periods=current_month.month,
-            freq="M")
+            start=f"{_py_year}-01", periods=12, freq="M")
         _PIE_METRIC_FN = {
             ("1. Sales Overview [App]", "COGS"):
                 lambda m: _get(cogs_per_month, m),
@@ -21308,12 +21313,15 @@ elif page == "Monthly Metrics":
         # `qbo_monthly_pl.py sync --months N` run (default 14) — no
         # automatic backfill like sale_lines/shopify_orders have.
         # Rather than silently show a too-small "prior year" total
-        # when Jan of that year was never synced, check for it and
-        # skip the second pie with an explanatory caption instead.
+        # when the prior year wasn't fully synced, check BOTH ends
+        # (Jan and Dec — a partial-year sync could cover the start
+        # without reaching all the way to December) and skip the
+        # second pie with an explanatory caption instead.
         _qbo_sections = {"6. Sales & Adjustments [QuickBooks]",
                           "7. Cost & Profitability [QuickBooks]",
                           "8. Shipping Detail [QuickBooks]"}
-        _py_qbo_data_ok = str(_py_months[0]) in _qb_by_month
+        _py_qbo_data_ok = (str(_py_months[0]) in _qb_by_month
+                             and str(_py_months[-1]) in _qb_by_month)
 
         def _pie_dict_prior_year_for_section(
                 section: str) -> Optional[dict]:
@@ -21390,10 +21398,6 @@ elif page == "Monthly Metrics":
             _cur_caption = (
                 f"{current_month.year} year-to-date breakdown"
                 if _pie_has_ytd else f"{_pie_month_label} breakdown")
-            import calendar
-            _py_span = (f"Jan–{calendar.month_abbr[current_month.month]} "
-                         f"{_py_year}" if current_month.month > 1
-                         else f"{calendar.month_abbr[1]} {_py_year}")
             if py_fig is not None:
                 col_cur, col_py = st.columns(2)
                 with col_cur:
@@ -21401,8 +21405,8 @@ elif page == "Monthly Metrics":
                     st.plotly_chart(fig, use_container_width=False,
                                       config={"displayModeBar": False})
                 with col_py:
-                    st.caption(f"{_py_span} breakdown (same stretch, "
-                                "last year)")
+                    st.caption(f"{_py_year} full year breakdown "
+                                "(last year)")
                     st.plotly_chart(py_fig, use_container_width=False,
                                       config={"displayModeBar": False})
             else:
@@ -21412,8 +21416,8 @@ elif page == "Monthly Metrics":
                 if section in _qbo_sections and not _py_qbo_data_ok:
                     st.caption(
                         f"⚠️ No prior-year comparison — QuickBooks "
-                        f"history doesn't reach back to "
-                        f"{_py_months[0]} yet. Run `python "
+                        f"history doesn't cover all of {_py_year} "
+                        f"yet. Run `python "
                         f"qbo_monthly_pl.py sync --months "
                         f"{(current_month.year - _py_year) * 12 + current_month.month}` "
                         f"to backfill it.")
