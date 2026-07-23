@@ -589,6 +589,7 @@ _SECTION_ORDER = [
     "1. Sales Overview [App]",
     "2. Margins & Purchasing [App]",
     "3. Customer Metrics [App]",
+    "4. Inventory [App]",
     "5. Revenue by Channel [Cin7/DEAR]",
     "6. Sales & Adjustments [QuickBooks]",
     "7. Cost & Profitability [QuickBooks]",
@@ -899,6 +900,112 @@ def _fmt_value(v: Any, fmt: str) -> str:
     return f"{v}"
 
 
+# {section: [(pie slice label, metric row to pull), ...]} — same
+# category breakdown as the dashboard's per-section pie (James,
+# 2026-07-23: bring the pies back, one per section, even if that
+# means each section gets its own page). Values are summed across
+# the CURRENT calendar year's months in the report range, matching
+# the dashboard's own YTD-based pie.
+_PIE_SECTION_METRICS: Dict[str, List[Tuple[str, str]]] = {
+    "1. Sales Overview [App]": [
+        ("COGS", "COGS"), ("Discounts", "Discounts"),
+        ("Gross Profit", "Gross Profit")],
+    "3. Customer Metrics [App]": [
+        ("New Customers", "New Customers"),
+        ("Lost Customers (3mo)", "Lost Customers (3mo)")],
+    "5. Revenue by Channel [Cin7/DEAR]": [
+        ("Shopify Online", "Shopify (Online Store)"),
+        ("Shopify Draft Orders", "Shopify (Draft Orders)"),
+        ("Shopify Other", "Shopify (Other/Unclassified)"),
+        ("Amazon", "Amazon"), ("eBay", "eBay"),
+        ("B2B / Direct", "B2B / Direct")],
+    "7. Cost & Profitability [QuickBooks]": [
+        ("Product COGS", "Product COGS (QB 500)"),
+        ("Amazon Fees", "Amazon Fees (QB 502)"),
+        ("Inventory Adj", "Inventory Adj (QB 550)")],
+    "8. Shipping Detail [QuickBooks]": [
+        ("Shipping Charged", "Shipping Charged (QB 405)"),
+        ("Shipping-Out Cost", "Shipping-Out Cost (QB 694)")],
+    "9. Order Counts [Cin7/DEAR]": [
+        ("Shopify Online", "Shopify (Online Store) Orders"),
+        ("Shopify Draft Orders", "Shopify (Draft Orders) Count"),
+        ("Shopify Other", "Shopify (Other/Unclassified) Orders"),
+        ("Amazon", "Amazon Orders"), ("eBay", "eBay Orders"),
+        ("B2B / Direct", "B2B / Direct Orders")],
+}
+_PIE_COLORS = ["#2f6fed", "#e8833a", "#3aa76d", "#c94f4f", "#8e6fce",
+               "#5aa9a3"]
+
+
+def _render_pie(pie: Dict[str, float], title: str = "") -> Optional[bytes]:
+    """Render one pie chart to PNG bytes. Returns None if there's
+    nothing meaningful to plot (all-zero / empty).
+
+    Uses a legend below the pie rather than labels on the wedges
+    themselves: several sections here regularly have one or two very
+    small slices next to much larger ones (e.g. "Amazon Fees" next to
+    "Product COGS"), and on-wedge labels for adjacent thin slices
+    overlap into an illegible smear regardless of font size. A legend
+    is robust to any slice-size distribution."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = [k for k, v in pie.items() if v and v > 0]
+    values = [v for v in pie.values() if v and v > 0]
+    if not values or sum(values) <= 0:
+        return None
+
+    fig, ax = plt.subplots(figsize=(3.6, 4.1), dpi=150)
+    total = sum(values)
+    wedges, _ = ax.pie(
+        values, startangle=90, colors=_PIE_COLORS[:len(values)])
+    legend_labels = [f"{lbl} ({v / total * 100:.0f}%)"
+                      for lbl, v in zip(labels, values)]
+    ax.legend(
+        wedges, legend_labels, loc="upper center",
+        bbox_to_anchor=(0.5, -0.02), ncol=1, frameon=False,
+        fontsize=9, handlelength=1.0, handletextpad=0.5,
+        labelspacing=0.4,
+    )
+    if title:
+        ax.set_title(title, fontsize=11)
+    ax.axis("equal")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _pie_dict_for_section(section: str,
+                           tables: Dict[str, Dict[str, Dict[str, float]]],
+                           months: List[str],
+                           ytd_year: int) -> Optional[dict]:
+    """Sums each pie slice's metric over the current calendar year's
+    months in the report range — same YTD basis as the dashboard's
+    own per-section pie."""
+    section_data = tables.get(section, {})
+
+    def _ytd_sum(label: str) -> float:
+        per_month = section_data.get(label, {})
+        return sum(per_month.get(m, 0.0) for m in months
+                   if int(m.split("-")[0]) == ytd_year)
+
+    if section == "6. Sales & Adjustments [QuickBooks]":
+        net_sales = _ytd_sum("Net Sales (QB 400)")
+        ship_income = _ytd_sum("Shipping Income (QB 405)")
+        total_rev = _ytd_sum("Total Revenue (QB Total Income)")
+        sundry = max(total_rev - net_sales - ship_income, 0.0)
+        return {"Net Sales": max(net_sales, 0.0),
+                "Shipping Income": max(ship_income, 0.0),
+                "Sundry Income": sundry}
+    cfg = _PIE_SECTION_METRICS.get(section)
+    if not cfg:
+        return None
+    return {label: abs(_ytd_sum(metric)) for label, metric in cfg}
+
+
 def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
               months: List[str],
               inventory_snapshot: Dict[str, float],
@@ -919,7 +1026,7 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
     from reportlab.lib.units import inch
     from reportlab.platypus import (
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-        KeepTogether,
+        KeepTogether, Image, PageBreak,
     )
 
     c_head = colors.HexColor(_C_HEAD)
@@ -1020,48 +1127,92 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
         t.setStyle(TableStyle(style_cmds))
         return t
 
-    for section in _SECTION_ORDER:
-        if section not in _SECTION_ROWS:
-            continue
-        story.append(KeepTogether([
-            Paragraph(section, section_style),
-            _section_table(section),
-        ]))
-        story.append(Spacer(1, 8))
+    # James, 2026-07-23: bring the pies back, placed with each
+    # section, even if that means each section gets its own page —
+    # the wide table already uses the full landscape width, so the
+    # pie goes below it rather than beside it, using whatever
+    # vertical room the page has left.
+    def _pie_image(pie: Optional[dict]):
+        if not pie:
+            return None
+        png = _render_pie(pie)
+        if not png:
+            return None
+        # Matches _render_pie's figsize aspect ratio (3.6 x 4.1).
+        return Image(io.BytesIO(png), width=2.6 * inch,
+                     height=2.6 * inch * (4.1 / 3.6))
 
-    # Section 4 — current snapshot only (see module docstring for why
-    # it isn't a per-month trend row like the others).
-    inv_rows = [
-        ["Metric", "Value"],
-        ["Total Stock Value (current)",
-         _fmt_value(inventory_snapshot.get(
-             "Total Stock Value (current)", 0.0), "money")],
-        ["Slow-Moving Stock Value (current)",
-         _fmt_value(inventory_snapshot.get(
-             "Slow-Moving Stock Value (current)", 0.0), "money")],
-    ]
-    inv_table = Table(inv_rows, colWidths=[2.4 * inch, 1.3 * inch])
-    inv_table.setStyle(TableStyle([
-        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("BACKGROUND", (0, 0), (-1, 0), c_head),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("BOX", (0, 0), (-1, -1), 0.4, c_border),
-        ("INNERGRID", (0, 0), (-1, -1), 0.25, c_border),
-        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
-    ]))
-    story.append(KeepTogether([
-        Paragraph("4. Inventory [App]", section_style),
-        inv_table,
-        Spacer(1, 2),
-        Paragraph(
-            "<i>Simplified: a CURRENT stock-value snapshot at report "
-            "time (not a per-month figure) — the dashboard's modelled "
-            "month-average walk-back isn't reproduced here.</i>",
-            note_style),
-    ]))
+    def _inventory_block() -> List:
+        # Section 4 — current snapshot only (see module docstring for
+        # why it isn't a per-month trend row like the others).
+        inv_rows = [
+            ["Metric", "Value"],
+            ["Total Stock Value (current)",
+             _fmt_value(inventory_snapshot.get(
+                 "Total Stock Value (current)", 0.0), "money")],
+            ["Slow-Moving Stock Value (current)",
+             _fmt_value(inventory_snapshot.get(
+                 "Slow-Moving Stock Value (current)", 0.0), "money")],
+        ]
+        inv_table = Table(inv_rows, colWidths=[2.4 * inch, 1.3 * inch])
+        inv_table.setStyle(TableStyle([
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 0), (-1, 0), c_head),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+            ("BOX", (0, 0), (-1, -1), 0.4, c_border),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, c_border),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ]))
+        inv_pie = {
+            "Slow-Moving Stock Value": max(
+                inventory_snapshot.get(
+                    "Slow-Moving Stock Value (current)", 0.0), 0.0),
+            "Other Stock Value": max(
+                inventory_snapshot.get(
+                    "Total Stock Value (current)", 0.0)
+                - inventory_snapshot.get(
+                    "Slow-Moving Stock Value (current)", 0.0), 0.0),
+        }
+        block: List = [
+            Paragraph("4. Inventory [App]", section_style),
+            inv_table,
+            Spacer(1, 2),
+            Paragraph(
+                "<i>Simplified: a CURRENT stock-value snapshot at "
+                "report time (not a per-month figure) — the "
+                "dashboard's modelled month-average walk-back isn't "
+                "reproduced here.</i>",
+                note_style),
+        ]
+        img = _pie_image(inv_pie)
+        if img:
+            block.append(Spacer(1, 10))
+            block.append(img)
+        return block
+
+    # Render every section in its natural numeric order (James,
+    # 2026-07-23: Section 4 had been tacked on at the very end —
+    # moved back into its normal 1,2,3,4,5... position).
+    sections_to_render = [
+        s for s in _SECTION_ORDER
+        if s in _SECTION_ROWS or s == "4. Inventory [App]"]
+    for i, section in enumerate(sections_to_render):
+        if section == "4. Inventory [App]":
+            block = _inventory_block()
+        else:
+            block = [Paragraph(section, section_style),
+                     _section_table(section)]
+            pie = _pie_dict_for_section(section, tables, months, ytd_year)
+            img = _pie_image(pie)
+            if img:
+                block.append(Spacer(1, 10))
+                block.append(img)
+        story.append(KeepTogether(block))
+        if i < len(sections_to_render) - 1:
+            story.append(PageBreak())
 
     def _footer(canvas, doc_):
         canvas.saveState()
