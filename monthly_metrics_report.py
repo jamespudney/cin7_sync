@@ -1,9 +1,9 @@
 """monthly_metrics_report.py
 =============================
-Generate a one-page-per-view, printable executive-summary PDF of the
-Monthly Metrics dashboard (headline KPIs + a pie chart per section for
-the most recently CLOSED calendar month) and post it to a Slack
-channel via the Wired4Signs bot.
+Generate a printable, multi-month PDF export of the Monthly Metrics
+dashboard (the same per-month tables shown on that page, landscape
+so every month column fits) and post it to a Slack channel via the
+Wired4Signs bot.
 
 Designed to run a few days into each new month (see the day-of-month
 guard in sync_loop.sh), by which point QuickBooks bookkeeping has
@@ -11,21 +11,23 @@ mostly caught up on the prior month — reporting on the just-finished
 month on day 1 would inherit the inflated-GP%/incomplete-COGS
 distortion documented in app.py's Monthly Metrics methodology notes.
 
-This is deliberately a LIGHTER-WEIGHT companion to the full Monthly
-Metrics page, not a byte-for-byte port of it — one figure is
-simplified on purpose, and is labelled as such in the PDF:
-  - "Inventory" here is a CURRENT stock-value snapshot (slow-moving vs
-    the rest), not the dashboard's modelled month-average walk-back.
-Everything else (Sales $, COGS, Discounts, channel/order breakdowns,
-customer counts, all QuickBooks-sourced figures) uses the exact same
-formulas and data sources as the dashboard.
+James (2026-07-23): the pie-per-section / single-month executive-
+summary layout this used to have didn't show the actual month-by-
+month figures the dashboard shows, which is what people actually
+need to read off this report. Rewritten to mirror the dashboard's
+own tables row-for-row (same labels, same order, same formulas) —
+one wide table per section, months across the top, landscape so a
+14-month run of columns actually fits and stays legible. Pie charts
+were dropped in this redesign to keep the focus on the visible
+figures; ask if you'd like them added back alongside the tables.
 
-Section 2 ("Margins & Purchasing") deliberately shows no shipping
-figures — App-side Shipping Charged/Cost/Margin were removed here
-(2026-07, James) for the same reason they were removed from the
-dashboard: QuickBooks' Section 8 (accounts 405/694) is the one
-canonical shipping-margin figure shown to management, rather than
-two structurally different numbers that disagreed every month.
+Section 4 ("Inventory") is the one deliberate exception — it's shown
+as a CURRENT stock-value snapshot (slow-moving vs the rest), not a
+per-month trend, because reproducing the dashboard's modelled
+month-average walk-back here would mean re-deriving that whole model
+a second time; a snapshot correctly labelled as such is preferable to
+either skipping it or showing a misleading repeated number across
+every month column.
 
 Configuration via environment variables:
     SLACK_BOT_TOKEN                  Wired4Signs Slack bot token (xoxb-...)
@@ -59,7 +61,9 @@ def _emit(msg: str, level: str = "info") -> None:
 # Target month
 # ---------------------------------------------------------------------------
 def _target_month(today: Optional[date] = None) -> str:
-    """The most recently completed calendar month, as 'YYYY-MM'."""
+    """The most recently completed calendar month, as 'YYYY-MM'. Used
+    for the report's headline/filename — the table itself spans a
+    wider month range (see `_report_months`)."""
     today = today or date.today()
     year, month = today.year, today.month
     if month == 1:
@@ -68,12 +72,20 @@ def _target_month(today: Optional[date] = None) -> str:
 
 
 def _current_partial_month(today: Optional[date] = None) -> str:
-    """The in-progress calendar month, as 'YYYY-MM'. James wants this
-    included in the report (not just the closed month) as long as
-    it's clearly marked partial — see build_pdf's partial-month
-    callout under each section."""
+    """The in-progress calendar month, as 'YYYY-MM' — the rightmost
+    (still-partial) column of the report table."""
     today = today or date.today()
     return f"{today.year}-{today.month:02d}"
+
+
+def _report_months(current_month: str, lookback: int = 14) -> List[str]:
+    """The month columns the report table shows — same default
+    lookback as the dashboard's "Months to show" control, ending
+    with the current in-progress month (matches the dashboard
+    including the partial month as a normal rightmost column)."""
+    import pandas as pd
+    periods = pd.period_range(end=current_month, periods=lookback, freq="M")
+    return [str(p) for p in periods]
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +269,11 @@ def _yoy_month(month: str) -> str:
     return f"{int(year) - 1}-{mon}"
 
 
+def _num(sl, col):
+    import pandas as pd
+    return pd.to_numeric(sl.get(col), errors="coerce").fillna(0)
+
+
 def _headline_cin7_metrics(sale_lines, month: str,
                             max_day: Optional[int] = None) -> Dict[str, float]:
     """A handful of top-line CIN7 figures for one month (optionally
@@ -277,13 +294,16 @@ def _headline_cin7_metrics(sale_lines, month: str,
     }
 
 
-def _headline_qb_metrics(db_module, month: str) -> Dict[str, float]:
+def _headline_qb_metrics(db_module, month: str,
+                          qb_by_month: Optional[dict] = None
+                          ) -> Dict[str, float]:
     """QuickBooks is only ever available at whole-month granularity
     (qbo_monthly_pl has no daily breakdown), so there's no partial-
     period version of this — only used for the closed-month YoY
     comparison, never the month-to-date one."""
-    mappings = db_module.get_qbo_account_mappings()
-    qb_by_month = db_module.qbo_monthly_pl_summary_by_category(mappings)
+    if qb_by_month is None:
+        mappings = db_module.get_qbo_account_mappings()
+        qb_by_month = db_module.qbo_monthly_pl_summary_by_category(mappings)
     qb = qb_by_month.get(month) or {}
     return {
         "net_sales": qb.get("sales", 0.0),
@@ -386,97 +406,350 @@ def build_commentary(data: Dict[str, Any], month: str,
 
 
 # ---------------------------------------------------------------------------
-# Per-section metric computation
+# Per-section, per-month row computation
 # ---------------------------------------------------------------------------
-def _num(sl, col):
+# {section: [(metric label, format), ...]} — same labels/order as the
+# dashboard's Monthly Metrics page. Section 4 isn't here — it's a
+# current snapshot, not a per-month row (see compute_inventory_snapshot).
+_SECTION_ROWS: Dict[str, List[Tuple[str, str]]] = {
+    "1. Sales Overview [App]": [
+        ("Sales $", "money"),
+        ("Sales $ with Tax", "money"),
+        ("# Orders", "int"),
+        ("Quantity Sold", "int"),
+        ("COGS", "money"),
+        ("Discounts", "money"),
+        ("Tax $", "money"),
+        ("Gross Profit", "money"),
+        ("GP %", "pct"),
+    ],
+    "2. Margins & Purchasing [App]": [
+        ("Avg Order Value", "money"),
+        ("# of Purchases", "int"),
+        ("Purchase $", "money"),
+    ],
+    "3. Customer Metrics [App]": [
+        ("New Customers", "int"),
+        ("Running Customer Count", "int"),
+        ("Lost Customers (3mo)", "int"),
+        ("Repeat Customer %", "pct"),
+    ],
+    "5. Revenue by Channel [Cin7/DEAR]": [
+        ("Shopify (Online Store)", "money"),
+        ("Shopify (Draft Orders)", "money"),
+        ("Shopify (Other/Unclassified)", "money"),
+        ("Shopify Total", "money"),
+        ("B2B / Direct", "money"),
+        ("Amazon", "money"),
+        ("eBay", "money"),
+        ("Total (CIN7)", "money"),
+        ("Net Sales (QB 400)", "money"),
+    ],
+    "6. Sales & Adjustments [QuickBooks]": [
+        ("Gross Sales (est.)", "money"),
+        ("Less: Discounts", "money"),
+        ("Net Sales (QB 400)", "money"),
+        ("Shipping Income (QB 405)", "money"),
+        ("Total Revenue (QB Total Income)", "money"),
+    ],
+    "7. Cost & Profitability [QuickBooks]": [
+        ("Product COGS (QB 500)", "money"),
+        ("Amazon Fees (QB 502)", "money"),
+        ("Inventory Adj (QB 550)", "money"),
+        ("Total COGS", "money"),
+        ("Gross Profit (QB)", "money"),
+        ("GP %", "pct"),
+        ("Total OpEx", "money"),
+        ("Operating Profit", "money"),
+        ("Op Margin %", "pct"),
+        ("Net Income (QB)", "money"),
+    ],
+    "8. Shipping Detail [QuickBooks]": [
+        ("Shipping Charged (QB 405)", "money"),
+        ("Shipping-Out Cost (QB 694)", "money"),
+        ("Shipping Margin", "money"),
+        ("Margin %", "pct"),
+    ],
+    "9. Order Counts [Cin7/DEAR]": [
+        ("Shopify (Online Store) Orders", "int"),
+        ("Shopify (Draft Orders) Count", "int"),
+        ("Shopify (Other/Unclassified) Orders", "int"),
+        ("Shopify Total Orders", "int"),
+        ("B2B / Direct Orders", "int"),
+        ("Amazon Orders", "int"),
+        ("eBay Orders", "int"),
+        ("Total Orders", "int"),
+    ],
+}
+
+_SECTION_ORDER = [
+    "1. Sales Overview [App]",
+    "2. Margins & Purchasing [App]",
+    "3. Customer Metrics [App]",
+    "5. Revenue by Channel [Cin7/DEAR]",
+    "6. Sales & Adjustments [QuickBooks]",
+    "7. Cost & Profitability [QuickBooks]",
+    "8. Shipping Detail [QuickBooks]",
+    "9. Order Counts [Cin7/DEAR]",
+]
+
+
+def _customer_first_last_seen(sale_lines):
+    """{CustomerID: first/last purchase MonthKey} over ALL history —
+    same basis app.py's Running Customer Count / Lost Customers (3mo)
+    / Repeat Customer % use, computed once rather than per month."""
     import pandas as pd
-    return pd.to_numeric(sl.get(col), errors="coerce").fillna(0)
+    sl = sale_lines.copy()
+    sl["InvoiceDate"] = pd.to_datetime(sl.get("InvoiceDate"), errors="coerce")
+    if "Status" in sl.columns:
+        sl = sl[~sl["Status"].astype(str).str.upper().isin(_BAD_STATUSES)]
+    sl = sl.dropna(subset=["InvoiceDate", "CustomerID"])
+    sl["MonthKey"] = sl["InvoiceDate"].dt.to_period("M")
+    first_seen = sl.groupby("CustomerID")["MonthKey"].min()
+    last_seen = sl.groupby("CustomerID")["MonthKey"].max()
+    return first_seen, last_seen
 
 
-def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
-    """Returns {section_name: {"pie": {label: value}, "table": [(label,
-    value_str), ...], "note": optional str}} for all 9 sections."""
+def compute_month_values(data: Dict[str, Any], month: str,
+                          first_seen, last_seen,
+                          qb_by_month: dict,
+                          shopify_disc_by_month: dict,
+                          shop_rev_by_src, shop_cnt_by_src
+                          ) -> Dict[str, Dict[str, float]]:
+    """Raw (unformatted) values for every row in every per-month
+    section, for ONE month. Mirrors app.py's Monthly Metrics row
+    formulas exactly (same labels/order/sign conventions) so the PDF
+    and dashboard always agree. The four precomputed arguments are
+    all whole-history aggregates that don't need re-deriving per
+    month — passed in so the caller only builds them once for the
+    whole report instead of once per month."""
     import pandas as pd
 
     sale_lines = data["sale_lines"]
-    stock = data["stock"]
-    db = data["db"]
+    purchase_lines = data["purchase_lines"]
 
+    month_period = pd.Period(month, freq="M")
     sl_month = _month_lines(sale_lines, month)
-    prod, _ = _split_product_shipping(sl_month)
+    prod, _ship = _split_product_shipping(sl_month)
 
     sales = float(_num(prod, "Total").sum())
+    tax = float(_num(prod, "Tax").sum())
+    quantity = float(_num(prod, "Quantity").sum())
     cogs = float((_num(prod, "Quantity") * _num(prod, "AverageCost")).sum())
-    # James: prefer the Shopify Admin API's own discount total (same
-    # source/table the dashboard's Section 1 + Section 6 both use)
-    # over CIN7's line-level Discount proxy, which undercounts true
-    # Shopify discounts by 60-70% (Viktor audit).
-    try:
-        _shopify_disc_month = (data["db"].all_shopify_monthly_discounts()
-                                 or {}).get(month)
-    except Exception:  # noqa: BLE001
-        _shopify_disc_month = None
+    orders = int(sl_month["SaleID"].nunique()) if "SaleID" in sl_month.columns else 0
+    gp = sales - cogs
+
+    # Discounts: prefer the Shopify Admin API's own total (same source
+    # Section 1 + Section 6 both use on the dashboard) over CIN7's
+    # line-level Discount proxy, which undercounts true Shopify
+    # discounts by 60-70% (Viktor audit).
+    _shopify_disc_month = shopify_disc_by_month.get(month)
     if _shopify_disc_month is not None and float(_shopify_disc_month) > 0:
         discounts = float(_shopify_disc_month)
     else:
         discounts = abs(float(_num(prod, "Discount").sum()))
-    gp = sales - cogs
 
-    out: Dict[str, Any] = {}
+    out: Dict[str, Dict[str, float]] = {}
 
-    # ---- 1. Sales Overview ------------------------------------------
     out["1. Sales Overview [App]"] = {
-        "pie": {"COGS": max(cogs, 0), "Discounts": max(discounts, 0),
-                "Gross Profit": max(gp, 0)},
-        "table": [
-            ("Sales $", f"${sales:,.0f}"),
-            ("COGS", f"${cogs:,.0f}"),
-            ("Discounts", f"-${discounts:,.0f}"),
-            ("Gross Profit", f"${gp:,.0f}"),
-            ("GP %", f"{(gp / sales * 100 if sales else 0):.1f}%"),
-        ],
+        "Sales $": sales,
+        "Sales $ with Tax": sales + tax,
+        "# Orders": orders,
+        "Quantity Sold": quantity,
+        "COGS": cogs,
+        "Discounts": -discounts,
+        "Tax $": tax,
+        "Gross Profit": gp,
+        "GP %": (gp / sales * 100 if sales else 0.0),
     }
 
-    # Section 2 ("Margins & Purchasing") used to show a simplified
-    # App-side Shipping Charged estimate here — removed 2026-07
-    # (James): QuickBooks' Section 8 (accounts 405/694) is the one
-    # canonical shipping-margin figure shown to management, rather
-    # than a second, structurally different number. Nothing else was
-    # ever shown in this section, so it's dropped entirely rather
-    # than left as an empty block — see _SECTION_ORDER below.
-
-    # ---- 3. Customer Metrics ----------------------------------------
-    sl_all = sale_lines.copy()
-    sl_all["InvoiceDate"] = pd.to_datetime(
-        sl_all.get("InvoiceDate"), errors="coerce")
-    if "Status" in sl_all.columns:
-        sl_all = sl_all[~sl_all["Status"].astype(str).str.upper()
-                        .isin(_BAD_STATUSES)]
-    sl_all = sl_all.dropna(subset=["InvoiceDate", "CustomerID"])
-    first_purchase = sl_all.groupby("CustomerID")["InvoiceDate"].min()
-    month_period = pd.Period(month, freq="M")
-    cust_in_month = set(
-        sl_month.dropna(subset=["CustomerID"])["CustomerID"].unique()
-        if "CustomerID" in sl_month.columns else [])
-    new_custs = {
-        c for c in cust_in_month
-        if c in first_purchase.index
-        and first_purchase[c].to_period("M") == month_period
+    # ---- 2. Margins & Purchasing -------------------------------------
+    avg_order_value = sales / orders if orders else 0.0
+    po_count = 0
+    po_spend = 0.0
+    if not purchase_lines.empty:
+        pl = purchase_lines.copy()
+        pl["OrderDate"] = pd.to_datetime(pl.get("OrderDate"), errors="coerce")
+        pl = pl.dropna(subset=["OrderDate"])
+        pl["MonthKey"] = pl["OrderDate"].dt.to_period("M")
+        pl_month = pl[pl["MonthKey"] == month_period]
+        if "PurchaseID" in pl_month.columns:
+            po_count = int(pl_month["PurchaseID"].nunique())
+        po_spend = float(_num(pl_month, "Total").sum())
+    out["2. Margins & Purchasing [App]"] = {
+        "Avg Order Value": avg_order_value,
+        "# of Purchases": po_count,
+        "Purchase $": po_spend,
     }
-    repeat_custs = cust_in_month - new_custs
+
+    # ---- 3. Customer Metrics ------------------------------------------
+    cust_in_month = (
+        set(sl_month.dropna(subset=["CustomerID"])["CustomerID"].unique())
+        if "CustomerID" in sl_month.columns else set())
+    new_custs = {c for c in cust_in_month
+                 if first_seen.get(c) == month_period}
+    running_count = int((first_seen <= month_period).sum())
+    lost_target = month_period - 3
+    lost_count = int((last_seen == lost_target).sum())
+    if cust_in_month:
+        repeat = sum(
+            1 for c in cust_in_month
+            if first_seen.get(c) is not None and first_seen.get(c) < month_period)
+        repeat_pct = repeat / len(cust_in_month) * 100
+    else:
+        repeat_pct = 0.0
     out["3. Customer Metrics [App]"] = {
-        "pie": {"New Customers": len(new_custs),
-                "Repeat Customers": len(repeat_custs)},
-        "table": [
-            ("New Customers", f"{len(new_custs):,}"),
-            ("Repeat Customers", f"{len(repeat_custs):,}"),
-            ("Total Customers This Month", f"{len(cust_in_month):,}"),
-        ],
+        "New Customers": len(new_custs),
+        "Running Customer Count": running_count,
+        "Lost Customers (3mo)": lost_count,
+        "Repeat Customer %": repeat_pct,
     }
 
-    # ---- 4. Inventory (simplified: current snapshot, not walk-back) -
-    stock_val_col = ("StockOnHand" if "StockOnHand" in stock.columns
-                      else None)
+    # ---- 5/9. Channel revenue + order counts ---------------------------
+    if "SourceChannel" in sl_month.columns or "SalesRepresentative" in sl_month.columns:
+        chan = prod.apply(
+            lambda r: _channel_of_row(
+                r.get("SourceChannel"), r.get("SalesRepresentative")),
+            axis=1)
+    else:
+        chan = pd.Series("B2B / Direct", index=prod.index)
+    _base_rev = prod.groupby(chan)["Total"].apply(
+        lambda s: float(_num(prod.loc[s.index], "Total").sum()))
+    _base_cnt = (prod.assign(_chan=chan).groupby("_chan")["SaleID"].nunique()
+                 if "SaleID" in prod.columns else pd.Series(dtype=int))
+
+    _cin7_shopify_rev = float(_base_rev.get("Shopify", 0.0))
+    _cin7_shopify_cnt = int(_base_cnt.get("Shopify", 0))
+    _online_rev = float(shop_rev_by_src.get((month_period, "web"), 0.0))
+    _draft_rev = float(shop_rev_by_src.get(
+        (month_period, "shopify_draft_order"), 0.0))
+    _other_rev = max(_cin7_shopify_rev - _online_rev - _draft_rev, 0.0)
+    _online_cnt = int(shop_cnt_by_src.get((month_period, "web"), 0))
+    _draft_cnt = int(shop_cnt_by_src.get(
+        (month_period, "shopify_draft_order"), 0))
+    _other_cnt = max(_cin7_shopify_cnt - _online_cnt - _draft_cnt, 0)
+
+    b2b_rev = float(_base_rev.get("B2B / Direct", 0.0))
+    amazon_rev = float(_base_rev.get("Amazon", 0.0))
+    ebay_rev = float(_base_rev.get("eBay", 0.0))
+    b2b_cnt = int(_base_cnt.get("B2B / Direct", 0))
+    amazon_cnt = int(_base_cnt.get("Amazon", 0))
+    ebay_cnt = int(_base_cnt.get("eBay", 0))
+
+    shopify_total_rev = _online_rev + _draft_rev + _other_rev
+    shopify_total_cnt = _online_cnt + _draft_cnt + _other_cnt
+    # "Total (CIN7)" ties to Section 1's Sales $ — built from the
+    # ORIGINAL unsplit CIN7 Shopify figure, not the split sub-rows,
+    # so it stays robust to the Online+Draft-exceeds-CIN7-total edge
+    # case (where Other/Unclassified floors at 0).
+    total_cin7_rev = _cin7_shopify_rev + b2b_rev + amazon_rev + ebay_rev
+    total_cin7_cnt = _cin7_shopify_cnt + b2b_cnt + amazon_cnt + ebay_cnt
+
+    qb = qb_by_month.get(month) or {}
+
+    def _qb(cat: str) -> float:
+        return float(qb.get(cat, 0.0) or 0.0)
+
+    out["5. Revenue by Channel [Cin7/DEAR]"] = {
+        "Shopify (Online Store)": _online_rev,
+        "Shopify (Draft Orders)": _draft_rev,
+        "Shopify (Other/Unclassified)": _other_rev,
+        "Shopify Total": shopify_total_rev,
+        "B2B / Direct": b2b_rev,
+        "Amazon": amazon_rev,
+        "eBay": ebay_rev,
+        "Total (CIN7)": total_cin7_rev,
+        "Net Sales (QB 400)": _qb("sales"),
+    }
+    out["9. Order Counts [Cin7/DEAR]"] = {
+        "Shopify (Online Store) Orders": _online_cnt,
+        "Shopify (Draft Orders) Count": _draft_cnt,
+        "Shopify (Other/Unclassified) Orders": _other_cnt,
+        "Shopify Total Orders": shopify_total_cnt,
+        "B2B / Direct Orders": b2b_cnt,
+        "Amazon Orders": amazon_cnt,
+        "eBay Orders": ebay_cnt,
+        "Total Orders": total_cin7_cnt,
+    }
+
+    # ---- 6/7/8. QuickBooks-sourced sections ----------------------------
+    out["6. Sales & Adjustments [QuickBooks]"] = {
+        "Gross Sales (est.)": _qb("sales") + discounts,
+        "Less: Discounts": discounts,
+        "Net Sales (QB 400)": _qb("sales"),
+        "Shipping Income (QB 405)": _qb("shipping_charged"),
+        "Total Revenue (QB Total Income)": _qb("total_income"),
+    }
+    total_income = _qb("total_income")
+    out["7. Cost & Profitability [QuickBooks]"] = {
+        "Product COGS (QB 500)": _qb("cogs"),
+        "Amazon Fees (QB 502)": _qb("cogs_amazon_fees"),
+        "Inventory Adj (QB 550)": _qb("inventory_adjustment"),
+        "Total COGS": _qb("total_cogs"),
+        "Gross Profit (QB)": _qb("qb_gross_profit"),
+        "GP %": (_qb("qb_gross_profit") / total_income * 100
+                 if total_income else 0.0),
+        "Total OpEx": _qb("qb_total_expenses"),
+        "Operating Profit": _qb("qb_net_operating_income"),
+        "Op Margin %": (_qb("qb_net_operating_income") / total_income * 100
+                        if total_income else 0.0),
+        "Net Income (QB)": _qb("qb_net_income"),
+    }
+    ship_charged = _qb("shipping_charged")
+    ship_cost = _qb("shipping_cost")
+    ship_margin = ship_charged - ship_cost
+    out["8. Shipping Detail [QuickBooks]"] = {
+        "Shipping Charged (QB 405)": ship_charged,
+        "Shipping-Out Cost (QB 694)": ship_cost,
+        "Shipping Margin": ship_margin,
+        "Margin %": (ship_margin / ship_charged * 100
+                     if ship_charged else 0.0),
+    }
+    return out
+
+
+def compute_monthly_tables(data: Dict[str, Any], months: List[str]
+                            ) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """{section: {metric label: {month: raw value}}} across every
+    month in `months`. Whole-history aggregates (customer first/last
+    seen, QBO P&L, Shopify discounts, Shopify order split) are built
+    ONCE here and threaded through per-month calls, rather than
+    re-derived 14 times."""
+    db = data["db"]
+    sale_lines = data["sale_lines"]
+
+    first_seen, last_seen = _customer_first_last_seen(sale_lines)
+    try:
+        qb_by_month = db.qbo_monthly_pl_summary_by_category(
+            db.get_qbo_account_mappings())
+    except Exception:  # noqa: BLE001
+        qb_by_month = {}
+    try:
+        shopify_disc_by_month = db.all_shopify_monthly_discounts() or {}
+    except Exception:  # noqa: BLE001
+        shopify_disc_by_month = {}
+    shop_rev_by_src, shop_cnt_by_src = _shopify_rev_and_cnt_by_source(
+        data.get("shopify_orders"))
+
+    raw: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for m in months:
+        month_vals = compute_month_values(
+            data, m, first_seen, last_seen, qb_by_month,
+            shopify_disc_by_month, shop_rev_by_src, shop_cnt_by_src)
+        for section, metrics in month_vals.items():
+            raw.setdefault(section, {})
+            for label, v in metrics.items():
+                raw[section].setdefault(label, {})[m] = v
+    return raw
+
+
+def compute_inventory_snapshot(data: Dict[str, Any]) -> Dict[str, float]:
+    """Section 4 — a CURRENT stock-value snapshot (not a per-month
+    trend, see the module docstring for why)."""
+    import pandas as pd
+    stock = data["stock"]
+    db = data["db"]
+    stock_val_col = "StockOnHand" if "StockOnHand" in stock.columns else None
     total_stock_value = (
         float(pd.to_numeric(stock[stock_val_col], errors="coerce")
               .fillna(0).sum()) if stock_val_col else 0.0)
@@ -492,371 +765,211 @@ def compute_sections(data: Dict[str, Any], month: str) -> Dict[str, Any]:
         slow_value = float(
             pd.to_numeric(stock.loc[mask, stock_val_col], errors="coerce")
             .fillna(0).sum())
-    out["4. Inventory [App]"] = {
-        "pie": {"Slow-Moving Stock Value": max(slow_value, 0),
-                "Other Stock Value": max(total_stock_value - slow_value, 0)},
-        "table": [
-            ("Total Stock Value (current)", f"${total_stock_value:,.0f}"),
-            ("Slow-Moving Stock Value (current)", f"${slow_value:,.0f}"),
-        ],
-        "note": ("Simplified: a CURRENT stock-value snapshot at report "
-                 "time, not the dashboard's modelled month-average "
-                 "walk-back figure."),
+    return {
+        "Total Stock Value (current)": total_stock_value,
+        "Slow-Moving Stock Value (current)": slow_value,
     }
-
-    # ---- 5. Revenue by Channel + 9. Order Counts ---------------------
-    if {"SourceChannel"}.issubset(sl_month.columns) or \
-            "SalesRepresentative" in sl_month.columns:
-        chan = prod.apply(
-            lambda r: _channel_of_row(
-                r.get("SourceChannel"), r.get("SalesRepresentative")),
-            axis=1)
-    else:
-        chan = pd.Series("B2B / Direct", index=prod.index)
-    _base_rev = prod.groupby(chan)["Total"].apply(
-        lambda s: float(_num(prod.loc[s.index], "Total").sum()))
-    _base_cnt = prod.assign(_chan=chan).groupby("_chan")["SaleID"].nunique() \
-        if "SaleID" in prod.columns else pd.Series(dtype=int)
-
-    # James: split "Shopify" into Online Store vs. Draft Orders, here
-    # too (Section 9), same as the dashboard — sourced directly from
-    # Shopify's own order data (TotalPrice/SourceName/CreatedAt), NOT
-    # joined through CIN7 (CIN7's OrderNumber for a Shopify sale is
-    # its own internal reference, unrelated to Shopify's order
-    # number — confirmed via a live CIN7 API pull). "Other/
-    # Unclassified" is CIN7's total Shopify figure for the month minus
-    # what's directly attributed to the other two, floored at 0 — so
-    # the three always tie back to CIN7's own total regardless of any
-    # POS/mobile-app orders or reconciliation gap between the systems.
-    _shop_rev_by_src, _shop_cnt_by_src = _shopify_rev_and_cnt_by_source(
-        data.get("shopify_orders"))
-    _month_period = pd.Period(month, freq="M")
-    _cin7_shopify_rev = float(_base_rev.get("Shopify", 0.0))
-    _cin7_shopify_cnt = int(_base_cnt.get("Shopify", 0))
-    _online_rev = float(_shop_rev_by_src.get((_month_period, "web"), 0.0))
-    _draft_rev = float(_shop_rev_by_src.get(
-        (_month_period, "shopify_draft_order"), 0.0))
-    _other_rev = max(_cin7_shopify_rev - _online_rev - _draft_rev, 0.0)
-    _online_cnt = int(_shop_cnt_by_src.get((_month_period, "web"), 0))
-    _draft_cnt = int(_shop_cnt_by_src.get(
-        (_month_period, "shopify_draft_order"), 0))
-    _other_cnt = max(_cin7_shopify_cnt - _online_cnt - _draft_cnt, 0)
-
-    chan_rev = {
-        "Shopify (Online Store)": _online_rev,
-        "Shopify (Draft Orders)": _draft_rev,
-        "Shopify (Other/Unclassified)": _other_rev,
-        "Amazon": float(_base_rev.get("Amazon", 0.0)),
-        "eBay": float(_base_rev.get("eBay", 0.0)),
-        "B2B / Direct": float(_base_rev.get("B2B / Direct", 0.0)),
-    }
-    chan_ord = {
-        "Shopify (Online Store)": _online_cnt,
-        "Shopify (Draft Orders)": _draft_cnt,
-        "Shopify (Other/Unclassified)": _other_cnt,
-        "Amazon": int(_base_cnt.get("Amazon", 0)),
-        "eBay": int(_base_cnt.get("eBay", 0)),
-        "B2B / Direct": int(_base_cnt.get("B2B / Direct", 0)),
-    }
-    # James: "Shopify Total" is a table-only rollup of the 3 Shopify
-    # rows (quick-glance sanity check) — kept out of the pie dict so
-    # it doesn't show up as a redundant slice alongside its own parts.
-    _shopify_total_rev = _online_rev + _draft_rev + _other_rev
-    _shopify_total_cnt = _online_cnt + _draft_cnt + _other_cnt
-    _rev_table = list(chan_rev.items())
-    _rev_table.insert(3, ("Shopify Total", _shopify_total_rev))
-    _ord_table = list(chan_ord.items())
-    _ord_table.insert(3, ("Shopify Total Orders", _shopify_total_cnt))
-    out["5. Revenue by Channel [Cin7/DEAR]"] = {
-        "pie": chan_rev,
-        "table": [(k, f"${v:,.0f}") for k, v in _rev_table],
-    }
-    out["9. Order Counts [Cin7/DEAR]"] = {
-        "pie": chan_ord,
-        "table": [(k, f"{v:,}") for k, v in _ord_table],
-    }
-
-    # ---- 6/7/8. QuickBooks-sourced sections --------------------------
-    mappings = db.get_qbo_account_mappings()
-    qb_by_month = db.qbo_monthly_pl_summary_by_category(mappings)
-    qb = (qb_by_month.get(month) or {})
-
-    total_income = qb.get("total_income", 0.0)
-    net_sales = qb.get("sales", 0.0)
-    shipping_income = qb.get("shipping_charged", 0.0)
-    sundry = max(total_income - net_sales - shipping_income, 0.0)
-    out["6. Sales & Adjustments [QuickBooks]"] = {
-        "pie": {"Net Sales": max(net_sales, 0), "Shipping Income":
-                max(shipping_income, 0), "Sundry Income": sundry},
-        "table": [
-            ("Net Sales (QB 400)", f"${net_sales:,.0f}"),
-            ("Shipping Income (QB 405)", f"${shipping_income:,.0f}"),
-            ("Total Revenue (QB Total Income)", f"${total_income:,.0f}"),
-        ],
-    }
-
-    prod_cogs = qb.get("cogs", 0.0)
-    amz_fees = qb.get("cogs_amazon_fees", 0.0)
-    inv_adj = qb.get("inventory_adjustment", 0.0)
-    total_cogs = qb.get("total_cogs", 0.0)
-    qb_gp = qb.get("qb_gross_profit", 0.0)
-    out["7. Cost & Profitability [QuickBooks]"] = {
-        "pie": {"Product COGS": max(prod_cogs, 0),
-                "Amazon Fees": max(amz_fees, 0),
-                "Inventory Adj": max(inv_adj, 0)},
-        "table": [
-            ("Product COGS (QB 500)", f"${prod_cogs:,.0f}"),
-            ("Amazon Fees (QB 502)", f"${amz_fees:,.0f}"),
-            ("Inventory Adj (QB 550)", f"${inv_adj:,.0f}"),
-            ("Total COGS", f"${total_cogs:,.0f}"),
-            ("Gross Profit (QB)", f"${qb_gp:,.0f}"),
-        ],
-    }
-
-    ship_charged_qb = qb.get("shipping_charged", 0.0)
-    ship_cost_qb = qb.get("shipping_cost", 0.0)
-    ship_margin_qb = ship_charged_qb - ship_cost_qb
-    out["8. Shipping Detail [QuickBooks]"] = {
-        # A pie only makes sense when cost fits inside what was charged
-        # (margin >= 0) -- clamping a negative margin to 0 would show
-        # a misleading "100% cost" slice. This is common here: our own
-        # audit found QB shipping margin negative in most months.
-        "pie": ({"Shipping-Out Cost": ship_cost_qb,
-                 "Shipping Margin": ship_margin_qb}
-                if ship_margin_qb >= 0 else {}),
-        "skip_pie": ship_margin_qb < 0,
-        "table": [
-            ("Shipping Charged (QB 405)", f"${ship_charged_qb:,.0f}"),
-            ("Shipping-Out Cost (QB 694)", f"${ship_cost_qb:,.0f}"),
-            ("Shipping Margin", f"${ship_margin_qb:,.0f}"),
-        ],
-        "note": (
-            "Shipping cost exceeded what was charged this month, so a "
-            "cost/margin split can't be shown as a pie — see the "
-            "figures above."
-            if ship_margin_qb < 0 else None),
-    }
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Chart generation
-# ---------------------------------------------------------------------------
-_PIE_COLORS = ["#2f6fed", "#e8833a", "#3aa76d", "#c94f4f", "#8e6fce"]
-
-
-def _render_pie(pie: Dict[str, float], title: str) -> Optional[bytes]:
-    """Render one pie chart to PNG bytes. Returns None if there's
-    nothing meaningful to plot (all-zero / empty).
-
-    Uses a legend below the pie rather than labels on the wedges
-    themselves: several sections here regularly have one or two very
-    small slices next to much larger ones (e.g. "Amazon Fees" next to
-    "Product COGS"), and on-wedge labels for adjacent thin slices
-    overlap into an illegible smear regardless of font size. A legend
-    is robust to any slice-size distribution."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    labels = [k for k, v in pie.items() if v and v > 0]
-    values = [v for v in pie.values() if v and v > 0]
-    if not values or sum(values) <= 0:
-        return None
-
-    fig, ax = plt.subplots(figsize=(3.0, 3.4), dpi=150)
-    total = sum(values)
-    wedges, _ = ax.pie(
-        values, startangle=90, colors=_PIE_COLORS[:len(values)])
-    legend_labels = [f"{lbl} ({v / total * 100:.0f}%)"
-                      for lbl, v in zip(labels, values)]
-    ax.legend(
-        wedges, legend_labels, loc="upper center",
-        bbox_to_anchor=(0.5, -0.02), ncol=1, frameon=False,
-        fontsize=7, handlelength=1.0, handletextpad=0.5,
-        labelspacing=0.3,
-    )
-    ax.set_title(title, fontsize=9)
-    ax.axis("equal")
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
 # PDF assembly
 # ---------------------------------------------------------------------------
-_SECTION_ORDER = [
-    "1. Sales Overview [App]",
-    "3. Customer Metrics [App]",
-    "4. Inventory [App]",
-    "5. Revenue by Channel [Cin7/DEAR]",
-    "6. Sales & Adjustments [QuickBooks]",
-    "7. Cost & Profitability [QuickBooks]",
-    "8. Shipping Detail [QuickBooks]",
-    "9. Order Counts [Cin7/DEAR]",
-]
-
 # Same muted, printer-friendly palette as po_pdf.py
 _C_HEAD = "#1f2933"
 _C_SUB = "#52606d"
 _C_BORDER = "#c3ccd8"
 _C_ZEBRA = "#f3f5f8"
+_C_SUMMARY_BG = "#eef1f5"
 
 
-def build_pdf(sections: Dict[str, Any], month: str,
-               partial_sections: Optional[Dict[str, Any]] = None,
-               partial_month: Optional[str] = None,
-               commentary: Optional[str] = None,
-               company: str = "Wired4Signs USA") -> bytes:
-    """`partial_sections`/`partial_month` are the CURRENT, still-in-
-    progress month — James wants this included (not just the closed
-    month), clearly marked as partial so nobody mistakes it for final
-    numbers. Rendered as an amber-highlighted callout under each
-    section's closed-month block, not a second full pie (keeps the
-    page count sane while still surfacing the same figures)."""
+def _fmt_value(v: Any, fmt: str) -> str:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if fmt == "money":
+        return f"${v:,.0f}"
+    if fmt == "int":
+        return f"{v:,.0f}"
+    if fmt == "pct":
+        return f"{v:.1f}%"
+    return f"{v}"
+
+
+def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
+              months: List[str],
+              inventory_snapshot: Dict[str, float],
+              month: str,
+              current_month: str,
+              commentary: Optional[str] = None,
+              company: str = "Wired4Signs USA") -> bytes:
+    """Landscape, one wide table per section (Metric rows x month
+    columns + YTD + Avg), matching the dashboard's own Monthly
+    Metrics tables row-for-row. `months` is the full column range
+    shown (oldest to newest); the last entry is `current_month`, the
+    still-in-progress month — included as a normal column, same as
+    the dashboard, with a note at the top rather than a separate
+    callout box."""
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.pagesizes import letter, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image,
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        KeepTogether,
     )
 
     c_head = colors.HexColor(_C_HEAD)
     c_sub = colors.HexColor(_C_SUB)
     c_border = colors.HexColor(_C_BORDER)
     c_zebra = colors.HexColor(_C_ZEBRA)
-    c_partial = colors.HexColor("#b0570f")   # amber/warning — matches
-                                              # po_pdf.py's C_WARN
+    c_summary_bg = colors.HexColor(_C_SUMMARY_BG)
 
+    page_size = landscape(letter)
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=letter,
-        leftMargin=0.55 * inch, rightMargin=0.55 * inch,
-        topMargin=0.55 * inch, bottomMargin=0.5 * inch,
+        buf, pagesize=page_size,
+        leftMargin=0.4 * inch, rightMargin=0.4 * inch,
+        topMargin=0.4 * inch, bottomMargin=0.4 * inch,
         title=f"Monthly Metrics — {month}",
         author=company,
     )
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
-        "TitleW4S", parent=styles["Title"], fontSize=18, leading=22,
+        "TitleW4S", parent=styles["Title"], fontSize=16, leading=19,
         textColor=c_head, spaceAfter=2)
     sub_style = ParagraphStyle(
-        "SubW4S", parent=styles["Normal"], fontSize=9.5, leading=12,
+        "SubW4S", parent=styles["Normal"], fontSize=8.5, leading=11,
         textColor=c_sub)
     section_style = ParagraphStyle(
-        "SectionW4S", parent=styles["Heading3"], fontSize=10.5,
-        leading=13, textColor=c_head, spaceBefore=2, spaceAfter=3)
+        "SectionW4S", parent=styles["Heading3"], fontSize=10,
+        leading=12, textColor=c_head, spaceBefore=6, spaceAfter=3)
+    commentary_style = ParagraphStyle(
+        "CommentaryW4S", parent=styles["Normal"], fontSize=8.5,
+        leading=11.5, textColor=c_head)
     note_style = ParagraphStyle(
         "NoteW4S", parent=styles["Normal"], fontSize=7, leading=9,
         textColor=c_sub)
-    partial_label_style = ParagraphStyle(
-        "PartialLabelW4S", parent=styles["Normal"], fontSize=7.5,
-        leading=10, textColor=c_partial, spaceBefore=4)
-    commentary_style = ParagraphStyle(
-        "CommentaryW4S", parent=styles["Normal"], fontSize=9.5,
-        leading=13, textColor=c_head)
 
     story: List = []
+    story.append(Paragraph(f"<b>{company}</b> — Monthly Metrics", title_style))
     story.append(Paragraph(
-        f"<b>{company}</b> — Monthly Metrics Executive Summary",
-        title_style))
-    story.append(Paragraph(
-        f"<b>Reporting month:</b> {month} &nbsp;·&nbsp; "
+        f"<b>Months shown:</b> {months[0]} &ndash; {months[-1]} "
+        f"(rightmost column, {current_month}, is still in progress — "
+        f"month-to-date, not final) &nbsp;&middot;&nbsp; "
         f"<b>Generated:</b> {datetime.now():%Y-%m-%d %H:%M}",
         sub_style))
-    story.append(Spacer(1, 8))
+    story.append(Spacer(1, 6))
     if commentary:
         story.append(Paragraph(commentary, commentary_style))
-        story.append(Spacer(1, 10))
-    else:
-        story.append(Spacer(1, 2))
+        story.append(Spacer(1, 8))
 
-    def _block(section: str, payload: Dict[str, Any],
-               partial_payload: Optional[Dict[str, Any]] = None):
-        cell_story: List = []
-        cell_story.append(Paragraph(section, section_style))
-        png = None
-        if not payload.get("skip_pie"):
-            png = _render_pie(payload.get("pie") or {}, "")
-        if png:
-            # Matches _render_pie's figsize aspect ratio (3.0 x 3.4,
-            # pie + legend below it) so the image isn't stretched.
-            img = Image(io.BytesIO(png), width=1.6 * inch,
-                        height=1.6 * inch * (3.4 / 3.0))
-            cell_story.append(img)
-        rows = payload.get("table") or []
-        if rows:
-            t = Table(rows, colWidths=[1.5 * inch, 0.65 * inch])
-            t.setStyle(TableStyle([
-                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-                ("TEXTCOLOR", (0, 0), (-1, -1), c_head),
-                ("LINEBELOW", (0, 0), (-1, -2), 0.25, c_zebra),
-                ("TOPPADDING", (0, 0), (-1, -1), 1.5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
-            ]))
-            cell_story.append(t)
-        if payload.get("note"):
-            cell_story.append(Spacer(1, 2))
-            cell_story.append(Paragraph(f"<i>{payload['note']}</i>",
-                                          note_style))
-        if partial_payload and partial_payload.get("table"):
-            cell_story.append(Paragraph(
-                f"⚠ THIS MONTH SO FAR — PARTIAL, THRU "
-                f"{date.today():%b %d}", partial_label_style))
-            pt = Table(partial_payload["table"],
-                       colWidths=[1.5 * inch, 0.65 * inch])
-            pt.setStyle(TableStyle([
-                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-                ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-                ("TEXTCOLOR", (0, 0), (-1, -1), c_partial),
-                ("BOX", (0, 0), (-1, -1), 0.5, c_partial),
-                ("TOPPADDING", (0, 0), (-1, -1), 1.5),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
-            ]))
-            cell_story.append(pt)
-        return cell_story
+    ytd_year = int(current_month.split("-")[0])
+    n_data_cols = len(months) + 2  # + YTD + Avg
+    page_w, _page_h = page_size
+    usable_w = page_w - doc.leftMargin - doc.rightMargin
+    metric_col_w = 1.3 * inch
+    data_col_w = (usable_w - metric_col_w) / n_data_cols
 
-    # 3-column grid of section blocks. Each row is its own small Table
-    # flowable (a handful of small blocks, well under a page), so rows
-    # naturally don't split — no KeepTogether needed. (KeepTogether
-    # nested inside a Table cell is a known-problematic reportlab
-    # combination: it can report an unbounded/garbage height and blow
-    # up doc.build with a LayoutError.)
-    ordered = [(s, sections[s]) for s in _SECTION_ORDER if s in sections]
-    ordered += [(s, v) for s, v in sections.items()
-                if s not in _SECTION_ORDER]
-    col_w = 2.35 * inch
-    for i in range(0, len(ordered), 3):
-        row_sections = ordered[i:i + 3]
-        row_cells = [_block(s, p, (partial_sections or {}).get(s))
-                     for s, p in row_sections]
-        while len(row_cells) < 3:
-            row_cells.append("")
-        grid = Table([row_cells], colWidths=[col_w] * 3)
-        grid.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+    def _section_table(section: str) -> Table:
+        rows_schema = _SECTION_ROWS[section]
+        section_data = tables.get(section, {})
+        header = ["Metric"] + months + ["YTD", "Avg"]
+        data_rows: List[list] = [header]
+        for label, fmt in rows_schema:
+            per_month = section_data.get(label, {})
+            vals_in_range = [per_month.get(m, 0.0) for m in months]
+            ytd_vals = [per_month.get(m, 0.0) for m in months
+                        if int(m.split("-")[0]) == ytd_year]
+            if fmt == "pct":
+                ytd = sum(ytd_vals) / len(ytd_vals) if ytd_vals else 0.0
+            else:
+                ytd = sum(ytd_vals)
+            avg = (sum(vals_in_range) / len(vals_in_range)
+                   if vals_in_range else 0.0)
+            row = ([label] + [_fmt_value(v, fmt) for v in vals_in_range]
+                   + [_fmt_value(ytd, fmt), _fmt_value(avg, fmt)])
+            data_rows.append(row)
+
+        col_widths = [metric_col_w] + [data_col_w] * n_data_cols
+        t = Table(data_rows, colWidths=col_widths, repeatRows=1)
+        style_cmds = [
+            ("FONTSIZE", (0, 0), (-1, -1), 6.3),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 0), (-1, 0), c_head),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("TEXTCOLOR", (0, 1), (-1, -1), c_head),
+            ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("ALIGN", (0, 0), (0, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("BOX", (0, 0), (-1, -1), 0.4, c_border),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, c_border),
+            # YTD/Avg summary columns get their own shaded background.
+            ("BACKGROUND", (-2, 1), (-1, -1), c_summary_bg),
+        ]
+        for r in range(1, len(data_rows), 2):
+            style_cmds.append(
+                ("BACKGROUND", (0, r), (-3, r), c_zebra))
+        t.setStyle(TableStyle(style_cmds))
+        return t
+
+    for section in _SECTION_ORDER:
+        if section not in _SECTION_ROWS:
+            continue
+        story.append(KeepTogether([
+            Paragraph(section, section_style),
+            _section_table(section),
         ]))
-        story.append(grid)
-        story.append(Spacer(1, 6))
+        story.append(Spacer(1, 8))
+
+    # Section 4 — current snapshot only (see module docstring for why
+    # it isn't a per-month trend row like the others).
+    inv_rows = [
+        ["Metric", "Value"],
+        ["Total Stock Value (current)",
+         _fmt_value(inventory_snapshot.get(
+             "Total Stock Value (current)", 0.0), "money")],
+        ["Slow-Moving Stock Value (current)",
+         _fmt_value(inventory_snapshot.get(
+             "Slow-Moving Stock Value (current)", 0.0), "money")],
+    ]
+    inv_table = Table(inv_rows, colWidths=[2.4 * inch, 1.3 * inch])
+    inv_table.setStyle(TableStyle([
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("BACKGROUND", (0, 0), (-1, 0), c_head),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("BOX", (0, 0), (-1, -1), 0.4, c_border),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, c_border),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+    ]))
+    story.append(KeepTogether([
+        Paragraph("4. Inventory [App]", section_style),
+        inv_table,
+        Spacer(1, 2),
+        Paragraph(
+            "<i>Simplified: a CURRENT stock-value snapshot at report "
+            "time (not a per-month figure) — the dashboard's modelled "
+            "month-average walk-back isn't reproduced here.</i>",
+            note_style),
+    ]))
 
     def _footer(canvas, doc_):
         canvas.saveState()
-        canvas.setFont("Helvetica", 7.5)
+        canvas.setFont("Helvetica", 7)
         canvas.setFillColor(c_sub)
-        page_w, _ = letter
+        pw, _ph = page_size
         canvas.drawString(
-            0.55 * inch, 0.3 * inch,
-            f"{company} · Monthly Metrics — {month} · "
+            0.4 * inch, 0.22 * inch,
+            f"{company} · Monthly Metrics · "
             f"Generated {datetime.now():%Y-%m-%d %H:%M}")
-        canvas.drawRightString(page_w - 0.55 * inch, 0.3 * inch,
+        canvas.drawRightString(pw - 0.4 * inch, 0.22 * inch,
                                 f"Page {doc_.page}")
         canvas.restoreState()
 
@@ -917,7 +1030,7 @@ def post_pdf_to_slack(pdf_bytes: bytes, month: str,
     # Step 3: complete the upload, sharing it to the target channel
     # with a short message + the YoY commentary underneath.
     comment = (
-        f"📊 Monthly Metrics executive summary for *{month}* is ready "
+        f"📊 Monthly Metrics report through *{month}* is ready "
         f"— see the attached PDF."
     )
     if commentary_slack:
@@ -938,8 +1051,10 @@ def post_pdf_to_slack(pdf_bytes: bytes, month: str,
 # ---------------------------------------------------------------------------
 def main() -> int:
     month = _target_month()
-    partial_month = _current_partial_month()
-    _emit(f"building report for {month} (+ partial {partial_month})")
+    current_month = _current_partial_month()
+    months = _report_months(current_month, lookback=14)
+    _emit(f"building report for {months[0]}..{months[-1]} "
+          f"(rightmost column partial)")
 
     try:
         cin7_data = _load_cin7_data()
@@ -948,37 +1063,26 @@ def main() -> int:
         return 2
 
     try:
-        sections = compute_sections(cin7_data, month)
+        tables = compute_monthly_tables(cin7_data, months)
+        inventory_snapshot = compute_inventory_snapshot(cin7_data)
     except Exception as exc:  # noqa: BLE001
         _emit(f"section computation failed: {exc!r}", level="error")
         return 3
 
-    # Partial (current, in-progress) month — James wants this shown
-    # too, clearly marked. Best-effort: if this fails for any reason,
-    # log it and still send the closed-month report rather than
-    # blocking the whole run on a "nice to have" addition.
-    try:
-        partial_sections = compute_sections(cin7_data, partial_month)
-    except Exception as exc:  # noqa: BLE001
-        _emit(f"partial-month computation failed (continuing without "
-              f"it): {exc!r}", level="warn")
-        partial_sections = {}
-
     # Year-over-year commentary (closed month vs same month last year,
-    # + month-to-date vs the same number of days last year). Also
-    # best-effort — a commentary failure shouldn't block the PDF/Slack
+    # + month-to-date vs the same number of days last year). Best-
+    # effort — a commentary failure shouldn't block the PDF/Slack
     # post going out.
     try:
-        commentary = build_commentary(cin7_data, month, partial_month)
+        commentary = build_commentary(cin7_data, month, current_month)
     except Exception as exc:  # noqa: BLE001
         _emit(f"commentary build failed (continuing without it): "
               f"{exc!r}", level="warn")
         commentary = {"html": None, "slack": None}
 
     try:
-        pdf_bytes = build_pdf(sections, month,
-                               partial_sections=partial_sections,
-                               partial_month=partial_month,
+        pdf_bytes = build_pdf(tables, months, inventory_snapshot, month,
+                               current_month,
                                commentary=commentary.get("html"))
     except Exception as exc:  # noqa: BLE001
         _emit(f"PDF build failed: {exc!r}", level="error")
