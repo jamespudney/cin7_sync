@@ -111,12 +111,9 @@ def _load_cin7_data() -> Dict[str, Any]:
 
     products_csv = _latest("products_*.csv")
     stock_csv = _latest("stock_on_hand_*.csv")
-    sale_lines_csv = _latest("sale_lines_last_*d_*.csv")
-    purchase_lines_csv = _latest("purchase_lines_last_*.csv")
     missing = [
         name for name, p in (
-            ("products", products_csv), ("stock_on_hand", stock_csv),
-            ("sale_lines", sale_lines_csv))
+            ("products", products_csv), ("stock_on_hand", stock_csv))
         if p is None
     ]
     if missing:
@@ -125,11 +122,13 @@ def _load_cin7_data() -> Dict[str, Any]:
 
     products = pd.read_csv(products_csv, low_memory=False)
     stock = pd.read_csv(stock_csv, low_memory=False)
-    sale_lines = filter_excluded_sales_customers(
-        pd.read_csv(sale_lines_csv, low_memory=False))
-    purchase_lines = (
-        pd.read_csv(purchase_lines_csv, low_memory=False)
-        if purchase_lines_csv is not None else pd.DataFrame())
+    sale_lines = _load_longest_sale_lines(
+        OUTPUT_DIR, pd, filter_excluded_sales_customers)
+    if sale_lines.empty:
+        raise FileNotFoundError(
+            f"No sale_lines_last_*d_*.csv found in {OUTPUT_DIR}. "
+            f"Has the sync run?")
+    purchase_lines = _load_longest_purchase_lines(OUTPUT_DIR, pd)
     shopify_orders = _load_shopify_orders(OUTPUT_DIR, pd)
 
     return {
@@ -137,6 +136,110 @@ def _load_cin7_data() -> Dict[str, Any]:
         "sale_lines": sale_lines, "purchase_lines": purchase_lines,
         "shopify_orders": shopify_orders, "db": db,
     }
+
+
+def _load_longest_sale_lines(output_dir, pd, filter_excluded_sales_customers):
+    """Union of the largest sale_lines_last_Nd_*.csv backfill window
+    plus any more-recently-synced smaller windows — same pattern as
+    app.py's _load_longest_sale_lines_cached (dedup logic copied
+    verbatim). Picking just the single most-recently-MODIFIED file
+    (the naive approach this used to use) almost always grabs a small
+    rolling sync (last_1d/_7d) instead of the multi-year backfill file,
+    silently truncating every month older than that window to zero —
+    confirmed live 2026-07-23: the commentary showed "$0 last year"
+    for a month (2025-06) the dashboard shows $385,681 of real sales
+    for, because this loader was reading only the last few days."""
+    import re as _re
+
+    files = []
+    for p in output_dir.glob("sale_lines_last_*d_*.csv"):
+        m = _re.match(r"sale_lines_last_(\d+)d_", p.name)
+        if m:
+            files.append((int(m.group(1)), p.stat().st_mtime, p))
+    if not files:
+        return pd.DataFrame()
+
+    files.sort(key=lambda x: (-x[0], -x[1]))
+    base_file = files[0][2]
+    base_mtime = files[0][1]
+    try:
+        base = pd.read_csv(base_file, low_memory=False)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+    for _days, mtime, p in files[1:]:
+        if mtime <= base_mtime:
+            continue
+        try:
+            more = pd.read_csv(p, low_memory=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if more.empty:
+            continue
+        base = pd.concat([base, more], ignore_index=True)
+
+    dedupe_cols = [c for c in
+                    ["SaleID", "SKU", "Quantity", "InvoiceNumber",
+                     "OrderNumber"]
+                    if c in base.columns]
+    if dedupe_cols:
+        base = base.drop_duplicates(subset=dedupe_cols, keep="last")
+
+    second_key = [c for c in
+                   ["SaleID", "SKU", "Quantity", "OrderNumber"]
+                   if c in base.columns]
+    if second_key and "InvoiceDate" in base.columns:
+        base = base.sort_values(
+            "InvoiceDate", na_position="first", kind="stable")
+        base = base.drop_duplicates(subset=second_key, keep="last")
+    base = filter_excluded_sales_customers(base)
+    return base.reset_index(drop=True)
+
+
+def _load_longest_purchase_lines(output_dir, pd):
+    """Same union-of-windows pattern as _load_longest_sale_lines, for
+    purchase_lines_last_Nd_*.csv (used by Section 2's Purchase $ /
+    # of Purchases) — mirrors app.py's
+    _load_longest_purchase_lines_cached."""
+    import re as _re
+
+    files = []
+    for p in output_dir.glob("purchase_lines_last_*d_*.csv"):
+        m = _re.match(r"purchase_lines_last_(\d+)d_", p.name)
+        if m:
+            files.append((int(m.group(1)), p.stat().st_mtime, p))
+    if not files:
+        return pd.DataFrame()
+
+    files.sort(key=lambda x: (-x[0], -x[1]))
+    base_file = files[0][2]
+    base_mtime = files[0][1]
+    try:
+        base = pd.read_csv(base_file, low_memory=False)
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+    for _days, mtime, p in files[1:]:
+        if mtime <= base_mtime:
+            continue
+        try:
+            more = pd.read_csv(p, low_memory=False)
+        except Exception:  # noqa: BLE001
+            continue
+        if more.empty:
+            continue
+        if "PurchaseID" in base.columns and "PurchaseID" in more.columns:
+            newer_pids = set(more["PurchaseID"].dropna().unique())
+            base = base[~base["PurchaseID"].isin(newer_pids)]
+        base = pd.concat([base, more], ignore_index=True)
+
+    dedupe_cols = [c for c in
+                    ["PurchaseID", "SKU", "Quantity", "OrderDate",
+                     "OrderNumber", "Price"]
+                    if c in base.columns]
+    if dedupe_cols:
+        base = base.drop_duplicates(subset=dedupe_cols, keep="last")
+    return base.reset_index(drop=True)
 
 
 def _load_shopify_orders(output_dir, pd):
