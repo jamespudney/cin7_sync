@@ -221,6 +221,91 @@ def compute_engine_signals(products: pd.DataFrame,
                 eff_90d_map[comp] = eff_90d_map.get(comp, 0) + u90 * qty_per
                 non_master_skus.add(asm)
 
+    # 4b-2. Exact purchase-pack rollup (base SKU -> final "-X<number>"
+    # pack SKU, e.g. SNFX-M-WH-SET -> SNFX-M-WH-SET-X250). Mirrors
+    # app.py's pack_rollup_rules exactly: only an unambiguous single
+    # pack-SKU candidate per base, and only when the base SKU isn't
+    # itself directly CIN7-supplier-assigned (which would mean it's
+    # ordered independently, not through a pack).
+    #
+    # James 2026-07-23: Andrew (buyer) flagged SNFX-M-WH-SET-X250's
+    # "effective 12mo demand" as wrong in the PO commentary bot (it
+    # showed ~49.6; real annual demand is ~270 units, ~22/month).
+    # Root cause: this rollup existed in app.py's dashboard engine
+    # (v2.67.xxx "Exact purchase-pack demand rollup") but was never
+    # ported here, so the bot was reading raw sale_lines quantity
+    # against the literal pack SKU code (a purchasing-only SKU,
+    # rarely if ever directly sold to a customer) instead of (base
+    # SKU's real 12mo sales) ÷ pack size.
+    #
+    # Additive with the pack SKU's own raw units, same as app.py's
+    # `tube_rollup_in` treatment of effective_units_12mo — if that
+    # raw figure is itself noisy for a given pack SKU, that's a
+    # pre-existing data-quality question shared with the dashboard,
+    # not something this fix changes. Does NOT zero the base SKU's
+    # own effective_units_12mo/90d (unlike the BOM/strip rollups
+    # above) — app.py's own _effective_units() formula leaves the
+    # base SKU's figure untouched by this rollup too; only a
+    # separate Ordering-grid "is independently orderable" flag
+    # (out of scope here — this module has no Ordering grid) is
+    # affected there.
+    try:
+        from engine.sku_rules import parse_pack_purchase_sku
+    except ImportError:  # pragma: no cover — defensive only
+        parse_pack_purchase_sku = None
+
+    if parse_pack_purchase_sku is not None and "SKU" in products.columns:
+        product_skus = set(products["SKU"].astype(str))
+        has_cin7_supplier: set[str] = set()
+        if "Suppliers" in products.columns:
+            for _, p in products.iterrows():
+                sups_raw = p.get("Suppliers")
+                if not sups_raw or sups_raw in ("[]", "None", None):
+                    continue
+                sups = sups_raw
+                if isinstance(sups, str):
+                    try:
+                        import json as _json
+                        sups = _json.loads(sups)
+                    except (ValueError, TypeError):
+                        continue
+                if not isinstance(sups, list) or not sups:
+                    continue
+                if any(isinstance(s, dict) and s.get("SupplierName")
+                        for s in sups):
+                    has_cin7_supplier.add(str(p.get("SKU") or ""))
+
+        pack_candidates_by_base: dict[str, list[tuple[str, int]]] = {}
+        for _sku in product_skus:
+            _pack = parse_pack_purchase_sku(_sku)
+            if not _pack:
+                continue
+            _base_sku, _pack_size = _pack
+            if _base_sku not in product_skus:
+                continue
+            pack_candidates_by_base.setdefault(_base_sku, []).append(
+                (_sku, _pack_size))
+
+        for _base_sku, _candidates in pack_candidates_by_base.items():
+            if _base_sku in has_cin7_supplier:
+                continue
+            _supplier_candidates = [
+                c for c in _candidates if c[0] in has_cin7_supplier]
+            _usable = (_supplier_candidates if _supplier_candidates
+                        else _candidates)
+            if len(_usable) != 1:
+                continue
+            _pack_sku, _pack_size = _usable[0]
+            if _pack_size <= 0:
+                continue
+            _own_u12 = float(eff_12mo_map.get(_base_sku, 0))
+            _own_u90 = float(eff_90d_map.get(_base_sku, 0))
+            if _own_u12 or _own_u90:
+                eff_12mo_map[_pack_sku] = (
+                    eff_12mo_map.get(_pack_sku, 0) + _own_u12 / _pack_size)
+                eff_90d_map[_pack_sku] = (
+                    eff_90d_map.get(_pack_sku, 0) + _own_u90 / _pack_size)
+
     # 4c. Naming fallback for BOM-sparse LED strip families. Pick the
     # largest active BULK buying roll as the master and convert child/cut
     # movement into master-roll equivalents. Short finished lengths must
