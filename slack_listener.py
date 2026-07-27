@@ -1363,17 +1363,44 @@ _LISTENER_DATA_CACHE: Dict[str, Any] = {
 DATA_CACHE_TTL_SECONDS = 600  # 10 min — listener can run staler than UI
 
 
-def _widest_window_file(paths: List[str],
-                        prefix: str) -> Optional[str]:
-    """Pick the widest rolling-window CSV, newest within that window.
+def _widest_window_file(paths: List[str], prefix: str,
+                        max_staleness_days: float = 7.0) -> Optional[str]:
+    """Pick the widest rolling-window CSV among those still reasonably
+    fresh — not simply the single widest file regardless of age.
 
     Plain lexicographic sorting puts `*_3d_*` after `*_30d_*`, which can
     make the worker load a 3-day sale window while claiming it has 30 days
-    of context.
+    of context — that's the bug this function was originally built to
+    fix. But picking by width alone introduced a different one: an
+    occasional big backfill (e.g. a manually-triggered 1825-day
+    snapshot) can sit on disk for weeks/months without being refreshed,
+    while narrower windows (30d/1d) keep re-syncing daily. Once that
+    happens, "widest" silently means "most stale" — the worker ends up
+    missing the most recent months of activity entirely, favoring an
+    old wide file over a fresh narrower one that actually covers more
+    of the *relevant* (recent) history.
+
+    James, 2026-07-24: confirmed live — sale_lines_last_1825d (5yr)
+    was 3 months stale while sale_lines_last_730d (2yr) was 6 days old;
+    the old "widest wins" logic always picked the stale 5yr file,
+    undercounting a buyer's demand figure for a SKU whose sales in the
+    missing 3 months weren't small. Fixed by first narrowing to files
+    within `max_staleness_days` of the freshest file's mtime (any
+    window size), THEN picking the widest among those — so an old wide
+    file never beats a recent narrower one. Falls back to the previous
+    widest-wins behavior only if every candidate is equally stale
+    (better than returning nothing if the sync pipeline has stalled
+    entirely).
+
+    Deliberately still a SINGLE-FILE pick, not a union of overlapping
+    windows (unlike app.py's dashboard loaders) — the worker runs on a
+    memory-constrained plan (see the shipments/shopify_orders windowed-
+    vs-full trade-off a few lines below), so loading multiple large
+    CSVs into memory at once risks an OOM kill. This keeps the same
+    "one CSV in, one CSV out" memory footprint as before, just picking
+    a better one.
     """
-    best_path = None
-    best_days = -1
-    best_mtime = -1.0
+    parsed: list[tuple[int, float, str]] = []
     pat = re.compile(rf"{re.escape(prefix)}_(\d+)d_", re.IGNORECASE)
     for p in paths:
         m = pat.search(Path(p).name)
@@ -1387,11 +1414,17 @@ def _widest_window_file(paths: List[str],
             mtime = os.path.getmtime(p)
         except OSError:
             mtime = 0.0
-        if days > best_days or (days == best_days and mtime > best_mtime):
-            best_path = p
-            best_days = days
-            best_mtime = mtime
-    return best_path
+        parsed.append((days, mtime, p))
+    if not parsed:
+        return None
+
+    freshest_mtime = max(mtime for _days, mtime, _p in parsed)
+    staleness_cutoff = freshest_mtime - (max_staleness_days * 86400)
+    fresh_enough = [t for t in parsed if t[1] >= staleness_cutoff]
+    candidates = fresh_enough if fresh_enough else parsed
+    # Widest first; freshest as the tiebreaker within the same window.
+    candidates.sort(key=lambda t: (-t[0], -t[1]))
+    return candidates[0][2]
 
 
 def _get_data_for_listener() -> Tuple[Any, Any]:
