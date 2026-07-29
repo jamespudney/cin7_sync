@@ -3100,6 +3100,66 @@ def _engine_refresh_running(max_age_minutes: int = 45) -> bool:
         return False
 
 
+def _acquire_engine_refresh_lock(payload: dict,
+                                  max_age_minutes: int = 45) -> bool:
+    """Atomically acquire the engine-refresh lock. Returns True if THIS
+    call acquired it (safe to spawn warm_engine.py), False if another
+    session/thread already holds a live one.
+
+    James, 2026-07-29: root-caused the recurring "wired4signs-app
+    exceeded its memory limit" crashes to this exact spot. The
+    previous check-then-write pattern (`_engine_refresh_running()`
+    read the lock, THEN a separate `.write_text()` call created it)
+    left a real gap between the check and the write. Streamlit runs
+    every browser session as its own thread of the SAME process, and
+    both the file-existence check and the write are OS calls that can
+    yield the GIL — so when the sale_lines fingerprint flips (every
+    ~15 min from near-sync) and several staff have tabs open at once,
+    more than one session's thread could see "no lock yet" before
+    either had written one, each spawning a full second warm_engine.py
+    Python process that reloads every large CSV and recomputes the
+    whole ABC engine again. Those subprocesses aren't sandboxed from
+    the main process's memory budget — they share the same Render
+    container's 4GB limit — so N concurrent spawns is N times the
+    heaviest computation in the app stacked on top of the live
+    dashboard, clustering around whenever multiple staff are active
+    at once (matching the "roughly twice a day" pattern much better
+    than any fixed schedule would).
+
+    `os.open(..., O_CREAT | O_EXCL)` makes "does the lock exist" and
+    "create it" a single atomic syscall — the OS guarantees only one
+    caller can ever win when several race the exact same instant,
+    closing the gap entirely. Preserves the existing staleness
+    handling: if a lock is already present but older than
+    `max_age_minutes` (the previous run crashed without cleaning up,
+    or simply ran long), it's removed and creation is retried once —
+    a second thread racing that exact retry just loses the O_EXCL
+    a second time and correctly backs off."""
+    payload_bytes = json.dumps(payload, default=str).encode("utf-8")
+
+    def _try_create() -> bool:
+        try:
+            fd = os.open(str(_ENGINE_REFRESH_LOCK),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False
+        try:
+            os.write(fd, payload_bytes)
+        finally:
+            os.close(fd)
+        return True
+
+    if _try_create():
+        return True
+    if not _engine_refresh_running(max_age_minutes):
+        try:
+            _ENGINE_REFRESH_LOCK.unlink()
+        except OSError:
+            pass
+        return _try_create()
+    return False
+
+
 def _read_engine_refresh_status() -> dict:
     try:
         if not _ENGINE_REFRESH_STATUS.exists():
@@ -3160,10 +3220,14 @@ def _write_engine_refresh_status(payload: dict) -> None:
 def _start_background_engine_refresh(reason: str,
                                      source_fp: Optional[tuple] = None
                                      ) -> bool:
-    """Start warm_engine.py without blocking the current Streamlit user."""
+    """Start warm_engine.py without blocking the current Streamlit user.
+
+    Concurrency-safe: see _acquire_engine_refresh_lock's docstring —
+    the actual "is one already running" decision happens atomically
+    inside that call, not via a separate check here, specifically so
+    two Streamlit sessions racing this function at the same instant
+    can't both spawn a warmer."""
     if os.environ.get("WARM_ENGINE_RUNNING") == "1":
-        return False
-    if _engine_refresh_running():
         return False
     threshold = _warm_engine_min_available_mb()
     available = _mem_available_mb()
@@ -3178,16 +3242,15 @@ def _start_background_engine_refresh(reason: str,
         return False
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        _ENGINE_REFRESH_LOCK.write_text(
-            json.dumps({
-                "started_at": datetime.utcnow().isoformat() + "Z",
-                "reason": reason,
-                "source_latest_mtime": (
-                    _fingerprint_latest_mtime(source_fp)
-                    if source_fp is not None else None),
-            }, default=str),
-            encoding="utf-8",
-        )
+        lock_payload = {
+            "started_at": datetime.utcnow().isoformat() + "Z",
+            "reason": reason,
+            "source_latest_mtime": (
+                _fingerprint_latest_mtime(source_fp)
+                if source_fp is not None else None),
+        }
+        if not _acquire_engine_refresh_lock(lock_payload):
+            return False
         _write_engine_refresh_status({
             "state": "running",
             "reason": reason,
