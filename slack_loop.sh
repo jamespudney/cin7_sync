@@ -382,6 +382,38 @@ while true; do
             "python cin7_sync.py boms"
     fi
 
+    # v2.67.xxx — monthly wide sale_lines re-backfill. The worker's
+    # own CIN7 salelines sync (bootstrap block above + the periodic
+    # refresh block below) has only ever requested a rolling --days
+    # 30 window — nowhere near enough for worker_engine.py's 12-month
+    # effective_units_12mo/90d calc, which every ABC/dormancy/PO-
+    # commentary answer depends on. Confirmed live 2026-07-29: the
+    # worker's widest available sale_lines file was 30 days old,
+    # silently undercounting demand for every SKU, not just the one
+    # a buyer happened to flag. Backfills 730 days once a month —
+    # same restart-safe marker-file pattern sync_loop.sh uses for its
+    # monthly report, so a redeploy on the 1st doesn't repeat the
+    # run. Backgrounded via _run_bg (same as the BOM sync above) —
+    # this is a much bigger pull than the usual 30-day sync and
+    # shouldn't block the listener while it runs.
+    day_of_month="$(date -u +%d)"
+    day_of_month="${day_of_month#0}"
+    this_month="$(date -u +%Y-%m)"
+    worker_salelines_backfill_marker="/data/.last_worker_salelines_backfill_month"
+    last_worker_salelines_backfill_month=""
+    if [ -f "$worker_salelines_backfill_marker" ]; then
+        last_worker_salelines_backfill_month="$(cat "$worker_salelines_backfill_marker" 2>/dev/null)"
+    fi
+    if [ "$day_of_month" -eq 1 ] \
+            && [ "$this_month" != "$last_worker_salelines_backfill_month" ] \
+            && [ -n "${CIN7_ACCOUNT_ID:-}" ] \
+            && [ -n "${CIN7_APPLICATION_KEY:-}" ]; then
+        echo "$this_month" > "$worker_salelines_backfill_marker"
+        echo "[$(stamp)] day $day_of_month of $this_month — worker sale_lines full re-backfill (730d)" >> "$LOG"
+        _run_bg "worker_salelines_backfill" \
+            "python cin7_sync.py salelines --days 730"
+    fi
+
     seconds_since_googleads=$(( now_epoch - last_googleads_epoch ))
     if [ "$seconds_since_googleads" -ge 86400 ] \
             && [ -n "${GOOGLE_ADS_DEVELOPER_TOKEN:-}" ] \
