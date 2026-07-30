@@ -6789,6 +6789,8 @@ def _abc_engine(products: pd.DataFrame,
         assembly_units_12mo_map).fillna(0)
     df["assembly_units_45d"] = df["SKU"].astype(str).map(
         assembly_units_45d_map).fillna(0)
+    df["assembly_units_90d"] = df["SKU"].astype(str).map(
+        assembly_units_90d_map).fillna(0)
 
     # Bulk-master length + fractional-eligibility flag.
     # is_bulk_master = strip master with ≥50m roll length. These SKUs
@@ -6881,6 +6883,16 @@ def _abc_engine(products: pd.DataFrame,
         eff_12mo = float(row.get("effective_units_12mo") or 0)
         eff_90d = float(row.get("effective_units_90d") or 0)
         if eff_12mo <= 0:
+            return False
+        # v2.67.374 — assembly-consumption grace. A bulk raw-material
+        # SKU (e.g. a 25m roll feeding per-foot cuts) can show a real
+        # 90d lull in eff_90d even while FG tasks are actively drawing
+        # it down, because assembly draws tend to be lumpy relative to
+        # the tiny physical-unit thresholds below. If an FG task has
+        # consumed it within the last 90 days, it's active manufacturing
+        # stock, not dormant — the tier-1/tier-2 checks below exist to
+        # catch customer-facing demand drop-off, not raw-material cadence.
+        if float(row.get("assembly_units_90d") or 0) > 0:
             return False
         # v2.67.48 — A-class grace. ABC=A by definition means a
         # high-revenue SKU with steady monthly movement; if it has

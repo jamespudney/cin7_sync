@@ -459,6 +459,18 @@ on hand. Computed by the engine on every recompute. Definitions:
   `_refine_dormancy_by_class` (class-aware refinement). The
   Ordering page surfaces a 💼 note explaining the grace when an
   A-class item's 90d activity is below threshold.
+- **Assembly-consumption grace (v2.67.374)** — a SKU with any FG
+  assembly consumption in the last 90 days (`assembly_units_90d > 0`)
+  is EXEMPT from dormancy flagging. Reasoning: bulk raw-material SKUs
+  (e.g. a 25m LED strip roll feeding per-foot cuts) are consumed
+  internally by assembly tasks, not sold directly to customers — that
+  consumption is lumpy relative to the tiny physical-unit thresholds
+  below, so a real manufacturing draw can still trip Tier 1/2 even
+  though the stock is actively in use. If assembly consumed it at all
+  in the last 90 days, it's active manufacturing stock, not dormant.
+  A SKU with zero recent assembly draw (and zero direct sales) still
+  flags normally. Excess/overstock calculations are unaffected — only
+  the dormancy flag itself is exempted.
 
 #### Overstock / excess (v2.67.47+)
 - `excess_units` — units held beyond expected near-term demand.
