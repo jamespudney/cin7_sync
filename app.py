@@ -23676,7 +23676,17 @@ elif page == "AI Assistant":
             "answers. Run `python shopify_sync.py` on the host."
         )
     elif _shopify_freshness.get("state") == "stale":
-        _hrs = _shopify_freshness.get("oldest_age_hours")
+        # v2.67.375 — report the SAME age that drove the "stale"
+        # verdict (last_sync_age_hours / marker, falling back to
+        # newest_age_hours), not oldest_age_hours. oldest_age_hours is
+        # just the single least-recently-changed product file across
+        # the whole indexed corpus (normal for slow-changing content,
+        # e.g. 1885h for a product description that hasn't changed in
+        # months) and was showing an alarmingly large, disconnected
+        # number even when the actual sync gap was a day or two.
+        _hrs = _shopify_freshness.get("last_sync_age_hours")
+        if _hrs is None:
+            _hrs = _shopify_freshness.get("newest_age_hours")
         st.warning(
             f":hourglass_flowing_sand: Shopify product docs last "
             f"synced {_hrs}h ago — may be stale. "
