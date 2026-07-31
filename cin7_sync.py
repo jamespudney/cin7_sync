@@ -40,6 +40,7 @@ import csv
 import json
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -61,6 +62,21 @@ PAGE_SIZE = 1000           # CIN7 v2 allows up to 1000 per page on most endpoint
 # Shopify sync, Xero etc. Override with CIN7_RATE_SECONDS in .env for quiet
 # windows (e.g. overnight you can drop to 1.5 for faster sync).
 DEFAULT_RATE_LIMIT_SECONDS = 2.5
+
+# v2.67.378 — shared, cross-process rate budget. The local per-process
+# pacing above assumes THIS invocation is the only consumer of the 60/min
+# account cap, which breaks down the moment 2+ of the web app's and
+# worker's sync loops run concurrently (confirmed live: daily_sync.sh took
+# 3+ hours to clear one step while both services hammered CIN7 at once).
+# When the Postgres backend is available (both services share it), every
+# request also claims a slot from a shared budget counter in
+# db.cin7_rate_limit_state before firing — the authoritative cross-process
+# cap. Falls back to local-only pacing (today's behaviour) when Postgres
+# isn't configured, since SQLite files aren't shared across Render
+# services anyway. See db.py's _SCHEMA / _PG_POST_CUTOVER_TABLES for the
+# table definition.
+DEFAULT_SHARED_RATE_LIMIT_PER_MIN = 50
+_SHARED_RATE_LIMIT_WINDOW_SECONDS = 60.0
 
 REQUEST_TIMEOUT = 60
 MAX_RETRIES = 5
@@ -114,7 +130,9 @@ class Cin7Client:
     """Minimal CIN7 Core v2 API client with pagination + polite rate limiting."""
 
     def __init__(self, account_id: str, application_key: str,
-                 rate_seconds: float = DEFAULT_RATE_LIMIT_SECONDS) -> None:
+                 rate_seconds: float = DEFAULT_RATE_LIMIT_SECONDS,
+                 shared_rate_limit_per_min: int =
+                     DEFAULT_SHARED_RATE_LIMIT_PER_MIN) -> None:
         if not account_id or not application_key:
             raise ValueError(
                 "Missing credentials. Set CIN7_ACCOUNT_ID and CIN7_APPLICATION_KEY "
@@ -131,17 +149,90 @@ class Cin7Client:
         )
         self.rate_seconds = max(0.5, float(rate_seconds))
         self._last_call_ts = 0.0
+        self._shared_budget = max(1, int(shared_rate_limit_per_min))
+        self._shared_limit_enabled = self._init_shared_limiter()
         log.info(
             "CIN7 client rate-limited to %.2fs between calls (~%.0f calls/min). "
-            "Full CIN7 account cap is ~60/min shared across all integrations.",
+            "Full CIN7 account cap is ~60/min shared across all integrations. "
+            "Shared cross-process budget: %s.",
             self.rate_seconds, 60.0 / self.rate_seconds,
+            f"{self._shared_budget}/min via Postgres"
+            if self._shared_limit_enabled else "disabled (no Postgres backend)",
         )
+
+    def _init_shared_limiter(self) -> bool:
+        """Whether the shared, Postgres-backed rate limiter should be
+        attempted. Only meaningful when the Postgres backend is active —
+        SQLite files aren't shared across Render services, so there's
+        nothing to coordinate in that case."""
+        try:
+            import db as _db
+            return bool(_db._backend_is_postgres())
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Shared CIN7 rate limiter unavailable (%s); "
+                      "using local-only pacing.", exc)
+            return False
 
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_call_ts
         if elapsed < self.rate_seconds:
             time.sleep(self.rate_seconds - elapsed)
         self._last_call_ts = time.monotonic()
+        if self._shared_limit_enabled:
+            self._acquire_shared_slot()
+
+    def _try_claim_shared_slot(self) -> tuple[bool, float]:
+        """One atomic round trip against db.cin7_rate_limit_state.
+        Returns (granted, seconds_until_next_window). The UPDATE only
+        matches (and only then returns a row) if the window has rolled
+        over OR the count is still under budget -- a conditional
+        UPDATE...RETURNING is compare-and-swap in a single round trip, so
+        this is safe under real concurrency from other processes/machines
+        without needing SELECT...FOR UPDATE."""
+        import db as _db
+        now = time.time()
+        window = _SHARED_RATE_LIMIT_WINDOW_SECONDS
+        with _db.connect() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO cin7_rate_limit_state "
+                "(id, window_start_ts, request_count) VALUES (1, 0, 0)")
+            cur = c.execute(
+                "UPDATE cin7_rate_limit_state "
+                "SET request_count = CASE WHEN (? - window_start_ts) >= ? "
+                "        THEN 1 ELSE request_count + 1 END, "
+                "    window_start_ts = CASE WHEN (? - window_start_ts) >= ? "
+                "        THEN ? ELSE window_start_ts END "
+                "WHERE id = 1 "
+                "  AND ((? - window_start_ts) >= ? OR request_count < ?) "
+                "RETURNING window_start_ts",
+                (now, window, now, window, now, now, window,
+                 self._shared_budget))
+            rows = cur.fetchall()
+            if rows:
+                return True, 0.0
+            cur2 = c.execute(
+                "SELECT window_start_ts FROM cin7_rate_limit_state "
+                "WHERE id = 1")
+            row = cur2.fetchone()
+            window_start = float(row[0] if row else now)
+            wait = max(0.0, window - (now - window_start))
+            return False, wait
+
+    def _acquire_shared_slot(self) -> None:
+        while True:
+            try:
+                granted, wait_hint = self._try_claim_shared_slot()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Shared CIN7 rate limiter round trip failed "
+                          "(%s); disabling for the rest of this run.", exc)
+                self._shared_limit_enabled = False
+                return
+            if granted:
+                return
+            sleep_s = max(0.5, wait_hint) + random.uniform(0, 0.5)
+            log.info("Shared CIN7 rate budget exhausted; waiting %.1fs "
+                      "for a slot.", sleep_s)
+            time.sleep(sleep_s)
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{BASE_URL}/{path.lstrip('/')}"
@@ -1943,8 +2034,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                     rate_env, DEFAULT_RATE_LIMIT_SECONDS)
         rate_seconds = DEFAULT_RATE_LIMIT_SECONDS
 
+    shared_rate_env = os.environ.get(
+        "CIN7_SHARED_RATE_LIMIT_PER_MIN", "").strip()
     try:
-        client = Cin7Client(account_id, application_key, rate_seconds=rate_seconds)
+        shared_rate_limit_per_min = (
+            int(shared_rate_env) if shared_rate_env
+            else DEFAULT_SHARED_RATE_LIMIT_PER_MIN)
+    except ValueError:
+        log.warning(
+            "CIN7_SHARED_RATE_LIMIT_PER_MIN=%r is not a number; "
+            "using default %d",
+            shared_rate_env, DEFAULT_SHARED_RATE_LIMIT_PER_MIN)
+        shared_rate_limit_per_min = DEFAULT_SHARED_RATE_LIMIT_PER_MIN
+
+    try:
+        client = Cin7Client(
+            account_id, application_key, rate_seconds=rate_seconds,
+            shared_rate_limit_per_min=shared_rate_limit_per_min)
     except ValueError as exc:
         log.error(str(exc))
         return 2

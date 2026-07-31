@@ -1474,6 +1474,23 @@ CREATE INDEX IF NOT EXISTS idx_product_feed_status_family
     ON product_feed_status(family);
 CREATE INDEX IF NOT EXISTS idx_product_feed_status_ads_status
     ON product_feed_status(ads_status);
+
+-- v2.67.378 — shared CIN7 rate-limit budget. CIN7's 60-req/min cap is
+-- shared across the whole account; every cin7_sync.py invocation used to
+-- pace itself independently assuming it was the only consumer, which
+-- collapses into cascading 429s the moment 2+ of the web app's and
+-- worker's sync loops run concurrently (confirmed live: daily_sync.sh
+-- took 3+ hours to clear one step). Single global row (id=1); a claim
+-- is an atomic conditional UPDATE...RETURNING keyed on this row, so it's
+-- safe across concurrent processes on different machines. Only
+-- meaningful on the Postgres backend (both services share it); SQLite
+-- files aren't shared across Render services, so cin7_sync.py skips
+-- this table entirely when DB_BACKEND isn't postgres.
+CREATE TABLE IF NOT EXISTS cin7_rate_limit_state (
+    id              INTEGER PRIMARY KEY,
+    window_start_ts REAL    NOT NULL DEFAULT 0,
+    request_count   INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -4081,6 +4098,16 @@ _PG_POST_CUTOVER_TABLES = [
           active             INTEGER NOT NULL DEFAULT 1,
           created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    # v2.67.378 — shared CIN7 rate-limit budget (see _SCHEMA for the
+    # SQLite-side definition and rationale).
+    ("cin7_rate_limit_state",
+      """
+      CREATE TABLE IF NOT EXISTS cin7_rate_limit_state (
+          id              INTEGER PRIMARY KEY,
+          window_start_ts DOUBLE PRECISION NOT NULL DEFAULT 0,
+          request_count   INTEGER NOT NULL DEFAULT 0
       );
       """),
 ]

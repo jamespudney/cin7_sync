@@ -26,6 +26,24 @@ through the database layer in `db.py`.
 5. Team state such as notes, flags, approvals, Slack audit logs, and UI layout
    preferences is stored through `db.py`.
 
+## CIN7 API rate limiting
+
+CIN7 Core enforces a 60-requests/min cap **shared across the whole account**
+— every integration (dashboard sync loops, worker resyncs, ad-hoc scripts)
+draws from the same budget. `cin7_sync.py`'s `Cin7Client` paces each
+invocation locally via `CIN7_RATE_SECONDS` (default 2.5s = 24/min), but that
+alone assumes it's the only consumer. When the Postgres backend is
+configured (`DB_BACKEND=postgres`), every request also claims a slot from a
+shared, atomic budget counter (`cin7_rate_limit_state` in `db.py`) before
+firing — this is the authoritative cross-process/cross-service cap, tunable
+via `CIN7_SHARED_RATE_LIMIT_PER_MIN` (default 50). Without it, running 2+ of
+the web app's sync loops and the worker's periodic resync concurrently
+reliably drove the whole account into cascading 429s (confirmed live:
+`daily_sync.sh` took 3+ hours to clear a single step). On SQLite (local/dev,
+`DB_BACKEND` unset), the shared limiter is skipped entirely — SQLite files
+aren't shared across Render services, so there's nothing to coordinate; only
+the local per-process pacing applies, same as before this existed.
+
 ## Key Code Areas
 
 - `cin7_sync.py`: CIN7 snapshot pulls.
