@@ -1511,7 +1511,8 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
             if engine_df is None or engine_df.empty:
                 import worker_engine
                 engine_df = worker_engine.compute_engine_signals(
-                    products, stock, sale_lines, boms=boms)
+                    products, stock, sale_lines, boms=boms,
+                    assemblies=assemblies)
                 ensure_storage_dim_column(engine_df)
         except Exception as exc:  # noqa: BLE001
             log.warning(
