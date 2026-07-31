@@ -24,14 +24,35 @@ simplified.
 Drift sources (will fix in v2.67.70 with shared Postgres):
 - No A-class grace check (worker may flag A-class as dormant when
   dashboard wouldn't)
+- No physical-unit Tier-1 dormancy floor for bulk rolls (dashboard
+  compares meters of strip flow; worker is purely rate-based)
 - Bulk/strip rollup is BOM-first with a naming fallback; still less rich
   than the dashboard engine but no longer direct-sales-only.
 - No buyer manual corrections (those live in web service's DB)
+
+Kept in sync with the dashboard (app.py's _abc_engine):
+- Real FG assembly-task consumption (assemblies_last_*.csv) feeds
+  effective_units_12mo/90d directly, same as app.py's v2.67.334 fix.
+- Assembly-consumption dormancy grace — a SKU with any real assembly
+  draw in the last 90 days is never flagged dormant, same as app.py's
+  v2.67.374 fix.
+- units_45d / units_prior_45d — own-SKU direct+assembly demand for the
+  last 45 days / the 45-90-days-ago window, same windows as app.py's
+  u45/uprior. PO commentary's ai_tools.get_purchase_order/get_purchase_live
+  read this straight off engine_df; without it, every worker PO
+  commentary silently read units_45d as 0 for every SKU (v2.67.377).
+
+Still-open drift (units_12mo raw / lineage_units_12mo are not
+distinguished from effective_units_12mo here — only affects the rarer
+"moved historically but engine isn't reordering from it" PO-commentary
+rule, not the primary units_45d recency signal above).
 
 Output columns added to engine_df:
 - ABC                       'A' | 'B' | 'C'
 - effective_units_12mo      float — 12-month demand in SKU units
 - effective_units_90d       float — 90-day demand
+- units_45d                 float — own-SKU demand, last 45 days
+- units_prior_45d           float — own-SKU demand, 45-90 days ago
 - annual_value              effective_units_12mo × AverageCost
 - is_dormant                bool — 12mo activity > 0 AND 90d ≤ 20% of 12mo rate
 - excess_units              max(0, OnHand - effective_units_12mo)
@@ -121,7 +142,8 @@ def _is_discontinued(name: object, status: object) -> bool:
 def compute_engine_signals(products: pd.DataFrame,
                               stock: pd.DataFrame,
                               sale_lines: pd.DataFrame,
-                              boms: Optional[pd.DataFrame] = None
+                              boms: Optional[pd.DataFrame] = None,
+                              assemblies: Optional[pd.DataFrame] = None
                               ) -> pd.DataFrame:
     """Compute the engine signals on the worker. Returns engine_df with
     one row per SKU and all derived columns."""
@@ -172,9 +194,24 @@ def compute_engine_signals(products: pd.DataFrame,
     today_ts = pd.Timestamp(datetime.now().date())
     cutoff_12mo = today_ts - pd.Timedelta(days=365)
     cutoff_90d = today_ts - pd.Timedelta(days=90)
+    cutoff_45d = today_ts - pd.Timedelta(days=45)
 
     eff_12mo_map: dict = {}
     eff_90d_map: dict = {}
+    # v2.67.377 — units_45d / units_prior_45d, mirroring app.py's own
+    # 45-day trend window (_abc_engine's u45/uprior). PO commentary's
+    # "demand hierarchy" instructions (slack_listener.py) lead with
+    # units_45d as the primary recency signal ("NEVER call dormant if
+    # units_45d > 0") and get_purchase_order/get_purchase_live
+    # (ai_tools.py) read it straight off engine_df — but this module
+    # never populated the column, so it silently defaulted to 0 for
+    # every SKU on every worker PO commentary. James 2026-07-30:
+    # PO-7067 commentary read "Trend SKU with strong recent momentum"
+    # (from trend_flag, which IS computed here) right next to "45-day
+    # demand: 0 ft" — the contradiction was this missing field, not a
+    # real absence of recent sales.
+    units_45d_map: dict = {}
+    units_prior_45d_map: dict = {}
     if sale_lines is not None and not sale_lines.empty:
         sl = filter_excluded_sales_customers(sale_lines).copy()
         if "SKU" in sl.columns and "Quantity" in sl.columns:
@@ -196,12 +233,86 @@ def compute_engine_signals(products: pd.DataFrame,
                                 .groupby("SKU")["__qty"].sum().to_dict())
                 eff_90d_map = (sl[sl["__dt"] >= cutoff_90d]
                                 .groupby("SKU")["__qty"].sum().to_dict())
+                units_45d_map = (sl[sl["__dt"] >= cutoff_45d]
+                                  .groupby("SKU")["__qty"].sum().to_dict())
+                units_prior_45d_map = (
+                    sl[(sl["__dt"] >= cutoff_90d)
+                       & (sl["__dt"] < cutoff_45d)]
+                    .groupby("SKU")["__qty"].sum().to_dict())
 
     non_master_skus: set[str] = set()
 
+    # 4a-2. REAL Finished-Goods assembly-task consumption
+    # (assemblies_last_*d_*.csv) — actual per-task component pick
+    # records, when available. Takes priority over the BOM-ratio
+    # proxy below for whichever components it covers, since it's a
+    # measurement of what was actually consumed, not an approximation
+    # from "the assembly's own sales x BOM ratio".
+    #
+    # James 2026-07-30: Andrew flagged LED-SILICONE-PMT80050 (a BOM
+    # component with zero direct sales) showing "12mo effective: 269
+    # units" in PO commentary when real demand is ~250/month (~3000/
+    # yr) -- a ~11x gap too large to explain by sale_lines staleness
+    # alone. Root cause: the BOM-ratio proxy below assumes assembly
+    # SOLD == assembly BUILT == component CONSUMED, which breaks down
+    # whenever kits get built ahead of demand or components move
+    # through other build paths. The real per-task consumption data
+    # (already synced and already used elsewhere in this codebase,
+    # e.g. the bot's current-month movement answers) is a direct
+    # measurement and doesn't have that assumption. Mirrors app.py's
+    # own CompletionDate-then-Date fallback and VOIDED/CANCELLED/
+    # CANCELED/DRAFT exclusion for this exact data (see the per-SKU
+    # demand-breakdown helper there).
+    real_consumed_12mo: set[str] = set()
+    assembly_units_90d_map: dict = {}
+    if (assemblies is not None and not assemblies.empty
+            and "ComponentSKU" in assemblies.columns
+            and "Quantity" in assemblies.columns):
+        asm_rows = assemblies.copy()
+        asm_rows["ComponentSKU"] = asm_rows["ComponentSKU"].astype(str)
+        asm_rows["__qty"] = _to_num(asm_rows["Quantity"]).fillna(0)
+        _completed = (pd.to_datetime(asm_rows["CompletionDate"],
+                                       errors="coerce", utc=True)
+                       if "CompletionDate" in asm_rows.columns
+                       else pd.Series(pd.NaT, index=asm_rows.index))
+        _fallback = (pd.to_datetime(asm_rows["Date"],
+                                      errors="coerce", utc=True)
+                      if "Date" in asm_rows.columns
+                      else pd.Series(pd.NaT, index=asm_rows.index))
+        asm_rows["__dt"] = _completed.fillna(_fallback)
+        asm_rows = asm_rows.dropna(subset=["__dt"])
+        asm_rows["__dt"] = asm_rows["__dt"].dt.tz_convert(None)
+        if "Status" in asm_rows.columns:
+            _bad_asm_statuses = ("VOIDED", "CANCELLED", "CANCELED", "DRAFT")
+            asm_rows = asm_rows[~asm_rows["Status"].astype(str).str.upper()
+                                  .isin(_bad_asm_statuses)]
+        real_12mo = (asm_rows[asm_rows["__dt"] >= cutoff_12mo]
+                     .groupby("ComponentSKU")["__qty"].sum())
+        real_90d = (asm_rows[asm_rows["__dt"] >= cutoff_90d]
+                    .groupby("ComponentSKU")["__qty"].sum())
+        real_45d = (asm_rows[asm_rows["__dt"] >= cutoff_45d]
+                    .groupby("ComponentSKU")["__qty"].sum())
+        real_prior_45d = (
+            asm_rows[(asm_rows["__dt"] >= cutoff_90d)
+                     & (asm_rows["__dt"] < cutoff_45d)]
+            .groupby("ComponentSKU")["__qty"].sum())
+        for comp, qty in real_12mo.items():
+            eff_12mo_map[comp] = eff_12mo_map.get(comp, 0) + float(qty)
+            real_consumed_12mo.add(comp)
+        for comp, qty in real_90d.items():
+            eff_90d_map[comp] = eff_90d_map.get(comp, 0) + float(qty)
+        for comp, qty in real_45d.items():
+            units_45d_map[comp] = units_45d_map.get(comp, 0) + float(qty)
+        for comp, qty in real_prior_45d.items():
+            units_prior_45d_map[comp] = (
+                units_prior_45d_map.get(comp, 0) + float(qty))
+        assembly_units_90d_map = real_90d.to_dict()
+
     # 4b. CIN7 BOM rollup. BOMs are the source of truth for assembly /
     # cut relationships: if SKU A is built from component B, demand on A
-    # should plan B.
+    # should plan B. Falls back to this ratio-based proxy only for
+    # components NOT already covered by real assembly-task consumption
+    # above (avoids double-counting whichever is more accurate).
     if boms is not None and not boms.empty:
         for _, row in boms.iterrows():
             asm = str(row.get("AssemblySKU") or "").strip()
@@ -216,10 +327,17 @@ def compute_engine_signals(products: pd.DataFrame,
                 continue
             u12 = float(eff_12mo_map.get(asm, 0))
             u90 = float(eff_90d_map.get(asm, 0))
-            if u12 or u90:
-                eff_12mo_map[comp] = eff_12mo_map.get(comp, 0) + u12 * qty_per
-                eff_90d_map[comp] = eff_90d_map.get(comp, 0) + u90 * qty_per
-                non_master_skus.add(asm)
+            if not (u12 or u90):
+                continue
+            # The assembly's own demand has been (or would be)
+            # explained by a component below — hide its own row
+            # regardless of whether the proxy or real data ends up
+            # being used for that component.
+            non_master_skus.add(asm)
+            if comp in real_consumed_12mo:
+                continue
+            eff_12mo_map[comp] = eff_12mo_map.get(comp, 0) + u12 * qty_per
+            eff_90d_map[comp] = eff_90d_map.get(comp, 0) + u90 * qty_per
 
     # 4b-2. Exact purchase-pack rollup (base SKU -> final "-X<number>"
     # pack SKU, e.g. SNFX-M-WH-SET -> SNFX-M-WH-SET-X250). Mirrors
@@ -400,6 +518,15 @@ def compute_engine_signals(products: pd.DataFrame,
     df["effective_units_90d"] = df["SKU"].map(
         lambda s: 0.0 if s in non_master_skus
         else float(eff_90d_map.get(s, 0)))
+    # v2.67.377 — own-SKU raw demand, NOT zeroed for non-master cuts
+    # (mirrors app.py's plain units_45d/units_prior_45d columns): staff
+    # asking about a specific per-foot cut SKU still want to see ITS
+    # OWN recent sales, distinct from the master roll's rolled-up
+    # effective figure.
+    df["units_45d"] = df["SKU"].map(
+        lambda s: float(units_45d_map.get(s, 0)))
+    df["units_prior_45d"] = df["SKU"].map(
+        lambda s: float(units_prior_45d_map.get(s, 0)))
 
     # 5. ABC classification — pragmatic 3-tier:
     # A = top 20% by annual_value AMONG SKUs with any 12mo sales
@@ -433,10 +560,19 @@ def compute_engine_signals(products: pd.DataFrame,
     # master rollup. Drift acceptable for v2.67.69; v2.67.70
     # Postgres migration will make worker read the dashboard's
     # canonical is_dormant value.
+    #
+    # v2.67.374 (app.py) / mirrored here — assembly-consumption grace.
+    # A bulk raw-material SKU actively drawn down by FG assembly tasks
+    # in the last 90 days is manufacturing stock in use, not dormant,
+    # even if its rate-based check below would otherwise flag it (real
+    # assembly draws are lumpy). Keeps the bot's dormancy answers
+    # consistent with the dashboard for the same underlying signal.
     def _dormant(row) -> bool:
         on_hand = float(row.get("OnHand") or 0)
         e12 = float(row["effective_units_12mo"] or 0)
         e90 = float(row["effective_units_90d"] or 0)
+        if assembly_units_90d_map.get(str(row.get("SKU") or ""), 0) > 0:
+            return False
         # Tier (a): stock-with-no-sales-history.
         if e12 == 0 and on_hand > 0:
             return True
