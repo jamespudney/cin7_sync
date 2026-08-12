@@ -22,22 +22,16 @@ stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 echo "[$(stamp)] sync_loop starting; target hour UTC = $SYNC_HOUR_UTC" \
   | tee -a "$LOG"
 
-_engine_refresh_running() {
-    local lock="${DATA_DIR}/output/engine_refresh.lock"
-    if [ ! -f "$lock" ]; then
-        return 1
-    fi
-    local now_epoch lock_epoch age_s
-    now_epoch=$(date -u +%s)
-    lock_epoch=$(date -u -r "$lock" +%s 2>/dev/null || echo 0)
-    age_s=$((now_epoch - lock_epoch))
-    if [ "$age_s" -le 2700 ]; then
-        return 0
-    fi
-    rm -f "$lock" 2>/dev/null || true
-    return 1
-}
-
+# v2.67.379 — the lock acquire/release/staleness logic used to be
+# reimplemented here in bash (`[ -f lock ] ... > lock`, a plain
+# check-then-write with no atomicity — the exact TOCTOU race a prior
+# Python-side fix, PR #47, eliminated in app.py but never touched
+# here). Render's OOM crashes continued after that fix because THIS
+# script's own lock could still race a Streamlit-triggered warm, and
+# nearsync.sh's warm_engine call had no lock check at all. All three
+# call sites now go through engine_refresh_lock.py's one atomic
+# implementation instead of three independent (and, it turned out,
+# inconsistent) reimplementations. See that module's docstring.
 _start_warm_engine() {
     local reason="$1"
     local delay_seconds="${2:-0}"
@@ -52,26 +46,19 @@ _start_warm_engine() {
         return 0
     fi
 
-    if _engine_refresh_running; then
-        echo "[$(stamp)] warm_engine already running; skipped (${reason})" \
-          | tee -a "$LOG"
-        return 0
-    fi
-
     (
         if [ "$delay_seconds" -gt 0 ]; then
             echo "[$(stamp)] warm_engine scheduled in ${delay_seconds}s (${reason})" \
               >> "$LOG"
             sleep "$delay_seconds"
         fi
-        if _engine_refresh_running; then
-            echo "[$(stamp)] warm_engine already running after delay; skipped (${reason})" \
+
+        if ! python engine_refresh_lock.py acquire \
+                --reason "sync_loop: ${reason}" > /dev/null 2>&1; then
+            echo "[$(stamp)] warm_engine already running; skipped (${reason})" \
               >> "$LOG"
             exit 0
         fi
-
-        printf '{"state":"running","reason":"%s","updated_at":"%s"}\n' \
-            "$reason" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$lock"
         cp "$lock" "$status" 2>/dev/null || true
 
         echo "[$(stamp)] warming engine cache (${reason})" \
@@ -86,7 +73,7 @@ _start_warm_engine() {
         if [ "$rc" -ne 0 ]; then
             echo "[$(stamp)] warm_engine failed/timed out (${reason}, rc=${rc})" \
               | tee -a "$LOG" >> "$engine_log"
-            rm -f "$lock" 2>/dev/null || true
+            python engine_refresh_lock.py release > /dev/null 2>&1
             printf '{"state":"failed","reason":"%s","exit_code":%s,"updated_at":"%s"}\n' \
                 "$reason" "$rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
                 > "$status"
