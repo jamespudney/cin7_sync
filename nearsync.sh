@@ -19,10 +19,30 @@ RC=$?
 if [ "$RC" -eq 0 ]; then
   echo "[$(stamp)] nearsync done (ok)" >> "$LOG"
   if [ "${WARM_ENGINE_AFTER_NEARSYNC:-1}" = "1" ]; then
-    echo "[$(stamp)] warm_engine after nearsync" >> "$LOG"
-    python warm_engine.py >> "$LOG" 2>&1 || \
-      echo "[$(stamp)] warm_engine after nearsync FAILED (continuing)" \
+    # v2.67.379 — this call used to launch warm_engine.py with NO lock
+    # check at all, running every ~15 minutes and fully invisible to
+    # the atomic lock app.py/sync_loop.sh use for the same subprocess
+    # (a duplicate warm_engine.py run doubles peak memory in the same
+    # 4GB container). Now goes through the same shared, atomic lock —
+    # see engine_refresh_lock.py's docstring.
+    lock="${DATA_DIR}/output/engine_refresh.lock"
+    status="${DATA_DIR}/output/engine_refresh_status.json"
+    if python engine_refresh_lock.py acquire \
+            --reason "nearsync" > /dev/null 2>&1; then
+      echo "[$(stamp)] warm_engine after nearsync" >> "$LOG"
+      cp "$lock" "$status" 2>/dev/null || true
+      ENGINE_REFRESH_LOCK_PATH="$lock" \
+      ENGINE_REFRESH_STATUS_PATH="$status" \
+      ENGINE_REFRESH_REASON="nearsync" \
+      python warm_engine.py >> "$LOG" 2>&1 || {
+        echo "[$(stamp)] warm_engine after nearsync FAILED (continuing)" \
+          >> "$LOG"
+        python engine_refresh_lock.py release > /dev/null 2>&1
+      }
+    else
+      echo "[$(stamp)] warm_engine after nearsync skipped: already running" \
         >> "$LOG"
+    fi
   fi
 else
   echo "[$(stamp)] nearsync exited rc=$RC" >> "$LOG"

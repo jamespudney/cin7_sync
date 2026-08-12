@@ -33,6 +33,7 @@ import subprocess
 import sys
 
 import db
+import engine_refresh_lock
 
 from app_config import (
     APP_DEPLOYED,
@@ -2910,7 +2911,13 @@ def _fingerprint_latest_mtime(fp: tuple) -> float:
 
 
 _ENGINE_OUTPUT_PATH = OUTPUT_DIR / "engine_output.csv"
-_ENGINE_REFRESH_LOCK = OUTPUT_DIR / "engine_refresh.lock"
+# v2.67.379 — the lock itself now lives in engine_refresh_lock.py, the
+# ONE shared implementation used by app.py, sync_loop.sh, and
+# nearsync.sh (see that module's docstring for why: two of those three
+# call sites weren't covered by the earlier atomicity fix). Keep this
+# alias so the few remaining direct file-path references below don't
+# need to change.
+_ENGINE_REFRESH_LOCK = engine_refresh_lock.LOCK_PATH
 _ENGINE_REFRESH_STATUS = OUTPUT_DIR / "engine_refresh_status.json"
 _ENGINE_REFRESH_LOG = OUTPUT_DIR / "engine_refresh.log"
 _STOCK_LOCATOR_COLUMNS = (
@@ -3088,76 +3095,30 @@ def _stock_bin_view(stock_df: pd.DataFrame,
 
 
 def _engine_refresh_running(max_age_minutes: int = 45) -> bool:
-    try:
-        if not _ENGINE_REFRESH_LOCK.exists():
-            return False
-        age_min = (
-            datetime.now().timestamp()
-            - _ENGINE_REFRESH_LOCK.stat().st_mtime
-        ) / 60.0
-        return age_min <= max_age_minutes
-    except OSError:
-        return False
+    """Thin wrapper — see engine_refresh_lock.py, the single shared
+    implementation used by app.py, sync_loop.sh, and nearsync.sh.
+
+    James, 2026-07-29: root-caused the recurring "wired4signs-app
+    exceeded its memory limit" crashes to this lock. The FIRST fix
+    (PR #47) made THIS Python call site atomic via
+    `os.open(O_CREAT|O_EXCL)`, closing a real check-then-write race
+    between concurrent Streamlit sessions. Crashes continued because
+    that fix only covered this one call site — nearsync.sh launched
+    warm_engine.py with NO lock check at all, and sync_loop.sh
+    reimplemented its own bash lock with the exact same
+    check-then-write gap, against the identical lock file. All three
+    now go through engine_refresh_lock.py's one atomic implementation
+    (also adds a PID-liveness check to stale-lock reclaim, closing a
+    second gap where a legitimately slow warm_engine.py run could get
+    "reclaimed" and duplicated by a later caller — see that module's
+    docstring)."""
+    return engine_refresh_lock.is_running(max_age_minutes)
 
 
 def _acquire_engine_refresh_lock(payload: dict,
                                   max_age_minutes: int = 45) -> bool:
-    """Atomically acquire the engine-refresh lock. Returns True if THIS
-    call acquired it (safe to spawn warm_engine.py), False if another
-    session/thread already holds a live one.
-
-    James, 2026-07-29: root-caused the recurring "wired4signs-app
-    exceeded its memory limit" crashes to this exact spot. The
-    previous check-then-write pattern (`_engine_refresh_running()`
-    read the lock, THEN a separate `.write_text()` call created it)
-    left a real gap between the check and the write. Streamlit runs
-    every browser session as its own thread of the SAME process, and
-    both the file-existence check and the write are OS calls that can
-    yield the GIL — so when the sale_lines fingerprint flips (every
-    ~15 min from near-sync) and several staff have tabs open at once,
-    more than one session's thread could see "no lock yet" before
-    either had written one, each spawning a full second warm_engine.py
-    Python process that reloads every large CSV and recomputes the
-    whole ABC engine again. Those subprocesses aren't sandboxed from
-    the main process's memory budget — they share the same Render
-    container's 4GB limit — so N concurrent spawns is N times the
-    heaviest computation in the app stacked on top of the live
-    dashboard, clustering around whenever multiple staff are active
-    at once (matching the "roughly twice a day" pattern much better
-    than any fixed schedule would).
-
-    `os.open(..., O_CREAT | O_EXCL)` makes "does the lock exist" and
-    "create it" a single atomic syscall — the OS guarantees only one
-    caller can ever win when several race the exact same instant,
-    closing the gap entirely. Preserves the existing staleness
-    handling: if a lock is already present but older than
-    `max_age_minutes` (the previous run crashed without cleaning up,
-    or simply ran long), it's removed and creation is retried once —
-    a second thread racing that exact retry just loses the O_EXCL
-    a second time and correctly backs off."""
-    payload_bytes = json.dumps(payload, default=str).encode("utf-8")
-
-    def _try_create() -> bool:
-        try:
-            fd = os.open(str(_ENGINE_REFRESH_LOCK),
-                         os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            return False
-        try:
-            os.write(fd, payload_bytes)
-        finally:
-            os.close(fd)
-        return True
-
-    if _try_create():
-        return True
-    if not _engine_refresh_running(max_age_minutes):
-        try:
-            _ENGINE_REFRESH_LOCK.unlink()
-        except OSError:
-            pass
-        return _try_create()
-    return False
+    """Thin wrapper — see engine_refresh_lock.py."""
+    return engine_refresh_lock.acquire(payload, max_age_minutes)
 
 
 def _read_engine_refresh_status() -> dict:

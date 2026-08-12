@@ -1104,11 +1104,22 @@ them. After the v2.67.163 Postgres cutover both live in the
 shared Postgres DB so the worker (Slack bot) and web service
 read the same provenance.
 
-ABC cache warming is opportunistic. `sync_loop.sh` starts
-`warm_engine.py` in the background after syncs, using the same
-`engine_refresh.lock` / `engine_refresh_status.json` files the app
-shows in the sidebar. Deploy catch-up warms are delayed by
-`WARM_ENGINE_BOOT_DELAY_MIN` (default 30 minutes), and the warmer
-skips if available memory is below `WARM_ENGINE_MIN_AVAILABLE_MB`
-(default 2500 MB on the shared 4 GB Render web instance).
+ABC cache warming is opportunistic. Three independent places can
+launch `warm_engine.py`: `sync_loop.sh` after the nightly daily sync,
+`nearsync.sh` after every ~15-minute near-sync, and the Streamlit app
+itself (`app.py`'s `_start_background_engine_refresh`) when a user
+hits a stale/missing engine snapshot. All three go through
+`engine_refresh_lock.py`'s single atomic lock implementation
+(`engine_refresh.lock` / `engine_refresh_status.json`, shown in the
+app's sidebar) — see that module's docstring for why a single shared
+implementation matters: two earlier, independent reimplementations of
+this same lock (one in bash, one missing entirely) let concurrent
+warm_engine.py launches double up and exceed the container's memory
+limit, even after the first race-condition fix. The lock also checks
+PID liveness (not just age) before reclaiming a "stale" lock, so a
+legitimately slow run can't be duplicated by a later caller. Deploy
+catch-up warms are delayed by `WARM_ENGINE_BOOT_DELAY_MIN` (default 30
+minutes), and the warmer skips if available memory is below
+`WARM_ENGINE_MIN_AVAILABLE_MB` (default 2500 MB on the shared 4 GB
+Render web instance).
 """
