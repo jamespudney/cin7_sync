@@ -18,6 +18,7 @@ Over the internet with auth (once you're ready):
 from __future__ import annotations
 
 import ast
+import base64
 import glob
 import json
 import os
@@ -24044,10 +24045,66 @@ elif page == "AI Assistant":
             st.session_state["_ai_intent"] = "both"
             st.rerun()
 
+        # v2.67.380 — file uploads (images + PDFs). Claude's Messages
+        # API accepts inline base64 image/document content blocks
+        # directly; Streamlit 1.50's st.chat_input(accept_file=...)
+        # returns a ChatInputValue(text, files) instead of a bare
+        # string. Scope is intentionally images + PDFs only, not
+        # arbitrary file types.
+        _AI_SUPPORTED_IMAGE_TYPES = {
+            "image/png", "image/jpeg", "image/gif", "image/webp"}
+        _AI_MAX_ATTACHMENT_FILES = 3
+        # Per-file raw-byte cap. Base64 inflates size ~1.33x; this
+        # keeps even 3 max-size files well under Claude's 32MB/request
+        # document limit.
+        _AI_MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+
+        def _ai_build_user_content_blocks(question: str, files: list) -> list:
+            blocks = []
+            for f in files:
+                if (f.type not in _AI_SUPPORTED_IMAGE_TYPES
+                        and f.type != "application/pdf"):
+                    continue  # file_type= already restricts the picker
+                data_b64 = base64.standard_b64encode(
+                    f.getvalue()).decode("utf-8")
+                block_type = ("document" if f.type == "application/pdf"
+                              else "image")
+                blocks.append({
+                    "type": block_type,
+                    "source": {"type": "base64", "media_type": f.type,
+                               "data": data_b64},
+                })
+            blocks.append({"type": "text", "text": question})
+            return blocks
+
+        def _ai_attachment_history_note(question: str, files: list) -> str:
+            # v2.67.380 — file content must NOT be resent every turn:
+            # st.session_state["_ai_messages"] has no size cap, and a
+            # PDF/image re-sent on every follow-up would balloon cost
+            # and tokens fast. Once the turn that analyzed it
+            # completes, collapse that turn back to a plain-text note
+            # for all FUTURE turns' history.
+            names = ", ".join(f.name for f in files)
+            note = (f"[Attached file(s) analyzed in this turn: {names} "
+                     "— content not retained in history]")
+            return f"{question}\n\n{note}" if question else note
+
         # Input
-        _user_question = st.chat_input(
-            "Ask anything about your inventory…")
-        if _user_question:
+        _chat_input = st.chat_input(
+            "Ask anything about your inventory…",
+            accept_file=True,
+            file_type=["png", "jpg", "jpeg", "gif", "webp", "pdf"],
+        )
+        _user_question = _chat_input.text if _chat_input else None
+        _uploaded_files = list(_chat_input.files) if _chat_input else []
+        if _uploaded_files and not _user_question:
+            _user_question = "Please analyze this attachment."
+        if len(_uploaded_files) > _AI_MAX_ATTACHMENT_FILES:
+            st.error(
+                f"Attach at most {_AI_MAX_ATTACHMENT_FILES} files at once.")
+        elif any(f.size > _AI_MAX_ATTACHMENT_BYTES for f in _uploaded_files):
+            st.error("One of your attachments is too large (max 15MB each).")
+        elif _user_question or _uploaded_files:
             # v2.67.25 — append the picked intent to the user's
             # message as a system-readable hint. Stays attached
             # through the audit log so we can later analyse which
@@ -24063,10 +24120,23 @@ elif page == "AI Assistant":
             }.get(st.session_state.get("_ai_intent", "stock"), "")
             if _intent_hint:
                 _user_question = f"{_user_question}\n\n{_intent_hint}"
+            # v2.67.380 — attachment marker for the visible transcript.
+            # Only a display-time note + live preview; the transcript
+            # (unlike _ai_messages) is never trimmed, so we don't
+            # persist raw image bytes here — that would just move the
+            # unbounded-per-session-memory problem into a different
+            # session_state key instead of solving it.
+            _display_question = _user_question
+            if _uploaded_files:
+                _names = ", ".join(f.name for f in _uploaded_files)
+                _display_question = f"📎 {_names}\n\n{_user_question}"
             st.session_state["_ai_transcript"].append({
-                "role": "user", "content": _user_question})
+                "role": "user", "content": _display_question})
             with st.chat_message("user"):
-                st.markdown(_user_question)
+                st.markdown(_display_question)
+                for _f in _uploaded_files:
+                    if _f.type in _AI_SUPPORTED_IMAGE_TYPES:
+                        st.image(_f.getvalue(), width=200)
 
             # ---- Viktor bridge (v2.67.126) ----
             # If this is a marketing question AND the current user
@@ -24430,8 +24500,18 @@ elif page == "AI Assistant":
             if "_ai_messages" not in st.session_state:
                 st.session_state["_ai_messages"] = []
             _messages = list(st.session_state["_ai_messages"])
-            _messages.append(
-                {"role": "user", "content": _user_question})
+            # v2.67.380 — fixed index: nothing removes/reorders earlier
+            # entries, only the tool-use loop below appends after this
+            # point, so this stays valid for the history-trim step once
+            # the loop finishes (see _ai_attachment_history_note usage).
+            _user_turn_index = len(_messages)
+            # Only switch to the content-block form when a file is
+            # actually attached — keeps the (overwhelmingly common)
+            # plain-text turn byte-for-byte identical to prior behavior.
+            _user_content = (
+                _ai_build_user_content_blocks(_user_question, _uploaded_files)
+                if _uploaded_files else _user_question)
+            _messages.append({"role": "user", "content": _user_content})
             _system_prompt = (
                 f"You are an inventory analyst assistant for "
                 f"{COMPANY_NAME}, a CIN7-using business that sells "
@@ -25584,6 +25664,12 @@ elif page == "AI Assistant":
             # tells them to use the Clear conversation button if it
             # keeps happening.
             if _final_text_parts:
+                if _uploaded_files:
+                    _messages[_user_turn_index] = {
+                        "role": "user",
+                        "content": _ai_attachment_history_note(
+                            _user_question, _uploaded_files),
+                    }
                 st.session_state["_ai_messages"] = _messages
             else:
                 # Don't persist the broken turn. Show a richer
