@@ -12,6 +12,7 @@ Streamlit sessions on one PC comfortably. Swap for Postgres later if hosted.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import sqlite3
 from contextlib import contextmanager
@@ -22,6 +23,14 @@ from typing import Any, Iterator, List, Optional, Tuple
 # DB_PATH lives in DATA_DIR so the SQLite file follows the persistent
 # disk on Render. data_paths.py defaults to the project folder locally.
 from data_paths import DB_PATH  # noqa: E402
+
+# v2.67.xxx — module logger. db.py had no logging of its own before;
+# added specifically so qbo_monthly_pl_summary_by_category's exclusion-
+# netting tripwire (see that function) can surface a loud warning
+# instead of silently miscalculating — this class of bug (double-
+# counted customer exclusion collapsing a whole P&L category) had no
+# visibility anywhere before it was traced by hand.
+log = logging.getLogger("db")
 
 
 # ---------------------------------------------------------------------------
@@ -282,12 +291,27 @@ CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_month
 CREATE INDEX IF NOT EXISTS idx_qbo_monthly_pl_acctnum
     ON qbo_monthly_pl(account_number);
 
--- v2.67.xxx — per-(month, account) amounts attributable to a
--- customer we exclude from company reporting (Altar'd State — see
+-- v2.67.xxx — per-(month, account) amounts attributable to the
+-- customer(s) we exclude from company reporting (Altar'd State — see
 -- sales_exclusions.py; that filter only touches CIN7 sale_lines, not
 -- this QBO-sourced table). qbo_monthly_pl_summary_by_category nets
 -- these off the matching qbo_monthly_pl row before categorising, so
 -- Sections 6/7/8 line up with the already-excluded CIN7 sections.
+--
+-- NOTE on customer_name / the UNIQUE constraint below: the netting
+-- query groups by (month, account_number, account_name) only —
+-- customer_name is NOT part of that identity, it is stored purely
+-- for human inspection (which excluded customer group a row came
+-- from). qbo_monthly_pl.sync_exclusions_for_customers() writes it as
+-- a fixed sentinel (EXCLUSION_CUSTOMER_LABEL), not a per-customer or
+-- joined-label value, precisely so this UNIQUE key stays meaningful
+-- as an identity. The real correctness guarantee comes from that
+-- sync's replace (delete-then-insert) semantics — see
+-- db.replace_qbo_monthly_pl_exclusions() — not from this constraint
+-- matching; a real incident happened because an earlier version
+-- upserted on a customer_name that changed shape between syncs,
+-- leaving stale rows under their old key that the netting query kept
+-- summing alongside the new one.
 CREATE TABLE IF NOT EXISTS qbo_monthly_pl_exclusions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     month           TEXT NOT NULL,
@@ -5113,10 +5137,25 @@ def batch_upsert_qbo_monthly_pl(rows: list) -> int:
 
 
 def batch_upsert_qbo_monthly_pl_exclusion(rows: list) -> int:
-    """Bulk upsert for qbo_monthly_pl_exclusions — same pattern as
-    batch_upsert_qbo_monthly_pl above. `rows` is a list of dicts with
-    keys: month, account_id, account_number, account_name,
-    customer_name, amount. Returns rows actually written."""
+    """Bulk upsert for qbo_monthly_pl_exclusions, keyed on the table's
+    UNIQUE(month, account_id, account_name, customer_name).
+
+    NOTE: this low-level upsert is kept around for tests that need to
+    seed rows under an ARBITRARY customer_name (e.g. reconstructing
+    the old, pre-fix per-customer write pattern, or a legacy stale
+    row left behind by it). Production sync code should NOT call this
+    directly any more — see replace_qbo_monthly_pl_exclusions() below,
+    which is what qbo_monthly_pl.sync_exclusions_for_customers() now
+    uses. Upserting by customer_name is exactly the fragile-key
+    pattern that caused the double-/triple-count incident: whenever
+    the string written as customer_name changes between syncs (one
+    row per customer vs. a joined label vs. anything else), the OLD
+    row under the OLD customer_name is a *different* key and is never
+    cleaned up, so qbo_monthly_pl_summary_by_category's customer_name
+    -blind SUM(...) GROUP BY (month, account_number, account_name)
+    keeps summing it too. `rows` is a list of dicts with keys: month,
+    account_id, account_number, account_name, customer_name, amount.
+    Returns rows actually written."""
     if not rows:
         return 0
     sql = (
@@ -5141,6 +5180,100 @@ def batch_upsert_qbo_monthly_pl_exclusion(rows: list) -> int:
                     month,
                     r.get("account_id") or "",
                     r.get("account_number"),
+                    name,
+                    cust,
+                    float(r.get("amount") or 0)))
+                n += 1
+            except Exception:  # noqa: BLE001
+                continue
+    return n
+
+
+def replace_qbo_monthly_pl_exclusions(rows: list) -> int:
+    """Delete-then-insert (replace) write path for
+    qbo_monthly_pl_exclusions — this is what production exclusion
+    syncs should call, NOT batch_upsert_qbo_monthly_pl_exclusion.
+
+    Why this exists
+    ----------------
+    qbo_monthly_pl_summary_by_category nets exclusions with:
+        SELECT month, account_number, account_name, SUM(amount)
+        FROM qbo_monthly_pl_exclusions
+        GROUP BY month, account_number, account_name
+    i.e. customer_name is NOT part of the netting identity — it is
+    stored for human inspection only. That means the table's
+    UNIQUE(month, account_id, account_name, customer_name) constraint
+    is the wrong tool for keeping this data correct: upserting on a
+    key that includes a mutable/derived customer_name string (one row
+    per matched customer, a joined "A, B" label, or anything else that
+    can change as the set of matched QBO customer records changes)
+    leaves the PREVIOUS sync's rows in place under their own old key
+    every time that string changes shape — and the customer_name
+    -blind SUM(...) above then sums the stale row(s) too. That is
+    exactly how a real incident went from a double-count to a
+    triple-count: a fix that changed the write pattern (without
+    deleting the old rows first) added a third row on top of two
+    pre-existing stale ones instead of replacing them.
+    `sync_exclusions_for_customers` now always writes a single fixed
+    sentinel customer_name (see qbo_monthly_pl.EXCLUSION_CUSTOMER_
+    LABEL) precisely so there is only ever one "current" row per
+    (month, account) key going forward — but that alone doesn't clean
+    up rows already on disk under a DIFFERENT (older) customer_name.
+    This function does: for every (month, account_number,
+    account_name) key present in `rows`, it DELETEs every existing
+    row at that key — regardless of what customer_name it was stored
+    under — before inserting the freshly computed total. That makes
+    it self-healing: the very first time this runs against a database
+    still holding old per-customer-name rows (from before this fix,
+    or from any future write-pattern change), those stale rows are
+    removed automatically, with no separate migration step.
+
+    Scope of the DELETE is intentionally narrow — only the exact
+    (month, account_number, account_name) keys present in `rows`,
+    never "every exclusion row this month" or "every exclusion row
+    period" — so that if a future, unrelated exclusion (a different
+    excluded customer or purpose, on a different account) is ever
+    added to this same table, this call won't wipe it out just
+    because it happens to fall in the same month.
+
+    `rows` is a list of dicts with keys: month, account_id,
+    account_number, account_name, customer_name, amount. Returns the
+    number of rows inserted."""
+    if not rows:
+        return 0
+    delete_sql = (
+        "DELETE FROM qbo_monthly_pl_exclusions "
+        "WHERE month = ? "
+        "  AND COALESCE(account_number, '') = COALESCE(?, '') "
+        "  AND LOWER(account_name) = LOWER(?)")
+    insert_sql = (
+        "INSERT INTO qbo_monthly_pl_exclusions "
+        "(month, account_id, account_number, account_name, "
+        " customer_name, amount, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(month, account_id, account_name, customer_name) "
+        "DO UPDATE SET account_number = excluded.account_number, "
+        "    amount = excluded.amount, "
+        "    synced_at = datetime('now')")
+    n = 0
+    deleted_keys: set = set()
+    with connect() as c:
+        for r in rows:
+            month = (r.get("month") or "").strip()
+            name = (r.get("account_name") or "").strip()
+            cust = (r.get("customer_name") or "").strip()
+            if not month or not name or not cust:
+                continue
+            acct_num = r.get("account_number")
+            key = (month, acct_num or "", name.lower())
+            if key not in deleted_keys:
+                c.execute(delete_sql, (month, acct_num, name))
+                deleted_keys.add(key)
+            try:
+                c.execute(insert_sql, (
+                    month,
+                    r.get("account_id") or "",
+                    acct_num,
                     name,
                     cust,
                     float(r.get("amount") or 0)))
@@ -5229,6 +5362,36 @@ def qbo_monthly_pl_summary_by_category(
                str(d.get("account_number") or "").strip(),
                str(d.get("account_name") or "").strip().lower())
         excl_by_key[key] = float(d.get("amount") or 0)
+    # v2.67.xxx — defensive floor on exclusion netting.
+    #
+    # Real incident (Aug 2026): Altar'd State existed in QBO as TWO
+    # overlapping customer records ("Altar'd State" + an inactive
+    # "Altar'd State 1"), both matched by _find_excluded_customer_ids()
+    # in qbo_monthly_pl.py. Pre-fix, that module synced each record's
+    # customer-scoped P&L separately and both amounts landed in
+    # qbo_monthly_pl_exclusions under the SAME (month, account_number,
+    # account_name) key, so the unconditional `amount -= excl` below
+    # subtracted roughly double the real exclusion — collapsing
+    # Product COGS from ~$220k/mo to $2.75k in Aug 2026 with GP%
+    # spiking to 99%, with no floor or warning to catch it.
+    #
+    # The root cause is now fixed at the sync layer (one combined
+    # multi-customer report query — see
+    # qbo_monthly_pl.sync_exclusions_for_customers), which removes the
+    # double-count by construction. This floor is kept as
+    # defense-in-depth so that ANY future customer-matching edge case
+    # (a new duplicate/child QBO record, a mapping bug, a manual data
+    # fix gone wrong, etc.) that again causes an over-large exclusion
+    # can't silently zero out / flip the sign of a whole category —
+    # instead the subtraction is capped and a loud warning is logged.
+    # Deliberately NOT a hard clamp on the category's absolute value:
+    # a genuinely large excluded customer in a genuinely small-revenue
+    # month is a valid (if rare) outcome, so we cap the *exclusion*
+    # at a generous share of the pre-exclusion amount rather than
+    # capping the result at some arbitrary floor value.
+    _EXCL_MAX_SHARE = 0.30  # an exclusion may net out at most 30% of
+                             # the pre-exclusion magnitude before the
+                             # tripwire below caps it and warns.
     for r in rows:
         d = dict(r)
         num = str(d.get("account_number") or "").strip()
@@ -5236,8 +5399,42 @@ def qbo_monthly_pl_summary_by_category(
         month = d.get("month") or ""
         if not month:
             continue
-        amount = float(d.get("amount") or 0)
-        amount -= excl_by_key.get((month, num, name), 0.0)
+        pre_amount = float(d.get("amount") or 0)
+        excl = excl_by_key.get((month, num, name), 0.0)
+        amount = pre_amount
+        if excl:
+            if pre_amount == 0:
+                # No matching qbo_monthly_pl row to net against —
+                # applying the exclusion here would manufacture a
+                # negative figure out of nothing. Skip netting for
+                # this key and warn so it can be investigated.
+                log.warning(
+                    "qbo_monthly_pl_summary_by_category: exclusion "
+                    "of %.2f for %s/%s in %s has no matching "
+                    "pre-exclusion amount (0) — skipping netting "
+                    "for this key.", excl, num or "-", name or "-",
+                    month)
+            else:
+                cap = abs(pre_amount) * _EXCL_MAX_SHARE
+                if abs(excl) > cap:
+                    log.warning(
+                        "qbo_monthly_pl_summary_by_category: "
+                        "exclusion tripwire fired for %s/%s in %s — "
+                        "excluded amount %.2f exceeds %.0f%% of the "
+                        "pre-exclusion amount %.2f. Capping the "
+                        "netted exclusion at %.2f and using the "
+                        "capped result instead of subtracting the "
+                        "full amount, to avoid silently zeroing out "
+                        "or sign-flipping this category (see "
+                        "double-count incident referenced above). "
+                        "This usually means an excluded customer "
+                        "matched more than one overlapping QBO "
+                        "customer record — check "
+                        "_find_excluded_customer_ids().",
+                        num or "-", name or "-", month, excl,
+                        _EXCL_MAX_SHARE * 100, pre_amount, cap)
+                    excl = math.copysign(cap, excl)
+                amount = pre_amount - excl
         for cat, (num_set, name_set) in cat_specs.items():
             if (num and num in num_set) or (name and name in name_set):
                 out.setdefault(month, {})

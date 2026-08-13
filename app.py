@@ -19931,7 +19931,39 @@ elif page == "Monthly Metrics":
             "the ~$5-15k/mo gap between App COGS and Total "
             "COGS. Both views are correct — narrow product "
             "COGS for buyer reporting, broad Total COGS for "
-            "accounting reconciliation."
+            "accounting reconciliation.\n\n"
+            "### 7. Exclusion netting & posting-lag timing "
+            "⚠️\n"
+            "Sections 6/7/8 (QuickBooks-sourced) net out excluded "
+            "customers (currently Altar'd State) so these figures "
+            "agree with the CIN7-sourced sections, which already "
+            "exclude the same customer at load time — see "
+            "`qbo_monthly_pl.py`'s excluded-customer netting and "
+            "`db.qbo_monthly_pl_summary_by_category`'s exclusion "
+            "tripwire. **A real incident** (Aug 2026): Altar'd "
+            "State existed as two overlapping QBO customer "
+            "records, and netting both out against the same "
+            "account/month double-subtracted the exclusion — "
+            "Product COGS collapsed from ~$220k/mo to $2.75k with "
+            "GP% spiking to 99% before it was caught. The sync "
+            "layer now issues one combined query so this can't "
+            "recur the same way, and the netting math now logs a "
+            "loud warning (and caps the subtraction) if an "
+            "exclusion ever again looks implausibly large relative "
+            "to the pre-exclusion figure — but always sanity-check "
+            "a month where GP% looks unusually high or a cost line "
+            "looks unusually low.\n\n"
+            "Separately, QBO posting can lag a few days into the "
+            "next month (vendor bills, AmEx/bank feed matching, "
+            "month-end journal entries) — the **most recent 1-2 "
+            "months** of Section 6/7 figures can look artificially "
+            "low or incomplete until QBO's own books catch up. "
+            "Section 7 rows show \"—\" (not $0) for a month with no "
+            "`qbo_monthly_pl.py sync` data at all, so a true sync "
+            "gap is now visually distinct from a genuine $0 posted "
+            "to an account — but a *partially* posted recent month "
+            "will still show a low (not missing) number, so treat "
+            "the last 1-2 months of QB figures as provisional."
         )
 
     # v2.67.88 — debug panel for shipments DataFrame state. Prints
@@ -20232,6 +20264,25 @@ elif page == "Monthly Metrics":
         def _qb_has_data(cat):
             return any(_qb(m, cat) for m in months)
 
+        def _qb_month_synced(m):
+            """True if qbo_monthly_pl.py has ever synced ANY row for
+            this month at all. `_qb(m, cat)`'s `.get(cat, 0.0) or 0.0`
+            fallback can't tell "$0 actually posted to this account
+            this month" apart from "this month has no QBO sync data
+            yet" — both render as a literal $0. Section 7 below uses
+            this to show "—" (no data) instead of a misleading $0 for
+            months that simply haven't been synced."""
+            return str(m) in _qb_by_month
+
+        def _qb_per_month(fn):
+            """Like _per_month, but for QuickBooks-sourced Section 7
+            rows: emits None (rendered as "—", distinct from a literal
+            $0) for any month with no qbo_monthly_pl sync data at
+            all, instead of silently defaulting through _qb()'s 0.0
+            fallback."""
+            return [(fn(m) if _qb_month_synced(m) else None)
+                     for m in months]
+
         # QB-canonical Sales and a Reconciliation block used to
         # live here (pre-v2.67.298). They've moved into sections 6
         # (Sales & Adjustments) and 7 (Cost & Profitability) below,
@@ -20329,30 +20380,37 @@ elif page == "Monthly Metrics":
         # Total COGS, Gross Profit, GP %, OpEx, Operating Profit,
         # Op Margin %, Net Income. The complete picture commission
         # base will eventually freeze against.
+        # v2.67.xxx — rows here use _qb_per_month (not _per_month) so
+        # a month with no qbo_monthly_pl sync data renders "—" rather
+        # than a literal $0 — the two used to be indistinguishable,
+        # which is exactly how a real double-counted exclusion (see
+        # the netting tripwire in db.py) could hide behind an
+        # innocent-looking $0 / near-0 figure instead of an obvious
+        # gap.
         if _qb_has_data("cogs"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Product COGS (QB 500)",
-                 _per_month(lambda m: _qb(m, "cogs")))
+                 _qb_per_month(lambda m: _qb(m, "cogs")))
         if _qb_has_data("cogs_amazon_fees"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Amazon Fees (QB 502)",
-                 _per_month(lambda m: _qb(m, "cogs_amazon_fees")))
+                 _qb_per_month(lambda m: _qb(m, "cogs_amazon_fees")))
         if _qb_has_data("inventory_adjustment"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Inventory Adj (QB 550)",
-                 _per_month(lambda m: _qb(m, "inventory_adjustment")))
+                 _qb_per_month(lambda m: _qb(m, "inventory_adjustment")))
         if _qb_has_data("total_cogs"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Total COGS",
-                 _per_month(lambda m: _qb(m, "total_cogs")))
+                 _qb_per_month(lambda m: _qb(m, "total_cogs")))
         if _qb_has_data("qb_gross_profit"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Gross Profit",
-                 _per_month(lambda m: _qb(m, "qb_gross_profit")))
+                 _qb_per_month(lambda m: _qb(m, "qb_gross_profit")))
             if _qb_has_data("total_income"):
                 _row("7. Cost & Profitability [QuickBooks]",
                      "GP %",
-                     _per_month(lambda m: (
+                     _qb_per_month(lambda m: (
                          _qb(m, "qb_gross_profit")
                          / _qb(m, "total_income") * 100
                          if _qb(m, "total_income") else 0.0)),
@@ -20360,15 +20418,15 @@ elif page == "Monthly Metrics":
         if _qb_has_data("qb_total_expenses"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Total OpEx",
-                 _per_month(lambda m: _qb(m, "qb_total_expenses")))
+                 _qb_per_month(lambda m: _qb(m, "qb_total_expenses")))
         if _qb_has_data("qb_net_operating_income"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Operating Profit",
-                 _per_month(lambda m: _qb(m, "qb_net_operating_income")))
+                 _qb_per_month(lambda m: _qb(m, "qb_net_operating_income")))
             if _qb_has_data("total_income"):
                 _row("7. Cost & Profitability [QuickBooks]",
                      "Op Margin %",
-                     _per_month(lambda m: (
+                     _qb_per_month(lambda m: (
                          _qb(m, "qb_net_operating_income")
                          / _qb(m, "total_income") * 100
                          if _qb(m, "total_income") else 0.0)),
@@ -20376,7 +20434,7 @@ elif page == "Monthly Metrics":
         if _qb_has_data("qb_net_income"):
             _row("7. Cost & Profitability [QuickBooks]",
                  "Net Income (QB)",
-                 _per_month(lambda m: _qb(m, "qb_net_income")))
+                 _qb_per_month(lambda m: _qb(m, "qb_net_income")))
 
         # v2.67.295 — Channel rows from CIN7 SalesRep field.
         # Amazon / eBay / Shopify / individual reps come in on the
@@ -20790,9 +20848,14 @@ elif page == "Monthly Metrics":
             ytd_labels = [lbl for lbl in month_labels
                             if int(lbl.split("-")[0]) == ytd_year]
             for idx, r in enumerate(rows):
+                # v2.67.xxx — Section 7 rows can now carry None for
+                # "no QBO sync data this month" (see _qb_per_month);
+                # exclude those from the YTD/Avg sums rather than
+                # letting None poison sum() or silently treating an
+                # un-synced month as $0 in the average.
                 ytd_vals = [v for lbl, v in zip(month_labels, r["Values"])
-                             if lbl in ytd_labels]
-                avg_vals = r["Values"]
+                             if lbl in ytd_labels and v is not None]
+                avg_vals = [v for v in r["Values"] if v is not None]
                 if r["Format"] == "pct":
                     # Avg of percents — weighted by the underlying totals
                     # is the "right" way, but the simple mean is what
@@ -20808,6 +20871,19 @@ elif page == "Monthly Metrics":
 
         # --- Format values for display ------------------------------
         def _fmt_cell(v, fmt):
+            # No QBO sync data for this month (see _qb_per_month) —
+            # distinct from a real $0 posted to the account. Checked
+            # with pd.isna() (not `v is None`) because a None mixed
+            # into a float column becomes NaN once it round-trips
+            # through pd.DataFrame(display_rows) below — pandas
+            # silently upcasts None to NaN in an all-numeric column,
+            # so a plain `is None` check would miss it there and
+            # print a literal "nan" instead of "—".
+            try:
+                if pd.isna(v):
+                    return "—"
+            except (TypeError, ValueError):
+                pass
             try:
                 v = float(v)
             except (ValueError, TypeError):
