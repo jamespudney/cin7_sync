@@ -871,6 +871,29 @@ Treat apostrophe variants (`Altar’d State`, `Altar'd State`, `ALTARD
 STATE`) as the same excluded customer. Do not describe these rows as
 missing or stale; they are deliberately out of scope.
 
+**Excluded customer sales — QuickBooks side.** The exclusion above only
+covers CIN7 data. Sections 6/7/8 (QuickBooks-sourced) are netted
+separately by `qbo_monthly_pl.py` / `db.qbo_monthly_pl_summary_by_category`,
+which subtract the excluded customer's QBO-reported amount from the
+matching account/month before categorising. This nets one combined
+customer-scoped report call across every matching QBO customer record
+(there can be more than one QBO record for the same real-world
+customer — e.g. a duplicate/inactive record). ⚠️ A prior bug summed
+two overlapping records' exclusions separately and double-subtracted,
+collapsing Product COGS to near-zero and spiking GP% to ~99% for a
+month (Aug 2026) — a tripwire now warns and caps the netted amount if
+an exclusion ever again looks implausibly large relative to the
+pre-exclusion figure, so treat a QB GP% that looks unusually high, or
+a QB cost line that looks unusually low, as worth double-checking
+against QBO directly rather than taken at face value. The combined
+query alone wasn't enough the first time it was tried — switching to a
+different stored label without deleting the old per-customer rows
+would have summed all of them together (double-count → triple-count).
+`db.replace_qbo_monthly_pl_exclusions()` now deletes any existing row
+at each `(month, account_number, account_name)` key before inserting
+the fresh total under one fixed label, self-healing any stale rows
+left on disk with no separate migration step.
+
 **Discounts.** Sourced from `shopify_monthly_discounts` table
 (populated by `python shopify_discounts.py sync` daily). The
 Shopify Admin API's order.total_discounts is the single source

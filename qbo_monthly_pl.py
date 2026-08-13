@@ -67,6 +67,24 @@ from sales_exclusions import (  # noqa: E402
 
 log = logging.getLogger("qbo_monthly_pl")
 
+# v2.67.xxx — the customer_name stored on every
+# qbo_monthly_pl_exclusions row this sync writes. This is
+# DELIBERATELY a fixed sentinel, not a joined label built from
+# whichever QBO customer records currently match the excluded-
+# customer list (e.g. "Altar'd State, Altar'd State 1"). The netting
+# query in db.qbo_monthly_pl_summary_by_category groups by (month,
+# account_number, account_name) only — customer_name is never part
+# of that identity — so a label that can change shape (a customer
+# record added/renamed/deactivated) would silently create a NEW
+# storage key next to the old one instead of replacing it. Using one
+# constant string means every sync run targets the same key, and
+# db.replace_qbo_monthly_pl_exclusions()'s delete-then-insert takes
+# care of correctness even so (see that function's docstring) — this
+# constant just keeps the stored customer_name human-readable and
+# stable rather than pretending it's still meaningful per-customer
+# granularity.
+EXCLUSION_CUSTOMER_LABEL = "Excluded customers (combined)"
+
 
 def _setup_log(verbose: bool = False) -> None:
     logging.basicConfig(
@@ -311,29 +329,70 @@ def _find_excluded_customer_ids() -> Dict[str, str]:
     return out
 
 
-def sync_exclusions_for_customer(customer_id: str, customer_name: str,
-                                   start: date, end: date,
-                                   acct_meta: Dict[str, Dict[str, str]]
-                                   ) -> int:
-    """Pull the SAME ProfitAndLoss report, scoped to one customer's
-    own transactions via QBO's `customer` report filter, and store
-    into qbo_monthly_pl_exclusions. Reuses parse_pnl() unchanged —
-    QBO computes this customer's own Total Income/Total COGS/Net
-    Operating Income subtotals the same way it does for the full-
-    company report, so netting row-for-row (in
-    qbo_monthly_pl_summary_by_category) stays consistent at every
-    level, not just the leaf accounts."""
+def sync_exclusions_for_customers(customer_ids: List[str],
+                                    customer_label: str,
+                                    start: date, end: date,
+                                    acct_meta: Dict[str, Dict[str, str]]
+                                    ) -> int:
+    """Pull ONE ProfitAndLoss report scoped to the UNION of all given
+    customer IDs via QBO's `customer` report filter (comma-separated,
+    per the Reports API), and REPLACE the matching rows in
+    qbo_monthly_pl_exclusions with the freshly computed totals.
+
+    v2.67.xxx — this replaced a loop that called the report once PER
+    matched customer and summed the results client-side. That was the
+    root cause of a real incident: Altar'd State exists in QBO as two
+    customer records ("Altar'd State" and an inactive "Altar'd
+    State 1"), both matched by _find_excluded_customer_ids(). Calling
+    the customer-scoped P&L once per record and then netting both
+    amounts off the SAME (month, account) row in
+    qbo_monthly_pl_summary_by_category double-subtracted the overlap,
+    which silently collapsed Product COGS from ~$220k/mo to $2.75k in
+    Aug 2026 with GP% spiking to 99% before it was traced back to this
+    exclusion double-counting.
+
+    Requesting `customer=id1,id2,...` in a single call instead makes
+    QBO itself resolve the union of matching customers' transactions
+    (deduping any parent/child or duplicate-record overlap at the
+    ledger level) — there is no client-side sum of multiple reports
+    left to double-count. Reuses parse_pnl() unchanged — QBO computes
+    the scoped Total Income/Total COGS/Net Operating Income subtotals
+    the same way it does for the full-company report, so netting
+    row-for-row (in qbo_monthly_pl_summary_by_category) stays
+    consistent at every level, not just the leaf accounts.
+
+    v2.67.xxx (follow-up) — an *earlier* version of this fix still
+    wrote rows via an upsert keyed on customer_name = `customer_label`
+    (a joined string like "Altar'd State, Altar'd State 1"). That
+    label is a different key every time the set of matched customer
+    records changes shape, so upserting on it left old rows (per-
+    customer names from before this fix, or an earlier joined label)
+    in place under their own key — and qbo_monthly_pl_summary_by_
+    category's customer_name-blind SUM(...) then summed those stale
+    rows too, on top of the new one (a double-count becoming a
+    triple-count). This is now fixed at the storage layer: the DB
+    write below always uses the fixed EXCLUSION_CUSTOMER_LABEL
+    sentinel and goes through db.replace_qbo_monthly_pl_exclusions(),
+    which deletes any existing row at each (month, account_number,
+    account_name) key — under ANY customer_name — before inserting
+    the new total, so this is self-healing regardless of what a prior
+    sync (or a future write-pattern change) stored. `customer_label`
+    is still accepted here and used only for logging — it is no
+    longer written to the database."""
+    ids = sorted({str(c).strip() for c in customer_ids if str(c).strip()})
+    if not ids:
+        return 0
     report = qbo_client.report("ProfitAndLoss", params={
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
         "summarize_column_by": "Month",
         "accounting_method": "Accrual",
-        "customer": customer_id,
+        "customer": ",".join(ids),
     })
     tuples = parse_pnl(report)
     if not tuples:
-        log.info("No P&L rows for excluded customer %s (Id=%s).",
-                  customer_name, customer_id)
+        log.info("No P&L rows for excluded customer(s) %s (Ids=%s).",
+                  customer_label, ",".join(ids))
         return 0
     payload = []
     for (month, acct_id, name, section, parent, amount) in tuples:
@@ -343,11 +402,14 @@ def sync_exclusions_for_customer(customer_id: str, customer_name: str,
             "account_id": acct_id,
             "account_number": meta.get("number") or None,
             "account_name": name,
-            "customer_name": customer_name,
+            "customer_name": EXCLUSION_CUSTOMER_LABEL,
             "amount": amount,
         })
-    n_ok = db.batch_upsert_qbo_monthly_pl_exclusion(payload)
-    log.info("Wrote %d exclusion row(s) for %s.", n_ok, customer_name)
+    n_ok = db.replace_qbo_monthly_pl_exclusions(payload)
+    log.info("Replaced %d exclusion row(s) for %s (%d QBO customer "
+              "record(s) combined into one query, stored under the "
+              "fixed label %r).",
+              n_ok, customer_label, len(ids), EXCLUSION_CUSTOMER_LABEL)
     return n_ok
 
 
@@ -437,13 +499,19 @@ def cmd_sync(args) -> int:
     if excluded:
         log.info("Netting out %d excluded QBO customer record(s): %s",
                   len(excluded), ", ".join(excluded))
-        for cust_name, cust_id in excluded.items():
-            try:
-                sync_exclusions_for_customer(
-                    cust_id, cust_name, start, end, acct_meta)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("Exclusion sync failed for %s: %s",
-                             cust_name, exc)
+        # v2.67.xxx — ONE combined report call for every matched QBO
+        # customer record (see sync_exclusions_for_customers docstring
+        # for the double-count incident this replaced), instead of
+        # looping and calling the customer-scoped report once per
+        # record and summing client-side.
+        cust_label = ", ".join(sorted(excluded.keys()))
+        try:
+            sync_exclusions_for_customers(
+                list(excluded.values()), cust_label, start, end,
+                acct_meta)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Exclusion sync failed for %s: %s",
+                         cust_label, exc)
     else:
         log.info("No excluded customers (%s) found in QBO — "
                   "nothing to net out.",

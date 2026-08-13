@@ -89,6 +89,49 @@ and reporting loaders filter these rows at read time. Match apostrophe
 variants (`Altar’d State`, `Altar'd State`, `ALTARD STATE`) as the same
 excluded customer.
 
+**3.1.4 QBO-side exclusion netting (Monthly Metrics Sections 6/7/8).**
+The 3.1.3 exclusion above only filters CIN7 `sale_lines`/`sales` — it has
+no effect on `qbo_monthly_pl.py`'s separate pull of QuickBooks Online
+P&L data. That module nets excluded customers back out of the QBO
+figures itself: `_find_excluded_customer_ids()` looks up every QBO
+Customer record whose name matches an excluded key (catching numbered
+duplicate/sub-customer records too), then `sync_exclusions_for_customers()`
+issues **one combined** customer-scoped `ProfitAndLoss` report (QBO's
+`customer` report filter accepts a comma-separated list of Customer
+IDs) and stores the result in `qbo_monthly_pl_exclusions`.
+`db.qbo_monthly_pl_summary_by_category()` subtracts those amounts from
+the matching `(month, account_number, account_name)` row before
+categorising, so Sections 6/7/8 agree with the CIN7-sourced sections.
+
+⚠️ **Real incident (Aug 2026):** before the single-combined-query fix,
+this exclusion was synced with one QBO report call **per matched
+customer record**, summed client-side. Altar'd State existed in QBO as
+two overlapping records ("Altar'd State" + an inactive "Altar'd
+State 1"), so the same account/month got netted twice — Product COGS
+collapsed from ~$220k/mo to $2.75k with GP% spiking to 99% before it
+was traced back to this double-count. `qbo_monthly_pl_summary_by_category`
+now also carries a tripwire: if an exclusion ever exceeds ~30% of the
+pre-exclusion amount for a given `(month, account)`, it caps the
+subtraction and logs a warning instead of silently zeroing out or
+sign-flipping the category. Section 7 on the Monthly Metrics page
+renders "—" (not a literal $0) for any month with no
+`qbo_monthly_pl.py sync` data at all, so a sync gap is visually
+distinct from a genuine $0 posted to an account.
+
+The single-combined-query change alone wasn't sufficient the first
+time it was tried: switching the write to a joined-label
+`customer_name` (e.g. "Altar'd State, Altar'd State 1") without
+deleting the two pre-existing per-customer-name rows first would have
+had the netting SUM (which is blind to `customer_name`) add all three
+rows together — turning the double-count into a triple-count on
+deploy. `db.replace_qbo_monthly_pl_exclusions()` fixes this properly:
+every sync deletes any existing row at each `(month, account_number,
+account_name)` key — regardless of what `customer_name` it was
+written under — before inserting the fresh total under one fixed
+sentinel name (`qbo_monthly_pl.EXCLUSION_CUSTOMER_LABEL`). This is
+self-healing: the first sync after this fix ships cleans up any stale
+rows already on disk, with no separate migration step.
+
 **3.2 Unfulfilled sales reduce effective position.** Count `BACKORDERED + ORDERED + ORDERING` as unfulfilled units. Subtract from `OnHand + OnOrder − Allocated` before comparing against target to get the real reorder need.
 
 **3.3 Migration: retiring SKU sales roll forward to successor.** Discontinued/phased-out lines (Smokies, Cascade) have their historical demand rolled into the successor (Sierra38, Sierra65) with a configurable share %. UI for managing these lives in the Ordering page's Migrations expander. Store in `sku_migrations` table.
