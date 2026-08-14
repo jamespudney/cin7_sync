@@ -132,6 +132,36 @@ sentinel name (`qbo_monthly_pl.EXCLUSION_CUSTOMER_LABEL`). This is
 self-healing: the first sync after this fix ships cleans up any stale
 rows already on disk, with no separate migration step.
 
+⚠️ **Follow-up incident (Aug 2026, same month, different root cause):**
+after the double-count fix above shipped and was confirmed correctly
+netting `$0` exclusions for Jun/Jul/Aug 2026, Section 7 was STILL
+showing the same collapsed COGS ($110,353 / $15,429 / $3,187). Direct,
+read-only inspection of QuickBooks' own `JournalEntry` records (via
+`qbo_client.query_all()`, bypassing the P&L report and this app's
+parsing entirely) found the real cause: **CIN7's own QuickBooks Online
+integration** — which posts inventory-relief/COGS journal entries per
+order (`DocNumber` prefix `FG-#####`, debiting/crediting "Inventory -
+On Hand" and "Cost of Goods Sold") — had silently stopped posting
+after 2026-06-17. Nothing in `cin7_sync`'s code was wrong;
+`qbo_client.py` has no write path to QuickBooks at all (read-only
+`report()`/`query()` only), so there was no sync bug to fix — the
+entries genuinely never arrived in QuickBooks. This is an external
+integration outage, not a code defect, and the fix is operational
+(reconnect CIN7's QuickBooks integration; ask CIN7 support about
+backfilling the missed Finished Goods entries).
+
+To stop a future occurrence of this from looking like a silent
+dashboard bug again, `db.qbo_monthly_pl_anomaly_months()` flags any
+month whose QBO "Total Cost of Goods Sold" falls below 60% of the
+median of the trailing clean (non-flagged) months, requiring at least
+3 months of clean history before flagging starts, and excluding
+flagged months from later baselines so a multi-month gap doesn't
+"normalise" against itself. Both `app.py`'s Monthly Metrics page
+(Section 7) and `monthly_metrics_report.py`'s Slack-posted PDF render
+the same caveat from this same function — keeping the dashboard and
+the Slack-facing report in agreement, per the standing rule that the
+two must always show the same information.
+
 **3.2 Unfulfilled sales reduce effective position.** Count `BACKORDERED + ORDERED + ORDERING` as unfulfilled units. Subtract from `OnHand + OnOrder − Allocated` before comparing against target to get the real reorder need.
 
 **3.3 Migration: retiring SKU sales roll forward to successor.** Discontinued/phased-out lines (Smokies, Cascade) have their historical demand rolled into the successor (Sierra38, Sierra65) with a configurable share %. UI for managing these lives in the Ordering page's Migrations expander. Store in `sku_migrations` table.

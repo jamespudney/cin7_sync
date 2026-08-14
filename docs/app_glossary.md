@@ -894,6 +894,25 @@ at each `(month, account_number, account_name)` key before inserting
 the fresh total under one fixed label, self-healing any stale rows
 left on disk with no separate migration step.
 
+⚠️ **QBO data-completeness caveat (Section 7).** The double-count fix
+above did NOT explain the full picture: after it shipped, Section 7
+still showed collapsed COGS for Jun/Jul/Aug 2026 ($110,353 / $15,429 /
+$3,187 vs a normal ~$180-220k/month). Direct inspection of QuickBooks'
+own `JournalEntry` records found the real cause — **CIN7's own
+QuickBooks Online integration** (which posts inventory-relief/COGS
+journal entries per order, `DocNumber` prefix `FG-#####`) had silently
+stopped posting after 2026-06-17. This is an upstream integration
+outage, not a bug in this app — `qbo_client.py` has no write path to
+QuickBooks at all, so there was nothing in this codebase to fix. When
+you see a month with implausibly low Product COGS / Total COGS and a
+correspondingly inflated GP%, check whether `db.
+qbo_monthly_pl_anomaly_months()` has flagged it (shown as a warning
+banner under Section 7 on the dashboard, and as an italic caveat under
+Section 7 in the Slack-posted monthly PDF) before assuming the sync or
+dashboard math is wrong — the flag means QuickBooks' own upstream data
+looks incomplete, most likely because CIN7's QuickBooks integration
+needs reconnecting.
+
 **Discounts.** Sourced from `shopify_monthly_discounts` table
 (populated by `python shopify_discounts.py sync` daily). The
 Shopify Admin API's order.total_discounts is the single source
