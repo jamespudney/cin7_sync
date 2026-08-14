@@ -20257,6 +20257,17 @@ elif page == "Monthly Metrics":
         except Exception:  # noqa: BLE001
             _qb_by_month = {}
 
+        # v2.67.xxx — surface likely-incomplete QBO months instead of
+        # letting them look like a silent dashboard bug (see the Aug
+        # 2026 CIN7-QBO integration outage incident documented on
+        # db.qbo_monthly_pl_anomaly_months).
+        try:
+            _qb_anomaly_months = (
+                db.qbo_monthly_pl_anomaly_months(_qb_by_month)
+                if _qb_by_month else {})
+        except Exception:  # noqa: BLE001
+            _qb_anomaly_months = {}
+
         def _qb(m, cat):
             return float((_qb_by_month.get(str(m)) or {}).get(
                 cat, 0.0) or 0.0)
@@ -21626,6 +21637,22 @@ elif page == "Monthly Metrics":
                 continue
             _seen_sections.append(section)
             st.subheader(f"🔹 {section}")
+            if (section == "7. Cost & Profitability [QuickBooks]"
+                    and _qb_anomaly_months):
+                _flag_bits = ", ".join(
+                    f"{m} (${v['value']:,.0f} vs a trailing "
+                    f"~${v['baseline']:,.0f} baseline)"
+                    for m, v in sorted(_qb_anomaly_months.items()))
+                st.warning(
+                    "⚠️ QuickBooks data may be incomplete for: "
+                    f"{_flag_bits}. This pattern (COGS far below "
+                    "trailing months) usually means an upstream sync "
+                    "into QuickBooks — e.g. CIN7's own QuickBooks "
+                    "Online integration, which posts inventory-"
+                    "relief/COGS journal entries per order — has "
+                    "stopped posting, not a bug in this dashboard. "
+                    "Check that integration's connection status "
+                    "before trusting these months' COGS/GP%/margins.")
             _render_metrics_table_html(sect_df)
             _render_section_pie(section)
         # Catch-all: render any section not in the explicit order

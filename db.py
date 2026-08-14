@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import sqlite3
+import statistics
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -5440,6 +5441,57 @@ def qbo_monthly_pl_summary_by_category(
                 out.setdefault(month, {})
                 out[month][cat] = out[month].get(cat, 0.0) + amount
     return out
+
+
+def qbo_monthly_pl_anomaly_months(
+        qb_by_month: dict,
+        category: str = "total_cogs",
+        baseline_window: int = 6,
+        min_baseline_months: int = 3,
+        threshold_fraction: float = 0.6) -> dict:
+    """Flag months where `category` (default: QB's own 'Total Cost of
+    Goods Sold' subtotal, from qbo_monthly_pl_summary_by_category's
+    output) falls below `threshold_fraction` of a trailing baseline —
+    the median of the most recent CLEAN (non-flagged) prior months, up
+    to `baseline_window` of them, requiring at least
+    `min_baseline_months` of clean history before any flagging starts.
+    A flagged month is excluded from later baselines so a real
+    multi-month gap doesn't get "normalised" against itself.
+
+    Real incident (Aug 2026): CIN7's own QuickBooks Online integration
+    (which posts inventory-relief/COGS journal entries per order)
+    silently stopped posting after 2026-06-17. Nothing in this app's
+    sync or dashboard code was wrong — qbo_monthly_pl faithfully
+    reproduced whatever QuickBooks' own P&L report said — but Section
+    7 [QuickBooks] COGS still collapsed from ~$200k/mo to $110k, $15k,
+    then $3k over Jun/Jul/Aug, with GP% climbing to 77%/97%/99%, and
+    it read as a dashboard bug until traced back to the upstream QBO
+    integration outage via qbo_client.query_all() against QuickBooks'
+    JournalEntry records directly. This flags that pattern so it's a
+    visible caveat next time instead of looking like silently wrong
+    numbers.
+
+    Returns {month: {'value': float, 'baseline': float,
+                      'ratio': float}} for flagged months only —
+    empty dict if nothing looks anomalous (or there's too little
+    history to judge)."""
+    if not qb_by_month:
+        return {}
+    clean_trailing: list = []
+    flagged: dict = {}
+    for m in sorted(qb_by_month.keys()):
+        value = float((qb_by_month.get(m) or {}).get(category, 0.0) or 0.0)
+        if len(clean_trailing) >= min_baseline_months:
+            baseline = statistics.median(clean_trailing[-baseline_window:])
+            if baseline > 0 and value < threshold_fraction * baseline:
+                flagged[m] = {
+                    "value": value,
+                    "baseline": baseline,
+                    "ratio": value / baseline,
+                }
+                continue
+        clean_trailing.append(value)
+    return flagged
 
 
 def get_qbo_account_mappings() -> dict:

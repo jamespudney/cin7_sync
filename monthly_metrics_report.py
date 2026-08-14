@@ -813,12 +813,16 @@ def compute_month_values(data: Dict[str, Any], month: str,
 
 
 def compute_monthly_tables(data: Dict[str, Any], months: List[str]
-                            ) -> Dict[str, Dict[str, Dict[str, float]]]:
+                            ) -> Tuple[Dict[str, Dict[str, Dict[str, float]]],
+                                       dict]:
     """{section: {metric label: {month: raw value}}} across every
-    month in `months`. Whole-history aggregates (customer first/last
-    seen, QBO P&L, Shopify discounts, Shopify order split) are built
-    ONCE here and threaded through per-month calls, rather than
-    re-derived 14 times."""
+    month in `months`, plus a QBO data-completeness flag dict (see
+    db.qbo_monthly_pl_anomaly_months) — mirrors app.py's Monthly
+    Metrics page so the Slack-posted PDF and dashboard always carry
+    the same caveat, not just the same numbers. Whole-history
+    aggregates (customer first/last seen, QBO P&L, Shopify discounts,
+    Shopify order split) are built ONCE here and threaded through
+    per-month calls, rather than re-derived 14 times."""
     db = data["db"]
     sale_lines = data["sale_lines"]
 
@@ -828,6 +832,12 @@ def compute_monthly_tables(data: Dict[str, Any], months: List[str]
             db.get_qbo_account_mappings())
     except Exception:  # noqa: BLE001
         qb_by_month = {}
+    try:
+        qb_anomaly_months = (
+            db.qbo_monthly_pl_anomaly_months(qb_by_month)
+            if qb_by_month else {})
+    except Exception:  # noqa: BLE001
+        qb_anomaly_months = {}
     try:
         shopify_disc_by_month = db.all_shopify_monthly_discounts() or {}
     except Exception:  # noqa: BLE001
@@ -844,7 +854,7 @@ def compute_monthly_tables(data: Dict[str, Any], months: List[str]
             raw.setdefault(section, {})
             for label, v in metrics.items():
                 raw[section].setdefault(label, {})[m] = v
-    return raw
+    return raw, qb_anomaly_months
 
 
 def compute_inventory_snapshot(data: Dict[str, Any]) -> Dict[str, float]:
@@ -1027,7 +1037,8 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
               current_month: str,
               commentary: Optional[str] = None,
               company: str = "Wired4Signs USA",
-              py_months: Optional[List[str]] = None) -> bytes:
+              py_months: Optional[List[str]] = None,
+              qb_anomaly_months: Optional[dict] = None) -> bytes:
     """Landscape, one wide table per section (Metric rows x month
     columns + YTD + Avg), matching the dashboard's own Monthly
     Metrics tables row-for-row. `months` is the full column range
@@ -1046,7 +1057,14 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
     dashboard uses. QBO-sourced sections (6/7/8) only get the
     comparison pie if qbo_monthly_pl actually has data that far
     back; otherwise a caption explains why, rather than showing a
-    misleadingly small pie."""
+    misleadingly small pie.
+
+    `qb_anomaly_months` (see db.qbo_monthly_pl_anomaly_months) adds a
+    caveat note under Section 7 for any month whose QBO COGS looks
+    anomalously low vs trailing months — mirrors the same warning
+    app.py's Monthly Metrics page shows, so the Slack-posted PDF and
+    the dashboard never disagree on whether a month's figures should
+    be trusted."""
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1313,6 +1331,24 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
         else:
             block = [Paragraph(section, section_style),
                      _section_table(section)]
+            if (section == "7. Cost & Profitability [QuickBooks]"
+                    and qb_anomaly_months):
+                flag_bits = ", ".join(
+                    f"{m} (${v['value']:,.0f} vs a trailing "
+                    f"~${v['baseline']:,.0f} baseline)"
+                    for m, v in sorted(qb_anomaly_months.items()))
+                block.append(Spacer(1, 2))
+                block.append(Paragraph(
+                    f"<i>⚠ QuickBooks data may be incomplete "
+                    f"for: {flag_bits}. This pattern (COGS far below "
+                    "trailing months) usually means an upstream sync "
+                    "into QuickBooks — e.g. CIN7's own QuickBooks "
+                    "Online integration, which posts inventory-"
+                    "relief/COGS journal entries per order — has "
+                    "stopped posting, not a bug in this report. "
+                    "Check that integration's connection status "
+                    "before trusting these months' COGS/GP%/"
+                    "margins.</i>", note_style))
             pies = _pies_block(section)
             if pies:
                 block.append(Spacer(1, 10))
@@ -1430,7 +1466,8 @@ def main() -> int:
         # `months`' own 14-month window — so each section's pie can
         # show a year-over-year comparison, same as the dashboard.
         all_months = sorted(set(months) | set(py_months))
-        tables = compute_monthly_tables(cin7_data, all_months)
+        tables, qb_anomaly_months = compute_monthly_tables(
+            cin7_data, all_months)
         inventory_snapshot = compute_inventory_snapshot(cin7_data)
     except Exception as exc:  # noqa: BLE001
         _emit(f"section computation failed: {exc!r}", level="error")
@@ -1451,7 +1488,8 @@ def main() -> int:
         pdf_bytes = build_pdf(tables, months, inventory_snapshot, month,
                                current_month,
                                commentary=commentary.get("html"),
-                               py_months=py_months)
+                               py_months=py_months,
+                               qb_anomaly_months=qb_anomaly_months)
     except Exception as exc:  # noqa: BLE001
         _emit(f"PDF build failed: {exc!r}", level="error")
         return 4
