@@ -4626,6 +4626,62 @@ def _normalise_po_number(raw: str) -> str:
     return s
 
 
+def _demand_snapshot_caveat(sku: str, sale_lines_df: Optional[pd.DataFrame],
+                             eff_12mo: float,
+                             lookback_days: int = 7) -> Optional[str]:
+    """Real incident (Aug 2026): PO-7558 commentary called LED-20.080
+    "no demand history (0 units 12mo, 0 effective)" moments after a
+    real sale (SO-60355, placed two days earlier) had already landed
+    in CIN7 — the widest sale_lines snapshot available at commentary
+    time was a monthly-refreshed 730-day backfill that simply
+    predated the order, so the demand figure hadn't caught up yet.
+    The gap was benign and self-corrected within the next sync cycle
+    (~an hour), but a confidently-worded "no demand history" for a
+    SKU with a sale two days prior needlessly alarmed the buyer.
+
+    Cross-checks effective_units_12mo (0) against whatever sale_lines
+    snapshot THIS SAME tool call already has loaded — if it shows a
+    sale for this exact SKU within `lookback_days`, the two numbers
+    disagree with each other in the same response, which is a much
+    cheaper and more reliable signal than trying to estimate whether
+    the snapshot itself is stale. Returns a caveat string to surface
+    verbatim, or None if nothing looks off."""
+    if eff_12mo > 0 or sale_lines_df is None or sale_lines_df.empty:
+        return None
+    if "SKU" not in sale_lines_df.columns:
+        return None
+    date_col = ("InvoiceDate" if "InvoiceDate" in sale_lines_df.columns
+                else "OrderDate" if "OrderDate" in sale_lines_df.columns
+                else None)
+    if not date_col:
+        return None
+    hits = sale_lines_df[
+        sale_lines_df["SKU"].astype(str) == str(sku or "")]
+    if hits.empty:
+        return None
+    dates = pd.to_datetime(hits[date_col], errors="coerce").dropna()
+    if dates.empty:
+        return None
+    most_recent = dates.max()
+    if (pd.Timestamp.now() - most_recent).days > lookback_days:
+        return None
+    order_col = next((c for c in ("OrderNumber", "SaleOrderNumber")
+                        if c in hits.columns), None)
+    order_ref = ""
+    if order_col:
+        recent_rows = hits[dates == most_recent]
+        if not recent_rows.empty:
+            order_ref = str(recent_rows.iloc[0].get(order_col) or "")
+    ref = (f"{order_ref}, {most_recent.date()}" if order_ref
+           else str(most_recent.date()))
+    return (
+        f"Demand snapshot may not be caught up yet — a sale for this "
+        f"SKU exists ({ref}) within the last {lookback_days} days "
+        f"despite effective_units_12mo reading 0. Do not describe "
+        f"this as confirmed zero/no demand history; note the "
+        f"discrepancy instead.")
+
+
 def get_purchase_order(engine_df: pd.DataFrame,
                         sale_lines_df: pd.DataFrame,
                         args: dict) -> dict:
@@ -4822,6 +4878,9 @@ def get_purchase_order(engine_df: pd.DataFrame,
                 "excess_units": _epо(_lsku, "excess_units", 0),
                 "suggested_reorder": _epо(_lsku, "suggested_reorder"),
                 "reorder_status": _epо(_lsku, "reorder_status", ""),
+                "demand_snapshot_caveat": _demand_snapshot_caveat(
+                    _lsku, sale_lines_df,
+                    float(_epо(_lsku, "effective_units_12mo", 0) or 0)),
             }))
 
         po_record = {
@@ -5581,6 +5640,9 @@ def get_purchase_live(engine_df: pd.DataFrame,
             "excess_units": _eng(sku, "excess_units", 0),
             "suggested_reorder": _eng(sku, "suggested_reorder", None),
             "reorder_status": _eng(sku, "reorder_status", ""),
+            "demand_snapshot_caveat": _demand_snapshot_caveat(
+                sku, sale_lines_df,
+                float(_eng(sku, "effective_units_12mo", 0) or 0)),
         })
 
     # Header-level metadata. v2.67.197 — surface draft status
