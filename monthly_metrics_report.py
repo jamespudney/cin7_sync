@@ -1333,22 +1333,13 @@ def build_pdf(tables: Dict[str, Dict[str, Dict[str, float]]],
                      _section_table(section)]
             if (section == "7. Cost & Profitability [QuickBooks]"
                     and qb_anomaly_months):
-                flag_bits = ", ".join(
-                    f"{m} (${v['value']:,.0f} vs a trailing "
-                    f"~${v['baseline']:,.0f} baseline)"
-                    for m, v in sorted(qb_anomaly_months.items()))
+                flagged = ", ".join(sorted(qb_anomaly_months.keys()))
                 block.append(Spacer(1, 2))
                 block.append(Paragraph(
-                    f"<i>⚠ QuickBooks data may be incomplete "
-                    f"for: {flag_bits}. This pattern (COGS far below "
-                    "trailing months) usually means an upstream sync "
-                    "into QuickBooks — e.g. CIN7's own QuickBooks "
-                    "Online integration, which posts inventory-"
-                    "relief/COGS journal entries per order — has "
-                    "stopped posting, not a bug in this report. "
-                    "Check that integration's connection status "
-                    "before trusting these months' COGS/GP%/"
-                    "margins.</i>", note_style))
+                    f"<i>⚠ QuickBooks COGS may be incomplete for "
+                    f"{flagged} — likely an upstream sync gap (e.g. "
+                    "CIN7's QuickBooks integration), not a report "
+                    "bug.</i>", note_style))
             pies = _pies_block(section)
             if pies:
                 block.append(Spacer(1, 10))

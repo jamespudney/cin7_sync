@@ -19836,6 +19836,21 @@ elif page == "Monthly Metrics":
             "toward zero as reconciliation completes.\n\n"
             "When QB rows are missing, run "
             "`python qbo_monthly_pl.py sync` to refresh.\n\n"
+            "⚠️ **QBO data-completeness flag (Section 7)** — a real "
+            "incident (Aug 2026): CIN7's own QuickBooks Online "
+            "integration silently stopped posting inventory-relief/"
+            "COGS journal entries per order, with the connection "
+            "itself still showing as active — CIN7 kept completing "
+            "assemblies normally the whole time, so nothing here or "
+            "in the sync was actually broken, but Product COGS still "
+            "collapsed for several months with GP% climbing toward "
+            "100%. Section 7 now flags any month whose QB Total COGS "
+            "falls far below the trailing average (see a small "
+            "caption under the table when this fires) — treat it as "
+            "\"go check the upstream integration,\" not a dashboard "
+            "bug. The flag clears itself automatically once "
+            "QuickBooks has real data again; nothing needs to be "
+            "manually reset.\n\n"
             "---\n\n"
             "**:satellite: Channel rows (CIN7 by SalesRep, "
             "v2.67.295)** — the rows under *Channel (CIN7 by "
@@ -21639,20 +21654,23 @@ elif page == "Monthly Metrics":
             st.subheader(f"🔹 {section}")
             if (section == "7. Cost & Profitability [QuickBooks]"
                     and _qb_anomaly_months):
-                _flag_bits = ", ".join(
-                    f"{m} (${v['value']:,.0f} vs a trailing "
-                    f"~${v['baseline']:,.0f} baseline)"
-                    for m, v in sorted(_qb_anomaly_months.items()))
-                st.warning(
-                    "⚠️ QuickBooks data may be incomplete for: "
-                    f"{_flag_bits}. This pattern (COGS far below "
-                    "trailing months) usually means an upstream sync "
-                    "into QuickBooks — e.g. CIN7's own QuickBooks "
-                    "Online integration, which posts inventory-"
-                    "relief/COGS journal entries per order — has "
-                    "stopped posting, not a bug in this dashboard. "
-                    "Check that integration's connection status "
-                    "before trusting these months' COGS/GP%/margins.")
+                # v2.67.xxx — a single terse line, not a full-width
+                # warning box: this is a live signal (see the general
+                # explanation in the "Methodology & known caveats"
+                # expander above), not something that needs to
+                # dominate the page every time it fires. Deliberately
+                # no dollar figures here — Streamlit's Markdown
+                # renderer treats a bare `$...$` pair as inline LaTeX
+                # math, so an earlier version ("$112,680 vs a
+                # trailing $208,518...") rendered as mangled,
+                # spaceless math instead of readable text.
+                _flagged = ", ".join(sorted(_qb_anomaly_months.keys()))
+                st.caption(
+                    f"⚠️ QuickBooks COGS may be incomplete for "
+                    f"{_flagged} — likely an upstream sync gap (e.g. "
+                    "CIN7's QuickBooks integration), not a dashboard "
+                    "bug. See \"Methodology & known caveats\" above "
+                    "for details.")
             _render_metrics_table_html(sect_df)
             _render_section_pie(section)
         # Catch-all: render any section not in the explicit order
