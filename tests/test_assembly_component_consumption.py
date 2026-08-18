@@ -104,6 +104,48 @@ class UpsertReadPruneTests(_TempDbTestCase):
         self.assertEqual(len(all_rows), 1)
         self.assertEqual(all_rows[0]["Quantity"], 99.0)
 
+    def test_multi_bin_pick_lines_sum_instead_of_overwrite(self) -> None:
+        # Real scenario flagged in review: one assembly task picks the
+        # SAME component from two different bins (split stock), which
+        # cin7_sync.py writes as two separate PickLine rows sharing
+        # the same (TaskID, ComponentSKU) but different BinID/
+        # Quantity. Before the fix, ON CONFLICT DO UPDATE overwrote
+        # rather than summed, silently losing whichever bin's
+        # quantity lost the race — the exact class of bug this whole
+        # feature exists to fix, reintroduced via a different path.
+        bin_a = _row("1", "LED-MC-20.009-S", 5, days_ago=1)
+        bin_a["BinID"] = "BIN-A"
+        bin_b = _row("1", "LED-MC-20.009-S", 3, days_ago=1)
+        bin_b["BinID"] = "BIN-B"
+
+        n = db.upsert_assembly_component_consumption([bin_a, bin_b])
+        self.assertEqual(n, 1)  # one merged row, not two
+
+        rows = db.get_assembly_component_consumption()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Quantity"], 8.0)  # 5 + 3, not 3 or 5
+
+    def test_repeated_upsert_of_same_batch_replaces_not_adds(self) -> None:
+        # Deliberately REPLACE, not ADD, on conflict — additive
+        # semantics would break idempotency: re-running the same sync
+        # twice (a legitimate operational scenario — manual retries,
+        # a scheduled run overlapping a manual one) would otherwise
+        # double the stored quantity every re-run. This is why the
+        # multi-bin fix merges within ONE call (summing before
+        # upserting) rather than relying on the DB to accumulate
+        # across calls — safe only because cin7_sync.py's row-
+        # building loop always appends a task's FULL pick-line set
+        # before that task is eligible for a flush, so one task's
+        # pick lines are never split across two separate upsert calls
+        # in practice (see the multi-bin test above for the case that
+        # matters).
+        row = _row("1", "LED-MC-20.009-S", 8, days_ago=1)
+        db.upsert_assembly_component_consumption([row])
+        db.upsert_assembly_component_consumption([row])  # same sync, re-run
+        rows = db.get_assembly_component_consumption()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Quantity"], 8.0)  # not 16.0
+
     def test_since_filter_excludes_older_rows(self) -> None:
         db.upsert_assembly_component_consumption([
             _row("1", "SKU-A", 1, days_ago=1),
@@ -126,6 +168,44 @@ class UpsertReadPruneTests(_TempDbTestCase):
         remaining = db.get_assembly_component_consumption()
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["TaskID"], "1")
+
+    def test_prune_also_removes_null_completion_date_rows(self) -> None:
+        # A CIN7 detail response missing BOTH CompletionDate and Date
+        # (task.get("Date") also empty) reaches cin7_sync.py with
+        # completion=None — such rows are already invisible to every
+        # actual demand calculation (worker_engine.py drops them via
+        # dropna()), so there's nothing to preserve by keeping them.
+        # Under plain SQL semantics `NULL < cutoff` is never true, so
+        # without an explicit `OR completion_date IS NULL` these rows
+        # would accumulate in the table forever.
+        dated = _row("1", "SKU-A", 1, days_ago=1)
+        undated = _row("2", "SKU-A", 1, days_ago=1)
+        undated["CompletionDate"] = None
+        db.upsert_assembly_component_consumption([dated, undated])
+        self.assertEqual(len(db.get_assembly_component_consumption()), 2)
+
+        n_pruned = db.prune_assembly_component_consumption(
+            older_than_days=400)
+        self.assertEqual(n_pruned, 1)
+        remaining = db.get_assembly_component_consumption()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["TaskID"], "1")
+
+    def test_get_excludes_null_completion_date_rows_when_since_set(self) -> None:
+        dated = _row("1", "SKU-A", 1, days_ago=1)
+        undated = _row("2", "SKU-A", 1, days_ago=1)
+        undated["CompletionDate"] = None
+        db.upsert_assembly_component_consumption([dated, undated])
+
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        rows = db.get_assembly_component_consumption(since=cutoff)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["TaskID"], "1")
+
+        # Without a `since` bound, the undated row is still returned —
+        # only the since-filtered path silently excludes NULLs.
+        all_rows = db.get_assembly_component_consumption()
+        self.assertEqual(len(all_rows), 2)
 
     def test_empty_rows_returns_zero(self) -> None:
         self.assertEqual(db.upsert_assembly_component_consumption([]), 0)

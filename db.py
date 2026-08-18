@@ -19,7 +19,7 @@ import statistics
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # DB_PATH lives in DATA_DIR so the SQLite file follows the persistent
 # disk on Render. data_paths.py defaults to the project folder locally.
@@ -5729,13 +5729,47 @@ def upsert_assembly_component_consumption(rows: list) -> int:
     matching cin7_sync.py's assemblies CSV schema: TaskID,
     ComponentSKU, AssemblyNumber, ParentSKU, ParentName, Quantity,
     CompletionDate, Status. Rows missing TaskID or ComponentSKU are
-    skipped. Returns the count actually written.
+    skipped. Returns the count of DISTINCT (task_id, component_sku)
+    rows written (after the merge described below) — logged by the
+    caller as "written of N attempted" so a systematic failure (e.g.
+    every row hitting the same constraint error) is visible instead
+    of silently reducing the count with no trail.
+
+    v2.67.xxx — pre-merges rows sharing the same (TaskID,
+    ComponentSKU) BEFORE upserting, summing Quantity. cin7_sync.py
+    appends one row per CIN7 PickLine, and a single assembly task can
+    pick the same component from more than one bin (split stock
+    across bins) — multiple PickLine rows with the SAME (TaskID,
+    ComponentSKU) but different BinID/Quantity. This table's key is
+    (task_id, component_sku) — nothing downstream needs bin-level
+    detail (worker_engine.py only reads ComponentSKU/Quantity/
+    CompletionDate/Status) — so upserting each pick line separately
+    would let `ON CONFLICT DO UPDATE` overwrite rather than
+    accumulate, silently losing whichever bin's quantity lost the
+    race. Merging first makes the overwrite semantics correct instead
+    of lossy, reproducing exactly the kind of silent demand
+    undercounting this whole feature exists to fix.
 
     Called from cin7_sync.py's sync_assemblies() alongside its
     existing CSV write, so the app service's already-paid CIN7 API
     cost gets shared with the worker instead of the worker re-fetching
     it (see the schema comment for why that re-fetch is expensive)."""
     if not rows:
+        return 0
+    merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in rows:
+        task_id = str(r.get("TaskID") or "").strip()
+        component_sku = str(r.get("ComponentSKU") or "").strip()
+        if not task_id or not component_sku:
+            continue
+        key = (task_id, component_sku)
+        qty = float(r.get("Quantity") or 0)
+        if key not in merged:
+            merged[key] = dict(r)
+            merged[key]["Quantity"] = qty
+        else:
+            merged[key]["Quantity"] += qty
+    if not merged:
         return 0
     sql = (
         "INSERT INTO assembly_component_consumption "
@@ -5752,11 +5786,7 @@ def upsert_assembly_component_consumption(rows: list) -> int:
         "  synced_at = datetime('now')")
     n = 0
     with connect() as c:
-        for r in rows:
-            task_id = str(r.get("TaskID") or "").strip()
-            component_sku = str(r.get("ComponentSKU") or "").strip()
-            if not task_id or not component_sku:
-                continue
+        for (task_id, component_sku), r in merged.items():
             try:
                 c.execute(sql, (
                     task_id,
@@ -5765,12 +5795,19 @@ def upsert_assembly_component_consumption(rows: list) -> int:
                     r.get("ParentSKU"),
                     r.get("ParentName"),
                     float(r.get("Quantity") or 0),
-                    r.get("CompletionDate") or r.get("Date"),
+                    r.get("CompletionDate"),
                     r.get("Status")))
                 n += 1
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 # Single-row failure: continue with the rest, same as
-                # batch_upsert_qbo_monthly_pl.
+                # batch_upsert_qbo_monthly_pl — but log it, since a
+                # systematic issue (e.g. every row hitting the same
+                # constraint error) should be visible rather than
+                # silently reducing the written count with no trail.
+                log.warning(
+                    "assembly_component_consumption upsert failed for "
+                    "task_id=%s component_sku=%s (continuing): %s",
+                    task_id, component_sku, exc)
                 continue
     return n
 
@@ -5782,41 +5819,45 @@ def get_assembly_component_consumption(
     casing worker_engine.py's aggregation code already expects), so
     the worker can build the same DataFrame it would from a CSV,
     just sourced from Postgres instead. `since` optionally bounds by
-    completion_date (inclusive, 'YYYY-MM-DD' string)."""
-    sql = ("SELECT task_id, component_sku, assembly_number, "
-           "parent_sku, parent_name, quantity, completion_date, "
-           "status FROM assembly_component_consumption")
+    completion_date (inclusive, 'YYYY-MM-DD' string) — rows with a
+    NULL completion_date (a CIN7 detail response missing both
+    CompletionDate and Date) are excluded when `since` is set, same
+    as they'd be dropped by worker_engine.py's own dropna() anyway,
+    so this never changes an actual demand number."""
+    sql = ('SELECT task_id AS "TaskID", component_sku AS "ComponentSKU", '
+           'assembly_number AS "AssemblyNumber", parent_sku AS "ParentSKU", '
+           'parent_name AS "ParentName", quantity AS "Quantity", '
+           'completion_date AS "CompletionDate", status AS "Status" '
+           "FROM assembly_component_consumption")
     params: list = []
     if since:
         sql += " WHERE completion_date >= ?"
         params.append(since)
     with connect() as c:
         rows = c.execute(sql, params).fetchall()
-    return [{
-        "TaskID": r["task_id"],
-        "ComponentSKU": r["component_sku"],
-        "AssemblyNumber": r["assembly_number"],
-        "ParentSKU": r["parent_sku"],
-        "ParentName": r["parent_name"],
-        "Quantity": r["quantity"],
-        "CompletionDate": r["completion_date"],
-        "Status": r["status"],
-    } for r in rows]
+    return [dict(r) for r in rows]
 
 
 def prune_assembly_component_consumption(older_than_days: int = 400) -> int:
     """Delete rows whose completion_date is older than
     `older_than_days` (default 400 — a ~5-week buffer past the 365-
     day demand window so nothing needed for a 12mo calc gets pruned
-    early). Keeps the table bounded — call periodically from the app
-    service's daily sync, not on every sync_assemblies() call.
-    Returns the number of rows deleted."""
+    early), OR whose completion_date is NULL (a malformed CIN7
+    response missing both CompletionDate and Date — these are already
+    invisible to every actual demand calculation via dropna(), so
+    there's nothing to preserve by keeping them; without this they'd
+    never satisfy `completion_date < cutoff` under SQL NULL semantics
+    and would accumulate in the table forever). Cheap indexed range
+    delete — safe to call on every sync_assemblies() run regardless
+    of which day-window was just synced, which is how cin7_sync.py
+    actually calls it. Returns the number of rows deleted."""
     cutoff = (datetime.now() - timedelta(days=older_than_days)
               ).strftime("%Y-%m-%d")
     with connect() as c:
         cur = c.execute(
             "DELETE FROM assembly_component_consumption "
-            "WHERE completion_date < ?", (cutoff,))
+            "WHERE completion_date < ? OR completion_date IS NULL",
+            (cutoff,))
         return int(cur.rowcount or 0)
 
 
