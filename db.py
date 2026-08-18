@@ -17,7 +17,7 @@ import math
 import sqlite3
 import statistics
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -1516,6 +1516,51 @@ CREATE TABLE IF NOT EXISTS cin7_rate_limit_state (
     window_start_ts REAL    NOT NULL DEFAULT 0,
     request_count   INTEGER NOT NULL DEFAULT 0
 );
+
+-- v2.67.xxx — real CIN7 Finished-Goods assembly-task consumption,
+-- shared via Postgres so the worker (cin7-sync-slack-bot, no disk)
+-- can see it without re-fetching from CIN7 itself.
+--
+-- Real incident (Aug 2026): worker_engine.py already had logic to
+-- prefer real per-task assembly consumption over a BOM-ratio proxy
+-- (built after Andrew flagged an ~11x-too-low reading for LED-
+-- SILICONE-PMT80050), but the worker never actually received any
+-- assemblies data — slack_loop.sh never runs `cin7_sync.py
+-- assemblies`, and assemblies_last_*.csv only ever lands on the app
+-- service's disk (Render disks aren't shared across services). So
+-- every BOM-heavy component with little direct sale_lines activity
+-- (e.g. LED-MC-20.009-S, a mounting clip) silently fell back to the
+-- same flawed proxy that caused the original incident — its real
+-- ~180/month demand read as "181 effective 12mo" for the whole year.
+--
+-- Re-fetching a full assemblies history independently on the worker
+-- was considered and rejected: sync_assemblies() requires one detail
+-- API call PER TASK (not just a list call), and a full window can
+-- take hours (14k+ tasks in a prior backfill) against the CIN7
+-- account's shared, deliberately-tuned 60/min rate limit. Sharing
+-- what the app service already fetches avoids that cost entirely.
+--
+-- One row per (task_id, component_sku) pair, mirroring the CSV grain
+-- (assemblies_last_*d_*.csv's own documented schema). cin7_sync.py's
+-- sync_assemblies() upserts here alongside its existing CSV write;
+-- worker_engine.py reads from here instead of (or as a fallback to)
+-- the local CSV glob it can never actually find data in.
+CREATE TABLE IF NOT EXISTS assembly_component_consumption (
+    task_id         TEXT NOT NULL,
+    component_sku   TEXT NOT NULL,
+    assembly_number TEXT,
+    parent_sku      TEXT,
+    parent_name     TEXT,
+    quantity        REAL NOT NULL DEFAULT 0,
+    completion_date TEXT,
+    status          TEXT,
+    synced_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (task_id, component_sku)
+);
+CREATE INDEX IF NOT EXISTS idx_assembly_component_consumption_sku
+    ON assembly_component_consumption(component_sku);
+CREATE INDEX IF NOT EXISTS idx_assembly_component_consumption_completion
+    ON assembly_component_consumption(completion_date);
 """
 
 
@@ -4135,6 +4180,34 @@ _PG_POST_CUTOVER_TABLES = [
           request_count   INTEGER NOT NULL DEFAULT 0
       );
       """),
+    # v2.67.xxx — shared real assembly-consumption data (see _SCHEMA
+    # for the SQLite-side definition and the Aug 2026 incident
+    # rationale — LED-MC-20.009-S and the original PMT80050 case).
+    ("assembly_component_consumption",
+      """
+      CREATE TABLE IF NOT EXISTS assembly_component_consumption (
+          task_id         TEXT NOT NULL,
+          component_sku   TEXT NOT NULL,
+          assembly_number TEXT,
+          parent_sku      TEXT,
+          parent_name     TEXT,
+          quantity        DOUBLE PRECISION NOT NULL DEFAULT 0,
+          completion_date TEXT,
+          status          TEXT,
+          synced_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (task_id, component_sku)
+      );
+      """),
+    ("assembly_component_consumption_sku_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_assembly_component_consumption_sku
+          ON assembly_component_consumption(component_sku);
+      """),
+    ("assembly_component_consumption_completion_idx",
+      """
+      CREATE INDEX IF NOT EXISTS idx_assembly_component_consumption_completion
+          ON assembly_component_consumption(completion_date);
+      """),
 ]
 
 
@@ -5643,6 +5716,108 @@ def seed_default_qbo_account_mappings(actor: str = "system") -> int:
             actor=actor)
         n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# Shared real assembly-consumption data (v2.67.xxx) — see
+# assembly_component_consumption's schema comment for the full Aug
+# 2026 incident writeup (LED-MC-20.009-S / PMT80050).
+# ---------------------------------------------------------------------------
+def upsert_assembly_component_consumption(rows: list) -> int:
+    """Bulk upsert variant (one connection, not per-row) — same
+    pattern as batch_upsert_qbo_monthly_pl. `rows` is a list of dicts
+    matching cin7_sync.py's assemblies CSV schema: TaskID,
+    ComponentSKU, AssemblyNumber, ParentSKU, ParentName, Quantity,
+    CompletionDate, Status. Rows missing TaskID or ComponentSKU are
+    skipped. Returns the count actually written.
+
+    Called from cin7_sync.py's sync_assemblies() alongside its
+    existing CSV write, so the app service's already-paid CIN7 API
+    cost gets shared with the worker instead of the worker re-fetching
+    it (see the schema comment for why that re-fetch is expensive)."""
+    if not rows:
+        return 0
+    sql = (
+        "INSERT INTO assembly_component_consumption "
+        "(task_id, component_sku, assembly_number, parent_sku, "
+        " parent_name, quantity, completion_date, status, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(task_id, component_sku) DO UPDATE SET "
+        "  assembly_number = excluded.assembly_number, "
+        "  parent_sku = excluded.parent_sku, "
+        "  parent_name = excluded.parent_name, "
+        "  quantity = excluded.quantity, "
+        "  completion_date = excluded.completion_date, "
+        "  status = excluded.status, "
+        "  synced_at = datetime('now')")
+    n = 0
+    with connect() as c:
+        for r in rows:
+            task_id = str(r.get("TaskID") or "").strip()
+            component_sku = str(r.get("ComponentSKU") or "").strip()
+            if not task_id or not component_sku:
+                continue
+            try:
+                c.execute(sql, (
+                    task_id,
+                    component_sku,
+                    r.get("AssemblyNumber"),
+                    r.get("ParentSKU"),
+                    r.get("ParentName"),
+                    float(r.get("Quantity") or 0),
+                    r.get("CompletionDate") or r.get("Date"),
+                    r.get("Status")))
+                n += 1
+            except Exception:  # noqa: BLE001
+                # Single-row failure: continue with the rest, same as
+                # batch_upsert_qbo_monthly_pl.
+                continue
+    return n
+
+
+def get_assembly_component_consumption(
+        since: Optional[str] = None) -> list:
+    """Return assembly_component_consumption rows as a list of dicts
+    keyed to match the CSV schema (TaskID/ComponentSKU/... — same
+    casing worker_engine.py's aggregation code already expects), so
+    the worker can build the same DataFrame it would from a CSV,
+    just sourced from Postgres instead. `since` optionally bounds by
+    completion_date (inclusive, 'YYYY-MM-DD' string)."""
+    sql = ("SELECT task_id, component_sku, assembly_number, "
+           "parent_sku, parent_name, quantity, completion_date, "
+           "status FROM assembly_component_consumption")
+    params: list = []
+    if since:
+        sql += " WHERE completion_date >= ?"
+        params.append(since)
+    with connect() as c:
+        rows = c.execute(sql, params).fetchall()
+    return [{
+        "TaskID": r["task_id"],
+        "ComponentSKU": r["component_sku"],
+        "AssemblyNumber": r["assembly_number"],
+        "ParentSKU": r["parent_sku"],
+        "ParentName": r["parent_name"],
+        "Quantity": r["quantity"],
+        "CompletionDate": r["completion_date"],
+        "Status": r["status"],
+    } for r in rows]
+
+
+def prune_assembly_component_consumption(older_than_days: int = 400) -> int:
+    """Delete rows whose completion_date is older than
+    `older_than_days` (default 400 — a ~5-week buffer past the 365-
+    day demand window so nothing needed for a 12mo calc gets pruned
+    early). Keeps the table bounded — call periodically from the app
+    service's daily sync, not on every sync_assemblies() call.
+    Returns the number of rows deleted."""
+    cutoff = (datetime.now() - timedelta(days=older_than_days)
+              ).strftime("%Y-%m-%d")
+    with connect() as c:
+        cur = c.execute(
+            "DELETE FROM assembly_component_consumption "
+            "WHERE completion_date < ?", (cutoff,))
+        return int(cur.rowcount or 0)
 
 
 def set_supplier_pricing(

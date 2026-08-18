@@ -86,6 +86,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Defaults to project folder locally. See data_paths.py.
 from data_paths import OUTPUT_DIR  # noqa: E402
 from storage_dimensions import extract_storage_dim  # noqa: E402
+import db  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1655,6 +1656,23 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
     detail_errors = 0
     flushed_at = len(processed_ids)
     FLUSH_EVERY = 100
+    # v2.67.xxx — track how much of `rows` has already been shared to
+    # Postgres so each flush only upserts the NEW slice, not the whole
+    # accumulated list (which would be O(n^2) work over a big
+    # backfill). See assembly_component_consumption's schema comment
+    # for why the worker needs this instead of re-fetching from CIN7
+    # itself. Idempotent (ON CONFLICT DO UPDATE), so a resumed run
+    # re-upserting already-shared rows is harmless, just redundant.
+    rows_shared_at = 0
+
+    def _share_new_rows() -> None:
+        nonlocal rows_shared_at
+        try:
+            db.upsert_assembly_component_consumption(rows[rows_shared_at:])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("assembly_component_consumption upsert failed "
+                        "(continuing, CSV output is unaffected): %s", exc)
+        rows_shared_at = len(rows)
 
     for i, task in enumerate(tasks, 1):
         tid = task.get("TaskID")
@@ -1726,6 +1744,7 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
             log.info("  Flushing: %d tasks processed, %d rows so far...",
                      len(processed_ids), len(rows))
             write_outputs(f"assemblies_last_{days}d", rows)
+            _share_new_rows()
             _save_checkpoint(ckpt_name, {
                 "processed_ids": sorted(processed_ids),
             })
@@ -1734,7 +1753,20 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
     log.info("  Final write: %d component-consumption rows from %d tasks.",
              len(rows), len(processed_ids))
     write_outputs(f"assemblies_last_{days}d", rows)
+    _share_new_rows()
     _clear_checkpoint(ckpt_name)
+
+    # v2.67.xxx — keep the shared table bounded. Cheap (indexed range
+    # delete) and independent of which `days` window this particular
+    # sync used, so it's safe to run on every call.
+    try:
+        n_pruned = db.prune_assembly_component_consumption()
+        if n_pruned:
+            log.info("  Pruned %d old assembly_component_consumption "
+                      "row(s) from Postgres.", n_pruned)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("assembly_component_consumption prune failed "
+                    "(continuing): %s", exc)
 
 
 # ---------------------------------------------------------------------------
