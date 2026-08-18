@@ -1655,6 +1655,42 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
     detail_errors = 0
     flushed_at = len(processed_ids)
     FLUSH_EVERY = 100
+    # v2.67.xxx — track how much of `rows` has already been shared to
+    # Postgres so each flush only upserts the NEW slice, not the whole
+    # accumulated list (which would be O(n^2) work over a big
+    # backfill). See assembly_component_consumption's schema comment
+    # for why the worker needs this instead of re-fetching from CIN7
+    # itself. Initialised to len(rows) (NOT 0) because on a resumed
+    # run `rows` was just repopulated from a prior CSV a few lines up
+    # — those recovered rows were already shared in the pre-restart
+    # run's own flushes (CSV + DB always update together), so starting
+    # at 0 would defeat the whole point of slicing by re-upserting the
+    # entire recovered list on the very next flush.
+    rows_shared_at = len(rows)
+
+    def _share_new_rows() -> None:
+        nonlocal rows_shared_at
+        new_rows = rows[rows_shared_at:]
+        rows_shared_at = len(rows)
+        if not new_rows:
+            return
+        try:
+            import db as _db  # local import — keeps cin7_sync's top-
+                                # level imports clean and avoids a hard
+                                # dependency (matches the established
+                                # pattern in _run_demand_reconcile_
+                                # after_salelines below).
+        except Exception as exc:  # noqa: BLE001
+            log.warning("assembly_component_consumption share skipped: "
+                        "db import failed (%s)", exc)
+            return
+        try:
+            n_written = _db.upsert_assembly_component_consumption(new_rows)
+            log.info("  Shared %d/%d new assembly-consumption row(s) "
+                      "to Postgres.", n_written, len(new_rows))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("assembly_component_consumption upsert failed "
+                        "(continuing, CSV output is unaffected): %s", exc)
 
     for i, task in enumerate(tasks, 1):
         tid = task.get("TaskID")
@@ -1726,6 +1762,7 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
             log.info("  Flushing: %d tasks processed, %d rows so far...",
                      len(processed_ids), len(rows))
             write_outputs(f"assemblies_last_{days}d", rows)
+            _share_new_rows()
             _save_checkpoint(ckpt_name, {
                 "processed_ids": sorted(processed_ids),
             })
@@ -1734,7 +1771,26 @@ def sync_assemblies(client: "Cin7Client", days: int) -> None:
     log.info("  Final write: %d component-consumption rows from %d tasks.",
              len(rows), len(processed_ids))
     write_outputs(f"assemblies_last_{days}d", rows)
+    _share_new_rows()
     _clear_checkpoint(ckpt_name)
+
+    # v2.67.xxx — keep the shared table bounded. Cheap (indexed range
+    # delete) and independent of which `days` window this particular
+    # sync used, so it's safe to run on every call.
+    try:
+        import db as _db  # local import — see _share_new_rows above.
+    except Exception as exc:  # noqa: BLE001
+        log.warning("assembly_component_consumption prune skipped: "
+                    "db import failed (%s)", exc)
+    else:
+        try:
+            n_pruned = _db.prune_assembly_component_consumption()
+            if n_pruned:
+                log.info("  Pruned %d old assembly_component_consumption "
+                          "row(s) from Postgres.", n_pruned)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("assembly_component_consumption prune failed "
+                        "(continuing): %s", exc)
 
 
 # ---------------------------------------------------------------------------

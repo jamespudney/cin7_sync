@@ -52,7 +52,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1473,14 +1473,42 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         sale_lines = filter_excluded_sales_customers(sale_lines)
         if sl_path:
             log.info("Listener loaded sale lines from %s", Path(sl_path).name)
-        asm_files = _glob.glob(str(OUTPUT_DIR / "assemblies_last_*d_*.csv"))
-        asm_path = _widest_window_file(asm_files, "assemblies_last")
-        assemblies = (
-            pd.read_csv(asm_path, low_memory=False)
-            if asm_path else pd.DataFrame())
-        if asm_path:
-            log.info("Listener loaded assemblies from %s",
-                     Path(asm_path).name)
+        # v2.67.xxx — prefer the shared Postgres table over the local
+        # CSV glob. The worker has no persistent disk (Render disks
+        # aren't shared across services) and slack_loop.sh never runs
+        # `cin7_sync.py assemblies` itself, so this CSV glob could
+        # never find anything in production — every BOM-heavy
+        # component with little direct sale_lines activity silently
+        # fell back to a flawed BOM-ratio proxy (see
+        # assembly_component_consumption's schema comment in db.py
+        # for the full incident writeup: LED-MC-20.009-S / PMT80050).
+        # `since` is a ~370-day window (a few days' buffer past the
+        # 365-day demand calc) so the worker doesn't pull more than it
+        # needs into memory on a constrained plan. Falls back to the
+        # local CSV glob only if the DB read is empty/unavailable
+        # (e.g. local dev against SQLite with no synced rows yet).
+        assemblies = pd.DataFrame()
+        try:
+            since = (datetime.now() - timedelta(days=370)
+                      ).strftime("%Y-%m-%d")
+            asm_rows = db.get_assembly_component_consumption(since=since)
+            if asm_rows:
+                assemblies = pd.DataFrame(asm_rows)
+                log.info("Listener loaded %d assembly-consumption "
+                         "row(s) from shared Postgres.", len(asm_rows))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not load assembly_component_consumption "
+                        "from DB (falling back to local CSV): %s", exc)
+        if assemblies.empty:
+            asm_files = _glob.glob(
+                str(OUTPUT_DIR / "assemblies_last_*d_*.csv"))
+            asm_path = _widest_window_file(asm_files, "assemblies_last")
+            assemblies = (
+                pd.read_csv(asm_path, low_memory=False)
+                if asm_path else pd.DataFrame())
+            if asm_path:
+                log.info("Listener loaded assemblies from local CSV %s",
+                         Path(asm_path).name)
 
         boms_files = sorted(_glob.glob(str(OUTPUT_DIR / "boms_*.csv")))
         boms_path = boms_files[-1] if boms_files else None

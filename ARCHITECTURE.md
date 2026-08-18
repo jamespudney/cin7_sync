@@ -44,6 +44,34 @@ reliably drove the whole account into cascading 429s (confirmed live:
 aren't shared across Render services, so there's nothing to coordinate; only
 the local per-process pacing applies, same as before this existed.
 
+## Assembly-consumption data sharing
+
+Render disks aren't shared across services — the dashboard's `/data/output/`
+CSV snapshots are invisible to the worker (`cin7-sync-slack-bot` has no disk
+at all). For most snapshot types this doesn't matter because the worker's own
+`slack_loop.sh` independently re-syncs its own copies of what it needs
+(products, stock, sale lines, purchase lines, BOMs). Real CIN7 Finished-Goods
+assembly-consumption data (`assemblies_last_*.csv`) is the one exception:
+`sync_assemblies()` requires one CIN7 detail API call **per assembly task**
+(not just a list call), so a full window can take hours against the shared,
+rate-limited account — giving the worker its own independent copy would
+roughly double that daily cost. Instead, `cin7_sync.py`'s `sync_assemblies()`
+upserts into a shared `assembly_component_consumption` Postgres table
+alongside its existing CSV write, and the worker reads from that table
+(`db.get_assembly_component_consumption()`) instead of re-fetching from CIN7,
+falling back to a local CSV glob only if the DB read is empty (e.g. local dev
+against SQLite).
+
+This closes a real incident (Aug 2026): `worker_engine.py` already had logic
+to prefer real per-task assembly consumption over a BOM-ratio proxy, but the
+worker never actually received any assemblies data at all — `slack_loop.sh`
+never ran `cin7_sync.py assemblies`, so every BOM-heavy component with little
+direct `sale_lines` activity (e.g. a mounting clip consumed mostly through kit
+builds) silently fell back to the same flawed proxy that had already caused a
+prior, separately-fixed incident (LED-SILICONE-PMT80050). See
+`assembly_component_consumption`'s schema comment in `db.py` for the full
+writeup.
+
 ## Key Code Areas
 
 - `cin7_sync.py`: CIN7 snapshot pulls.
