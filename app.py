@@ -7991,6 +7991,51 @@ def _clear_engine_df_cache() -> None:
 _get_engine_df.clear = _clear_engine_df_cache  # type: ignore[attr-defined]
 
 
+# v2.67.xxx -- hotfix: these five names used to live inside the Ordering
+# page's own top-level script code, where Draft PO's helper functions
+# (defined later in the SAME flat elif-block scope) could see them via
+# normal sequential execution. Moving the shared setup into
+# _build_ordering_context() turned them into locals of THAT function,
+# invisible to Draft PO's _vendor_default_lead_time_for_row and
+# _supplier_has_sku_buying_policy (which stayed on the Ordering page,
+# outside the extracted function) -- causing a production NameError on
+# _FREIGHT_SEA_CATEGORIES. All five are pure/stateless (a static rule
+# table and two stateless numeric coercion helpers), so hoisting them to
+# true module scope is a straightforward, zero-risk fix -- nothing here
+# depends on per-request data or session state.
+
+# v2.67.340 — category × length default freight rule. James
+# 2026-06-02: products in these categories at ≥3m ship sea by
+# default regardless of supplier air-eligibility (long awkward
+# items aren't economical on air). All other products keep the
+# existing supplier-based default (air if eligible, sea otherwise).
+# IP's observed actual lead time still wins below (that's the real
+# measurement, not a default).
+_FREIGHT_SEA_CATEGORIES = (
+    "Profiles - Channels",
+    "Accessories - Profiles - Inner profiles",
+    "Diffusers",
+)
+# v2.67.341 — James 2026-06-02: "3m only", not "≥3m". Use a small
+# tolerance band so a SKU whose length parses as 2998 or 3010 still
+# matches the rule (parser rounding from "3m (118")" style names).
+_FREIGHT_SEA_LEN_MIN_MM = 2950.0
+_FREIGHT_SEA_LEN_MAX_MM = 3050.0
+
+
+def _positive_float_or_zero(value) -> float:
+    try:
+        val = float(pd.to_numeric(value, errors="coerce"))
+    except (TypeError, ValueError):
+        return 0.0
+    return val if val > 0 else 0.0
+
+
+def _positive_int_or_zero(value) -> int:
+    val = _positive_float_or_zero(value)
+    return int(round(val)) if val > 0 else 0
+
+
 def _build_ordering_context() -> "SimpleNamespace":
     """Shared engine-context builder for the Ordering / Stock Optimisation
     / Supplier Setup pages (split out of what used to be one large page
@@ -8147,17 +8192,9 @@ def _build_ordering_context() -> "SimpleNamespace":
         ip_lead_times_by_sku = db.get_ip_lead_times()
     except Exception:  # noqa: BLE001
         ip_lead_times_by_sku = {}
-    def _positive_float_or_zero(value) -> float:
-        try:
-            val = float(pd.to_numeric(value, errors="coerce"))
-        except (TypeError, ValueError):
-            return 0.0
-        return val if val > 0 else 0.0
-
-    def _positive_int_or_zero(value) -> int:
-        val = _positive_float_or_zero(value)
-        return int(round(val)) if val > 0 else 0
-
+    # _positive_float_or_zero / _positive_int_or_zero now live at module
+    # scope (see the hotfix note above _build_ordering_context) -- Draft
+    # PO's _supplier_has_sku_buying_policy needs them too.
     try:
         sku_buying_settings_db = {
             str(r["sku"]): dict(r) for r in db.all_sku_pack()
@@ -8281,23 +8318,10 @@ def _build_ordering_context() -> "SimpleNamespace":
             })
         return len(closed), matched
 
-    # v2.67.340 — category × length default freight rule. James
-    # 2026-06-02: products in these categories at ≥3m ship sea by
-    # default regardless of supplier air-eligibility (long awkward
-    # items aren't economical on air). All other products keep the
-    # existing supplier-based default (air if eligible, sea otherwise).
-    # IP's observed actual lead time still wins below (that's the real
-    # measurement, not a default).
-    _FREIGHT_SEA_CATEGORIES = (
-        "Profiles - Channels",
-        "Accessories - Profiles - Inner profiles",
-        "Diffusers",
-    )
-    # v2.67.341 — James 2026-06-02: "3m only", not "≥3m". Use a small
-    # tolerance band so a SKU whose length parses as 2998 or 3010 still
-    # matches the rule (parser rounding from "3m (118")" style names).
-    _FREIGHT_SEA_LEN_MIN_MM = 2950.0
-    _FREIGHT_SEA_LEN_MAX_MM = 3050.0
+    # _FREIGHT_SEA_CATEGORIES / _FREIGHT_SEA_LEN_MIN_MM / _MAX_MM now
+    # live at module scope (see the hotfix note above
+    # _build_ordering_context) -- Draft PO's
+    # _vendor_default_lead_time_for_row needs them too.
 
     def _compute_target_and_reorder(row: pd.Series,
                                     include_trace: bool = False) -> dict:
@@ -9834,7 +9858,13 @@ def _build_ordering_context() -> "SimpleNamespace":
         closures_by_supplier=closures_by_supplier,
         ip_lead_times_by_sku=ip_lead_times_by_sku,
         sku_buying_settings=sku_buying_settings,
+        sku_buying_settings_db=sku_buying_settings_db,
         dropship_skus=dropship_skus,
+        cin7_always_ds=cin7_always_ds,
+        cin7_no_ds=cin7_no_ds,
+        cin7_tag_ds=cin7_tag_ds,
+        per_sku_ds=per_sku_ds,
+        not_ds_overrides=not_ds_overrides,
         excluded_skus=excluded_skus,
         latest_notes_map=latest_notes_map,
         dormancy_warnings_map=dormancy_warnings_map,
@@ -13623,7 +13653,13 @@ elif page == "Ordering":
     closures_by_supplier = _ctx.closures_by_supplier
     ip_lead_times_by_sku = _ctx.ip_lead_times_by_sku
     sku_buying_settings = _ctx.sku_buying_settings
+    sku_buying_settings_db = _ctx.sku_buying_settings_db
     dropship_skus = _ctx.dropship_skus
+    cin7_always_ds = _ctx.cin7_always_ds
+    cin7_no_ds = _ctx.cin7_no_ds
+    cin7_tag_ds = _ctx.cin7_tag_ds
+    per_sku_ds = _ctx.per_sku_ds
+    not_ds_overrides = _ctx.not_ds_overrides
     excluded_skus = _ctx.excluded_skus
     latest_notes_map = _ctx.latest_notes_map
     dormancy_warnings_map = _ctx.dormancy_warnings_map
@@ -18527,7 +18563,13 @@ elif page == "Stock Optimisation":
     closures_by_supplier = _ctx.closures_by_supplier
     ip_lead_times_by_sku = _ctx.ip_lead_times_by_sku
     sku_buying_settings = _ctx.sku_buying_settings
+    sku_buying_settings_db = _ctx.sku_buying_settings_db
     dropship_skus = _ctx.dropship_skus
+    cin7_always_ds = _ctx.cin7_always_ds
+    cin7_no_ds = _ctx.cin7_no_ds
+    cin7_tag_ds = _ctx.cin7_tag_ds
+    per_sku_ds = _ctx.per_sku_ds
+    not_ds_overrides = _ctx.not_ds_overrides
     excluded_skus = _ctx.excluded_skus
     latest_notes_map = _ctx.latest_notes_map
     dormancy_warnings_map = _ctx.dormancy_warnings_map
@@ -18805,7 +18847,13 @@ elif page == "Supplier Setup":
     closures_by_supplier = _ctx.closures_by_supplier
     ip_lead_times_by_sku = _ctx.ip_lead_times_by_sku
     sku_buying_settings = _ctx.sku_buying_settings
+    sku_buying_settings_db = _ctx.sku_buying_settings_db
     dropship_skus = _ctx.dropship_skus
+    cin7_always_ds = _ctx.cin7_always_ds
+    cin7_no_ds = _ctx.cin7_no_ds
+    cin7_tag_ds = _ctx.cin7_tag_ds
+    per_sku_ds = _ctx.per_sku_ds
+    not_ds_overrides = _ctx.not_ds_overrides
     excluded_skus = _ctx.excluded_skus
     latest_notes_map = _ctx.latest_notes_map
     dormancy_warnings_map = _ctx.dormancy_warnings_map
