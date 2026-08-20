@@ -103,8 +103,10 @@ PAGE_GROUPS = OrderedDict({
     ],
     "Buying": [
         "Ordering",
+        "Stock Optimisation",
         "Finishing Work Orders",
         "Slow Movers",
+        "Supplier Setup",
         "Supplier Pricing",
         "FixedCost Audit",
         "Migrations",
@@ -139,11 +141,19 @@ PAGE_DESCRIPTIONS = {
     "AI Assistant": "Natural-language Q&A grounded in live CIN7 + Shopify data.",
     "Data Health": "Sync freshness, CSV row counts, data integrity flags.",
     "Ordering": "ABC-driven reorder workbench with PO drafts.",
+    "Stock Optimisation": (
+        "Business-wide stock $ health: current vs optimum, excess, "
+        "understock, dead stock."
+    ),
     "Finishing Work Orders": (
         "BOM-driven coating/anodizing work queue for finished SKU replenishment."
     ),
     "Slow Movers": "Stock-reduction workspace: dormant SKUs, value tied up, dismiss/flag.",
-    "Supplier Pricing": "Per-SKU supplier costs, freight modes, lead times.",
+    "Supplier Setup": (
+        "Per-supplier lead times, MOQ/MOV, freight, holiday closures, "
+        "and product-to-supplier assignment."
+    ),
+    "Supplier Pricing": "Tier prices, setup fees, aggregation rules, pack quantities.",
     "FixedCost Audit": "Review fixed-cost overrides applied to PO calculations.",
     "Migrations": "Retiring -> successor SKU mappings + impact.",
     "Product Detail": "Single-SKU drill-down: stock, sales, BOM, pricing, history.",
