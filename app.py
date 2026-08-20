@@ -8036,6 +8036,157 @@ def _positive_int_or_zero(value) -> int:
     return int(round(val)) if val > 0 else 0
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def _load_ordering_shared_db_state() -> "SimpleNamespace":
+    """Cached bundle of the DB reads + per-product dropship-flag
+    resolution that _build_ordering_context() used to redo from
+    scratch on every single render -- including every navigation
+    between Ordering / Stock Optimisation / Supplier Setup, since none
+    of it was cached. That's what buyers were feeling as "real slow to
+    move between sections" after the page split: ~8 sequential DB
+    round-trips plus two full `.iterrows()` passes over `products`,
+    all repeated on every page switch even when nothing had changed.
+
+    Deliberately @st.cache_data (which returns an independent COPY per
+    call), NOT @st.cache_resource (which would return the SAME shared
+    object by reference): _build_ordering_context mutates
+    sku_buying_settings afterward (merging in the per-session SKU-
+    buying-preview overlay from st.session_state) -- if that mutation
+    landed on a cache_resource-shared dict, one session's in-progress
+    edit would leak into every other session's view on the next cache
+    hit. None of what's cached HERE depends on session_state (that
+    overlay merge stays in _build_ordering_context precisely because
+    it does read session_state), so a plain, session-independent cache
+    is correct.
+
+    A 15s TTL, not exclusively manual invalidation: this cache is also
+    explicitly `.clear()`-ed at every one of the ~9 existing call sites
+    that already pop st.session_state["_reorder_apply_sig"] to force a
+    recompute after a supplier-config, SKU-buying-policy, or supplier-
+    assignment save (see those call sites) -- so a user's own save is
+    reflected immediately, same as before this cache existed. The TTL
+    is a backstop for the general case (another user's save, or any
+    call site a future change misses), not the primary invalidation
+    path."""
+    excluded_skus = db.all_do_not_reorder_skus()
+    latest_notes_map = db.latest_note_per_sku()
+    # v2.67.36 — dormancy provenance lookup. Returns {sku: info}
+    # for every SKU that has an active "once-slow" warning. The
+    # engine writes to this on every recompute; here we just read.
+    try:
+        dormancy_warnings_map = db.get_dormancy_warnings()
+    except Exception:  # noqa: BLE001
+        dormancy_warnings_map = {}
+
+    # --- Effective dropship set — combined from 4 sources -----------
+    # Priority / merging logic (documented in RULES.md §5.4):
+    #   1. CIN7 DropShipMode = "Always Drop Ship"  → dropship (authoritative)
+    #   2. CIN7 Tags contains "Dropship"           → dropship (belt-and-braces)
+    #   3. Per-SKU app flag in `flags` table       → dropship (user override)
+    #   4. Supplier-level `dropship_default`       → dropship, UNLESS CIN7
+    #                                                 explicitly says
+    #                                                 "No Drop Ship" for that
+    #                                                 individual SKU
+    #
+    # This way CIN7 is the source of truth but the buyer has escape
+    # hatches for edge cases without having to fix CIN7 first.
+    cin7_always_ds: set = set()
+    cin7_no_ds: set = set()
+    cin7_tag_ds: set = set()
+    if not products.empty:
+        for idx, p in products.iterrows():
+            sku = str(p.get("SKU") or "")
+            if not sku:
+                continue
+            mode = str(p.get("DropShipMode") or "").strip()
+            if mode == "Always Drop Ship":
+                cin7_always_ds.add(sku)
+            elif mode == "No Drop Ship":
+                cin7_no_ds.add(sku)
+            tags = str(p.get("Tags") or "").lower()
+            if "dropship" in tags:
+                cin7_tag_ds.add(sku)
+
+    per_sku_ds = set(db.all_dropship_skus())
+    # Overrides — user explicitly wants these NOT dropship despite CIN7
+    # saying so. Candidates for CIN7 write-back (see pending-writes
+    # expander below the PO editor).
+    not_ds_overrides = set(db.all_not_dropship_skus())
+
+    # Supplier-level dropship_default
+    supp_configs = db.all_supplier_configs()
+    _dropship_suppliers = {
+        name for name, cfg in supp_configs.items()
+        if cfg.get("dropship_default")
+    }
+    supplier_ds_skus: set = set()
+    if _dropship_suppliers and not products.empty:
+        for _, p in products.iterrows():
+            sups_raw = p.get("Suppliers")
+            if pd.isna(sups_raw) or not sups_raw:
+                continue
+            try:
+                sups = (json.loads(sups_raw)
+                          if isinstance(sups_raw, str) else sups_raw)
+            except Exception:
+                continue
+            if not isinstance(sups, list) or not sups:
+                continue
+            primary = next(
+                (s for s in sups if s.get("IsDefault")), sups[0])
+            supp_name = primary.get("SupplierName") or ""
+            if supp_name in _dropship_suppliers:
+                supplier_ds_skus.add(str(p.get("SKU") or ""))
+
+    # Combine: CIN7 signals + app overrides, with CIN7 "No Drop Ship"
+    # winning over supplier-level default (but NOT over per-SKU flag).
+    # Subtract the user's "Not dropship" overrides at the end — they're
+    # the user's explicit intent that these SKUs should be stocked.
+    dropship_skus = (
+        cin7_always_ds
+        | cin7_tag_ds
+        | per_sku_ds
+        | (supplier_ds_skus - cin7_no_ds)
+    ) - not_ds_overrides
+
+    # v2.67.284 — load supplier holidays once for the engine
+    # (closures used per-row inside _compute_target_and_reorder).
+    closures_by_supplier = db.all_supplier_holidays_by_supplier()
+    # v2.67.285 — observed actual lead times from Inventory Planner.
+    # Refreshed weekly by ip_lead_times.py. The engine prefers these
+    # (sane-clamped) over the supplier_config defaults.
+    try:
+        ip_lead_times_by_sku = db.get_ip_lead_times()
+    except Exception:  # noqa: BLE001
+        ip_lead_times_by_sku = {}
+    try:
+        sku_buying_settings_db = {
+            str(r["sku"]): dict(r) for r in db.all_sku_pack()
+        }
+    except Exception:  # noqa: BLE001
+        sku_buying_settings_db = {}
+    sku_buying_settings = {
+        str(k): dict(v) for k, v in sku_buying_settings_db.items()
+    }
+
+    return SimpleNamespace(
+        excluded_skus=excluded_skus,
+        latest_notes_map=latest_notes_map,
+        dormancy_warnings_map=dormancy_warnings_map,
+        dropship_skus=dropship_skus,
+        cin7_always_ds=cin7_always_ds,
+        cin7_no_ds=cin7_no_ds,
+        cin7_tag_ds=cin7_tag_ds,
+        per_sku_ds=per_sku_ds,
+        not_ds_overrides=not_ds_overrides,
+        supp_configs=supp_configs,
+        closures_by_supplier=closures_by_supplier,
+        ip_lead_times_by_sku=ip_lead_times_by_sku,
+        sku_buying_settings_db=sku_buying_settings_db,
+        sku_buying_settings=sku_buying_settings,
+    )
+
+
 def _build_ordering_context() -> "SimpleNamespace":
     """Shared engine-context builder for the Ordering / Stock Optimisation
     / Supplier Setup pages (split out of what used to be one large page
@@ -8089,89 +8240,26 @@ def _build_ordering_context() -> "SimpleNamespace":
     # instance until the user clicks Refresh.
     engine_df = _get_engine_df()
 
-    # --- Buyer exclusions + inline notes (loaded once per render) -------
-    excluded_skus = db.all_do_not_reorder_skus()
-    latest_notes_map = db.latest_note_per_sku()
-    # v2.67.36 — dormancy provenance lookup. Returns {sku: info}
-    # for every SKU that has an active "once-slow" warning. The
-    # engine writes to this on every recompute; here we just read.
-    try:
-        dormancy_warnings_map = db.get_dormancy_warnings()
-    except Exception:  # noqa: BLE001
-        dormancy_warnings_map = {}
-
-    # --- Effective dropship set — combined from 4 sources -----------
-    # Priority / merging logic (documented in RULES.md §5.4):
-    #   1. CIN7 DropShipMode = "Always Drop Ship"  → dropship (authoritative)
-    #   2. CIN7 Tags contains "Dropship"           → dropship (belt-and-braces)
-    #   3. Per-SKU app flag in `flags` table       → dropship (user override)
-    #   4. Supplier-level `dropship_default`       → dropship, UNLESS CIN7
-    #                                                 explicitly says
-    #                                                 "No Drop Ship" for that
-    #                                                 individual SKU
-    #
-    # This way CIN7 is the source of truth but the buyer has escape
-    # hatches for edge cases without having to fix CIN7 first.
-    cin7_always_ds: set = set()
-    cin7_no_ds: set = set()
-    cin7_tag_ds: set = set()
-    if not products.empty:
-        _mode_col = products.get("DropShipMode")
-        _tags_col = products.get("Tags")
-        for idx, p in products.iterrows():
-            sku = str(p.get("SKU") or "")
-            if not sku:
-                continue
-            mode = str(p.get("DropShipMode") or "").strip()
-            if mode == "Always Drop Ship":
-                cin7_always_ds.add(sku)
-            elif mode == "No Drop Ship":
-                cin7_no_ds.add(sku)
-            tags = str(p.get("Tags") or "").lower()
-            if "dropship" in tags:
-                cin7_tag_ds.add(sku)
-
-    per_sku_ds = set(db.all_dropship_skus())
-    # Overrides — user explicitly wants these NOT dropship despite CIN7
-    # saying so. Candidates for CIN7 write-back (see pending-writes
-    # expander below the PO editor).
-    not_ds_overrides = set(db.all_not_dropship_skus())
-
-    # Supplier-level dropship_default
-    _all_supp_cfgs = db.all_supplier_configs()
-    _dropship_suppliers = {
-        name for name, cfg in _all_supp_cfgs.items()
-        if cfg.get("dropship_default")
-    }
-    supplier_ds_skus: set = set()
-    if _dropship_suppliers and not products.empty:
-        for _, p in products.iterrows():
-            sups_raw = p.get("Suppliers")
-            if pd.isna(sups_raw) or not sups_raw:
-                continue
-            try:
-                sups = (json.loads(sups_raw)
-                          if isinstance(sups_raw, str) else sups_raw)
-            except Exception:
-                continue
-            if not isinstance(sups, list) or not sups:
-                continue
-            primary = next(
-                (s for s in sups if s.get("IsDefault")), sups[0])
-            supp_name = primary.get("SupplierName") or ""
-            if supp_name in _dropship_suppliers:
-                supplier_ds_skus.add(str(p.get("SKU") or ""))
-
-    # Combine: CIN7 signals + app overrides, with CIN7 "No Drop Ship"
-    # winning over supplier-level default (but NOT over per-SKU flag).
-    # Subtract the user's "Not dropship" overrides at the end — they're
-    # the user's explicit intent that these SKUs should be stocked.
-    dropship_skus = (
-        cin7_always_ds
-        | cin7_tag_ds
-        | per_sku_ds
-        | (supplier_ds_skus - cin7_no_ds)
-    ) - not_ds_overrides
+    # v2.67.xxx — the DB reads + per-product dropship-flag resolution
+    # that used to happen fresh, right here, on every single render are
+    # now behind a shared, session-independent cache (see
+    # _load_ordering_shared_db_state's own docstring for why it's safe
+    # to cache this specific slice and not the rest of this function).
+    _shared_db = _load_ordering_shared_db_state()
+    excluded_skus = _shared_db.excluded_skus
+    latest_notes_map = _shared_db.latest_notes_map
+    dormancy_warnings_map = _shared_db.dormancy_warnings_map
+    dropship_skus = _shared_db.dropship_skus
+    supp_configs = _shared_db.supp_configs
+    closures_by_supplier = _shared_db.closures_by_supplier
+    ip_lead_times_by_sku = _shared_db.ip_lead_times_by_sku
+    sku_buying_settings_db = _shared_db.sku_buying_settings_db
+    # sku_buying_settings gets a per-session preview overlay merged in
+    # below, so it must be this call's OWN copy, not the cached
+    # namespace's shared reference — .cache_data already gives every
+    # caller an independent copy of the whole returned namespace, so a
+    # plain attribute read is already safe to mutate here.
+    sku_buying_settings = _shared_db.sku_buying_settings
 
     # Hide excluded SKUs from the main reorder list. They still appear in
     # the "Archived (do not reorder)" expander below with a Reactivate button.
@@ -8180,30 +8268,6 @@ def _build_ordering_context() -> "SimpleNamespace":
             ~engine_df["SKU"].astype(str).isin(excluded_skus)
         ].reset_index(drop=True)
 
-    # --- Apply per-supplier config to compute targets ------------------
-    supp_configs = db.all_supplier_configs()
-    # v2.67.284 — load supplier holidays once for the engine
-    # (closures used per-row inside _compute_target_and_reorder).
-    closures_by_supplier = db.all_supplier_holidays_by_supplier()
-    # v2.67.285 — observed actual lead times from Inventory Planner.
-    # Refreshed weekly by ip_lead_times.py. The engine prefers these
-    # (sane-clamped) over the supplier_config defaults.
-    try:
-        ip_lead_times_by_sku = db.get_ip_lead_times()
-    except Exception:  # noqa: BLE001
-        ip_lead_times_by_sku = {}
-    # _positive_float_or_zero / _positive_int_or_zero now live at module
-    # scope (see the hotfix note above _build_ordering_context) -- Draft
-    # PO's _supplier_has_sku_buying_policy needs them too.
-    try:
-        sku_buying_settings_db = {
-            str(r["sku"]): dict(r) for r in db.all_sku_pack()
-        }
-    except Exception:  # noqa: BLE001
-        sku_buying_settings_db = {}
-    sku_buying_settings = {
-        str(k): dict(v) for k, v in sku_buying_settings_db.items()
-    }
     _sku_buying_preview = st.session_state.get(
         "_ordering_sku_buying_preview", {})
     if isinstance(_sku_buying_preview, dict):
@@ -13533,6 +13597,7 @@ elif page == "Ordering":
                 _engine_source_fingerprint())
             _get_engine_df.clear()
             st.session_state.pop("_reorder_apply_sig", None)
+            _load_ordering_shared_db_state.clear()
             if _started:
                 st.success(
                     "ABC refresh started in the background. You can "
@@ -16550,6 +16615,7 @@ elif page == "Ordering":
                 _preview_changed = True
         if _preview_changed:
             st.session_state.pop("_reorder_apply_sig", None)
+            _load_ordering_shared_db_state.clear()
             st.rerun()
 
     _preview_now = st.session_state.get("_ordering_sku_buying_preview", {})
@@ -16734,6 +16800,7 @@ elif page == "Ordering":
                     for sku_e, *_ in _sku_buying_edits:
                         _preview.pop(sku_e, None)
                 st.session_state.pop("_reorder_apply_sig", None)
+                _load_ordering_shared_db_state.clear()
                 msgs.append(
                     f"Saved SKU buying settings for "
                     f"{len(_sku_buying_edits)} SKU(s)")
@@ -16788,6 +16855,7 @@ elif page == "Ordering":
                 "Freight mode overrides saved. Recalculating reorder qty…"
             )
             st.session_state.pop("_reorder_apply_sig", None)
+            _load_ordering_shared_db_state.clear()
             st.rerun()
 
     po_lines = edited[(edited["Include?"]) & (edited["Order qty"] > 0)]
@@ -17243,6 +17311,7 @@ elif page == "Ordering":
                 except Exception:
                     pass
             st.session_state.pop("_reorder_apply_sig", None)
+            _load_ordering_shared_db_state.clear()
             st.rerun()
 
     def _ordering_add_selected_rows_to_po(
@@ -19436,6 +19505,7 @@ elif page == "Supplier Setup":
                 # safe — only one engine in memory at a time, no
                 # multi-frame pile-up that triggers the 2GB ceiling.
                 st.session_state.pop("_reorder_apply_sig", None)
+                _load_ordering_shared_db_state.clear()
                 try:
                     _get_engine_df.clear()
                 except Exception:  # noqa: BLE001
@@ -19612,6 +19682,7 @@ elif page == "Supplier Setup":
                     # Override is read at engine-compute time, so the
                     # engine must rebuild for the new bucket to appear.
                     st.session_state.pop("_reorder_apply_sig", None)
+                    _load_ordering_shared_db_state.clear()
                     try:
                         _get_engine_df.clear()
                     except Exception:  # noqa: BLE001
@@ -19634,6 +19705,7 @@ elif page == "Supplier Setup":
                                disabled=(_clear_pick == "—")):
                     db.clear_sku_supplier(_clear_pick, _actor_assign)
                     st.session_state.pop("_reorder_apply_sig", None)
+                    _load_ordering_shared_db_state.clear()
                     try:
                         _get_engine_df.clear()
                     except Exception:  # noqa: BLE001
@@ -22698,6 +22770,7 @@ elif page == "Product Detail":
                         st.success(
                             f"Saved SKU buying settings for {sku}.")
                     st.session_state.pop("_reorder_apply_sig", None)
+                    _load_ordering_shared_db_state.clear()
                     st.rerun()
 
         # --- Demand breakdown -----------------------------------------------
