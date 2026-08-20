@@ -25,6 +25,7 @@ import os
 import re
 from datetime import datetime, timedelta, date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import pandas as pd
@@ -7990,6 +7991,1861 @@ def _clear_engine_df_cache() -> None:
 _get_engine_df.clear = _clear_engine_df_cache  # type: ignore[attr-defined]
 
 
+def _build_ordering_context() -> "SimpleNamespace":
+    """Shared engine-context builder for the Ordering / Stock Optimisation
+    / Supplier Setup pages (split out of what used to be one large page
+    -- see the buyer-facing UX cleanup that moved Stock Optimisation and
+    Supplier Configuration to their own pages under Buying).
+
+    Deliberately takes NO parameters -- relies entirely on already-bound
+    module globals (products, stock, sale_lines, purchase_lines,
+    assemblies, current_user_profile, etc.), exactly as the original
+    inline code did before this extraction. This avoids the single
+    highest-risk part of this refactor: an incomplete or wrong kwarg
+    list for ~1,800 lines of real reorder-math that drives actual
+    purchasing decisions. The body below is moved verbatim from the
+    Ordering page's own top-level script code -- same variable names,
+    same logic, no rewriting.
+
+    Deliberately NOT @st.cache_data-wrapped: it reads st.session_state
+    directly inside its body (the sku-buying-preview lookup and the
+    _reorder_apply_sig memoization gate below), so naive caching risks
+    serving one session's cached result to a different session. The one
+    genuinely expensive step (the per-row .apply(_compute_target_and_
+    reorder) call) is already gated by _reorder_apply_sig comparing a
+    signature of the relevant config inputs, so splitting this across 3
+    pages does not multiply that cost -- don't "helpfully" add caching
+    here without re-deriving that gate's correctness for the new
+    call sites (Stock Optimisation and Supplier Setup also read
+    st.session_state["_reorder_apply_sig"] via this same mechanism).
+
+    Also don't add a defensive .copy() of engine_df "for safety" --
+    engine_df is a @st.cache_resource singleton (see _get_engine_df)
+    mutated in place by design, a deliberate fix for a real Render 2GB
+    memory-ceiling incident. Copying it here would reintroduce that."""
+    if products.empty or sale_lines.empty:
+        st.warning("Need products + 12-month sales to run ABC.")
+        st.stop()
+
+    # --- Build the full ABC engine DataFrame ---------------------------
+    # persist="disk" pickles the result into .streamlit/cache/ so it
+    # survives Streamlit restarts. The cache only invalidates when the
+    # function source OR its inputs change — so editing UI code
+    # elsewhere in app.py no longer triggers a recompute. Cuts dev
+    # iteration time by ~80%. ttl extended from 5min to 1h since the
+    # underlying data only refreshes via the daily sync.
+    # v2.67.32 - _abc_engine moved to module scope so the AI Assistant
+    # page can call it too. The early-exit guard above still gates this
+    # page on having products + sale_lines.
+
+    # v2.67.41 — go via the session-cached accessor so navigating
+    # away and back is instant. First page that needs the engine
+    # primes the session cache; subsequent pages reuse the same
+    # instance until the user clicks Refresh.
+    engine_df = _get_engine_df()
+
+    # --- Buyer exclusions + inline notes (loaded once per render) -------
+    excluded_skus = db.all_do_not_reorder_skus()
+    latest_notes_map = db.latest_note_per_sku()
+    # v2.67.36 — dormancy provenance lookup. Returns {sku: info}
+    # for every SKU that has an active "once-slow" warning. The
+    # engine writes to this on every recompute; here we just read.
+    try:
+        dormancy_warnings_map = db.get_dormancy_warnings()
+    except Exception:  # noqa: BLE001
+        dormancy_warnings_map = {}
+
+    # --- Effective dropship set — combined from 4 sources -----------
+    # Priority / merging logic (documented in RULES.md §5.4):
+    #   1. CIN7 DropShipMode = "Always Drop Ship"  → dropship (authoritative)
+    #   2. CIN7 Tags contains "Dropship"           → dropship (belt-and-braces)
+    #   3. Per-SKU app flag in `flags` table       → dropship (user override)
+    #   4. Supplier-level `dropship_default`       → dropship, UNLESS CIN7
+    #                                                 explicitly says
+    #                                                 "No Drop Ship" for that
+    #                                                 individual SKU
+    #
+    # This way CIN7 is the source of truth but the buyer has escape
+    # hatches for edge cases without having to fix CIN7 first.
+    cin7_always_ds: set = set()
+    cin7_no_ds: set = set()
+    cin7_tag_ds: set = set()
+    if not products.empty:
+        _mode_col = products.get("DropShipMode")
+        _tags_col = products.get("Tags")
+        for idx, p in products.iterrows():
+            sku = str(p.get("SKU") or "")
+            if not sku:
+                continue
+            mode = str(p.get("DropShipMode") or "").strip()
+            if mode == "Always Drop Ship":
+                cin7_always_ds.add(sku)
+            elif mode == "No Drop Ship":
+                cin7_no_ds.add(sku)
+            tags = str(p.get("Tags") or "").lower()
+            if "dropship" in tags:
+                cin7_tag_ds.add(sku)
+
+    per_sku_ds = set(db.all_dropship_skus())
+    # Overrides — user explicitly wants these NOT dropship despite CIN7
+    # saying so. Candidates for CIN7 write-back (see pending-writes
+    # expander below the PO editor).
+    not_ds_overrides = set(db.all_not_dropship_skus())
+
+    # Supplier-level dropship_default
+    _all_supp_cfgs = db.all_supplier_configs()
+    _dropship_suppliers = {
+        name for name, cfg in _all_supp_cfgs.items()
+        if cfg.get("dropship_default")
+    }
+    supplier_ds_skus: set = set()
+    if _dropship_suppliers and not products.empty:
+        for _, p in products.iterrows():
+            sups_raw = p.get("Suppliers")
+            if pd.isna(sups_raw) or not sups_raw:
+                continue
+            try:
+                sups = (json.loads(sups_raw)
+                          if isinstance(sups_raw, str) else sups_raw)
+            except Exception:
+                continue
+            if not isinstance(sups, list) or not sups:
+                continue
+            primary = next(
+                (s for s in sups if s.get("IsDefault")), sups[0])
+            supp_name = primary.get("SupplierName") or ""
+            if supp_name in _dropship_suppliers:
+                supplier_ds_skus.add(str(p.get("SKU") or ""))
+
+    # Combine: CIN7 signals + app overrides, with CIN7 "No Drop Ship"
+    # winning over supplier-level default (but NOT over per-SKU flag).
+    # Subtract the user's "Not dropship" overrides at the end — they're
+    # the user's explicit intent that these SKUs should be stocked.
+    dropship_skus = (
+        cin7_always_ds
+        | cin7_tag_ds
+        | per_sku_ds
+        | (supplier_ds_skus - cin7_no_ds)
+    ) - not_ds_overrides
+
+    # Hide excluded SKUs from the main reorder list. They still appear in
+    # the "Archived (do not reorder)" expander below with a Reactivate button.
+    if excluded_skus:
+        engine_df = engine_df[
+            ~engine_df["SKU"].astype(str).isin(excluded_skus)
+        ].reset_index(drop=True)
+
+    # --- Apply per-supplier config to compute targets ------------------
+    supp_configs = db.all_supplier_configs()
+    # v2.67.284 — load supplier holidays once for the engine
+    # (closures used per-row inside _compute_target_and_reorder).
+    closures_by_supplier = db.all_supplier_holidays_by_supplier()
+    # v2.67.285 — observed actual lead times from Inventory Planner.
+    # Refreshed weekly by ip_lead_times.py. The engine prefers these
+    # (sane-clamped) over the supplier_config defaults.
+    try:
+        ip_lead_times_by_sku = db.get_ip_lead_times()
+    except Exception:  # noqa: BLE001
+        ip_lead_times_by_sku = {}
+    def _positive_float_or_zero(value) -> float:
+        try:
+            val = float(pd.to_numeric(value, errors="coerce"))
+        except (TypeError, ValueError):
+            return 0.0
+        return val if val > 0 else 0.0
+
+    def _positive_int_or_zero(value) -> int:
+        val = _positive_float_or_zero(value)
+        return int(round(val)) if val > 0 else 0
+
+    try:
+        sku_buying_settings_db = {
+            str(r["sku"]): dict(r) for r in db.all_sku_pack()
+        }
+    except Exception:  # noqa: BLE001
+        sku_buying_settings_db = {}
+    sku_buying_settings = {
+        str(k): dict(v) for k, v in sku_buying_settings_db.items()
+    }
+    _sku_buying_preview = st.session_state.get(
+        "_ordering_sku_buying_preview", {})
+    if isinstance(_sku_buying_preview, dict):
+        _stale_zero_preview_skus = []
+        for _preview_sku, _preview_vals in list(_sku_buying_preview.items()):
+            if not isinstance(_preview_vals, dict):
+                continue
+            _preview_sku = str(_preview_sku or "")
+            if not _preview_sku:
+                continue
+            _base_policy = dict(sku_buying_settings.get(_preview_sku, {}))
+            _preview_lt = _positive_int_or_zero(
+                _preview_vals.get("lead_time_days"))
+            _preview_moq = _positive_float_or_zero(_preview_vals.get("moq"))
+            _preview_eoq = _positive_float_or_zero(
+                _preview_vals.get("eoq_qty"))
+            _base_has_value = bool(
+                _positive_int_or_zero(_base_policy.get("lead_time_days")) > 0
+                or _positive_float_or_zero(_base_policy.get("moq")) > 0
+                or _positive_float_or_zero(_base_policy.get("eoq_qty")) > 0
+                or _positive_float_or_zero(_base_policy.get("pack_qty")) > 0
+            )
+            if (
+                _base_has_value
+                and _preview_lt <= 0
+                and _preview_moq <= 0
+                and _preview_eoq <= 0
+            ):
+                # A stale data-editor reload can send blank/zero policy cells
+                # before the DB values are repainted. Never let that temporary
+                # preview mask buyer-entered LT/MOQ/EOQ values.
+                _stale_zero_preview_skus.append(_preview_sku)
+                continue
+            _base_policy["sku"] = _preview_sku
+            _base_policy["lead_time_days"] = _preview_lt
+            _base_policy["moq"] = _preview_moq
+            _base_policy["eoq_qty"] = _preview_eoq
+            sku_buying_settings[_preview_sku] = _base_policy
+        for _preview_sku in _stale_zero_preview_skus:
+            _sku_buying_preview.pop(_preview_sku, None)
+    _today_for_engine = date.today()
+
+    def _sku_policy_float(sku: str, key: str) -> float:
+        try:
+            val = float((sku_buying_settings.get(str(sku) or "", {})
+                         or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return val if val > 0 else 0.0
+
+    def _ceil_to_multiple(value: float, multiple: float) -> float:
+        if value <= 0 or multiple <= 0:
+            return value
+        import math as _math
+        return _math.ceil((value - 1e-9) / multiple) * multiple
+
+    def _sku_buying_values(sku: str) -> tuple[int, float, float]:
+        sku_policy = sku_buying_settings.get(str(sku) or "", {}) or {}
+        try:
+            lead_time = int(sku_policy.get("lead_time_days") or 0)
+        except (TypeError, ValueError):
+            lead_time = 0
+        if not 1 <= lead_time <= 365:
+            lead_time = 0
+        sku_moq = _sku_policy_float(str(sku), "moq")
+        sku_eoq = (_sku_policy_float(str(sku), "eoq_qty")
+                   or _sku_policy_float(str(sku), "pack_qty"))
+        return lead_time, sku_moq, sku_eoq
+
+    def _format_iso_weeks_range(start, end):
+        """'Wk 32' for a same-week span, 'Wk 32-34' otherwise."""
+        ws = start.isocalendar()[1]
+        we = end.isocalendar()[1]
+        return f"Wk {ws}" if ws == we else f"Wk {ws}-{we}"
+
+    def _closure_days_in_window(closures, win_start, win_end):
+        """Count distinct CLOSED days within [win_start, win_end]
+        across all of a supplier's closure periods, plus a
+        per-closure detail list for the buyer's explanation."""
+        if not closures:
+            return 0, []
+        closed = set()
+        matched = []
+        for cl in closures:
+            s = cl.get("start_date")
+            e = cl.get("end_date")
+            if isinstance(s, str):
+                try:
+                    s = date.fromisoformat(s[:10])
+                except ValueError:
+                    continue
+            if isinstance(e, str):
+                try:
+                    e = date.fromisoformat(e[:10])
+                except ValueError:
+                    continue
+            if s is None or e is None:
+                continue
+            os_ = max(s, win_start)
+            oe = min(e, win_end)
+            if os_ > oe:
+                continue
+            d = os_
+            while d <= oe:
+                closed.add(d)
+                d += timedelta(days=1)
+            matched.append({
+                "start_date": s,
+                "end_date": e,
+                "label": (cl.get("label") or "").strip(),
+                "overlap_days": (oe - os_).days + 1,
+            })
+        return len(closed), matched
+
+    # v2.67.340 — category × length default freight rule. James
+    # 2026-06-02: products in these categories at ≥3m ship sea by
+    # default regardless of supplier air-eligibility (long awkward
+    # items aren't economical on air). All other products keep the
+    # existing supplier-based default (air if eligible, sea otherwise).
+    # IP's observed actual lead time still wins below (that's the real
+    # measurement, not a default).
+    _FREIGHT_SEA_CATEGORIES = (
+        "Profiles - Channels",
+        "Accessories - Profiles - Inner profiles",
+        "Diffusers",
+    )
+    # v2.67.341 — James 2026-06-02: "3m only", not "≥3m". Use a small
+    # tolerance band so a SKU whose length parses as 2998 or 3010 still
+    # matches the rule (parser rounding from "3m (118")" style names).
+    _FREIGHT_SEA_LEN_MIN_MM = 2950.0
+    _FREIGHT_SEA_LEN_MAX_MM = 3050.0
+
+    def _compute_target_and_reorder(row: pd.Series,
+                                    include_trace: bool = False) -> dict:
+        """Return dict with target_stock, reorder_qty, lead_time_used,
+        freight_mode_used, and optionally calc_trace (markdown-ready)."""
+        supplier = row.get("Supplier") or ""
+        # v2.67.349 — normalise the engine-side supplier string before
+        # lookup to match db.all_supplier_configs's now-normalised
+        # keys. Without this, an SKU whose resolved supplier name has
+        # invisible whitespace (NBSP, trailing space) silently misses
+        # the supp_configs lookup and falls back to schema defaults —
+        # the bug James saw where Luz Negra safety_pct config "didn't
+        # save".
+        supplier_norm = " ".join(str(supplier).split()).strip()
+        cfg = supp_configs.get(supplier_norm, supp_configs.get(supplier, {}))
+        lt_sea = cfg.get("lead_time_sea_days") or 35
+        lt_air = cfg.get("lead_time_air_days")
+        air_eligible_default = bool(cfg.get("air_eligible_default") or 0)
+        air_max_len = cfg.get("air_max_length_mm")
+        length_mm = row.get("LengthMM")
+        sku_key = str(row.get("SKU") or "")
+        _sku_lt_int, sku_moq, sku_eoq = _sku_buying_values(sku_key)
+
+        # Per-SKU air-eligibility: default from supplier cfg, BUT disqualify
+        # if length exceeds supplier's air_max_length_mm
+        sku_air_ok = air_eligible_default
+        if (air_eligible_default and air_max_len
+                and length_mm is not None and length_mm > air_max_len):
+            sku_air_ok = False
+
+        # v2.67.340 — category-level sea rule (channels / inner profiles /
+        # diffusers at 3m). v2.67.341: window narrowed from "≥3m" to
+        # "3m only" (2950-3050mm tolerance band) per James. Overrides
+        # the air default when matched.
+        _category = str(row.get("Category") or "").strip()
+        _length_for_rule = (
+            float(length_mm) if length_mm not in (None, "") else 0.0)
+        _category_rule_sea = (
+            _category in _FREIGHT_SEA_CATEGORIES
+            and _FREIGHT_SEA_LEN_MIN_MM
+                <= _length_for_rule
+                <= _FREIGHT_SEA_LEN_MAX_MM
+        )
+        # Set by the category-rule branch below; appended to the freight
+        # line in the calc trace so the reason is visible without
+        # corrupting the selectbox-restricted `freight_mode` value.
+        _freight_rule_note = ""
+
+        # Default: air whenever supplier offers it AND the SKU is eligible
+        # (length within air_max_length_mm). Sea is the fallback.
+        # `preferred_freight` on the supplier config is treated as a hint
+        # only — if "sea" is preferred, air is still used for small items
+        # when beneficial (shorter LT = less inventory tied up).
+        if _category_rule_sea:
+            lead_time_days = lt_sea
+            # v2.67.342 — keep the column value in the selectbox's
+            # allowed set ("air"/"sea"); the *reason* is surfaced in
+            # the calc trace below via `_freight_rule_note`. Without
+            # this Streamlit blanks the Freight cell entirely.
+            freight_mode_used = "sea"
+            _freight_rule_note = (
+                f" (category rule: {_category} at ~3m → sea)")
+        elif sku_air_ok and lt_air:
+            lead_time_days = lt_air
+            freight_mode_used = "air"
+        else:
+            lead_time_days = lt_sea
+            freight_mode_used = "sea"
+        # Buyer-facing Vendor LT must mean the supplier/freight default
+        # only. IP observed/configured and Sku LT can still change Used LT
+        # below, but they should not make "Vendor LT" vary unexpectedly.
+        vendor_lead_time_days = lead_time_days
+        vendor_lead_time_basis = "supplier"
+
+        # v2.67.285 — prefer IP's observed actual lead time when
+        # we have one. IP literally measures PO-to-receipt time
+        # (avg_lead_time) — that's the real lead time, not a
+        # default. Sane clamp to [3, 120] days so a noisy sample
+        # (e.g. a single freak shipment) can't break ordering.
+        # v2.67.343 — only override the lead-time DURATION; do NOT
+        # overwrite freight_mode_used. The freight METHOD is still
+        # air or sea per the supplier/category rule above; IP just
+        # tells us the actual transit time. The old code stored
+        # "IP observed actual" / "IP configured" in freight_mode_used,
+        # which isn't in the Freight selectbox's options set and
+        # blanked the cell for every IP-tracked SKU (most of them).
+        # The basis ("observed" / "configured") is still surfaced in
+        # the calc trace below.
+        _ip_row = ip_lead_times_by_sku.get(sku_key) or {}
+        _obs_lt = _ip_row.get("observed_lead_time_days")
+        _conf_lt_ip = _ip_row.get("configured_lead_time_days")
+        lead_time_basis = "supplier"
+        if _obs_lt and 3 <= int(_obs_lt) <= 120:
+            lead_time_days = int(_obs_lt)
+            lead_time_basis = "ip_observed"
+        elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
+            lead_time_days = int(_conf_lt_ip)
+            lead_time_basis = "ip_configured"
+        if _sku_lt_int and 1 <= _sku_lt_int <= 365:
+            lead_time_days = _sku_lt_int
+            lead_time_basis = "sku"
+
+        # Safety factor by class
+        abc = row.get("ABC") or "C"
+        safety_pct = {
+            "A": cfg.get("safety_pct_A") or 30.0,
+            "B": cfg.get("safety_pct_B") or 20.0,
+            "C": cfg.get("safety_pct_C") or 15.0,
+        }.get(abc, 20.0)
+        # v2.67.283 — review period = the supplier's ACTUAL reorder
+        # cadence when configured (e.g. 7 for a weekly supplier).
+        # The ABC-class review_days are only the fallback. Carrying
+        # a generic 30-45d of next-cycle stock when you actually
+        # reorder weekly is the single biggest cash drag.
+        abc_review_days = {
+            "A": cfg.get("review_days_A") or 14,
+            "B": cfg.get("review_days_B") or 30,
+            "C": cfg.get("review_days_C") or 45,
+        }.get(abc, 30)
+        _cadence = cfg.get("order_cadence_days")
+        if _cadence and int(_cadence) > 0:
+            review_days = int(_cadence)
+            review_basis = (
+                f"you reorder {supplier or 'this supplier'} every "
+                f"{review_days}d, so each order only bridges to the "
+                f"next one")
+        else:
+            review_days = abc_review_days
+            review_basis = (
+                f"class-{abc} default — set this supplier's order "
+                f"cadence in Supplier settings to tighten it")
+
+        avg_daily = row["avg_daily"]
+
+        # v2.67.349 — 12-month concentrated-demand clamp. When one
+        # customer accounted for >50% of the SKU's 12mo volume AND
+        # recent demand has dried up (momentum < 0.5), the annualised
+        # avg_daily is dominated by a one-off past spike that won't
+        # recur. The 45-day Project rule only catches CURRENT spikes
+        # (momentum > 1.5); this catches PAST one-offs that the
+        # engine would otherwise budget against. James 2026-06-02:
+        # LED-EC-19.101 (B-class, OnHand 28) showed Reorder 70 because
+        # 12mo=698 — almost all from one historical big sale, with
+        # recent demand near zero.
+        _top12 = float(row.get("top_cust_units_12mo") or 0)
+        _eff12_for_clamp = float(row.get("effective_units_12mo") or 0)
+        _u12 = float(row.get("units_12mo") or 0)
+        _mom = float(row.get("momentum") or 1.0)
+        _top12_share = float(row.get("top_cust_pct_12mo") or 0)
+        if _top12_share <= 0 and _u12 > 0:
+            _top12_share = _top12 / _u12
+        clamp_active = False
+        clamp_note = ""
+
+        # v2.67.351 — first check: zero sales in last 90 days.
+        # James 2026-06-02: LED-14.007-3 (last sale August 2025, no
+        # activity in 90+ days) was still asking for 50 units to
+        # reorder. The 12mo top-customer-share clamp couldn't fire
+        # (top customer is empty because there's been no recent
+        # activity to compute a top from) so avg_daily kept treating
+        # the historic 227 units like steady demand. For SKUs with
+        # genuinely ZERO recent activity, the right answer is
+        # avg_daily = 0 — target → 0 → reorder → 0. Buyer manually
+        # triggers any new-project order.
+        #
+        # v2.67.353 — TIGHTEN the trigger. Original check used
+        # `effective_units_90d == 0`, but effective_units_90d
+        # includes `tube_rollup_in_90d` (sister-variant rollup).
+        # LED-18.074-6 (James 2026-06-02): own 90d activity was 0
+        # (no direct sales, no assemblies in 90d) but sister rollup
+        # from LED-18.074-2/-2390 kept eff_90d > 0, so the clamp
+        # skipped and the engine asked for 22 units against ended
+        # project demand. The engine already correctly flags this
+        # case as `project_reason == "stale-12mo"` (line 7379 checks
+        # u90 = units_90d = direct + own assembly only). Trust THAT
+        # signal — it's the canonical "no own activity in 90d" flag.
+        # Fall back to the old eff_90d_check for SKUs not flagged
+        # stale-12mo but where eff_90d is also zero (no rollup).
+        _proj_reason = str(row.get("project_reason") or "")
+        _own_units_90d = float(row.get("units_90d") or 0)
+        _eff_90d_check = float(row.get("effective_units_90d") or 0)
+        if (_proj_reason == "stale-12mo"
+                and _eff12_for_clamp > 0
+                and _u12 > 0):
+            avg_daily = 0.0
+            clamp_active = True
+            clamp_note = (
+                " — clamped to zero: no OWN activity (zero direct "
+                "sales AND zero assembly consumption) in the last "
+                "90 days, so the historic 12mo (dominated by ended "
+                "project work) doesn't justify any reorder. Sister "
+                "tube rollup in 90d is ignored for this check — it "
+                "represents demand on sibling SKUs, not on this "
+                "one. Manually override the Order qty if a new "
+                "project lands.")
+        elif (_eff_90d_check == 0
+                and _eff12_for_clamp > 0
+                and _u12 > 0):
+            avg_daily = 0.0
+            clamp_active = True
+            clamp_note = (
+                " — clamped to zero: no sales in last 90 days, so "
+                "the historic 12mo (dominated by ended project work) "
+                "doesn't justify any reorder. Manually override the "
+                "Order qty if a new project lands.")
+        elif (_top12_share > 0.50 and _mom < 0.5
+                and _eff12_for_clamp > 0):
+            # Baseline = everything except this one customer's
+            # contribution, expressed against the original 12mo
+            # window. Apply the same RATIO to effective_units_12mo so
+            # rollup contributions scale down proportionally — the
+            # alternative (raw subtraction) would over-penalise SKUs
+            # whose effective_units_12mo includes assembly/tube rollup
+            # that ISN'T attributable to the top customer.
+            _baseline_share = max(0.0, 1.0 - _top12_share)
+            _baseline_eff = _eff12_for_clamp * _baseline_share
+            # 12mo annualisation — divide by 365 (this function runs
+            # on the Ordering page where `window_days` from
+            # _abc_engine isn't in scope; the engine always uses 365
+            # for the 12mo bucket anyway).
+            avg_daily = _baseline_eff / 365.0
+            clamp_active = True
+            _top_name = str(
+                row.get("top_cust_name_12mo")
+                or row.get("top_cust_name")
+                or "—")[:40]
+            clamp_note = (
+                f" — clamped: top customer **{_top_name}** took "
+                f"**{_top12_share:.0%}** of 12mo and momentum is "
+                f"**{_mom:.2f}×**, so the rest of the year (baseline "
+                f"{_baseline_eff:.0f} units/yr) drives the reorder, "
+                f"not the past one-off")
+
+        lt_demand = avg_daily * lead_time_days
+        safety = lt_demand * (safety_pct / 100.0)
+        review_demand = avg_daily * review_days
+        # v2.67.284 — supplier holiday cover. Any days the supplier
+        # is closed within the upcoming lead-time + cadence window
+        # get added to the target as extra cover, so an order
+        # placed before a known shutdown automatically bridges it.
+        window_end = _today_for_engine + timedelta(
+            days=int(lead_time_days + review_days))
+        closure_days, matched_closures = _closure_days_in_window(
+            closures_by_supplier.get(supplier or "", []),
+            _today_for_engine, window_end)
+        holiday_cover = avg_daily * closure_days
+        target = lt_demand + safety + review_demand + holiday_cover
+        raw_target = target
+        is_project_row = (str(row.get("trend_flag") or "")
+                          == "🎯 Project")
+        target_policy_notes = []
+        if not is_project_row:
+            if sku_moq > 0 and target < sku_moq:
+                target = sku_moq
+                target_policy_notes.append(
+                    f"SKU MOQ lifts target to {sku_moq:g}")
+            if sku_eoq > 0:
+                rounded_target = _ceil_to_multiple(target, sku_eoq)
+                if rounded_target > target + 1e-9:
+                    target_policy_notes.append(
+                        f"SKU EOQ rounds target to {rounded_target:g} "
+                        f"(multiple of {sku_eoq:g})")
+                    target = rounded_target
+        onhand = row["OnHand"]
+        allocated = float(row.get("Allocated") or 0)
+        available = float(row.get("Available") or 0)
+        on_order = row["OnOrder"]
+        unfulfilled = float(row.get("unfulfilled") or 0)
+        # Fractional ordering — for bulk-roll masters where the supplier
+        # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
+        # rounding up to 1 full 100m roll). Neonica's 100m rolls are
+        # explicitly fractional; other suppliers use the supplier-level
+        # `allow_fractional_qty` config flag, defaulting to True.
+        is_bulk = bool(row.get("is_bulk_master", False))
+        bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
+        use_fractional = fractional_bulk_order_allowed(
+            supplier, is_bulk, bulk_len_m, cfg)
+        planning_onhand = normalise_planning_quantity(
+            onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        planning_available = normalise_planning_quantity(
+            available, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        planning_on_order = normalise_planning_quantity(
+            on_order, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        target_for_position = normalise_planning_quantity(
+            target, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        # Effective position = what we'll actually have for future demand.
+        #
+        # v2.67.319 — Available ALREADY nets Allocated (CIN7's calc:
+        # Available = OnHand − Allocated). When we're over-committed it
+        # goes negative, and that negative value IS the backorder — the
+        # same number CIN7 shows and the same number now in `unfulfilled`
+        # (= max(0, Allocated − OnHand) = max(0, −Available)).
+        #
+        # So effective_pos = Available + OnOrder. We must NOT subtract
+        # `unfulfilled` on top — Available has already accounted for it.
+        # The old `available + on_order − unfulfilled` DOUBLE-counted the
+        # backorder (it was the root of "app shows 14, CIN7 shows 7" and
+        # the earlier 29-vs-16 reorder inflation). `unfulfilled` is now
+        # kept purely for DISPLAY (the Backorders column); it is no
+        # longer a term in the reorder math.
+        effective_pos = planning_available + planning_on_order
+        shortfall = max(0, target_for_position - effective_pos)
+
+        def _snap_to_10m(value, length_m):
+            """Round a fractional reorder qty to the nearest 10m equivalent.
+            For a 100m roll, value 0.26 → 0.30 (= 30m). For a 50m roll,
+            value 0.45 → 0.40 (= 20m). Provides cleaner ordering than
+            arbitrary fractions like 0.42, while still being more capital-
+            efficient than always rounding to a full roll.
+
+            Demand <5m rounds to 0 (don't reorder for trivial demand).
+            Demand 5m-15m snaps up to 10m (smallest meaningful order).
+            Demand >15m rounds to nearest 10m increment."""
+            if not length_m or length_m <= 0 or value <= 0:
+                return value
+            metres = value * length_m
+            # Below 5m of demand: not worth ordering. This eliminates the
+            # spurious 0.10-roll suggestions for SKUs whose 12mo daily is
+            # near zero (e.g. items that haven't sold in years but have
+            # tiny rolled-up demand from a per-foot child).
+            if metres < 5.0:
+                return 0.0
+            rounded_metres = round(metres / 10.0) * 10.0
+            # 5-15m range snaps up to 10m (smallest meaningful order).
+            if rounded_metres < 10.0:
+                rounded_metres = 10.0
+            return rounded_metres / length_m
+
+        if use_fractional:
+            raw_reorder = round(float(shortfall), 2)
+            reorder = round(_snap_to_10m(raw_reorder, bulk_len_m), 2)
+        else:
+            reorder = int(round(shortfall))
+
+        # --- Stockout recovery boost ---------------------------------
+        # When we're truly out (effective_pos ≤ 0), simply ordering
+        # `target - effective_pos` leaves us at bare-minimum coverage
+        # right when sales are returning. Google Ads / advertising
+        # algorithms penalise out-of-stock listings and that penalty
+        # lingers — so we need to over-stock on recovery.
+        #
+        # Formula:  base_avg_daily × (lead_time + stockout_min_cover_days)
+        #
+        # Key: uses the UNADJUSTED base velocity, not trend-adjusted. If
+        # a Project-classification discounted the SKU to near-zero
+        # velocity, that customer-specific spike is irrelevant to
+        # recovery — what matters is the broad baseline of demand we
+        # want back on the shelf.
+        #
+        # Exception: skip the boost for 💤 Dormant SKUs. If the family
+        # hasn't moved in 90 days, "recovery" doesn't apply — there's
+        # nothing to recover to. Boosting based on stale 12mo demand
+        # would defeat the dormancy detection.
+        #
+        # v2.67.316 — ALSO skip for 🎯 Project SKUs. The boost uses
+        # `avg_daily_base` (the unadjusted 12mo rate) deliberately, to
+        # ignore the project-customer's spike and recover to a "broad
+        # baseline". But for project SKUs there IS no broad baseline —
+        # all the historical demand IS the project customer's contribution.
+        # So the boost recreates the over-reorder the velocity override
+        # was meant to prevent. James 2026-05-27: LEDFLEX180R-24V-5
+        # was flagged Project correctly but still suggested 8 units
+        # because of this boost path. Buyer can manually order 1 unit
+        # for shelf presence if they want it (matching James's stated
+        # policy).
+        stockout_boost_applied = False
+        is_dormant_row = bool(row.get("is_dormant", False))
+        if (effective_pos <= 0
+                and not is_dormant_row
+                and not is_project_row):
+            base_avg = float(row.get("avg_daily_base") or 0) or avg_daily
+            recovery_days = int(
+                cfg.get("stockout_min_cover_days") or 60)
+            stockout_min = base_avg * (lead_time_days + recovery_days)
+            if use_fractional:
+                # Apply same 10m snap to stockout boost so it doesn't
+                # produce sub-5m fractional suggestions (e.g. 0.01 of a
+                # 100m roll = 1m). Was a bug — stockout boost previously
+                # bypassed the snap and surfaced absurdly small qtys for
+                # near-zero-velocity SKUs that had OnHand=0.
+                stockout_qty = round(_snap_to_10m(
+                    round(float(stockout_min), 2), bulk_len_m), 2)
+            else:
+                stockout_qty = int(round(stockout_min))
+            if stockout_qty > reorder:
+                stockout_boost_applied = True
+                reorder = stockout_qty
+
+        # SKU MOQ / EOQ beats supplier MOQ. Supplier MOQ remains a
+        # reorder-qty floor only; SKU MOQ/EOQ also lifted target above
+        # so optimum/excess reflect the SKU's true buying constraint.
+        moq = sku_moq or cfg.get("moq_units") or 0
+        if (reorder > 0 and moq and reorder < moq
+                and not is_project_row
+                and (sku_moq > 0 or not use_fractional)):
+            reorder = float(moq)
+        if reorder > 0 and sku_eoq > 0 and not is_project_row:
+            reorder = _ceil_to_multiple(float(reorder), sku_eoq)
+        if not use_fractional:
+            reorder = int(round(float(reorder)))
+        elif reorder:
+            reorder = round(float(reorder), 2)
+
+        # Excess = OnHand beyond target. For bulk masters, ignore
+        # non-actionable residue below 5m so 0.002 rolls left on a 100m
+        # SKU doesn't show as "Overstocked" / "$5 tied up".
+        excess_units = excess_units_over_target(
+            onhand, target,
+            is_bulk_master=is_bulk,
+            bulk_length_m=bulk_len_m,
+        )
+        excess_value = excess_units * row["AverageCost"]
+        result = {
+            "target_stock": target,
+            "reorder_qty": reorder,
+            "vendor_lead_time_days": vendor_lead_time_days,
+            "lead_time_days": lead_time_days,
+            "sku_lead_time_days": (
+                _sku_lt_int if _sku_lt_int and _sku_lt_int > 0 else 0),
+            "sku_moq": sku_moq,
+            "sku_eoq_qty": sku_eoq,
+            "freight_mode": freight_mode_used,
+            "excess_units": excess_units,
+            "excess_value": excess_value,
+        }
+        if not include_trace:
+            return result
+
+        residue_note = ""
+        if is_bulk and bulk_len_m > 0:
+            ignored = []
+            for label, raw_val, planning_val in (
+                ("OnHand", onhand, planning_onhand),
+                ("Available", available, planning_available),
+                ("OnOrder", on_order, planning_on_order),
+                ("Target", target, target_for_position),
+            ):
+                try:
+                    raw_f = float(raw_val or 0)
+                    plan_f = float(planning_val or 0)
+                except (TypeError, ValueError):
+                    continue
+                if raw_f and plan_f == 0:
+                    ignored.append(
+                        f"{label} {raw_f:.3f} rolls "
+                        f"(~{raw_f * bulk_len_m:.1f}m)")
+            if ignored:
+                residue_note = (
+                    "- Tiny bulk-roll residue below 5m is treated as "
+                    "0 for reorder, excess, and status calculations: "
+                    + "; ".join(ignored)
+                    + ".\n"
+                )
+
+        # Demand breakdown — show migration + tube rollup + assembly
+        # contributions. units_12mo here ALREADY INCLUDES assembly
+        # consumption (we folded synthetic FG-pick rows into sl before
+        # the velocity groupby in v2.67.334); subtract to recover the
+        # genuine direct-sales count for display.
+        units_12mo_total = float(row["units_12mo"])
+        asm_u = float(row.get("assembly_units_12mo", 0))
+        direct_u = max(0.0, units_12mo_total - asm_u)
+        mig_in = float(row.get("migrated_in", 0))
+        mig_out = float(row.get("migrated_out", 0))
+        rollup_in = float(row.get("tube_rollup_in", 0))
+        eff_u = float(row.get("effective_units_12mo", units_12mo_total))
+
+        demand_lines = [f"**Supplier**: {supplier or 'unassigned'}\n"]
+        if row.get("is_non_master_tube"):
+            demand_lines.append(
+                "**Tube variant (non-master)** — demand is rolled up "
+                "into its master tube SKU, so effective units here = 0 "
+                "(we don't order this SKU directly; it's assembled "
+                "from a master).\n"
+            )
+        else:
+            demand_lines.append(
+                f"**Velocity breakdown** (12mo → effective "
+                f"{eff_u:.0f} units):\n"
+                f"- Direct sales of this SKU: **{direct_u:.0f}** units\n"
+            )
+            if asm_u > 0:
+                # v2.67.334 — assembly (FG-XXXX) consumption: every kit
+                # built that included this SKU as a pick-line. Ground
+                # truth for components mostly used in kits (the BOM
+                # rollup is skipped for these SKUs to avoid double-
+                # counting the same demand twice).
+                demand_lines.append(
+                    f"- Assembly consumption (FG- tasks): "
+                    f"**+{asm_u:.0f}** units "
+                    f"(ground truth — kits built using this part)\n"
+                )
+            if mig_in > 0:
+                demand_lines.append(
+                    f"- Migrated IN from retiring SKUs: "
+                    f"**+{mig_in:.0f}** units "
+                    f"({row.get('migrated_from') or 'see below'})\n"
+                )
+            if mig_out > 0:
+                demand_lines.append(
+                    f"- Migrated OUT (share going to successor): "
+                    f"**−{mig_out:.0f}** units\n"
+                )
+            if rollup_in > 0:
+                demand_lines.append(
+                    f"- Demand rollup IN from variants / packs / cuts: "
+                    f"**+{rollup_in:.0f}** units "
+                    f"(see tube_rollup_notes)\n"
+                )
+
+        # Dormancy note — surface when this SKU has been classified
+        # dormant. Shows the buyer exactly why the suggestion is what
+        # it is (or zero) — direct comparison of 90d vs 12mo daily rate.
+        _is_dormant_row = bool(row.get("is_dormant", False))
+        if _is_dormant_row:
+            eff_12mo_d = float(row.get("effective_units_12mo") or 0)
+            eff_90d_d = float(row.get("effective_units_90d") or 0)
+            rate_12mo_daily = eff_12mo_d / 365.0 if eff_12mo_d else 0.0
+            rate_90d_daily = eff_90d_d / 90.0 if eff_90d_d else 0.0
+            ratio_pct = (rate_90d_daily / rate_12mo_daily * 100.0
+                          if rate_12mo_daily > 0 else 0.0)
+            demand_lines.append(
+                f"\n**💤 Dormant detection**:\n"
+                f"- 12mo effective rate: **{rate_12mo_daily:.2f} units/day** "
+                f"(based on {eff_12mo_d:.0f} units over 365d)\n"
+                f"- Last 90d effective rate: **{rate_90d_daily:.3f} units/day** "
+                f"(based on {eff_90d_d:.0f} units over 90d)\n"
+                f"- Ratio: **{ratio_pct:.1f}%** of historical rate "
+                f"(threshold for dormancy: <20%)\n"
+                f"- **Engine override**: using 90d rate instead of 12mo rate, "
+                f"so reorder suggestion reflects actual recent demand. "
+                f"Stockout-recovery boost is also suppressed for dormant SKUs.\n"
+            )
+
+        # Trend classification note — always included when the flag is
+        # anything other than "Stable" so the buyer knows the engine
+        # spotted something.
+        _tf = row.get("trend_flag") or "Stable"
+        if pd.isna(_tf):
+            _tf = "Stable"
+        if _tf != "Stable" and not _is_dormant_row:
+            # Defensive NaN-handling — any of these can arrive as NaN
+            # for SKUs with no recent sales that got flagged by another
+            # signal (rare, but possible after a cache refresh).
+            def _fnum(v, default=0.0):
+                try:
+                    v = float(v)
+                    return default if pd.isna(v) else v
+                except (ValueError, TypeError):
+                    return default
+            u45v = _fnum(row.get("units_45d"))
+            uprv = _fnum(row.get("units_prior_45d"))
+            n_cust = int(_fnum(row.get("customers_45d")))
+            top_pct = _fnum(row.get("top_cust_pct")) * 100
+            top_2_pct = _fnum(row.get("top_2_cust_pct")) * 100
+            non_top_avg = _fnum(row.get("non_top_avg_units"))
+            top_name = str(row.get("top_cust_name") or "—")[:40]
+            mom = _fnum(row.get("momentum"), default=1.0)
+            mom_s = (f"{mom:.2f}×" if mom != float("inf") else "new")
+            _cust12 = int(_fnum(row.get("customers_12mo")))
+            # v2.67.354 — customer count line: clarify that
+            # customers_45d is rolled up across the strip family
+            # (line 7084 overwrites the raw groupby with rolled-up
+            # counts) while customers_12mo is direct-only (line 5780
+            # groupby on sl directly). On strip masters with zero
+            # direct sales (e.g. LED-13.019 — all demand is sister
+            # rollup + assembly), the trace previously read
+            # "3 in 45d, 0 in 12mo" — apparently impossible because
+            # the metrics measure different things. Make both
+            # measurements explicit.
+            demand_lines.append(
+                f"\n**Trend signal**: {_tf}  \n"
+                f"- Last 45d: **{u45v:.0f} units** "
+                f"(prior 45d: {uprv:.0f}, momentum **{mom_s}**)\n"
+                f"- **{n_cust} customer(s) in last 45d** "
+                f"(rolled up across strip family), "
+                f"**{_cust12} direct customer(s) over 12mo** "
+                f"(this SKU only — sister-variant buyers not counted "
+                f"here; 3+ direct ⇒ diversified, never auto-flagged "
+                f"Project)\n"
+                f"- top customer **{top_name}** took **{top_pct:.0f}%**, "
+                f"top 2 combined **{top_2_pct:.0f}%**\n"
+                f"- Non-top customers avg **{non_top_avg:.1f} units** "
+                f"each (key trend-vs-project signal)\n"
+            )
+            if _tf == "📈 Trend":
+                demand_lines.append(
+                    "- **Velocity override**: using last-45d rate "
+                    "instead of 12mo avg because demand is "
+                    "accelerating broadly. Engine will build stock "
+                    "faster to catch up.\n"
+                )
+            elif _tf == "📉 Decline":
+                # v2.67.354 — Decline override transparency. Either
+                # the override fired (sustained decline) or it didn't
+                # (lumpy 45d timing). Either way the buyer sees the
+                # comparison so they understand the engine's choice.
+                _eff90_d = float(row.get("effective_units_90d") or 0)
+                _eff12_d = float(row.get("effective_units_12mo") or 0)
+                _mom_d = float(row.get("momentum") or 1.0)
+                _rate90yr = (
+                    _eff90_d * (365.0 / 90.0) if _eff90_d > 0 else 0)
+                _share_pct = (
+                    (_rate90yr / _eff12_d * 100.0)
+                    if _eff12_d > 0 else 0.0)
+                if (_eff12_d > 0 and _eff90_d > 0
+                        and _rate90yr < _eff12_d * 0.7
+                        and _mom_d < 0.5):
+                    demand_lines.append(
+                        f"- **Velocity override**: 90d annualised "
+                        f"rate (**{_rate90yr:.0f} units/yr**) is "
+                        f"**{_share_pct:.0f}%** of 12mo "
+                        f"({_eff12_d:.0f}) AND 45d momentum is "
+                        f"**{_mom_d:.2f}×** — sustained decline "
+                        f"confirmed across both windows. Using "
+                        f"90d rate (**{_eff90_d/90:.2f}/day**) "
+                        f"instead of 12mo, to avoid over-ordering "
+                        f"against demand that's stepped down.\n"
+                    )
+                else:
+                    demand_lines.append(
+                        f"- **No velocity override**: 45d momentum "
+                        f"(**{_mom_d:.2f}×**) flags decline, but 90d "
+                        f"annualised rate (**{_rate90yr:.0f} "
+                        f"units/yr**) is **{_share_pct:.0f}%** of "
+                        f"12mo ({_eff12_d:.0f}) — likely lumpy "
+                        f"timing (assembly batches, single big "
+                        f"customer order in prior 45d window), not "
+                        f"sustained decline. Engine keeps the 12mo "
+                        f"annualised rate; the Decline label is a "
+                        f"watch-flag, not an action signal.\n"
+                    )
+            elif _tf == "🎯 Project":
+                _topu = float(row.get("top_cust_units_12mo") or 0)
+                _topname = str(
+                    row.get("top_cust_name_12mo")
+                    or row.get("top_cust_name")
+                    or "—")[:40]
+                _preason = str(row.get("project_reason") or "concentrated")
+                _eff_lv = float(row.get("effective_units_12mo") or 0)
+                _raw_lv = float(row.get("units_12mo") or 0)
+                _lineage_lv = float(row.get("lineage_units_12mo") or 0)
+                _visible_lv = max(_eff_lv, _raw_lv, _lineage_lv)
+                _share = (_topu / _visible_lv * 100) if _visible_lv > 0 else 0
+                _cust12_lv = int(row.get("customers_12mo") or 0)
+                if _preason == "rolled-up-history":
+                    demand_lines.append(
+                        f"- **Project / rolled-up history** — visible "
+                        f"12mo demand is **{_visible_lv:.0f} units** "
+                        "from the trend lineage, but reorder-math "
+                        f"demand is **{_eff_lv:.0f}** for this row. "
+                        "That means the movement has been rolled to a "
+                        "master/successor or suppressed from automatic "
+                        "buying. Do not treat this as a steady baseline "
+                        "for this SKU; manually order only when there is "
+                        "a known project or direct buyer need.\n"
+                    )
+                elif _preason == "low-volume":
+                    demand_lines.append(
+                        f"- **Low-volume Project** — only "
+                        f"**{_visible_lv:.0f} units in 12mo** total (<1/mo "
+                        f"avg). Not dormant (a sale landed inside the "
+                        f"90d window) but too sparse to call Stable. "
+                        f"Treated as project demand: subtracting top "
+                        f"customer **{_topname}**'s 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
+                        f"effective demand) before annualising — the "
+                        f"rest is sporadic one-offs that shouldn't "
+                        f"drive reorder.\n"
+                    )
+                elif _preason == "sporadic-few-buyers":
+                    demand_lines.append(
+                        f"- **Few-buyer Project** — "
+                        f"**{_visible_lv:.0f} units in 12mo** across "
+                        f"only **{_cust12_lv} customers**. That is not "
+                        "broad replenishment demand. Velocity override: "
+                        f"subtracting the top customer's 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of visible "
+                        "demand) before annualising, so the engine doesn't "
+                        "auto-restock for an already-served project.\n"
+                    )
+                elif _preason == "stale-12mo":
+                    demand_lines.append(
+                        f"- **Stale 12mo Project** — "
+                        f"**{_visible_lv:.0f} units in 12mo** total but "
+                        f"**zero sales in the last 90 days**. The "
+                        f"historic activity isn't a baseline you "
+                        f"can plan against — it was project work "
+                        f"that's now ended. Velocity override: "
+                        f"subtracting top customer "
+                        f"**{_topname}**'s 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
+                        f"effective demand) before annualising, so "
+                        f"the engine doesn't auto-restock against "
+                        f"already-fulfilled project demand. If a "
+                        f"new project lands, override the suggested "
+                        f"qty manually.\n"
+                    )
+                elif _preason == "sporadic-single-buyer":
+                    demand_lines.append(
+                        f"- **Sporadic single-buyer Project** — "
+                        f"**{_visible_lv:.0f} units in 12mo** total, but "
+                        f"top customer **{_topname}** took "
+                        f"**{_topu:.0f} units ({_share:.0f}%)** of "
+                        f"that. Few transactions clustered to one "
+                        f"buyer = project pattern even though the "
+                        f"unit count looks decent. Velocity override: "
+                        f"subtracting the top customer's 12mo "
+                        f"contribution before annualising, leaving a "
+                        f"near-zero baseline so the engine doesn't "
+                        f"auto-restock against demand that's unlikely "
+                        f"to repeat.\n"
+                    )
+                else:
+                    demand_lines.append(
+                        "- **Velocity override**: subtracting top "
+                        f"customer **{_topname}**'s 12mo contribution "
+                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
+                        f"effective demand) before annualising, "
+                        "because the spike is concentrated to one "
+                        "buyer — unlikely to repeat.\n"
+                    )
+            # v2.67.352 — include the +asm_u term in the formula so the
+            # LHS actually sums to the displayed eff_u. Pre-v2.67.352
+            # the line read "0 - 0 + 0 + 356 = 588" which dropped the
+            # +232 assembly term, making the math look broken even
+            # though the engine computed eff_u correctly.
+            # v2.67.362 — for 🎯 Project SKUs, also show the top-customer
+            # subtraction in the formula so the RHS matches the daily
+            # velocity displayed below. Pre-fix: "27 - 0 + 0 + 0 = 27"
+            # but avg_daily showed 0.03 (= 11/365 not 27/365), making the
+            # math look inconsistent. Now shows "27 - 16 + 0 + 0 = 11".
+            _proj_top_u = (
+                _topu if _tf == "🎯 Project" and "_topu" in dir()
+                else 0.0)
+            _proj_top_u = _proj_top_u if not pd.isna(_proj_top_u) else 0.0
+            _display_eff = max(0.0, eff_u - _proj_top_u)
+            demand_lines.append(
+                f"- **Effective total**: {direct_u:.0f}"
+                + (f" + {asm_u:.0f}" if asm_u > 0 else "")
+                + f" - {mig_out:.0f} "
+                f"+ {mig_in:.0f} + {rollup_in:.0f}"
+                + (f" - {_proj_top_u:.0f} *(top-buyer removed)*"
+                   if _proj_top_u > 0 else "")
+                + f" = **{_display_eff:.0f}** units/year\n"
+            )
+            # v2.67.358 — show avg/month alongside avg/day. James
+            # 2026-06-03: buyers think in months, not days. avg/month
+            # is more intuitive for replenishment cadence ("about 60
+            # a month" is easier to reason about than "2.0/day").
+            # Computed as avg_daily × 30.4 (avg days per month).
+            _avg_month = avg_daily * 30.4
+            demand_lines.append(
+                f"- Avg daily: {eff_u:.0f} / 365 = "
+                f"**{avg_daily:.2f}** units/day "
+                f"(≈ **{_avg_month:.0f}/month**)"
+                + (f"{clamp_note}\n" if clamp_active else "\n")
+            )
+            # v2.67.353 — recency diagnostic. Splits the 90d activity
+            # into "own" (direct + own assembly — what counts toward
+            # the stale-12mo check at engine line 7379) vs "tube
+            # rollup IN" (sister-variant rollup) vs "effective"
+            # (sum). The stale-90d clamp uses OWN. Surfacing this
+            # one-glance saves a CSV export next time a buyer asks
+            # "why isn't this clamped to zero".
+            _own90 = float(row.get("units_90d") or 0)
+            _eff90 = float(row.get("effective_units_90d") or 0)
+            _roll90 = float(row.get("tube_rollup_in_90d") or 0)
+            demand_lines.append(
+                f"- 90-day activity (recency diagnostic): "
+                f"**own = {_own90:.1f}** (direct + own assembly — "
+                f"used by stale-90d clamp), "
+                f"sister tube rollup IN = {_roll90:.1f}, "
+                f"effective = {_eff90:.1f}\n"
+            )
+
+        if lead_time_basis == "sku":
+            lead_time_basis_note = (
+                " — SKU-level lead-time override from buying settings; "
+                f"overrides Vendor LT {vendor_lead_time_days:g}d "
+                f"({vendor_lead_time_basis}).\n\n")
+        elif lead_time_basis == "ip_observed":
+            lead_time_basis_note = (
+                " — IP's measured average PO-to-receipt time for "
+                "this SKU; overrides the supplier-config default "
+                "with the real number.\n\n")
+        elif lead_time_basis == "ip_configured":
+            lead_time_basis_note = (
+                " — IP's configured lead-time setting for "
+                "this SKU; overrides the supplier-config default.\n\n")
+        elif (air_eligible_default and air_max_len
+                and length_mm is not None
+                and length_mm > air_max_len):
+            lead_time_basis_note = (
+                f" — SKU length {length_mm}mm > {air_max_len}mm "
+                f"air max, forced sea\n\n")
+        else:
+            lead_time_basis_note = "\n\n"
+
+        if target_policy_notes:
+            target_policy_text = (
+                f"\n\n**SKU buying policy**: raw target "
+                f"{raw_target:.1f} → **{target:.1f}** units ("
+                + "; ".join(target_policy_notes)
+                + ")")
+        else:
+            target_policy_text = ""
+
+        reorder_policy_bits = []
+        if sku_moq > 0:
+            reorder_policy_bits.append(f"SKU MOQ {sku_moq:g}")
+        elif moq:
+            reorder_policy_bits.append(f"supplier MOQ {float(moq):g}")
+        if sku_eoq > 0:
+            reorder_policy_bits.append(f"SKU EOQ {sku_eoq:g}")
+        reorder_policy_text = (
+            " (" + ", ".join(reorder_policy_bits) + " applied)"
+            if reorder_policy_bits and not is_project_row else "")
+
+        trace = "".join(demand_lines) + (
+            f"**Lead time**: {lead_time_days} days "
+            f"({freight_mode_used}{_freight_rule_note})"
+            + lead_time_basis_note
+            + f"**ABC class**: {abc} → safety {safety_pct:.0f}%\n\n"
+            f"**Review period**: {review_days}d — {review_basis}\n\n"
+            f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "
+            f"= {lt_demand:.1f} units\n\n"
+            f"**Safety stock**: {lt_demand:.1f} × {safety_pct/100:.2f} "
+            f"= {safety:.1f} units\n\n"
+            f"**Review-period demand**: {avg_daily:.2f} × {review_days} "
+            f"= {review_demand:.1f} units\n\n"
+            + (
+                f"**Holiday cover**: +{closure_days}d ("
+                + "; ".join(
+                    f"{(m['label'] or 'closure')} "
+                    f"({_format_iso_weeks_range(m['start_date'], m['end_date'])}: "
+                    f"{m['start_date']}→{m['end_date']}, "
+                    f"{m['overlap_days']}d in window)"
+                    for m in matched_closures
+                )
+                + f") → +{holiday_cover:.1f} units — "
+                  f"the supplier is shut for part of this order's "
+                  f"cover window, so we carry the closed days as "
+                  f"extra stock to bridge it.\n\n"
+                if closure_days > 0 else ""
+            )
+            + f"**Target stock**: {lt_demand:.1f} + {safety:.1f} + "
+            f"{review_demand:.1f}"
+            + (f" + {holiday_cover:.1f}" if closure_days > 0 else "")
+            + f" = **{raw_target:.1f} units**"
+            + target_policy_text
+            + "\n\n"
+            f"**Current position**:\n"
+            f"- OnHand: {onhand:.0f} physical units\n"
+            f"- Allocated (reserved for open orders): {allocated:.0f}\n"
+            f"- Available (OnHand − Allocated): {available:.0f}"
+            + ("  ← negative = we're over-committed\n"
+               if available < 0 else "\n")
+            + f"- OnOrder (incoming POs): {on_order:.0f}\n"
+            + residue_note
+            + f"- Backorder (= max(0, Allocated − OnHand), matches CIN7): "
+            f"{unfulfilled:.0f}  ← already reflected in negative "
+            f"Available, NOT subtracted again\n"
+            f"- **Effective position**: {planning_available:.0f} + "
+            f"{planning_on_order:.0f} "
+            f"= **{effective_pos:.0f}**\n\n"
+            f"**Suggested reorder**: max(0, {target_for_position:.1f} - "
+            f"{effective_pos:.0f}) = "
+            + (f"**{reorder:.2f}** rolls "
+               f"(fractional — supplier accepts decimal qtys; "
+               f"bulk master is {row.get('bulk_length_m', 0):g}m)"
+               if use_fractional
+               else f"{reorder} units")
+            + reorder_policy_text
+            + (f" (rounded up to MOQ {moq:g})"
+               if (moq and not use_fractional and not is_project_row
+                   and reorder == int(moq))
+               else "")
+            + (f" (MOQ {moq:g} not auto-applied to Project rows)"
+               if (moq and not use_fractional and is_project_row
+                   and 0 < reorder < float(moq))
+               else "")
+            + f"\n\n"
+            f"**Excess stock** (over target): {excess_units:.0f} units × "
+            f"${row['AverageCost']:.2f} = **${excess_value:,.0f} tied up**"
+        )
+        result["calc_trace"] = trace
+        return result
+
+    # v2.67.289 — skip the apply when nothing changed. engine_df
+    # is cached via @st.cache_resource — Streamlit returns the
+    # SAME DataFrame object across renders until the cache is
+    # invalidated, so any columns we added on a previous render
+    # are still present. If supp_configs / closures / IP lead
+    # times / today are all unchanged, the apply would produce
+    # identical values — skipping it removes the 10k-row markdown
+    # rebuild that was spiking memory and crashing Render on every
+    # navigation, holiday save, and cadence save.
+    _reorder_cols = ("target_stock", "reorder_qty",
+                       "vendor_lead_time_days", "lead_time_days",
+                       "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
+                       "freight_mode", "excess_units", "excess_value")
+    try:
+        _cache_sig = json.dumps({
+            "supp": supp_configs,
+            "clos": closures_by_supplier,
+            "ip_lt": ip_lead_times_by_sku,
+            "sku_buying": sku_buying_settings,
+            "today": _today_for_engine.isoformat(),
+        }, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        _cache_sig = None  # never hit on dict-of-simple-types
+    _have_columns = all(c in engine_df.columns for c in _reorder_cols)
+    _sig_unchanged = (
+        _cache_sig is not None
+        and st.session_state.get("_reorder_apply_sig") == _cache_sig)
+    if _have_columns and _sig_unchanged:
+        pass  # cache hit — engine_df already has these columns
+    else:
+        applied = engine_df.apply(_compute_target_and_reorder, axis=1)
+        engine_df["target_stock"] = applied.apply(lambda x: x["target_stock"])
+        engine_df["reorder_qty"] = applied.apply(lambda x: x["reorder_qty"])
+        engine_df["vendor_lead_time_days"] = applied.apply(
+            lambda x: x["vendor_lead_time_days"])
+        engine_df["lead_time_days"] = applied.apply(lambda x: x["lead_time_days"])
+        engine_df["sku_lead_time_days"] = applied.apply(
+            lambda x: x["sku_lead_time_days"])
+        engine_df["sku_moq"] = applied.apply(lambda x: x["sku_moq"])
+        engine_df["sku_eoq_qty"] = applied.apply(lambda x: x["sku_eoq_qty"])
+        engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
+        engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
+        engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
+        if _cache_sig is not None:
+            st.session_state["_reorder_apply_sig"] = _cache_sig
+    # Never keep per-SKU markdown traces on the table DataFrame. They are
+    # large and only one is viewed at a time, so Inspect builds them lazily.
+    if "calc_trace" in engine_df.columns:
+        engine_df = engine_df.drop(columns=["calc_trace"])
+
+    _product_status = engine_df.get(
+        "Status", pd.Series("", index=engine_df.index)
+    ).astype(str)
+
+    # Dropship override: these SKUs are order-on-demand. Zero the target
+    # and reorder, leave everything else (sales history, OnHand etc.)
+    # intact so buyer can watch volume and decide when to promote to
+    # stocked via the Dropship expander below. Final Status badge is
+    # applied after the computed status pass.
+    if dropship_skus:
+        _ds_mask = engine_df["SKU"].astype(str).isin(dropship_skus)
+        engine_df.loc[_ds_mask, "target_stock"] = 0
+        engine_df.loc[_ds_mask, "reorder_qty"] = 0
+        engine_df.loc[_ds_mask, "excess_units"] = 0
+        engine_df.loc[_ds_mask, "excess_value"] = 0
+
+    # Discontinued override: any SKU with "[Discontinued]" in its Name
+    # (case-insensitive) OR Status="Discontinued" in CIN7 — force
+    # reorder_qty=0 and target_stock=0 so the engine never suggests
+    # ordering more of a product that's been retired. The buyer can
+    # still see direct sales history, OnHand, and excess for cleanup
+    # decisions. Trend is set to "🚫 Discontinued" (distinct from
+    # 💤 Dormant) so it's visually obvious in the PO editor.
+    _disc_name_mask = (engine_df["Name"].astype(str)
+                       .str.contains(r"\[Discontinued\]", case=False,
+                                      regex=True, na=False))
+    _disc_status_mask = (_product_status.str.lower() == "discontinued")
+    _disc_mask = _disc_name_mask | _disc_status_mask
+    if _disc_mask.any():
+        engine_df.loc[_disc_mask, "target_stock"] = 0
+        engine_df.loc[_disc_mask, "reorder_qty"] = 0
+        engine_df.loc[_disc_mask, "trend_flag"] = "🚫 Discontinued"
+    # OnHandValue: prefer CIN7's authoritative StockOnHand (FIFO-based
+    # dollar value shown in CIN7's Product Availability screen).
+    # Fall back to OnHand × AverageCost/FixedCost only when CIN7 returns 0.
+    engine_df["OnHandValue"] = engine_df.apply(
+        lambda r: (float(r["StockOnHand"]) if float(r["StockOnHand"]) > 0
+                   else float(r["OnHand"]) * float(r["AverageCost"])),
+        axis=1,
+    )
+    # Per-unit cost chain, priority order:
+    #   1. CIN7 StockOnHand ÷ OnHand  (real FIFO)
+    #   2. Supplier FixedCost  (already in UnitCost via cin7_cost_local)
+    #   3. Product.AverageCost  (raw from CIN7)
+    #   4. Family-prefix MEDIAN cost  (same SKU prefix siblings)
+    #   5. Category MEDIAN cost  (same Category field)
+    #   6. 0  (genuinely unknown)
+    def _direct_unit_cost(r):
+        sv = float(r["StockOnHand"] or 0)
+        oh = float(r["OnHand"] or 0)
+        if sv > 0 and oh > 0:
+            return sv / oh
+        return float(r["AverageCost"] or 0)
+
+    engine_df["_direct_cost"] = engine_df.apply(_direct_unit_cost, axis=1)
+
+    # Compute family-prefix median cost
+    def _family_prefix(sku: str) -> str:
+        parts = str(sku).split("-")
+        if len(parts) >= 3:
+            return "-".join(parts[:-1])
+        return str(sku)
+
+    engine_df["_family_prefix"] = engine_df["SKU"].apply(_family_prefix)
+    # Only use rows with a confident direct cost to compute medians
+    _confident_costs = engine_df[engine_df["_direct_cost"] > 0]
+    if not _confident_costs.empty:
+        family_median = (_confident_costs.groupby("_family_prefix")
+                          ["_direct_cost"].median().to_dict())
+        category_median = (_confident_costs.groupby("Category")
+                            ["_direct_cost"].median().to_dict())
+    else:
+        family_median, category_median = {}, {}
+
+    def _effective_unit_cost(r):
+        direct = float(r["_direct_cost"] or 0)
+        if direct > 0:
+            return direct, "direct"
+        fam_med = family_median.get(r["_family_prefix"], 0)
+        if fam_med > 0:
+            return float(fam_med), "family-median"
+        cat_med = category_median.get(r.get("Category"), 0)
+        if cat_med > 0:
+            return float(cat_med), "category-median"
+        return 0.0, "unknown"
+
+    _cost_apply = engine_df.apply(_effective_unit_cost, axis=1)
+    engine_df["EffectiveUnitCost"] = _cost_apply.apply(lambda x: x[0])
+    engine_df["CostBasisDetail"] = _cost_apply.apply(lambda x: x[1])
+    engine_df["TargetValue"] = (
+        engine_df["target_stock"] * engine_df["EffectiveUnitCost"]
+    )
+    # Status — must use EFFECTIVE units (direct + migrated + rollup),
+    # otherwise masters with rolled-up demand (e.g. Sierra65-W-2, strip
+    # bulk rolls) get wrongly flagged as Dead Stock.
+    # v2.67.36 — prepend "❗" to the Status when the SKU has an
+    # active once-slow dormancy warning. This is the buyer's cue
+    # to verify whether reorder demand is sales-driven (we just
+    # surfaced it as slow stock and are clearing it) vs genuine
+    # market recovery. The warning auto-lifts after 90d sustained
+    # activity or via manual dismiss.
+    def _status(r):
+        eff = float(r.get("effective_units_12mo",
+                            r.get("units_12mo", 0)) or 0)
+        raw_onhand = float(r.get("OnHand") or 0)
+        allocated = float(r.get("Allocated") or 0)
+        # v2.67.333 — Status now uses AVAILABLE (= OnHand − Allocated),
+        # not OnHand. The old logic compared OnHand to target_stock,
+        # which mislabelled deeply-oversold SKUs as "Overstocked":
+        # LED-NEON-FLEX-SUPER-SLIM-ST-2M, OnHand=7, Allocated=35,
+        # Available=-28, target=0.8 → 7 > 1.2 → "🔵 Overstocked" → the
+        # default status filter hid it → many Neonica products went
+        # missing from the reorder view despite reorder_qty=29. The
+        # engine's reorder math always used Available; only the label
+        # (and so the filter) lagged. Now they agree.
+        #
+        # Tiers, in order:
+        #   🔴 Reorder now if any of:
+        #        – Available < 0          (oversold)
+        #        – Available < lead-time demand
+        #        – reorder_qty > 0 AND Available < target
+        #   ⚪ No demand, no stock        (no visible/effective demand,
+        #                                  no stock)
+        #   💀 Dead stock                 (no visible/effective demand,
+        #                                  holding stock)
+        #   🟠 Reorder soon                (Available < target)
+        #   🔵 Overstocked                 (Available > target × 1.5)
+        #   🟢 On target                   (everything else)
+        raw_available = raw_onhand - allocated
+        is_bulk = bool(r.get("is_bulk_master", False))
+        bulk_len_m = float(r.get("bulk_length_m") or 0)
+        onhand = normalise_planning_quantity(
+            raw_onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
+        available = normalise_planning_quantity(
+            raw_available, is_bulk_master=is_bulk,
+            bulk_length_m=bulk_len_m)
+        target = normalise_planning_quantity(
+            float(r.get("target_stock") or 0),
+            is_bulk_master=is_bulk,
+            bulk_length_m=bulk_len_m,
+        )
+        avg_daily = float(r.get("avg_daily") or 0)
+        lead_time = float(r.get("lead_time_days") or 0)
+        reorder_qty = float(r.get("reorder_qty") or 0)
+        lineage_12mo = float(r.get("lineage_units_12mo") or 0)
+        display_12mo = float(r.get("display_units_12mo") or 0)
+        raw_units_12mo = float(r.get("units_12mo") or 0)
+        visible_12mo = max(eff, lineage_12mo, display_12mo, raw_units_12mo)
+        sku_str = str(r.get("SKU") or "")
+        once_slow = sku_str in dormancy_warnings_map
+        if available < 0:
+            # Oversold always wins. A customer shortage should never be
+            # hidden behind Dead Stock / Project / Overstocked wording.
+            base = "🔴 Reorder now"
+        elif available == 0 and (target > 0 or reorder_qty > 0):
+            base = "🔴 Reorder now"
+        elif visible_12mo <= 0 and onhand == 0:
+            base = "⚪ No demand, no stock"
+        elif visible_12mo <= 0 and onhand > 0:
+            base = "💀 Dead stock"
+        elif target == 0 and reorder_qty <= 0 and available == 0:
+            # Dormant/project SKUs can correctly have target=0 and
+            # reorder=0. If there is also no meaningful stock left, this
+            # is not "Reorder now" and not "Overstocked"; it is simply at
+            # the engine's current target.
+            base = "🟢 On target"
+        elif available < avg_daily * lead_time:
+            base = "🔴 Reorder now"
+        elif reorder_qty > 0 and available < target:
+            # Engine still wants to reorder but we have some free
+            # stock — softer urgency.
+            base = "🟠 Reorder soon"
+        elif available < target:
+            base = "🟠 Reorder soon"
+        elif available > target * 1.5:
+            base = "🔵 Overstocked"
+        else:
+            base = "🟢 On target"
+        return f"❗ {base}" if once_slow else base
+    engine_df["Status"] = engine_df.apply(_status, axis=1)
+    # Final Status overrides happen after the computed status pass so
+    # the displayed buyer action cannot be overwritten by cached or
+    # earlier labels.
+    if dropship_skus:
+        engine_df.loc[_ds_mask, "Status"] = "📦 Dropship"
+    if _disc_mask.any():
+        engine_df.loc[_disc_mask, "Status"] = "🚫 Discontinued"
+
+    # --- SKU detail panel (v2.67.326) ---------------------------------
+    # James 2026-05-28: see a SKU's full detail without leaving the
+    # ordering page. The original v2.67.324 attempt used a LinkColumn
+    # (?inspect=<SKU>) + st.dialog — it bombed (Streamlit data_editor
+    # links open a new tab / the dialog API + control-flow exceptions
+    # were brittle). Replaced with a rock-solid "🔍 Inspect a SKU"
+    # selectbox + inline bordered panel rendered via _render_sku_detail
+    # right above the editor. Pure native widgets, can't bomb.
+    def _render_sku_detail(_sku: str) -> None:
+        _hit = engine_df[engine_df["SKU"].astype(str) == str(_sku)]
+        if _hit.empty:
+            st.warning(f"No engine data for `{_sku}`.")
+            return
+        _r = _hit.iloc[0]
+        _trend_12m = _r.get("trend_12m")
+        if not isinstance(_trend_12m, list):
+            _trend_12m = _parse_engine_list_cell(_trend_12m)
+        _current_month_engine_units = (
+            float(_trend_12m[-1]) if _trend_12m else 0.0)
+        _current_month_live = build_sku_current_month_movement(
+            _sku, sale_lines, assemblies)
+        _current_month_live_units = float(
+            _current_month_live.get("total_qty") or 0)
+        _current_month_product_movements = (
+            _cached_live_product_movements_for_sku(_sku))
+        _current_month_product_units = 0.0
+        if _current_month_product_movements.get("ok"):
+            _current_month_product_units = float(
+                _current_month_product_movements.get("demand_qty") or 0)
+        # For assembly-heavy SKUs, the engine bucket can lag the live
+        # movement evidence until the background ABC refresh finishes.
+        # Prefer CIN7 product Movements when available because that is the
+        # same ledger shown in CIN7's product movement screen.
+        _current_month_units = max(
+            _current_month_engine_units,
+            _current_month_live_units,
+            _current_month_product_units,
+        )
+        st.markdown(f"#### {_sku}")
+        # v2.67.349 — render the SKU as a code block too so Streamlit's
+        # built-in hover-copy clipboard icon appears. One-click copy
+        # for pasting into CIN7, Slack, search, etc. No JS injection
+        # needed — pure native widget.
+        st.code(_sku, language=None)
+        st.caption(str(_r.get("Name") or ""))
+        _m = st.columns(3)
+        _m[0].metric("ABC", str(_r.get("ABC") or "—"))
+        _m[1].metric("Trend", str(_r.get("trend_flag") or "Stable"))
+        _m[2].metric("Status", str(_r.get("Status") or "—"))
+        _s = st.columns(4)
+        _s[0].metric("OnHand", f"{float(_r.get('OnHand') or 0):.0f}")
+        _s[1].metric("Allocated", f"{float(_r.get('Allocated') or 0):.0f}")
+        _s[2].metric("Available", f"{float(_r.get('Available') or 0):.0f}")
+        _s[3].metric("OnOrder", f"{float(_r.get('OnOrder') or 0):.0f}")
+        _d = st.columns(4)
+        _raw_u12 = float(_r.get("units_12mo") or 0)
+        _eff_u12 = float(_r.get("effective_units_12mo") or 0)
+        _lineage_u12 = float(_r.get("lineage_units_12mo") or 0)
+        _display_u12 = max(_raw_u12, _eff_u12, _lineage_u12)
+        _d[0].metric(
+            "12mo demand",
+            f"{_display_u12:.0f}",
+            help=(
+                "Buyer-visible demand from the 12-month trend lineage. "
+                "The reorder math still uses effective_units_12mo, which "
+                "may be lower/zero for child, migrated, or project-style "
+                "rows to prevent accidental auto-buying."
+            ),
+        )
+        _d[1].metric("45d units", f"{float(_r.get('units_45d') or 0):.0f}")
+        _d[2].metric("Customers 12mo",
+                     f"{int(_r.get('customers_12mo') or 0)}")
+        _d[3].metric("Suggested reorder",
+                     f"{float(_r.get('reorder_qty') or 0):.0f}")
+        _d2 = st.columns(4)
+        _d2[0].metric(
+            "Current month",
+            f"{_current_month_units:.0f}",
+            help=("Uses the ABC monthly bucket, but falls forward to "
+                  "live synced sale-lines + FG assembly consumption, "
+                  "then to CIN7 product Movements when that live ledger "
+                  "is available and ahead."),
+        )
+        _d2[1].metric("90d units",
+                      f"{float(_r.get('units_90d') or 0):.0f}")
+        _d2[2].metric("Customers 45d",
+                      f"{int(_r.get('customers_45d') or 0)}")
+        _d2[3].metric("Momentum",
+                      f"{float(_r.get('momentum') or 0):.2f}x")
+        st.markdown(
+            f"**Supplier:** {_r.get('Supplier') or '—'}  \n"
+            f"**Last 6 months:** {_r.get('last_6mo_series') or '—'}  \n"
+            f"**Last 12 months:** {_r.get('last_12mo_series') or '—'}  \n"
+            f"**Reorder-math 12mo:** {_eff_u12:.0f}"
+            f"  ·  **Raw direct+FG 12mo:** {_raw_u12:.0f}  \n"
+            f"**Target stock:** {float(_r.get('target_stock') or 0):.0f}"
+            f"  ·  **Used LT:** "
+            f"{float(_r.get('lead_time_days') or 0):.0f}d "
+            f"({_r.get('freight_mode') or '—'})"
+            f"  ·  **Vendor LT:** "
+            f"{float(_r.get('vendor_lead_time_days') or 0):.0f}d"
+            f"  ·  **SKU LT/MOQ/EOQ:** "
+            f"{float(_r.get('sku_lead_time_days') or 0):.0f}d / "
+            f"{float(_r.get('sku_moq') or 0):g} / "
+            f"{float(_r.get('sku_eoq_qty') or 0):g}"
+        )
+        if _current_month_product_units > max(
+                _current_month_engine_units, _current_month_live_units) + 1:
+            _by_type = _current_month_product_movements.get("by_type") or {}
+            _type_bits = []
+            for _typ, _vals in _by_type.items():
+                if isinstance(_vals, dict):
+                    _signed = float(_vals.get("signed_qty") or 0)
+                    if _signed:
+                        _type_bits.append(f"{_typ} {_signed:g}")
+            _type_note = (
+                " (" + ", ".join(_type_bits[:4]) + ")"
+                if _type_bits else "")
+            st.warning(
+                "Live CIN7 product Movements show "
+                f"{_current_month_product_units:.0f} demand units in "
+                f"{_current_month_product_movements.get('period')}"
+                f"{_type_note}, ahead of both the cached ABC bucket "
+                f"({_current_month_engine_units:.0f}) and synced "
+                f"sale-line/FG assembly movement "
+                f"({_current_month_live_units:.0f}). Product Movements "
+                "is the displayed source until the movement cache is "
+                "reconciled."
+            )
+        elif _current_month_live_units > _current_month_engine_units + 1:
+            st.warning(
+                "Live synced movement shows "
+                f"{_current_month_live_units:.0f} units in "
+                f"{_current_month_live.get('period')}, ahead of the "
+                f"cached ABC monthly bucket "
+                f"({_current_month_engine_units:.0f}). This SKU is "
+                "being displayed from live sale-lines + FG assembly "
+                "consumption until the background ABC refresh catches up."
+            )
+        _trace = _compute_target_and_reorder(
+            _r, include_trace=True).get("calc_trace")
+        if isinstance(_trace, str) and _trace.strip():
+            with st.expander("Full reorder math", expanded=False):
+                st.markdown(_trace)
+
+        try:
+            _sales_audit = build_sku_sales_audit(_sku, sale_lines)
+            if _sales_audit.get("ok"):
+                _summary = _sales_audit.get("summary", {})
+                with st.expander("SKU sales audit (calendar months)",
+                                 expanded=False):
+                    st.caption(
+                        "Source: synced CIN7 sale_lines. The engine's "
+                        "monthly buckets use InvoiceDate and exclude "
+                        "credited, voided, and cancelled lines. OrderDate "
+                        "is shown beside it to catch open/uninvoiced orders.")
+                    _sa = st.columns(4)
+                    _sa[0].metric(
+                        f"{_summary.get('current_month')} invoice qty",
+                        f"{float(_summary.get('current_invoice_qty') or 0):.2f}")
+                    _sa[1].metric(
+                        f"{_summary.get('current_month')} OrderDate qty",
+                        f"{float(_summary.get('current_order_qty') or 0):.2f}")
+                    _sa[2].metric(
+                        "OrderDate not counted",
+                        f"{float(_summary.get('current_order_not_in_invoice_month_qty') or 0):.2f}")
+                    _sa[3].metric(
+                        "Last invoice",
+                        str(_summary.get("last_invoice_date") or "—"))
+                    _audit_current_invoice = float(
+                        _summary.get("current_invoice_qty") or 0)
+                    if (_audit_current_invoice
+                            > _current_month_engine_units + 1):
+                        st.warning(
+                            "Exact synced sale lines show "
+                            f"{_audit_current_invoice:.0f} units invoiced "
+                            f"this month, but the ABC monthly bucket shows "
+                            f"{_current_month_engine_units:.0f}. The engine "
+                            "snapshot is likely stale or missing recent "
+                            "sale-line files; run/await the background ABC "
+                            "refresh after the 30-day sale-line catch-up.")
+
+                    _monthly_rows = _sales_audit.get("monthly_rows")
+                    if isinstance(_monthly_rows, pd.DataFrame) and not _monthly_rows.empty:
+                        st.dataframe(
+                            _monthly_rows,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=250,
+                            column_config={
+                                "Invoice qty (engine)":
+                                    st.column_config.NumberColumn(format="%.2f"),
+                                "OrderDate qty":
+                                    st.column_config.NumberColumn(format="%.2f"),
+                                "OrderDate not in invoice month":
+                                    st.column_config.NumberColumn(format="%.2f"),
+                            },
+                        )
+                    _recent_sku_rows = _sales_audit.get("recent_rows")
+                    if isinstance(_recent_sku_rows, pd.DataFrame) and not _recent_sku_rows.empty:
+                        with st.expander(
+                            f"Recent exact-SKU sale lines ({len(_recent_sku_rows)} shown)",
+                            expanded=False,
+                        ):
+                            st.dataframe(
+                                _recent_sku_rows,
+                                hide_index=True,
+                                use_container_width=True,
+                                height=280,
+                            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Live synced movement audit for LED strip / bulk-roll families.
+        # This answers the operational question that raw same-SKU rows
+        # cannot: "which child/cut SKUs are actually feeding this 100m
+        # roll's demand, and does the top-customer/project signal explain
+        # a zero reorder suggestion?"
+        try:
+            _audit = build_strip_movement_audit(_sku, products, sale_lines)
+            if _audit.get("ok"):
+                _summary = _audit.get("summary", {})
+                _master_len = float(_audit.get("master_length_m") or 0)
+                with st.expander(
+                    "Strip family movement audit "
+                    f"({int(_master_len) if _master_len else 'master'}m "
+                    "roll equivalents)",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Source: synced CIN7 sale_lines. Credited, voided, "
+                        "and cancelled lines are excluded, matching the ABC "
+                        "engine's demand filter.")
+                    _a = st.columns(5)
+                    _a[0].metric(
+                        "Direct 12mo",
+                        f"{float(_summary.get('direct_master_rolls_12mo') or 0):.2f}")
+                    _a[1].metric(
+                        "Child/cut rollup",
+                        f"{float(_summary.get('child_master_rolls_12mo') or 0):.2f}")
+                    _a[2].metric(
+                        "Family total",
+                        f"{float(_summary.get('total_master_rolls_12mo') or 0):.2f}")
+                    _a[3].metric(
+                        "Metres",
+                        f"{float(_summary.get('total_metres_12mo') or 0):.0f}")
+                    _a[4].metric(
+                        "Last family sale",
+                        str(_summary.get("last_family_sale") or "—"))
+
+                    _top_pct = float(
+                        _summary.get("top_customer_pct_12mo") or 0)
+                    st.markdown(
+                        f"**Family base:** `{_audit.get('base')}`  \n"
+                        f"**Top customer:** "
+                        f"{_summary.get('top_customer') or '—'} "
+                        f"({float(_summary.get('top_customer_rolls_12mo') or 0):.2f} "
+                        f"roll equivalents, {_top_pct:.0f}% of 12mo family movement)"
+                    )
+
+                    _family_rows = _audit.get("family_rows")
+                    if isinstance(_family_rows, pd.DataFrame) and not _family_rows.empty:
+                        st.dataframe(
+                            _family_rows,
+                            hide_index=True,
+                            use_container_width=True,
+                            height=260,
+                            column_config={
+                                "Length m": st.column_config.NumberColumn(
+                                    format="%.3g"),
+                                "12mo qty": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                                "90d qty": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                                "45d qty": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                                "12mo metres": st.column_config.NumberColumn(
+                                    format="%.1f"),
+                                "Master roll equiv": st.column_config.NumberColumn(
+                                    format="%.2f"),
+                            },
+                        )
+
+                    _recent_rows = _audit.get("recent_rows")
+                    if isinstance(_recent_rows, pd.DataFrame) and not _recent_rows.empty:
+                        with st.expander(
+                            f"Recent family sale lines ({len(_recent_rows)} shown)",
+                            expanded=False,
+                        ):
+                            st.dataframe(
+                                _recent_rows,
+                                hide_index=True,
+                                use_container_width=True,
+                                height=280,
+                                column_config={
+                                    "Master roll equiv":
+                                        st.column_config.NumberColumn(
+                                            format="%.3f"),
+                                },
+                            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # v2.67.332 — raw sale_lines records for THIS SKU, post-dedup.
+        # Lets staff (and Claude) see exactly which records the engine
+        # actually counted when a SKU's monthly buckets look wrong —
+        # e.g. James 2026-06-01: LED-NEON-FLEX-SUPER-SLIM-ST shows
+        # April's single 12-unit sale duplicated into May despite three
+        # rounds of dedup. CIN7's movement screen is the source of truth
+        # (one -12 stock movement); if this expander shows two rows of
+        # 12, our dedup key isn't catching whatever field differs
+        # between the two records. Sorted newest-first.
+        try:
+            if not sale_lines.empty:
+                _raw = sale_lines[
+                    sale_lines["SKU"].astype(str) == str(_sku)]
+                if not _raw.empty:
+                    with st.expander(
+                        f"📜 Raw sale-line records ({len(_raw)} rows) "
+                        f"— sum of Quantity is what the engine counts",
+                        expanded=False,
+                    ):
+                        _cols = [c for c in [
+                            "SaleID", "OrderNumber", "Customer",
+                            "InvoiceNumber", "InvoiceDate", "Status",
+                            "Quantity", "Total", "Price",
+                        ] if c in _raw.columns]
+                        _disp = _raw[_cols].copy()
+                        if "InvoiceDate" in _disp.columns:
+                            _disp = _disp.sort_values(
+                                "InvoiceDate", ascending=False,
+                                na_position="last")
+                        st.dataframe(
+                            _disp, hide_index=True,
+                            use_container_width=True, height=280)
+                        # Total + per-OrderNumber roll-up so duplicates
+                        # are obvious at a glance.
+                        try:
+                            _q_total = float(pd.to_numeric(
+                                _disp["Quantity"], errors="coerce"
+                            ).fillna(0).sum())
+                            st.caption(
+                                f"**Quantity sum across all rows: "
+                                f"{_q_total:.0f}**  ·  Distinct "
+                                f"OrderNumbers: "
+                                f"{_disp['OrderNumber'].nunique()}  ·  "
+                                f"Distinct InvoiceNumbers: "
+                                f"{_disp.get('InvoiceNumber', pd.Series(dtype=object)).nunique()}"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        # v2.67.334 — assembly (FG-XXXX) consumption records for this
+        # SKU. Components consumed in kits show up here even when they
+        # never appear in direct sale_lines.
+        try:
+            if not assemblies.empty:
+                _ra = assemblies[
+                    assemblies["ComponentSKU"].astype(str) == str(_sku)]
+                if not _ra.empty:
+                    with st.expander(
+                        f"🏗️ Assembly consumption ({len(_ra)} FG- tasks) "
+                        f"— components consumed when kits were built",
+                        expanded=False,
+                    ):
+                        _ac = [c for c in [
+                            "AssemblyNumber", "Date", "CompletionDate",
+                            "Status", "ParentSKU", "ParentName",
+                            "ParentQuantity", "Quantity", "Cost",
+                        ] if c in _ra.columns]
+                        _adisp = _ra[_ac].copy()
+                        if "CompletionDate" in _adisp.columns:
+                            _adisp = _adisp.sort_values(
+                                "CompletionDate", ascending=False,
+                                na_position="last")
+                        elif "Date" in _adisp.columns:
+                            _adisp = _adisp.sort_values(
+                                "Date", ascending=False,
+                                na_position="last")
+                        st.dataframe(
+                            _adisp, hide_index=True,
+                            use_container_width=True, height=280)
+                        try:
+                            _q_total = float(pd.to_numeric(
+                                _adisp["Quantity"], errors="coerce"
+                            ).fillna(0).sum())
+                            _parents_n = _adisp["ParentSKU"].nunique()
+                            st.caption(
+                                f"**Total consumed: {_q_total:.0f} "
+                                f"units across {len(_adisp)} tasks**  ·  "
+                                f"Distinct parent kits: {_parents_n}"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        st.caption(
+            "For the complete drill-through (BOM, full sales/PO history) "
+            f"open the **Product Detail** page and search `{_sku}`.")
+
+    return SimpleNamespace(
+        engine_df=engine_df,
+        supp_configs=supp_configs,
+        closures_by_supplier=closures_by_supplier,
+        ip_lead_times_by_sku=ip_lead_times_by_sku,
+        sku_buying_settings=sku_buying_settings,
+        dropship_skus=dropship_skus,
+        excluded_skus=excluded_skus,
+        latest_notes_map=latest_notes_map,
+        dormancy_warnings_map=dormancy_warnings_map,
+        compute_target_and_reorder=_compute_target_and_reorder,
+        sku_buying_values=_sku_buying_values,
+        ceil_to_multiple=_ceil_to_multiple,
+        render_sku_detail=_render_sku_detail,
+    )
+
+
+
 # v2.67.356 — engine cache auto-invalidate on fresh source files.
 #
 # _get_engine_df is @st.cache_resource so the engine_df is shared
@@ -11761,2844 +13617,26 @@ elif page == "Ordering":
             st.session_state[_ord_ai_key] = []
             st.rerun()
 
-    if products.empty or sale_lines.empty:
-        st.warning("Need products + 12-month sales to run ABC.")
-        st.stop()
-
-    # --- Build the full ABC engine DataFrame ---------------------------
-    # persist="disk" pickles the result into .streamlit/cache/ so it
-    # survives Streamlit restarts. The cache only invalidates when the
-    # function source OR its inputs change — so editing UI code
-    # elsewhere in app.py no longer triggers a recompute. Cuts dev
-    # iteration time by ~80%. ttl extended from 5min to 1h since the
-    # underlying data only refreshes via the daily sync.
-    # v2.67.32 - _abc_engine moved to module scope so the AI Assistant
-    # page can call it too. The early-exit guard above still gates this
-    # page on having products + sale_lines.
-
-    # v2.67.41 — go via the session-cached accessor so navigating
-    # away and back is instant. First page that needs the engine
-    # primes the session cache; subsequent pages reuse the same
-    # instance until the user clicks Refresh.
-    engine_df = _get_engine_df()
-
-    # --- Buyer exclusions + inline notes (loaded once per render) -------
-    excluded_skus = db.all_do_not_reorder_skus()
-    latest_notes_map = db.latest_note_per_sku()
-    # v2.67.36 — dormancy provenance lookup. Returns {sku: info}
-    # for every SKU that has an active "once-slow" warning. The
-    # engine writes to this on every recompute; here we just read.
-    try:
-        dormancy_warnings_map = db.get_dormancy_warnings()
-    except Exception:  # noqa: BLE001
-        dormancy_warnings_map = {}
-
-    # --- Effective dropship set — combined from 4 sources -----------
-    # Priority / merging logic (documented in RULES.md §5.4):
-    #   1. CIN7 DropShipMode = "Always Drop Ship"  → dropship (authoritative)
-    #   2. CIN7 Tags contains "Dropship"           → dropship (belt-and-braces)
-    #   3. Per-SKU app flag in `flags` table       → dropship (user override)
-    #   4. Supplier-level `dropship_default`       → dropship, UNLESS CIN7
-    #                                                 explicitly says
-    #                                                 "No Drop Ship" for that
-    #                                                 individual SKU
-    #
-    # This way CIN7 is the source of truth but the buyer has escape
-    # hatches for edge cases without having to fix CIN7 first.
-    cin7_always_ds: set = set()
-    cin7_no_ds: set = set()
-    cin7_tag_ds: set = set()
-    if not products.empty:
-        _mode_col = products.get("DropShipMode")
-        _tags_col = products.get("Tags")
-        for idx, p in products.iterrows():
-            sku = str(p.get("SKU") or "")
-            if not sku:
-                continue
-            mode = str(p.get("DropShipMode") or "").strip()
-            if mode == "Always Drop Ship":
-                cin7_always_ds.add(sku)
-            elif mode == "No Drop Ship":
-                cin7_no_ds.add(sku)
-            tags = str(p.get("Tags") or "").lower()
-            if "dropship" in tags:
-                cin7_tag_ds.add(sku)
-
-    per_sku_ds = set(db.all_dropship_skus())
-    # Overrides — user explicitly wants these NOT dropship despite CIN7
-    # saying so. Candidates for CIN7 write-back (see pending-writes
-    # expander below the PO editor).
-    not_ds_overrides = set(db.all_not_dropship_skus())
-
-    # Supplier-level dropship_default
-    _all_supp_cfgs = db.all_supplier_configs()
-    _dropship_suppliers = {
-        name for name, cfg in _all_supp_cfgs.items()
-        if cfg.get("dropship_default")
-    }
-    supplier_ds_skus: set = set()
-    if _dropship_suppliers and not products.empty:
-        for _, p in products.iterrows():
-            sups_raw = p.get("Suppliers")
-            if pd.isna(sups_raw) or not sups_raw:
-                continue
-            try:
-                sups = (json.loads(sups_raw)
-                          if isinstance(sups_raw, str) else sups_raw)
-            except Exception:
-                continue
-            if not isinstance(sups, list) or not sups:
-                continue
-            primary = next(
-                (s for s in sups if s.get("IsDefault")), sups[0])
-            supp_name = primary.get("SupplierName") or ""
-            if supp_name in _dropship_suppliers:
-                supplier_ds_skus.add(str(p.get("SKU") or ""))
-
-    # Combine: CIN7 signals + app overrides, with CIN7 "No Drop Ship"
-    # winning over supplier-level default (but NOT over per-SKU flag).
-    # Subtract the user's "Not dropship" overrides at the end — they're
-    # the user's explicit intent that these SKUs should be stocked.
-    dropship_skus = (
-        cin7_always_ds
-        | cin7_tag_ds
-        | per_sku_ds
-        | (supplier_ds_skus - cin7_no_ds)
-    ) - not_ds_overrides
-
-    # Hide excluded SKUs from the main reorder list. They still appear in
-    # the "Archived (do not reorder)" expander below with a Reactivate button.
-    if excluded_skus:
-        engine_df = engine_df[
-            ~engine_df["SKU"].astype(str).isin(excluded_skus)
-        ].reset_index(drop=True)
-
-    # --- Apply per-supplier config to compute targets ------------------
-    supp_configs = db.all_supplier_configs()
-    # v2.67.284 — load supplier holidays once for the engine
-    # (closures used per-row inside _compute_target_and_reorder).
-    closures_by_supplier = db.all_supplier_holidays_by_supplier()
-    # v2.67.285 — observed actual lead times from Inventory Planner.
-    # Refreshed weekly by ip_lead_times.py. The engine prefers these
-    # (sane-clamped) over the supplier_config defaults.
-    try:
-        ip_lead_times_by_sku = db.get_ip_lead_times()
-    except Exception:  # noqa: BLE001
-        ip_lead_times_by_sku = {}
-    def _positive_float_or_zero(value) -> float:
-        try:
-            val = float(pd.to_numeric(value, errors="coerce"))
-        except (TypeError, ValueError):
-            return 0.0
-        return val if val > 0 else 0.0
-
-    def _positive_int_or_zero(value) -> int:
-        val = _positive_float_or_zero(value)
-        return int(round(val)) if val > 0 else 0
-
-    try:
-        sku_buying_settings_db = {
-            str(r["sku"]): dict(r) for r in db.all_sku_pack()
-        }
-    except Exception:  # noqa: BLE001
-        sku_buying_settings_db = {}
-    sku_buying_settings = {
-        str(k): dict(v) for k, v in sku_buying_settings_db.items()
-    }
-    _sku_buying_preview = st.session_state.get(
-        "_ordering_sku_buying_preview", {})
-    if isinstance(_sku_buying_preview, dict):
-        _stale_zero_preview_skus = []
-        for _preview_sku, _preview_vals in list(_sku_buying_preview.items()):
-            if not isinstance(_preview_vals, dict):
-                continue
-            _preview_sku = str(_preview_sku or "")
-            if not _preview_sku:
-                continue
-            _base_policy = dict(sku_buying_settings.get(_preview_sku, {}))
-            _preview_lt = _positive_int_or_zero(
-                _preview_vals.get("lead_time_days"))
-            _preview_moq = _positive_float_or_zero(_preview_vals.get("moq"))
-            _preview_eoq = _positive_float_or_zero(
-                _preview_vals.get("eoq_qty"))
-            _base_has_value = bool(
-                _positive_int_or_zero(_base_policy.get("lead_time_days")) > 0
-                or _positive_float_or_zero(_base_policy.get("moq")) > 0
-                or _positive_float_or_zero(_base_policy.get("eoq_qty")) > 0
-                or _positive_float_or_zero(_base_policy.get("pack_qty")) > 0
-            )
-            if (
-                _base_has_value
-                and _preview_lt <= 0
-                and _preview_moq <= 0
-                and _preview_eoq <= 0
-            ):
-                # A stale data-editor reload can send blank/zero policy cells
-                # before the DB values are repainted. Never let that temporary
-                # preview mask buyer-entered LT/MOQ/EOQ values.
-                _stale_zero_preview_skus.append(_preview_sku)
-                continue
-            _base_policy["sku"] = _preview_sku
-            _base_policy["lead_time_days"] = _preview_lt
-            _base_policy["moq"] = _preview_moq
-            _base_policy["eoq_qty"] = _preview_eoq
-            sku_buying_settings[_preview_sku] = _base_policy
-        for _preview_sku in _stale_zero_preview_skus:
-            _sku_buying_preview.pop(_preview_sku, None)
-    _today_for_engine = date.today()
-
-    def _sku_policy_float(sku: str, key: str) -> float:
-        try:
-            val = float((sku_buying_settings.get(str(sku) or "", {})
-                         or {}).get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-        return val if val > 0 else 0.0
-
-    def _ceil_to_multiple(value: float, multiple: float) -> float:
-        if value <= 0 or multiple <= 0:
-            return value
-        import math as _math
-        return _math.ceil((value - 1e-9) / multiple) * multiple
-
-    def _sku_buying_values(sku: str) -> tuple[int, float, float]:
-        sku_policy = sku_buying_settings.get(str(sku) or "", {}) or {}
-        try:
-            lead_time = int(sku_policy.get("lead_time_days") or 0)
-        except (TypeError, ValueError):
-            lead_time = 0
-        if not 1 <= lead_time <= 365:
-            lead_time = 0
-        sku_moq = _sku_policy_float(str(sku), "moq")
-        sku_eoq = (_sku_policy_float(str(sku), "eoq_qty")
-                   or _sku_policy_float(str(sku), "pack_qty"))
-        return lead_time, sku_moq, sku_eoq
-
-    def _format_iso_weeks_range(start, end):
-        """'Wk 32' for a same-week span, 'Wk 32-34' otherwise."""
-        ws = start.isocalendar()[1]
-        we = end.isocalendar()[1]
-        return f"Wk {ws}" if ws == we else f"Wk {ws}-{we}"
-
-    def _closure_days_in_window(closures, win_start, win_end):
-        """Count distinct CLOSED days within [win_start, win_end]
-        across all of a supplier's closure periods, plus a
-        per-closure detail list for the buyer's explanation."""
-        if not closures:
-            return 0, []
-        closed = set()
-        matched = []
-        for cl in closures:
-            s = cl.get("start_date")
-            e = cl.get("end_date")
-            if isinstance(s, str):
-                try:
-                    s = date.fromisoformat(s[:10])
-                except ValueError:
-                    continue
-            if isinstance(e, str):
-                try:
-                    e = date.fromisoformat(e[:10])
-                except ValueError:
-                    continue
-            if s is None or e is None:
-                continue
-            os_ = max(s, win_start)
-            oe = min(e, win_end)
-            if os_ > oe:
-                continue
-            d = os_
-            while d <= oe:
-                closed.add(d)
-                d += timedelta(days=1)
-            matched.append({
-                "start_date": s,
-                "end_date": e,
-                "label": (cl.get("label") or "").strip(),
-                "overlap_days": (oe - os_).days + 1,
-            })
-        return len(closed), matched
-
-    # v2.67.340 — category × length default freight rule. James
-    # 2026-06-02: products in these categories at ≥3m ship sea by
-    # default regardless of supplier air-eligibility (long awkward
-    # items aren't economical on air). All other products keep the
-    # existing supplier-based default (air if eligible, sea otherwise).
-    # IP's observed actual lead time still wins below (that's the real
-    # measurement, not a default).
-    _FREIGHT_SEA_CATEGORIES = (
-        "Profiles - Channels",
-        "Accessories - Profiles - Inner profiles",
-        "Diffusers",
-    )
-    # v2.67.341 — James 2026-06-02: "3m only", not "≥3m". Use a small
-    # tolerance band so a SKU whose length parses as 2998 or 3010 still
-    # matches the rule (parser rounding from "3m (118")" style names).
-    _FREIGHT_SEA_LEN_MIN_MM = 2950.0
-    _FREIGHT_SEA_LEN_MAX_MM = 3050.0
-
-    def _compute_target_and_reorder(row: pd.Series,
-                                    include_trace: bool = False) -> dict:
-        """Return dict with target_stock, reorder_qty, lead_time_used,
-        freight_mode_used, and optionally calc_trace (markdown-ready)."""
-        supplier = row.get("Supplier") or ""
-        # v2.67.349 — normalise the engine-side supplier string before
-        # lookup to match db.all_supplier_configs's now-normalised
-        # keys. Without this, an SKU whose resolved supplier name has
-        # invisible whitespace (NBSP, trailing space) silently misses
-        # the supp_configs lookup and falls back to schema defaults —
-        # the bug James saw where Luz Negra safety_pct config "didn't
-        # save".
-        supplier_norm = " ".join(str(supplier).split()).strip()
-        cfg = supp_configs.get(supplier_norm, supp_configs.get(supplier, {}))
-        lt_sea = cfg.get("lead_time_sea_days") or 35
-        lt_air = cfg.get("lead_time_air_days")
-        air_eligible_default = bool(cfg.get("air_eligible_default") or 0)
-        air_max_len = cfg.get("air_max_length_mm")
-        length_mm = row.get("LengthMM")
-        sku_key = str(row.get("SKU") or "")
-        _sku_lt_int, sku_moq, sku_eoq = _sku_buying_values(sku_key)
-
-        # Per-SKU air-eligibility: default from supplier cfg, BUT disqualify
-        # if length exceeds supplier's air_max_length_mm
-        sku_air_ok = air_eligible_default
-        if (air_eligible_default and air_max_len
-                and length_mm is not None and length_mm > air_max_len):
-            sku_air_ok = False
-
-        # v2.67.340 — category-level sea rule (channels / inner profiles /
-        # diffusers at 3m). v2.67.341: window narrowed from "≥3m" to
-        # "3m only" (2950-3050mm tolerance band) per James. Overrides
-        # the air default when matched.
-        _category = str(row.get("Category") or "").strip()
-        _length_for_rule = (
-            float(length_mm) if length_mm not in (None, "") else 0.0)
-        _category_rule_sea = (
-            _category in _FREIGHT_SEA_CATEGORIES
-            and _FREIGHT_SEA_LEN_MIN_MM
-                <= _length_for_rule
-                <= _FREIGHT_SEA_LEN_MAX_MM
-        )
-        # Set by the category-rule branch below; appended to the freight
-        # line in the calc trace so the reason is visible without
-        # corrupting the selectbox-restricted `freight_mode` value.
-        _freight_rule_note = ""
-
-        # Default: air whenever supplier offers it AND the SKU is eligible
-        # (length within air_max_length_mm). Sea is the fallback.
-        # `preferred_freight` on the supplier config is treated as a hint
-        # only — if "sea" is preferred, air is still used for small items
-        # when beneficial (shorter LT = less inventory tied up).
-        if _category_rule_sea:
-            lead_time_days = lt_sea
-            # v2.67.342 — keep the column value in the selectbox's
-            # allowed set ("air"/"sea"); the *reason* is surfaced in
-            # the calc trace below via `_freight_rule_note`. Without
-            # this Streamlit blanks the Freight cell entirely.
-            freight_mode_used = "sea"
-            _freight_rule_note = (
-                f" (category rule: {_category} at ~3m → sea)")
-        elif sku_air_ok and lt_air:
-            lead_time_days = lt_air
-            freight_mode_used = "air"
-        else:
-            lead_time_days = lt_sea
-            freight_mode_used = "sea"
-        # Buyer-facing Vendor LT must mean the supplier/freight default
-        # only. IP observed/configured and Sku LT can still change Used LT
-        # below, but they should not make "Vendor LT" vary unexpectedly.
-        vendor_lead_time_days = lead_time_days
-        vendor_lead_time_basis = "supplier"
-
-        # v2.67.285 — prefer IP's observed actual lead time when
-        # we have one. IP literally measures PO-to-receipt time
-        # (avg_lead_time) — that's the real lead time, not a
-        # default. Sane clamp to [3, 120] days so a noisy sample
-        # (e.g. a single freak shipment) can't break ordering.
-        # v2.67.343 — only override the lead-time DURATION; do NOT
-        # overwrite freight_mode_used. The freight METHOD is still
-        # air or sea per the supplier/category rule above; IP just
-        # tells us the actual transit time. The old code stored
-        # "IP observed actual" / "IP configured" in freight_mode_used,
-        # which isn't in the Freight selectbox's options set and
-        # blanked the cell for every IP-tracked SKU (most of them).
-        # The basis ("observed" / "configured") is still surfaced in
-        # the calc trace below.
-        _ip_row = ip_lead_times_by_sku.get(sku_key) or {}
-        _obs_lt = _ip_row.get("observed_lead_time_days")
-        _conf_lt_ip = _ip_row.get("configured_lead_time_days")
-        lead_time_basis = "supplier"
-        if _obs_lt and 3 <= int(_obs_lt) <= 120:
-            lead_time_days = int(_obs_lt)
-            lead_time_basis = "ip_observed"
-        elif _conf_lt_ip and 3 <= int(_conf_lt_ip) <= 120:
-            lead_time_days = int(_conf_lt_ip)
-            lead_time_basis = "ip_configured"
-        if _sku_lt_int and 1 <= _sku_lt_int <= 365:
-            lead_time_days = _sku_lt_int
-            lead_time_basis = "sku"
-
-        # Safety factor by class
-        abc = row.get("ABC") or "C"
-        safety_pct = {
-            "A": cfg.get("safety_pct_A") or 30.0,
-            "B": cfg.get("safety_pct_B") or 20.0,
-            "C": cfg.get("safety_pct_C") or 15.0,
-        }.get(abc, 20.0)
-        # v2.67.283 — review period = the supplier's ACTUAL reorder
-        # cadence when configured (e.g. 7 for a weekly supplier).
-        # The ABC-class review_days are only the fallback. Carrying
-        # a generic 30-45d of next-cycle stock when you actually
-        # reorder weekly is the single biggest cash drag.
-        abc_review_days = {
-            "A": cfg.get("review_days_A") or 14,
-            "B": cfg.get("review_days_B") or 30,
-            "C": cfg.get("review_days_C") or 45,
-        }.get(abc, 30)
-        _cadence = cfg.get("order_cadence_days")
-        if _cadence and int(_cadence) > 0:
-            review_days = int(_cadence)
-            review_basis = (
-                f"you reorder {supplier or 'this supplier'} every "
-                f"{review_days}d, so each order only bridges to the "
-                f"next one")
-        else:
-            review_days = abc_review_days
-            review_basis = (
-                f"class-{abc} default — set this supplier's order "
-                f"cadence in Supplier settings to tighten it")
-
-        avg_daily = row["avg_daily"]
-
-        # v2.67.349 — 12-month concentrated-demand clamp. When one
-        # customer accounted for >50% of the SKU's 12mo volume AND
-        # recent demand has dried up (momentum < 0.5), the annualised
-        # avg_daily is dominated by a one-off past spike that won't
-        # recur. The 45-day Project rule only catches CURRENT spikes
-        # (momentum > 1.5); this catches PAST one-offs that the
-        # engine would otherwise budget against. James 2026-06-02:
-        # LED-EC-19.101 (B-class, OnHand 28) showed Reorder 70 because
-        # 12mo=698 — almost all from one historical big sale, with
-        # recent demand near zero.
-        _top12 = float(row.get("top_cust_units_12mo") or 0)
-        _eff12_for_clamp = float(row.get("effective_units_12mo") or 0)
-        _u12 = float(row.get("units_12mo") or 0)
-        _mom = float(row.get("momentum") or 1.0)
-        _top12_share = float(row.get("top_cust_pct_12mo") or 0)
-        if _top12_share <= 0 and _u12 > 0:
-            _top12_share = _top12 / _u12
-        clamp_active = False
-        clamp_note = ""
-
-        # v2.67.351 — first check: zero sales in last 90 days.
-        # James 2026-06-02: LED-14.007-3 (last sale August 2025, no
-        # activity in 90+ days) was still asking for 50 units to
-        # reorder. The 12mo top-customer-share clamp couldn't fire
-        # (top customer is empty because there's been no recent
-        # activity to compute a top from) so avg_daily kept treating
-        # the historic 227 units like steady demand. For SKUs with
-        # genuinely ZERO recent activity, the right answer is
-        # avg_daily = 0 — target → 0 → reorder → 0. Buyer manually
-        # triggers any new-project order.
-        #
-        # v2.67.353 — TIGHTEN the trigger. Original check used
-        # `effective_units_90d == 0`, but effective_units_90d
-        # includes `tube_rollup_in_90d` (sister-variant rollup).
-        # LED-18.074-6 (James 2026-06-02): own 90d activity was 0
-        # (no direct sales, no assemblies in 90d) but sister rollup
-        # from LED-18.074-2/-2390 kept eff_90d > 0, so the clamp
-        # skipped and the engine asked for 22 units against ended
-        # project demand. The engine already correctly flags this
-        # case as `project_reason == "stale-12mo"` (line 7379 checks
-        # u90 = units_90d = direct + own assembly only). Trust THAT
-        # signal — it's the canonical "no own activity in 90d" flag.
-        # Fall back to the old eff_90d_check for SKUs not flagged
-        # stale-12mo but where eff_90d is also zero (no rollup).
-        _proj_reason = str(row.get("project_reason") or "")
-        _own_units_90d = float(row.get("units_90d") or 0)
-        _eff_90d_check = float(row.get("effective_units_90d") or 0)
-        if (_proj_reason == "stale-12mo"
-                and _eff12_for_clamp > 0
-                and _u12 > 0):
-            avg_daily = 0.0
-            clamp_active = True
-            clamp_note = (
-                " — clamped to zero: no OWN activity (zero direct "
-                "sales AND zero assembly consumption) in the last "
-                "90 days, so the historic 12mo (dominated by ended "
-                "project work) doesn't justify any reorder. Sister "
-                "tube rollup in 90d is ignored for this check — it "
-                "represents demand on sibling SKUs, not on this "
-                "one. Manually override the Order qty if a new "
-                "project lands.")
-        elif (_eff_90d_check == 0
-                and _eff12_for_clamp > 0
-                and _u12 > 0):
-            avg_daily = 0.0
-            clamp_active = True
-            clamp_note = (
-                " — clamped to zero: no sales in last 90 days, so "
-                "the historic 12mo (dominated by ended project work) "
-                "doesn't justify any reorder. Manually override the "
-                "Order qty if a new project lands.")
-        elif (_top12_share > 0.50 and _mom < 0.5
-                and _eff12_for_clamp > 0):
-            # Baseline = everything except this one customer's
-            # contribution, expressed against the original 12mo
-            # window. Apply the same RATIO to effective_units_12mo so
-            # rollup contributions scale down proportionally — the
-            # alternative (raw subtraction) would over-penalise SKUs
-            # whose effective_units_12mo includes assembly/tube rollup
-            # that ISN'T attributable to the top customer.
-            _baseline_share = max(0.0, 1.0 - _top12_share)
-            _baseline_eff = _eff12_for_clamp * _baseline_share
-            # 12mo annualisation — divide by 365 (this function runs
-            # on the Ordering page where `window_days` from
-            # _abc_engine isn't in scope; the engine always uses 365
-            # for the 12mo bucket anyway).
-            avg_daily = _baseline_eff / 365.0
-            clamp_active = True
-            _top_name = str(
-                row.get("top_cust_name_12mo")
-                or row.get("top_cust_name")
-                or "—")[:40]
-            clamp_note = (
-                f" — clamped: top customer **{_top_name}** took "
-                f"**{_top12_share:.0%}** of 12mo and momentum is "
-                f"**{_mom:.2f}×**, so the rest of the year (baseline "
-                f"{_baseline_eff:.0f} units/yr) drives the reorder, "
-                f"not the past one-off")
-
-        lt_demand = avg_daily * lead_time_days
-        safety = lt_demand * (safety_pct / 100.0)
-        review_demand = avg_daily * review_days
-        # v2.67.284 — supplier holiday cover. Any days the supplier
-        # is closed within the upcoming lead-time + cadence window
-        # get added to the target as extra cover, so an order
-        # placed before a known shutdown automatically bridges it.
-        window_end = _today_for_engine + timedelta(
-            days=int(lead_time_days + review_days))
-        closure_days, matched_closures = _closure_days_in_window(
-            closures_by_supplier.get(supplier or "", []),
-            _today_for_engine, window_end)
-        holiday_cover = avg_daily * closure_days
-        target = lt_demand + safety + review_demand + holiday_cover
-        raw_target = target
-        is_project_row = (str(row.get("trend_flag") or "")
-                          == "🎯 Project")
-        target_policy_notes = []
-        if not is_project_row:
-            if sku_moq > 0 and target < sku_moq:
-                target = sku_moq
-                target_policy_notes.append(
-                    f"SKU MOQ lifts target to {sku_moq:g}")
-            if sku_eoq > 0:
-                rounded_target = _ceil_to_multiple(target, sku_eoq)
-                if rounded_target > target + 1e-9:
-                    target_policy_notes.append(
-                        f"SKU EOQ rounds target to {rounded_target:g} "
-                        f"(multiple of {sku_eoq:g})")
-                    target = rounded_target
-        onhand = row["OnHand"]
-        allocated = float(row.get("Allocated") or 0)
-        available = float(row.get("Available") or 0)
-        on_order = row["OnOrder"]
-        unfulfilled = float(row.get("unfulfilled") or 0)
-        # Fractional ordering — for bulk-roll masters where the supplier
-        # accepts decimal quantities (e.g. 0.40 × 100m roll instead of
-        # rounding up to 1 full 100m roll). Neonica's 100m rolls are
-        # explicitly fractional; other suppliers use the supplier-level
-        # `allow_fractional_qty` config flag, defaulting to True.
-        is_bulk = bool(row.get("is_bulk_master", False))
-        bulk_len_m = float(row.get("bulk_length_m", 0) or 0)
-        use_fractional = fractional_bulk_order_allowed(
-            supplier, is_bulk, bulk_len_m, cfg)
-        planning_onhand = normalise_planning_quantity(
-            onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
-        planning_available = normalise_planning_quantity(
-            available, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
-        planning_on_order = normalise_planning_quantity(
-            on_order, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
-        target_for_position = normalise_planning_quantity(
-            target, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
-        # Effective position = what we'll actually have for future demand.
-        #
-        # v2.67.319 — Available ALREADY nets Allocated (CIN7's calc:
-        # Available = OnHand − Allocated). When we're over-committed it
-        # goes negative, and that negative value IS the backorder — the
-        # same number CIN7 shows and the same number now in `unfulfilled`
-        # (= max(0, Allocated − OnHand) = max(0, −Available)).
-        #
-        # So effective_pos = Available + OnOrder. We must NOT subtract
-        # `unfulfilled` on top — Available has already accounted for it.
-        # The old `available + on_order − unfulfilled` DOUBLE-counted the
-        # backorder (it was the root of "app shows 14, CIN7 shows 7" and
-        # the earlier 29-vs-16 reorder inflation). `unfulfilled` is now
-        # kept purely for DISPLAY (the Backorders column); it is no
-        # longer a term in the reorder math.
-        effective_pos = planning_available + planning_on_order
-        shortfall = max(0, target_for_position - effective_pos)
-
-        def _snap_to_10m(value, length_m):
-            """Round a fractional reorder qty to the nearest 10m equivalent.
-            For a 100m roll, value 0.26 → 0.30 (= 30m). For a 50m roll,
-            value 0.45 → 0.40 (= 20m). Provides cleaner ordering than
-            arbitrary fractions like 0.42, while still being more capital-
-            efficient than always rounding to a full roll.
-
-            Demand <5m rounds to 0 (don't reorder for trivial demand).
-            Demand 5m-15m snaps up to 10m (smallest meaningful order).
-            Demand >15m rounds to nearest 10m increment."""
-            if not length_m or length_m <= 0 or value <= 0:
-                return value
-            metres = value * length_m
-            # Below 5m of demand: not worth ordering. This eliminates the
-            # spurious 0.10-roll suggestions for SKUs whose 12mo daily is
-            # near zero (e.g. items that haven't sold in years but have
-            # tiny rolled-up demand from a per-foot child).
-            if metres < 5.0:
-                return 0.0
-            rounded_metres = round(metres / 10.0) * 10.0
-            # 5-15m range snaps up to 10m (smallest meaningful order).
-            if rounded_metres < 10.0:
-                rounded_metres = 10.0
-            return rounded_metres / length_m
-
-        if use_fractional:
-            raw_reorder = round(float(shortfall), 2)
-            reorder = round(_snap_to_10m(raw_reorder, bulk_len_m), 2)
-        else:
-            reorder = int(round(shortfall))
-
-        # --- Stockout recovery boost ---------------------------------
-        # When we're truly out (effective_pos ≤ 0), simply ordering
-        # `target - effective_pos` leaves us at bare-minimum coverage
-        # right when sales are returning. Google Ads / advertising
-        # algorithms penalise out-of-stock listings and that penalty
-        # lingers — so we need to over-stock on recovery.
-        #
-        # Formula:  base_avg_daily × (lead_time + stockout_min_cover_days)
-        #
-        # Key: uses the UNADJUSTED base velocity, not trend-adjusted. If
-        # a Project-classification discounted the SKU to near-zero
-        # velocity, that customer-specific spike is irrelevant to
-        # recovery — what matters is the broad baseline of demand we
-        # want back on the shelf.
-        #
-        # Exception: skip the boost for 💤 Dormant SKUs. If the family
-        # hasn't moved in 90 days, "recovery" doesn't apply — there's
-        # nothing to recover to. Boosting based on stale 12mo demand
-        # would defeat the dormancy detection.
-        #
-        # v2.67.316 — ALSO skip for 🎯 Project SKUs. The boost uses
-        # `avg_daily_base` (the unadjusted 12mo rate) deliberately, to
-        # ignore the project-customer's spike and recover to a "broad
-        # baseline". But for project SKUs there IS no broad baseline —
-        # all the historical demand IS the project customer's contribution.
-        # So the boost recreates the over-reorder the velocity override
-        # was meant to prevent. James 2026-05-27: LEDFLEX180R-24V-5
-        # was flagged Project correctly but still suggested 8 units
-        # because of this boost path. Buyer can manually order 1 unit
-        # for shelf presence if they want it (matching James's stated
-        # policy).
-        stockout_boost_applied = False
-        is_dormant_row = bool(row.get("is_dormant", False))
-        if (effective_pos <= 0
-                and not is_dormant_row
-                and not is_project_row):
-            base_avg = float(row.get("avg_daily_base") or 0) or avg_daily
-            recovery_days = int(
-                cfg.get("stockout_min_cover_days") or 60)
-            stockout_min = base_avg * (lead_time_days + recovery_days)
-            if use_fractional:
-                # Apply same 10m snap to stockout boost so it doesn't
-                # produce sub-5m fractional suggestions (e.g. 0.01 of a
-                # 100m roll = 1m). Was a bug — stockout boost previously
-                # bypassed the snap and surfaced absurdly small qtys for
-                # near-zero-velocity SKUs that had OnHand=0.
-                stockout_qty = round(_snap_to_10m(
-                    round(float(stockout_min), 2), bulk_len_m), 2)
-            else:
-                stockout_qty = int(round(stockout_min))
-            if stockout_qty > reorder:
-                stockout_boost_applied = True
-                reorder = stockout_qty
-
-        # SKU MOQ / EOQ beats supplier MOQ. Supplier MOQ remains a
-        # reorder-qty floor only; SKU MOQ/EOQ also lifted target above
-        # so optimum/excess reflect the SKU's true buying constraint.
-        moq = sku_moq or cfg.get("moq_units") or 0
-        if (reorder > 0 and moq and reorder < moq
-                and not is_project_row
-                and (sku_moq > 0 or not use_fractional)):
-            reorder = float(moq)
-        if reorder > 0 and sku_eoq > 0 and not is_project_row:
-            reorder = _ceil_to_multiple(float(reorder), sku_eoq)
-        if not use_fractional:
-            reorder = int(round(float(reorder)))
-        elif reorder:
-            reorder = round(float(reorder), 2)
-
-        # Excess = OnHand beyond target. For bulk masters, ignore
-        # non-actionable residue below 5m so 0.002 rolls left on a 100m
-        # SKU doesn't show as "Overstocked" / "$5 tied up".
-        excess_units = excess_units_over_target(
-            onhand, target,
-            is_bulk_master=is_bulk,
-            bulk_length_m=bulk_len_m,
-        )
-        excess_value = excess_units * row["AverageCost"]
-        result = {
-            "target_stock": target,
-            "reorder_qty": reorder,
-            "vendor_lead_time_days": vendor_lead_time_days,
-            "lead_time_days": lead_time_days,
-            "sku_lead_time_days": (
-                _sku_lt_int if _sku_lt_int and _sku_lt_int > 0 else 0),
-            "sku_moq": sku_moq,
-            "sku_eoq_qty": sku_eoq,
-            "freight_mode": freight_mode_used,
-            "excess_units": excess_units,
-            "excess_value": excess_value,
-        }
-        if not include_trace:
-            return result
-
-        residue_note = ""
-        if is_bulk and bulk_len_m > 0:
-            ignored = []
-            for label, raw_val, planning_val in (
-                ("OnHand", onhand, planning_onhand),
-                ("Available", available, planning_available),
-                ("OnOrder", on_order, planning_on_order),
-                ("Target", target, target_for_position),
-            ):
-                try:
-                    raw_f = float(raw_val or 0)
-                    plan_f = float(planning_val or 0)
-                except (TypeError, ValueError):
-                    continue
-                if raw_f and plan_f == 0:
-                    ignored.append(
-                        f"{label} {raw_f:.3f} rolls "
-                        f"(~{raw_f * bulk_len_m:.1f}m)")
-            if ignored:
-                residue_note = (
-                    "- Tiny bulk-roll residue below 5m is treated as "
-                    "0 for reorder, excess, and status calculations: "
-                    + "; ".join(ignored)
-                    + ".\n"
-                )
-
-        # Demand breakdown — show migration + tube rollup + assembly
-        # contributions. units_12mo here ALREADY INCLUDES assembly
-        # consumption (we folded synthetic FG-pick rows into sl before
-        # the velocity groupby in v2.67.334); subtract to recover the
-        # genuine direct-sales count for display.
-        units_12mo_total = float(row["units_12mo"])
-        asm_u = float(row.get("assembly_units_12mo", 0))
-        direct_u = max(0.0, units_12mo_total - asm_u)
-        mig_in = float(row.get("migrated_in", 0))
-        mig_out = float(row.get("migrated_out", 0))
-        rollup_in = float(row.get("tube_rollup_in", 0))
-        eff_u = float(row.get("effective_units_12mo", units_12mo_total))
-
-        demand_lines = [f"**Supplier**: {supplier or 'unassigned'}\n"]
-        if row.get("is_non_master_tube"):
-            demand_lines.append(
-                "**Tube variant (non-master)** — demand is rolled up "
-                "into its master tube SKU, so effective units here = 0 "
-                "(we don't order this SKU directly; it's assembled "
-                "from a master).\n"
-            )
-        else:
-            demand_lines.append(
-                f"**Velocity breakdown** (12mo → effective "
-                f"{eff_u:.0f} units):\n"
-                f"- Direct sales of this SKU: **{direct_u:.0f}** units\n"
-            )
-            if asm_u > 0:
-                # v2.67.334 — assembly (FG-XXXX) consumption: every kit
-                # built that included this SKU as a pick-line. Ground
-                # truth for components mostly used in kits (the BOM
-                # rollup is skipped for these SKUs to avoid double-
-                # counting the same demand twice).
-                demand_lines.append(
-                    f"- Assembly consumption (FG- tasks): "
-                    f"**+{asm_u:.0f}** units "
-                    f"(ground truth — kits built using this part)\n"
-                )
-            if mig_in > 0:
-                demand_lines.append(
-                    f"- Migrated IN from retiring SKUs: "
-                    f"**+{mig_in:.0f}** units "
-                    f"({row.get('migrated_from') or 'see below'})\n"
-                )
-            if mig_out > 0:
-                demand_lines.append(
-                    f"- Migrated OUT (share going to successor): "
-                    f"**−{mig_out:.0f}** units\n"
-                )
-            if rollup_in > 0:
-                demand_lines.append(
-                    f"- Demand rollup IN from variants / packs / cuts: "
-                    f"**+{rollup_in:.0f}** units "
-                    f"(see tube_rollup_notes)\n"
-                )
-
-        # Dormancy note — surface when this SKU has been classified
-        # dormant. Shows the buyer exactly why the suggestion is what
-        # it is (or zero) — direct comparison of 90d vs 12mo daily rate.
-        _is_dormant_row = bool(row.get("is_dormant", False))
-        if _is_dormant_row:
-            eff_12mo_d = float(row.get("effective_units_12mo") or 0)
-            eff_90d_d = float(row.get("effective_units_90d") or 0)
-            rate_12mo_daily = eff_12mo_d / 365.0 if eff_12mo_d else 0.0
-            rate_90d_daily = eff_90d_d / 90.0 if eff_90d_d else 0.0
-            ratio_pct = (rate_90d_daily / rate_12mo_daily * 100.0
-                          if rate_12mo_daily > 0 else 0.0)
-            demand_lines.append(
-                f"\n**💤 Dormant detection**:\n"
-                f"- 12mo effective rate: **{rate_12mo_daily:.2f} units/day** "
-                f"(based on {eff_12mo_d:.0f} units over 365d)\n"
-                f"- Last 90d effective rate: **{rate_90d_daily:.3f} units/day** "
-                f"(based on {eff_90d_d:.0f} units over 90d)\n"
-                f"- Ratio: **{ratio_pct:.1f}%** of historical rate "
-                f"(threshold for dormancy: <20%)\n"
-                f"- **Engine override**: using 90d rate instead of 12mo rate, "
-                f"so reorder suggestion reflects actual recent demand. "
-                f"Stockout-recovery boost is also suppressed for dormant SKUs.\n"
-            )
-
-        # Trend classification note — always included when the flag is
-        # anything other than "Stable" so the buyer knows the engine
-        # spotted something.
-        _tf = row.get("trend_flag") or "Stable"
-        if pd.isna(_tf):
-            _tf = "Stable"
-        if _tf != "Stable" and not _is_dormant_row:
-            # Defensive NaN-handling — any of these can arrive as NaN
-            # for SKUs with no recent sales that got flagged by another
-            # signal (rare, but possible after a cache refresh).
-            def _fnum(v, default=0.0):
-                try:
-                    v = float(v)
-                    return default if pd.isna(v) else v
-                except (ValueError, TypeError):
-                    return default
-            u45v = _fnum(row.get("units_45d"))
-            uprv = _fnum(row.get("units_prior_45d"))
-            n_cust = int(_fnum(row.get("customers_45d")))
-            top_pct = _fnum(row.get("top_cust_pct")) * 100
-            top_2_pct = _fnum(row.get("top_2_cust_pct")) * 100
-            non_top_avg = _fnum(row.get("non_top_avg_units"))
-            top_name = str(row.get("top_cust_name") or "—")[:40]
-            mom = _fnum(row.get("momentum"), default=1.0)
-            mom_s = (f"{mom:.2f}×" if mom != float("inf") else "new")
-            _cust12 = int(_fnum(row.get("customers_12mo")))
-            # v2.67.354 — customer count line: clarify that
-            # customers_45d is rolled up across the strip family
-            # (line 7084 overwrites the raw groupby with rolled-up
-            # counts) while customers_12mo is direct-only (line 5780
-            # groupby on sl directly). On strip masters with zero
-            # direct sales (e.g. LED-13.019 — all demand is sister
-            # rollup + assembly), the trace previously read
-            # "3 in 45d, 0 in 12mo" — apparently impossible because
-            # the metrics measure different things. Make both
-            # measurements explicit.
-            demand_lines.append(
-                f"\n**Trend signal**: {_tf}  \n"
-                f"- Last 45d: **{u45v:.0f} units** "
-                f"(prior 45d: {uprv:.0f}, momentum **{mom_s}**)\n"
-                f"- **{n_cust} customer(s) in last 45d** "
-                f"(rolled up across strip family), "
-                f"**{_cust12} direct customer(s) over 12mo** "
-                f"(this SKU only — sister-variant buyers not counted "
-                f"here; 3+ direct ⇒ diversified, never auto-flagged "
-                f"Project)\n"
-                f"- top customer **{top_name}** took **{top_pct:.0f}%**, "
-                f"top 2 combined **{top_2_pct:.0f}%**\n"
-                f"- Non-top customers avg **{non_top_avg:.1f} units** "
-                f"each (key trend-vs-project signal)\n"
-            )
-            if _tf == "📈 Trend":
-                demand_lines.append(
-                    "- **Velocity override**: using last-45d rate "
-                    "instead of 12mo avg because demand is "
-                    "accelerating broadly. Engine will build stock "
-                    "faster to catch up.\n"
-                )
-            elif _tf == "📉 Decline":
-                # v2.67.354 — Decline override transparency. Either
-                # the override fired (sustained decline) or it didn't
-                # (lumpy 45d timing). Either way the buyer sees the
-                # comparison so they understand the engine's choice.
-                _eff90_d = float(row.get("effective_units_90d") or 0)
-                _eff12_d = float(row.get("effective_units_12mo") or 0)
-                _mom_d = float(row.get("momentum") or 1.0)
-                _rate90yr = (
-                    _eff90_d * (365.0 / 90.0) if _eff90_d > 0 else 0)
-                _share_pct = (
-                    (_rate90yr / _eff12_d * 100.0)
-                    if _eff12_d > 0 else 0.0)
-                if (_eff12_d > 0 and _eff90_d > 0
-                        and _rate90yr < _eff12_d * 0.7
-                        and _mom_d < 0.5):
-                    demand_lines.append(
-                        f"- **Velocity override**: 90d annualised "
-                        f"rate (**{_rate90yr:.0f} units/yr**) is "
-                        f"**{_share_pct:.0f}%** of 12mo "
-                        f"({_eff12_d:.0f}) AND 45d momentum is "
-                        f"**{_mom_d:.2f}×** — sustained decline "
-                        f"confirmed across both windows. Using "
-                        f"90d rate (**{_eff90_d/90:.2f}/day**) "
-                        f"instead of 12mo, to avoid over-ordering "
-                        f"against demand that's stepped down.\n"
-                    )
-                else:
-                    demand_lines.append(
-                        f"- **No velocity override**: 45d momentum "
-                        f"(**{_mom_d:.2f}×**) flags decline, but 90d "
-                        f"annualised rate (**{_rate90yr:.0f} "
-                        f"units/yr**) is **{_share_pct:.0f}%** of "
-                        f"12mo ({_eff12_d:.0f}) — likely lumpy "
-                        f"timing (assembly batches, single big "
-                        f"customer order in prior 45d window), not "
-                        f"sustained decline. Engine keeps the 12mo "
-                        f"annualised rate; the Decline label is a "
-                        f"watch-flag, not an action signal.\n"
-                    )
-            elif _tf == "🎯 Project":
-                _topu = float(row.get("top_cust_units_12mo") or 0)
-                _topname = str(
-                    row.get("top_cust_name_12mo")
-                    or row.get("top_cust_name")
-                    or "—")[:40]
-                _preason = str(row.get("project_reason") or "concentrated")
-                _eff_lv = float(row.get("effective_units_12mo") or 0)
-                _raw_lv = float(row.get("units_12mo") or 0)
-                _lineage_lv = float(row.get("lineage_units_12mo") or 0)
-                _visible_lv = max(_eff_lv, _raw_lv, _lineage_lv)
-                _share = (_topu / _visible_lv * 100) if _visible_lv > 0 else 0
-                _cust12_lv = int(row.get("customers_12mo") or 0)
-                if _preason == "rolled-up-history":
-                    demand_lines.append(
-                        f"- **Project / rolled-up history** — visible "
-                        f"12mo demand is **{_visible_lv:.0f} units** "
-                        "from the trend lineage, but reorder-math "
-                        f"demand is **{_eff_lv:.0f}** for this row. "
-                        "That means the movement has been rolled to a "
-                        "master/successor or suppressed from automatic "
-                        "buying. Do not treat this as a steady baseline "
-                        "for this SKU; manually order only when there is "
-                        "a known project or direct buyer need.\n"
-                    )
-                elif _preason == "low-volume":
-                    demand_lines.append(
-                        f"- **Low-volume Project** — only "
-                        f"**{_visible_lv:.0f} units in 12mo** total (<1/mo "
-                        f"avg). Not dormant (a sale landed inside the "
-                        f"90d window) but too sparse to call Stable. "
-                        f"Treated as project demand: subtracting top "
-                        f"customer **{_topname}**'s 12mo contribution "
-                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
-                        f"effective demand) before annualising — the "
-                        f"rest is sporadic one-offs that shouldn't "
-                        f"drive reorder.\n"
-                    )
-                elif _preason == "sporadic-few-buyers":
-                    demand_lines.append(
-                        f"- **Few-buyer Project** — "
-                        f"**{_visible_lv:.0f} units in 12mo** across "
-                        f"only **{_cust12_lv} customers**. That is not "
-                        "broad replenishment demand. Velocity override: "
-                        f"subtracting the top customer's 12mo contribution "
-                        f"(**{_topu:.0f} units**, {_share:.0f}% of visible "
-                        "demand) before annualising, so the engine doesn't "
-                        "auto-restock for an already-served project.\n"
-                    )
-                elif _preason == "stale-12mo":
-                    demand_lines.append(
-                        f"- **Stale 12mo Project** — "
-                        f"**{_visible_lv:.0f} units in 12mo** total but "
-                        f"**zero sales in the last 90 days**. The "
-                        f"historic activity isn't a baseline you "
-                        f"can plan against — it was project work "
-                        f"that's now ended. Velocity override: "
-                        f"subtracting top customer "
-                        f"**{_topname}**'s 12mo contribution "
-                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
-                        f"effective demand) before annualising, so "
-                        f"the engine doesn't auto-restock against "
-                        f"already-fulfilled project demand. If a "
-                        f"new project lands, override the suggested "
-                        f"qty manually.\n"
-                    )
-                elif _preason == "sporadic-single-buyer":
-                    demand_lines.append(
-                        f"- **Sporadic single-buyer Project** — "
-                        f"**{_visible_lv:.0f} units in 12mo** total, but "
-                        f"top customer **{_topname}** took "
-                        f"**{_topu:.0f} units ({_share:.0f}%)** of "
-                        f"that. Few transactions clustered to one "
-                        f"buyer = project pattern even though the "
-                        f"unit count looks decent. Velocity override: "
-                        f"subtracting the top customer's 12mo "
-                        f"contribution before annualising, leaving a "
-                        f"near-zero baseline so the engine doesn't "
-                        f"auto-restock against demand that's unlikely "
-                        f"to repeat.\n"
-                    )
-                else:
-                    demand_lines.append(
-                        "- **Velocity override**: subtracting top "
-                        f"customer **{_topname}**'s 12mo contribution "
-                        f"(**{_topu:.0f} units**, {_share:.0f}% of "
-                        f"effective demand) before annualising, "
-                        "because the spike is concentrated to one "
-                        "buyer — unlikely to repeat.\n"
-                    )
-            # v2.67.352 — include the +asm_u term in the formula so the
-            # LHS actually sums to the displayed eff_u. Pre-v2.67.352
-            # the line read "0 - 0 + 0 + 356 = 588" which dropped the
-            # +232 assembly term, making the math look broken even
-            # though the engine computed eff_u correctly.
-            # v2.67.362 — for 🎯 Project SKUs, also show the top-customer
-            # subtraction in the formula so the RHS matches the daily
-            # velocity displayed below. Pre-fix: "27 - 0 + 0 + 0 = 27"
-            # but avg_daily showed 0.03 (= 11/365 not 27/365), making the
-            # math look inconsistent. Now shows "27 - 16 + 0 + 0 = 11".
-            _proj_top_u = (
-                _topu if _tf == "🎯 Project" and "_topu" in dir()
-                else 0.0)
-            _proj_top_u = _proj_top_u if not pd.isna(_proj_top_u) else 0.0
-            _display_eff = max(0.0, eff_u - _proj_top_u)
-            demand_lines.append(
-                f"- **Effective total**: {direct_u:.0f}"
-                + (f" + {asm_u:.0f}" if asm_u > 0 else "")
-                + f" - {mig_out:.0f} "
-                f"+ {mig_in:.0f} + {rollup_in:.0f}"
-                + (f" - {_proj_top_u:.0f} *(top-buyer removed)*"
-                   if _proj_top_u > 0 else "")
-                + f" = **{_display_eff:.0f}** units/year\n"
-            )
-            # v2.67.358 — show avg/month alongside avg/day. James
-            # 2026-06-03: buyers think in months, not days. avg/month
-            # is more intuitive for replenishment cadence ("about 60
-            # a month" is easier to reason about than "2.0/day").
-            # Computed as avg_daily × 30.4 (avg days per month).
-            _avg_month = avg_daily * 30.4
-            demand_lines.append(
-                f"- Avg daily: {eff_u:.0f} / 365 = "
-                f"**{avg_daily:.2f}** units/day "
-                f"(≈ **{_avg_month:.0f}/month**)"
-                + (f"{clamp_note}\n" if clamp_active else "\n")
-            )
-            # v2.67.353 — recency diagnostic. Splits the 90d activity
-            # into "own" (direct + own assembly — what counts toward
-            # the stale-12mo check at engine line 7379) vs "tube
-            # rollup IN" (sister-variant rollup) vs "effective"
-            # (sum). The stale-90d clamp uses OWN. Surfacing this
-            # one-glance saves a CSV export next time a buyer asks
-            # "why isn't this clamped to zero".
-            _own90 = float(row.get("units_90d") or 0)
-            _eff90 = float(row.get("effective_units_90d") or 0)
-            _roll90 = float(row.get("tube_rollup_in_90d") or 0)
-            demand_lines.append(
-                f"- 90-day activity (recency diagnostic): "
-                f"**own = {_own90:.1f}** (direct + own assembly — "
-                f"used by stale-90d clamp), "
-                f"sister tube rollup IN = {_roll90:.1f}, "
-                f"effective = {_eff90:.1f}\n"
-            )
-
-        if lead_time_basis == "sku":
-            lead_time_basis_note = (
-                " — SKU-level lead-time override from buying settings; "
-                f"overrides Vendor LT {vendor_lead_time_days:g}d "
-                f"({vendor_lead_time_basis}).\n\n")
-        elif lead_time_basis == "ip_observed":
-            lead_time_basis_note = (
-                " — IP's measured average PO-to-receipt time for "
-                "this SKU; overrides the supplier-config default "
-                "with the real number.\n\n")
-        elif lead_time_basis == "ip_configured":
-            lead_time_basis_note = (
-                " — IP's configured lead-time setting for "
-                "this SKU; overrides the supplier-config default.\n\n")
-        elif (air_eligible_default and air_max_len
-                and length_mm is not None
-                and length_mm > air_max_len):
-            lead_time_basis_note = (
-                f" — SKU length {length_mm}mm > {air_max_len}mm "
-                f"air max, forced sea\n\n")
-        else:
-            lead_time_basis_note = "\n\n"
-
-        if target_policy_notes:
-            target_policy_text = (
-                f"\n\n**SKU buying policy**: raw target "
-                f"{raw_target:.1f} → **{target:.1f}** units ("
-                + "; ".join(target_policy_notes)
-                + ")")
-        else:
-            target_policy_text = ""
-
-        reorder_policy_bits = []
-        if sku_moq > 0:
-            reorder_policy_bits.append(f"SKU MOQ {sku_moq:g}")
-        elif moq:
-            reorder_policy_bits.append(f"supplier MOQ {float(moq):g}")
-        if sku_eoq > 0:
-            reorder_policy_bits.append(f"SKU EOQ {sku_eoq:g}")
-        reorder_policy_text = (
-            " (" + ", ".join(reorder_policy_bits) + " applied)"
-            if reorder_policy_bits and not is_project_row else "")
-
-        trace = "".join(demand_lines) + (
-            f"**Lead time**: {lead_time_days} days "
-            f"({freight_mode_used}{_freight_rule_note})"
-            + lead_time_basis_note
-            + f"**ABC class**: {abc} → safety {safety_pct:.0f}%\n\n"
-            f"**Review period**: {review_days}d — {review_basis}\n\n"
-            f"**Lead-time demand**: {avg_daily:.2f} × {lead_time_days} "
-            f"= {lt_demand:.1f} units\n\n"
-            f"**Safety stock**: {lt_demand:.1f} × {safety_pct/100:.2f} "
-            f"= {safety:.1f} units\n\n"
-            f"**Review-period demand**: {avg_daily:.2f} × {review_days} "
-            f"= {review_demand:.1f} units\n\n"
-            + (
-                f"**Holiday cover**: +{closure_days}d ("
-                + "; ".join(
-                    f"{(m['label'] or 'closure')} "
-                    f"({_format_iso_weeks_range(m['start_date'], m['end_date'])}: "
-                    f"{m['start_date']}→{m['end_date']}, "
-                    f"{m['overlap_days']}d in window)"
-                    for m in matched_closures
-                )
-                + f") → +{holiday_cover:.1f} units — "
-                  f"the supplier is shut for part of this order's "
-                  f"cover window, so we carry the closed days as "
-                  f"extra stock to bridge it.\n\n"
-                if closure_days > 0 else ""
-            )
-            + f"**Target stock**: {lt_demand:.1f} + {safety:.1f} + "
-            f"{review_demand:.1f}"
-            + (f" + {holiday_cover:.1f}" if closure_days > 0 else "")
-            + f" = **{raw_target:.1f} units**"
-            + target_policy_text
-            + "\n\n"
-            f"**Current position**:\n"
-            f"- OnHand: {onhand:.0f} physical units\n"
-            f"- Allocated (reserved for open orders): {allocated:.0f}\n"
-            f"- Available (OnHand − Allocated): {available:.0f}"
-            + ("  ← negative = we're over-committed\n"
-               if available < 0 else "\n")
-            + f"- OnOrder (incoming POs): {on_order:.0f}\n"
-            + residue_note
-            + f"- Backorder (= max(0, Allocated − OnHand), matches CIN7): "
-            f"{unfulfilled:.0f}  ← already reflected in negative "
-            f"Available, NOT subtracted again\n"
-            f"- **Effective position**: {planning_available:.0f} + "
-            f"{planning_on_order:.0f} "
-            f"= **{effective_pos:.0f}**\n\n"
-            f"**Suggested reorder**: max(0, {target_for_position:.1f} - "
-            f"{effective_pos:.0f}) = "
-            + (f"**{reorder:.2f}** rolls "
-               f"(fractional — supplier accepts decimal qtys; "
-               f"bulk master is {row.get('bulk_length_m', 0):g}m)"
-               if use_fractional
-               else f"{reorder} units")
-            + reorder_policy_text
-            + (f" (rounded up to MOQ {moq:g})"
-               if (moq and not use_fractional and not is_project_row
-                   and reorder == int(moq))
-               else "")
-            + (f" (MOQ {moq:g} not auto-applied to Project rows)"
-               if (moq and not use_fractional and is_project_row
-                   and 0 < reorder < float(moq))
-               else "")
-            + f"\n\n"
-            f"**Excess stock** (over target): {excess_units:.0f} units × "
-            f"${row['AverageCost']:.2f} = **${excess_value:,.0f} tied up**"
-        )
-        result["calc_trace"] = trace
-        return result
-
-    # v2.67.289 — skip the apply when nothing changed. engine_df
-    # is cached via @st.cache_resource — Streamlit returns the
-    # SAME DataFrame object across renders until the cache is
-    # invalidated, so any columns we added on a previous render
-    # are still present. If supp_configs / closures / IP lead
-    # times / today are all unchanged, the apply would produce
-    # identical values — skipping it removes the 10k-row markdown
-    # rebuild that was spiking memory and crashing Render on every
-    # navigation, holiday save, and cadence save.
-    _reorder_cols = ("target_stock", "reorder_qty",
-                       "vendor_lead_time_days", "lead_time_days",
-                       "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
-                       "freight_mode", "excess_units", "excess_value")
-    try:
-        _cache_sig = json.dumps({
-            "supp": supp_configs,
-            "clos": closures_by_supplier,
-            "ip_lt": ip_lead_times_by_sku,
-            "sku_buying": sku_buying_settings,
-            "today": _today_for_engine.isoformat(),
-        }, sort_keys=True, default=str)
-    except (TypeError, ValueError):
-        _cache_sig = None  # never hit on dict-of-simple-types
-    _have_columns = all(c in engine_df.columns for c in _reorder_cols)
-    _sig_unchanged = (
-        _cache_sig is not None
-        and st.session_state.get("_reorder_apply_sig") == _cache_sig)
-    if _have_columns and _sig_unchanged:
-        pass  # cache hit — engine_df already has these columns
-    else:
-        applied = engine_df.apply(_compute_target_and_reorder, axis=1)
-        engine_df["target_stock"] = applied.apply(lambda x: x["target_stock"])
-        engine_df["reorder_qty"] = applied.apply(lambda x: x["reorder_qty"])
-        engine_df["vendor_lead_time_days"] = applied.apply(
-            lambda x: x["vendor_lead_time_days"])
-        engine_df["lead_time_days"] = applied.apply(lambda x: x["lead_time_days"])
-        engine_df["sku_lead_time_days"] = applied.apply(
-            lambda x: x["sku_lead_time_days"])
-        engine_df["sku_moq"] = applied.apply(lambda x: x["sku_moq"])
-        engine_df["sku_eoq_qty"] = applied.apply(lambda x: x["sku_eoq_qty"])
-        engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
-        engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
-        engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
-        if _cache_sig is not None:
-            st.session_state["_reorder_apply_sig"] = _cache_sig
-    # Never keep per-SKU markdown traces on the table DataFrame. They are
-    # large and only one is viewed at a time, so Inspect builds them lazily.
-    if "calc_trace" in engine_df.columns:
-        engine_df = engine_df.drop(columns=["calc_trace"])
-
-    _product_status = engine_df.get(
-        "Status", pd.Series("", index=engine_df.index)
-    ).astype(str)
-
-    # Dropship override: these SKUs are order-on-demand. Zero the target
-    # and reorder, leave everything else (sales history, OnHand etc.)
-    # intact so buyer can watch volume and decide when to promote to
-    # stocked via the Dropship expander below. Final Status badge is
-    # applied after the computed status pass.
-    if dropship_skus:
-        _ds_mask = engine_df["SKU"].astype(str).isin(dropship_skus)
-        engine_df.loc[_ds_mask, "target_stock"] = 0
-        engine_df.loc[_ds_mask, "reorder_qty"] = 0
-        engine_df.loc[_ds_mask, "excess_units"] = 0
-        engine_df.loc[_ds_mask, "excess_value"] = 0
-
-    # Discontinued override: any SKU with "[Discontinued]" in its Name
-    # (case-insensitive) OR Status="Discontinued" in CIN7 — force
-    # reorder_qty=0 and target_stock=0 so the engine never suggests
-    # ordering more of a product that's been retired. The buyer can
-    # still see direct sales history, OnHand, and excess for cleanup
-    # decisions. Trend is set to "🚫 Discontinued" (distinct from
-    # 💤 Dormant) so it's visually obvious in the PO editor.
-    _disc_name_mask = (engine_df["Name"].astype(str)
-                       .str.contains(r"\[Discontinued\]", case=False,
-                                      regex=True, na=False))
-    _disc_status_mask = (_product_status.str.lower() == "discontinued")
-    _disc_mask = _disc_name_mask | _disc_status_mask
-    if _disc_mask.any():
-        engine_df.loc[_disc_mask, "target_stock"] = 0
-        engine_df.loc[_disc_mask, "reorder_qty"] = 0
-        engine_df.loc[_disc_mask, "trend_flag"] = "🚫 Discontinued"
-    # OnHandValue: prefer CIN7's authoritative StockOnHand (FIFO-based
-    # dollar value shown in CIN7's Product Availability screen).
-    # Fall back to OnHand × AverageCost/FixedCost only when CIN7 returns 0.
-    engine_df["OnHandValue"] = engine_df.apply(
-        lambda r: (float(r["StockOnHand"]) if float(r["StockOnHand"]) > 0
-                   else float(r["OnHand"]) * float(r["AverageCost"])),
-        axis=1,
-    )
-    # Per-unit cost chain, priority order:
-    #   1. CIN7 StockOnHand ÷ OnHand  (real FIFO)
-    #   2. Supplier FixedCost  (already in UnitCost via cin7_cost_local)
-    #   3. Product.AverageCost  (raw from CIN7)
-    #   4. Family-prefix MEDIAN cost  (same SKU prefix siblings)
-    #   5. Category MEDIAN cost  (same Category field)
-    #   6. 0  (genuinely unknown)
-    def _direct_unit_cost(r):
-        sv = float(r["StockOnHand"] or 0)
-        oh = float(r["OnHand"] or 0)
-        if sv > 0 and oh > 0:
-            return sv / oh
-        return float(r["AverageCost"] or 0)
-
-    engine_df["_direct_cost"] = engine_df.apply(_direct_unit_cost, axis=1)
-
-    # Compute family-prefix median cost
-    def _family_prefix(sku: str) -> str:
-        parts = str(sku).split("-")
-        if len(parts) >= 3:
-            return "-".join(parts[:-1])
-        return str(sku)
-
-    engine_df["_family_prefix"] = engine_df["SKU"].apply(_family_prefix)
-    # Only use rows with a confident direct cost to compute medians
-    _confident_costs = engine_df[engine_df["_direct_cost"] > 0]
-    if not _confident_costs.empty:
-        family_median = (_confident_costs.groupby("_family_prefix")
-                          ["_direct_cost"].median().to_dict())
-        category_median = (_confident_costs.groupby("Category")
-                            ["_direct_cost"].median().to_dict())
-    else:
-        family_median, category_median = {}, {}
-
-    def _effective_unit_cost(r):
-        direct = float(r["_direct_cost"] or 0)
-        if direct > 0:
-            return direct, "direct"
-        fam_med = family_median.get(r["_family_prefix"], 0)
-        if fam_med > 0:
-            return float(fam_med), "family-median"
-        cat_med = category_median.get(r.get("Category"), 0)
-        if cat_med > 0:
-            return float(cat_med), "category-median"
-        return 0.0, "unknown"
-
-    _cost_apply = engine_df.apply(_effective_unit_cost, axis=1)
-    engine_df["EffectiveUnitCost"] = _cost_apply.apply(lambda x: x[0])
-    engine_df["CostBasisDetail"] = _cost_apply.apply(lambda x: x[1])
-    engine_df["TargetValue"] = (
-        engine_df["target_stock"] * engine_df["EffectiveUnitCost"]
-    )
-    # Status — must use EFFECTIVE units (direct + migrated + rollup),
-    # otherwise masters with rolled-up demand (e.g. Sierra65-W-2, strip
-    # bulk rolls) get wrongly flagged as Dead Stock.
-    # v2.67.36 — prepend "❗" to the Status when the SKU has an
-    # active once-slow dormancy warning. This is the buyer's cue
-    # to verify whether reorder demand is sales-driven (we just
-    # surfaced it as slow stock and are clearing it) vs genuine
-    # market recovery. The warning auto-lifts after 90d sustained
-    # activity or via manual dismiss.
-    def _status(r):
-        eff = float(r.get("effective_units_12mo",
-                            r.get("units_12mo", 0)) or 0)
-        raw_onhand = float(r.get("OnHand") or 0)
-        allocated = float(r.get("Allocated") or 0)
-        # v2.67.333 — Status now uses AVAILABLE (= OnHand − Allocated),
-        # not OnHand. The old logic compared OnHand to target_stock,
-        # which mislabelled deeply-oversold SKUs as "Overstocked":
-        # LED-NEON-FLEX-SUPER-SLIM-ST-2M, OnHand=7, Allocated=35,
-        # Available=-28, target=0.8 → 7 > 1.2 → "🔵 Overstocked" → the
-        # default status filter hid it → many Neonica products went
-        # missing from the reorder view despite reorder_qty=29. The
-        # engine's reorder math always used Available; only the label
-        # (and so the filter) lagged. Now they agree.
-        #
-        # Tiers, in order:
-        #   🔴 Reorder now if any of:
-        #        – Available < 0          (oversold)
-        #        – Available < lead-time demand
-        #        – reorder_qty > 0 AND Available < target
-        #   ⚪ No demand, no stock        (no visible/effective demand,
-        #                                  no stock)
-        #   💀 Dead stock                 (no visible/effective demand,
-        #                                  holding stock)
-        #   🟠 Reorder soon                (Available < target)
-        #   🔵 Overstocked                 (Available > target × 1.5)
-        #   🟢 On target                   (everything else)
-        raw_available = raw_onhand - allocated
-        is_bulk = bool(r.get("is_bulk_master", False))
-        bulk_len_m = float(r.get("bulk_length_m") or 0)
-        onhand = normalise_planning_quantity(
-            raw_onhand, is_bulk_master=is_bulk, bulk_length_m=bulk_len_m)
-        available = normalise_planning_quantity(
-            raw_available, is_bulk_master=is_bulk,
-            bulk_length_m=bulk_len_m)
-        target = normalise_planning_quantity(
-            float(r.get("target_stock") or 0),
-            is_bulk_master=is_bulk,
-            bulk_length_m=bulk_len_m,
-        )
-        avg_daily = float(r.get("avg_daily") or 0)
-        lead_time = float(r.get("lead_time_days") or 0)
-        reorder_qty = float(r.get("reorder_qty") or 0)
-        lineage_12mo = float(r.get("lineage_units_12mo") or 0)
-        display_12mo = float(r.get("display_units_12mo") or 0)
-        raw_units_12mo = float(r.get("units_12mo") or 0)
-        visible_12mo = max(eff, lineage_12mo, display_12mo, raw_units_12mo)
-        sku_str = str(r.get("SKU") or "")
-        once_slow = sku_str in dormancy_warnings_map
-        if available < 0:
-            # Oversold always wins. A customer shortage should never be
-            # hidden behind Dead Stock / Project / Overstocked wording.
-            base = "🔴 Reorder now"
-        elif available == 0 and (target > 0 or reorder_qty > 0):
-            base = "🔴 Reorder now"
-        elif visible_12mo <= 0 and onhand == 0:
-            base = "⚪ No demand, no stock"
-        elif visible_12mo <= 0 and onhand > 0:
-            base = "💀 Dead stock"
-        elif target == 0 and reorder_qty <= 0 and available == 0:
-            # Dormant/project SKUs can correctly have target=0 and
-            # reorder=0. If there is also no meaningful stock left, this
-            # is not "Reorder now" and not "Overstocked"; it is simply at
-            # the engine's current target.
-            base = "🟢 On target"
-        elif available < avg_daily * lead_time:
-            base = "🔴 Reorder now"
-        elif reorder_qty > 0 and available < target:
-            # Engine still wants to reorder but we have some free
-            # stock — softer urgency.
-            base = "🟠 Reorder soon"
-        elif available < target:
-            base = "🟠 Reorder soon"
-        elif available > target * 1.5:
-            base = "🔵 Overstocked"
-        else:
-            base = "🟢 On target"
-        return f"❗ {base}" if once_slow else base
-    engine_df["Status"] = engine_df.apply(_status, axis=1)
-    # Final Status overrides happen after the computed status pass so
-    # the displayed buyer action cannot be overwritten by cached or
-    # earlier labels.
-    if dropship_skus:
-        engine_df.loc[_ds_mask, "Status"] = "📦 Dropship"
-    if _disc_mask.any():
-        engine_df.loc[_disc_mask, "Status"] = "🚫 Discontinued"
-
-    # --- SKU detail panel (v2.67.326) ---------------------------------
-    # James 2026-05-28: see a SKU's full detail without leaving the
-    # ordering page. The original v2.67.324 attempt used a LinkColumn
-    # (?inspect=<SKU>) + st.dialog — it bombed (Streamlit data_editor
-    # links open a new tab / the dialog API + control-flow exceptions
-    # were brittle). Replaced with a rock-solid "🔍 Inspect a SKU"
-    # selectbox + inline bordered panel rendered via _render_sku_detail
-    # right above the editor. Pure native widgets, can't bomb.
-    def _render_sku_detail(_sku: str) -> None:
-        _hit = engine_df[engine_df["SKU"].astype(str) == str(_sku)]
-        if _hit.empty:
-            st.warning(f"No engine data for `{_sku}`.")
-            return
-        _r = _hit.iloc[0]
-        _trend_12m = _r.get("trend_12m")
-        if not isinstance(_trend_12m, list):
-            _trend_12m = _parse_engine_list_cell(_trend_12m)
-        _current_month_engine_units = (
-            float(_trend_12m[-1]) if _trend_12m else 0.0)
-        _current_month_live = build_sku_current_month_movement(
-            _sku, sale_lines, assemblies)
-        _current_month_live_units = float(
-            _current_month_live.get("total_qty") or 0)
-        _current_month_product_movements = (
-            _cached_live_product_movements_for_sku(_sku))
-        _current_month_product_units = 0.0
-        if _current_month_product_movements.get("ok"):
-            _current_month_product_units = float(
-                _current_month_product_movements.get("demand_qty") or 0)
-        # For assembly-heavy SKUs, the engine bucket can lag the live
-        # movement evidence until the background ABC refresh finishes.
-        # Prefer CIN7 product Movements when available because that is the
-        # same ledger shown in CIN7's product movement screen.
-        _current_month_units = max(
-            _current_month_engine_units,
-            _current_month_live_units,
-            _current_month_product_units,
-        )
-        st.markdown(f"#### {_sku}")
-        # v2.67.349 — render the SKU as a code block too so Streamlit's
-        # built-in hover-copy clipboard icon appears. One-click copy
-        # for pasting into CIN7, Slack, search, etc. No JS injection
-        # needed — pure native widget.
-        st.code(_sku, language=None)
-        st.caption(str(_r.get("Name") or ""))
-        _m = st.columns(3)
-        _m[0].metric("ABC", str(_r.get("ABC") or "—"))
-        _m[1].metric("Trend", str(_r.get("trend_flag") or "Stable"))
-        _m[2].metric("Status", str(_r.get("Status") or "—"))
-        _s = st.columns(4)
-        _s[0].metric("OnHand", f"{float(_r.get('OnHand') or 0):.0f}")
-        _s[1].metric("Allocated", f"{float(_r.get('Allocated') or 0):.0f}")
-        _s[2].metric("Available", f"{float(_r.get('Available') or 0):.0f}")
-        _s[3].metric("OnOrder", f"{float(_r.get('OnOrder') or 0):.0f}")
-        _d = st.columns(4)
-        _raw_u12 = float(_r.get("units_12mo") or 0)
-        _eff_u12 = float(_r.get("effective_units_12mo") or 0)
-        _lineage_u12 = float(_r.get("lineage_units_12mo") or 0)
-        _display_u12 = max(_raw_u12, _eff_u12, _lineage_u12)
-        _d[0].metric(
-            "12mo demand",
-            f"{_display_u12:.0f}",
-            help=(
-                "Buyer-visible demand from the 12-month trend lineage. "
-                "The reorder math still uses effective_units_12mo, which "
-                "may be lower/zero for child, migrated, or project-style "
-                "rows to prevent accidental auto-buying."
-            ),
-        )
-        _d[1].metric("45d units", f"{float(_r.get('units_45d') or 0):.0f}")
-        _d[2].metric("Customers 12mo",
-                     f"{int(_r.get('customers_12mo') or 0)}")
-        _d[3].metric("Suggested reorder",
-                     f"{float(_r.get('reorder_qty') or 0):.0f}")
-        _d2 = st.columns(4)
-        _d2[0].metric(
-            "Current month",
-            f"{_current_month_units:.0f}",
-            help=("Uses the ABC monthly bucket, but falls forward to "
-                  "live synced sale-lines + FG assembly consumption, "
-                  "then to CIN7 product Movements when that live ledger "
-                  "is available and ahead."),
-        )
-        _d2[1].metric("90d units",
-                      f"{float(_r.get('units_90d') or 0):.0f}")
-        _d2[2].metric("Customers 45d",
-                      f"{int(_r.get('customers_45d') or 0)}")
-        _d2[3].metric("Momentum",
-                      f"{float(_r.get('momentum') or 0):.2f}x")
-        st.markdown(
-            f"**Supplier:** {_r.get('Supplier') or '—'}  \n"
-            f"**Last 6 months:** {_r.get('last_6mo_series') or '—'}  \n"
-            f"**Last 12 months:** {_r.get('last_12mo_series') or '—'}  \n"
-            f"**Reorder-math 12mo:** {_eff_u12:.0f}"
-            f"  ·  **Raw direct+FG 12mo:** {_raw_u12:.0f}  \n"
-            f"**Target stock:** {float(_r.get('target_stock') or 0):.0f}"
-            f"  ·  **Used LT:** "
-            f"{float(_r.get('lead_time_days') or 0):.0f}d "
-            f"({_r.get('freight_mode') or '—'})"
-            f"  ·  **Vendor LT:** "
-            f"{float(_r.get('vendor_lead_time_days') or 0):.0f}d"
-            f"  ·  **SKU LT/MOQ/EOQ:** "
-            f"{float(_r.get('sku_lead_time_days') or 0):.0f}d / "
-            f"{float(_r.get('sku_moq') or 0):g} / "
-            f"{float(_r.get('sku_eoq_qty') or 0):g}"
-        )
-        if _current_month_product_units > max(
-                _current_month_engine_units, _current_month_live_units) + 1:
-            _by_type = _current_month_product_movements.get("by_type") or {}
-            _type_bits = []
-            for _typ, _vals in _by_type.items():
-                if isinstance(_vals, dict):
-                    _signed = float(_vals.get("signed_qty") or 0)
-                    if _signed:
-                        _type_bits.append(f"{_typ} {_signed:g}")
-            _type_note = (
-                " (" + ", ".join(_type_bits[:4]) + ")"
-                if _type_bits else "")
-            st.warning(
-                "Live CIN7 product Movements show "
-                f"{_current_month_product_units:.0f} demand units in "
-                f"{_current_month_product_movements.get('period')}"
-                f"{_type_note}, ahead of both the cached ABC bucket "
-                f"({_current_month_engine_units:.0f}) and synced "
-                f"sale-line/FG assembly movement "
-                f"({_current_month_live_units:.0f}). Product Movements "
-                "is the displayed source until the movement cache is "
-                "reconciled."
-            )
-        elif _current_month_live_units > _current_month_engine_units + 1:
-            st.warning(
-                "Live synced movement shows "
-                f"{_current_month_live_units:.0f} units in "
-                f"{_current_month_live.get('period')}, ahead of the "
-                f"cached ABC monthly bucket "
-                f"({_current_month_engine_units:.0f}). This SKU is "
-                "being displayed from live sale-lines + FG assembly "
-                "consumption until the background ABC refresh catches up."
-            )
-        _trace = _compute_target_and_reorder(
-            _r, include_trace=True).get("calc_trace")
-        if isinstance(_trace, str) and _trace.strip():
-            with st.expander("Full reorder math", expanded=False):
-                st.markdown(_trace)
-
-        try:
-            _sales_audit = build_sku_sales_audit(_sku, sale_lines)
-            if _sales_audit.get("ok"):
-                _summary = _sales_audit.get("summary", {})
-                with st.expander("SKU sales audit (calendar months)",
-                                 expanded=False):
-                    st.caption(
-                        "Source: synced CIN7 sale_lines. The engine's "
-                        "monthly buckets use InvoiceDate and exclude "
-                        "credited, voided, and cancelled lines. OrderDate "
-                        "is shown beside it to catch open/uninvoiced orders.")
-                    _sa = st.columns(4)
-                    _sa[0].metric(
-                        f"{_summary.get('current_month')} invoice qty",
-                        f"{float(_summary.get('current_invoice_qty') or 0):.2f}")
-                    _sa[1].metric(
-                        f"{_summary.get('current_month')} OrderDate qty",
-                        f"{float(_summary.get('current_order_qty') or 0):.2f}")
-                    _sa[2].metric(
-                        "OrderDate not counted",
-                        f"{float(_summary.get('current_order_not_in_invoice_month_qty') or 0):.2f}")
-                    _sa[3].metric(
-                        "Last invoice",
-                        str(_summary.get("last_invoice_date") or "—"))
-                    _audit_current_invoice = float(
-                        _summary.get("current_invoice_qty") or 0)
-                    if (_audit_current_invoice
-                            > _current_month_engine_units + 1):
-                        st.warning(
-                            "Exact synced sale lines show "
-                            f"{_audit_current_invoice:.0f} units invoiced "
-                            f"this month, but the ABC monthly bucket shows "
-                            f"{_current_month_engine_units:.0f}. The engine "
-                            "snapshot is likely stale or missing recent "
-                            "sale-line files; run/await the background ABC "
-                            "refresh after the 30-day sale-line catch-up.")
-
-                    _monthly_rows = _sales_audit.get("monthly_rows")
-                    if isinstance(_monthly_rows, pd.DataFrame) and not _monthly_rows.empty:
-                        st.dataframe(
-                            _monthly_rows,
-                            hide_index=True,
-                            use_container_width=True,
-                            height=250,
-                            column_config={
-                                "Invoice qty (engine)":
-                                    st.column_config.NumberColumn(format="%.2f"),
-                                "OrderDate qty":
-                                    st.column_config.NumberColumn(format="%.2f"),
-                                "OrderDate not in invoice month":
-                                    st.column_config.NumberColumn(format="%.2f"),
-                            },
-                        )
-                    _recent_sku_rows = _sales_audit.get("recent_rows")
-                    if isinstance(_recent_sku_rows, pd.DataFrame) and not _recent_sku_rows.empty:
-                        with st.expander(
-                            f"Recent exact-SKU sale lines ({len(_recent_sku_rows)} shown)",
-                            expanded=False,
-                        ):
-                            st.dataframe(
-                                _recent_sku_rows,
-                                hide_index=True,
-                                use_container_width=True,
-                                height=280,
-                            )
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Live synced movement audit for LED strip / bulk-roll families.
-        # This answers the operational question that raw same-SKU rows
-        # cannot: "which child/cut SKUs are actually feeding this 100m
-        # roll's demand, and does the top-customer/project signal explain
-        # a zero reorder suggestion?"
-        try:
-            _audit = build_strip_movement_audit(_sku, products, sale_lines)
-            if _audit.get("ok"):
-                _summary = _audit.get("summary", {})
-                _master_len = float(_audit.get("master_length_m") or 0)
-                with st.expander(
-                    "Strip family movement audit "
-                    f"({int(_master_len) if _master_len else 'master'}m "
-                    "roll equivalents)",
-                    expanded=False,
-                ):
-                    st.caption(
-                        "Source: synced CIN7 sale_lines. Credited, voided, "
-                        "and cancelled lines are excluded, matching the ABC "
-                        "engine's demand filter.")
-                    _a = st.columns(5)
-                    _a[0].metric(
-                        "Direct 12mo",
-                        f"{float(_summary.get('direct_master_rolls_12mo') or 0):.2f}")
-                    _a[1].metric(
-                        "Child/cut rollup",
-                        f"{float(_summary.get('child_master_rolls_12mo') or 0):.2f}")
-                    _a[2].metric(
-                        "Family total",
-                        f"{float(_summary.get('total_master_rolls_12mo') or 0):.2f}")
-                    _a[3].metric(
-                        "Metres",
-                        f"{float(_summary.get('total_metres_12mo') or 0):.0f}")
-                    _a[4].metric(
-                        "Last family sale",
-                        str(_summary.get("last_family_sale") or "—"))
-
-                    _top_pct = float(
-                        _summary.get("top_customer_pct_12mo") or 0)
-                    st.markdown(
-                        f"**Family base:** `{_audit.get('base')}`  \n"
-                        f"**Top customer:** "
-                        f"{_summary.get('top_customer') or '—'} "
-                        f"({float(_summary.get('top_customer_rolls_12mo') or 0):.2f} "
-                        f"roll equivalents, {_top_pct:.0f}% of 12mo family movement)"
-                    )
-
-                    _family_rows = _audit.get("family_rows")
-                    if isinstance(_family_rows, pd.DataFrame) and not _family_rows.empty:
-                        st.dataframe(
-                            _family_rows,
-                            hide_index=True,
-                            use_container_width=True,
-                            height=260,
-                            column_config={
-                                "Length m": st.column_config.NumberColumn(
-                                    format="%.3g"),
-                                "12mo qty": st.column_config.NumberColumn(
-                                    format="%.2f"),
-                                "90d qty": st.column_config.NumberColumn(
-                                    format="%.2f"),
-                                "45d qty": st.column_config.NumberColumn(
-                                    format="%.2f"),
-                                "12mo metres": st.column_config.NumberColumn(
-                                    format="%.1f"),
-                                "Master roll equiv": st.column_config.NumberColumn(
-                                    format="%.2f"),
-                            },
-                        )
-
-                    _recent_rows = _audit.get("recent_rows")
-                    if isinstance(_recent_rows, pd.DataFrame) and not _recent_rows.empty:
-                        with st.expander(
-                            f"Recent family sale lines ({len(_recent_rows)} shown)",
-                            expanded=False,
-                        ):
-                            st.dataframe(
-                                _recent_rows,
-                                hide_index=True,
-                                use_container_width=True,
-                                height=280,
-                                column_config={
-                                    "Master roll equiv":
-                                        st.column_config.NumberColumn(
-                                            format="%.3f"),
-                                },
-                            )
-        except Exception:  # noqa: BLE001
-            pass
-
-        # v2.67.332 — raw sale_lines records for THIS SKU, post-dedup.
-        # Lets staff (and Claude) see exactly which records the engine
-        # actually counted when a SKU's monthly buckets look wrong —
-        # e.g. James 2026-06-01: LED-NEON-FLEX-SUPER-SLIM-ST shows
-        # April's single 12-unit sale duplicated into May despite three
-        # rounds of dedup. CIN7's movement screen is the source of truth
-        # (one -12 stock movement); if this expander shows two rows of
-        # 12, our dedup key isn't catching whatever field differs
-        # between the two records. Sorted newest-first.
-        try:
-            if not sale_lines.empty:
-                _raw = sale_lines[
-                    sale_lines["SKU"].astype(str) == str(_sku)]
-                if not _raw.empty:
-                    with st.expander(
-                        f"📜 Raw sale-line records ({len(_raw)} rows) "
-                        f"— sum of Quantity is what the engine counts",
-                        expanded=False,
-                    ):
-                        _cols = [c for c in [
-                            "SaleID", "OrderNumber", "Customer",
-                            "InvoiceNumber", "InvoiceDate", "Status",
-                            "Quantity", "Total", "Price",
-                        ] if c in _raw.columns]
-                        _disp = _raw[_cols].copy()
-                        if "InvoiceDate" in _disp.columns:
-                            _disp = _disp.sort_values(
-                                "InvoiceDate", ascending=False,
-                                na_position="last")
-                        st.dataframe(
-                            _disp, hide_index=True,
-                            use_container_width=True, height=280)
-                        # Total + per-OrderNumber roll-up so duplicates
-                        # are obvious at a glance.
-                        try:
-                            _q_total = float(pd.to_numeric(
-                                _disp["Quantity"], errors="coerce"
-                            ).fillna(0).sum())
-                            st.caption(
-                                f"**Quantity sum across all rows: "
-                                f"{_q_total:.0f}**  ·  Distinct "
-                                f"OrderNumbers: "
-                                f"{_disp['OrderNumber'].nunique()}  ·  "
-                                f"Distinct InvoiceNumbers: "
-                                f"{_disp.get('InvoiceNumber', pd.Series(dtype=object)).nunique()}"
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-        except Exception:  # noqa: BLE001
-            pass
-
-        # v2.67.334 — assembly (FG-XXXX) consumption records for this
-        # SKU. Components consumed in kits show up here even when they
-        # never appear in direct sale_lines.
-        try:
-            if not assemblies.empty:
-                _ra = assemblies[
-                    assemblies["ComponentSKU"].astype(str) == str(_sku)]
-                if not _ra.empty:
-                    with st.expander(
-                        f"🏗️ Assembly consumption ({len(_ra)} FG- tasks) "
-                        f"— components consumed when kits were built",
-                        expanded=False,
-                    ):
-                        _ac = [c for c in [
-                            "AssemblyNumber", "Date", "CompletionDate",
-                            "Status", "ParentSKU", "ParentName",
-                            "ParentQuantity", "Quantity", "Cost",
-                        ] if c in _ra.columns]
-                        _adisp = _ra[_ac].copy()
-                        if "CompletionDate" in _adisp.columns:
-                            _adisp = _adisp.sort_values(
-                                "CompletionDate", ascending=False,
-                                na_position="last")
-                        elif "Date" in _adisp.columns:
-                            _adisp = _adisp.sort_values(
-                                "Date", ascending=False,
-                                na_position="last")
-                        st.dataframe(
-                            _adisp, hide_index=True,
-                            use_container_width=True, height=280)
-                        try:
-                            _q_total = float(pd.to_numeric(
-                                _adisp["Quantity"], errors="coerce"
-                            ).fillna(0).sum())
-                            _parents_n = _adisp["ParentSKU"].nunique()
-                            st.caption(
-                                f"**Total consumed: {_q_total:.0f} "
-                                f"units across {len(_adisp)} tasks**  ·  "
-                                f"Distinct parent kits: {_parents_n}"
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-        except Exception:  # noqa: BLE001
-            pass
-
-        st.caption(
-            "For the complete drill-through (BOM, full sales/PO history) "
-            f"open the **Product Detail** page and search `{_sku}`.")
-
-    # --- Top-of-page stock optimisation headline -----------------------
-    st.markdown("### :moneybag: Stock optimisation overview")
-
-    # Master-only view for TARGET calculations (non-masters have
-    # target=0; they roll their demand up to masters). But CURRENT
-    # stock value sums across ALL SKUs because physical cuts held
-    # from returns/over-production are real working capital.
-    master_only = engine_df[~engine_df["is_non_master_tube"]]
-
-    # v2.67.37 — headline must match CIN7 / Overview / Monthly
-    # Metrics. Use the shared `_headline_stock_value` helper which
-    # sums CIN7's StockOnHand directly (no AverageCost fallback).
-    # The richer per-SKU `OnHandValue` column on engine_df (with
-    # family/category-median fallbacks for missing costs) is still
-    # used downstream for excess/optimum calculations — those need
-    # a sensible number for every row, but the headline does not.
-    # Sum-of-OnHandValue and headline differ by exactly the dollar
-    # contribution of SKUs where CIN7 hasn't published a FIFO value
-    # but our cost chain estimated one.
-    total_onhand_value = _headline_stock_value(stock, products)
-    # Internal/diagnostic: total-with-fallback for cost-coverage
-    # logging. NOT shown as the headline tile.
-    total_onhand_value_with_fallback = float(engine_df["OnHandValue"].sum())
-
-    # Optimum / target: master SKUs only (non-masters have target=0).
-    total_target_value = float(master_only["TargetValue"].sum())
-
-    # Excess — two-part definition:
-    #   Masters: OnHandValue above TargetValue (classic overstock)
-    #   Non-masters: OnHandValue ONLY IF direct sales == 0 (true dead
-    #     physical cuts; cuts with their own direct sales are treated
-    #     as working inventory, not excess)
-    def _row_excess_value(r):
-        if bool(r.get("is_non_master_tube")):
-            if float(r.get("units_12mo") or 0) == 0:
-                return float(r.get("OnHandValue") or 0)
-            return 0.0  # has direct sales → working inventory
-        # Master
-        ohv = float(r.get("OnHandValue") or 0)
-        tv = float(r.get("TargetValue") or 0)
-        return max(0.0, ohv - tv)
-
-    engine_df["row_excess_value"] = engine_df.apply(
-        _row_excess_value, axis=1)
-    total_excess_value = float(engine_df["row_excess_value"].sum())
-
-    # v2.67.282 — Understock counterpart. "Excess" floors every SKU
-    # at zero, so it only counts SKUs OVER target and never nets the
-    # ones UNDER it. Without this half the tiles look contradictory:
-    # Current − Optimum (a NET figure) never equals Excess (a GROSS
-    # one). Understock = master SKUs below TargetValue, summed — the
-    # cash you'd redeploy bringing them up to target.
-    def _row_understock_value(r):
-        if bool(r.get("is_non_master_tube")):
-            return 0.0  # non-masters roll up; target = 0
-        ohv = float(r.get("OnHandValue") or 0)
-        tv = float(r.get("TargetValue") or 0)
-        return max(0.0, tv - ohv)
-
-    engine_df["row_understock_value"] = engine_df.apply(
-        _row_understock_value, axis=1)
-    total_understock_value = float(
-        engine_df["row_understock_value"].sum())
-    # Master-only overstock for the EXACT reconciliation identity:
-    #   master_overstock − understock == master_onhand − optimum.
-    master_overstock_value = float(
-        engine_df.loc[~engine_df["is_non_master_tube"],
-                       "row_excess_value"].sum())
-    master_onhand_value = float(master_only["OnHandValue"].sum())
-    net_over_position = master_overstock_value - total_understock_value
-
-    # Dead stock: zero effective demand AND physical stock held.
-    # For masters, use the engine's Status flag. For non-masters,
-    # also include them if they have physical stock but zero direct sales.
-    dead_master_value = float(
-        master_only.loc[master_only["Status"] == "💀 Dead stock",
-                         "OnHandValue"].sum()
-    )
-    dead_cut_value = float(
-        engine_df.loc[
-            engine_df["is_non_master_tube"]
-            & (engine_df["units_12mo"] == 0)
-            & (engine_df["OnHandValue"] > 0),
-            "OnHandValue",
-        ].sum()
-    )
-    dead_value = dead_master_value + dead_cut_value
-
-    # Cost-coverage diagnostics across MASTERS (what drives optimum)
-    cov = master_only["CostBasisDetail"].value_counts().to_dict()
-    direct_c = cov.get("direct", 0)
-    fam_c = cov.get("family-median", 0)
-    cat_c = cov.get("category-median", 0)
-    unk_c = cov.get("unknown", 0)
-
-    # v2.67.305 — tucked into a collapsed expander. Pre-cleanup
-    # the cost-basis caption sat between the section header and
-    # the five metric tiles as a wall of small grey text, making
-    # the page feel busy and pushing the tiles below the fold on
-    # smaller laptops. Staff don't need this detail at first
-    # glance — it's a finance-trust note. One click to expand.
-    with st.expander(
-            "ℹ️ Cost basis coverage & scope notes",
-            expanded=False):
-        st.markdown(
-            f"**Cost basis coverage (masters, drives Optimum)**: "
-            f"direct CIN7 cost on **{direct_c:,}**; "
-            f"family-median fallback on {fam_c:,}; "
-            f"category-median fallback on {cat_c:,}; "
-            f"no cost info (contribute $0 to Optimum) on "
-            f"**{unk_c:,}**.\n\n"
-            f"**Scope note**: Current value sums across all "
-            f"{len(engine_df):,} SKUs (real physical dollars); "
-            f"Optimum across {len(master_only):,} masters only "
-            f"(non-masters roll up to their masters)."
-        )
-
-    oc1, oc2, oc3, oc4, oc5 = st.columns(5)
-    # v2.67.37 — headline now ties to Overview + Monthly Metrics.
-    # Help text spells out the tie-out so the buyer trusts it.
-    _fallback_delta = total_onhand_value_with_fallback - total_onhand_value
-    oc1.metric("Current stock value",
-               _fmt_money(total_onhand_value),
-               help=(
-                   "CIN7's FIFO inventory value (sum of StockOnHand "
-                   "across all SKUs). MATCHES the Overview page's "
-                   "'Stock value (FIFO, CIN7)' tile and the Monthly "
-                   "Metrics report (commissions reference). v2.67.37 "
-                   "unified the three so they tie out exactly. "
-                   f"For internal diagnostics, an OnHand × cost-chain "
-                   f"fallback estimate would add "
-                   f"~{_fmt_money(_fallback_delta)} for SKUs where "
-                   "CIN7 hasn't published a FIFO number — that "
-                   "estimate is used for per-SKU excess/optimum "
-                   "math, NOT the headline."))
-    oc2.metric("Optimum stock value",
-               _fmt_money(total_target_value),
-               help="Sum of target_stock × AverageCost per SKU. "
-                    "This is what your working capital should be at.")
-    oc3.metric("Excess (cash to free up)",
-               _fmt_money(total_excess_value),
-               delta=f"{total_excess_value/total_onhand_value*100:.1f}% of current"
-                     if total_onhand_value else None,
-               delta_color="inverse",
-               help="OnHand beyond target stock, by SKU, summed. "
-                    "The money sitting on shelves that doesn't need to be.")
-    oc4.metric("Understock (cash to redeploy)",
-               _fmt_money(total_understock_value),
-               help="Master SKUs sitting BELOW target stock, by "
-                    "SKU, summed — the working capital you'd "
-                    "redeploy to bring them up to target. The "
-                    "counterpart to Excess: netting the two "
-                    "(Excess − Understock) gives your TRUE "
-                    "over-position, which Current − Optimum on "
-                    "its own doesn't reveal.")
-    oc5.metric("Dead stock (zero demand, holding stock)",
-               _fmt_money(dead_value),
-               help="Two buckets combined: "
-                    "(1) MASTER SKUs with zero effective 12-month demand "
-                    "(direct + migrated + rolled-up) AND physical stock. "
-                    "(2) Non-master variants with physical stock AND zero "
-                    "direct sales. "
-                    "Non-masters that HAVE direct sales are treated as "
-                    "working inventory, not dead.")
-
-    # v2.67.305 — reconciliation moved into a collapsed expander.
-    # Pre-cleanup this was 6+ lines of small math text directly
-    # under the tile row — useful for finance, noise for buying
-    # staff. Top-line takeaway lives in the expander label so the
-    # reader sees the key number without expanding.
-    _net_cash_freeable = (
-        total_excess_value - total_understock_value)
-    with st.expander(
-            f"📐 How these tiles reconcile · net cash you "
-            f"could actually free ≈ "
-            f"{_fmt_money(_net_cash_freeable)}",
-            expanded=False):
-        st.markdown(
-            f"**Excess ({_fmt_money(total_excess_value)})** is "
-            f"the GROSS cash recoverable by selling every "
-            f"over-target SKU down to target. **Understock "
-            f"({_fmt_money(total_understock_value)})** is what "
-            f"you'd re-spend bringing under-target SKUs UP to "
-            f"target.\n\n"
-            f"Across master SKUs: overstock "
-            f"{_fmt_money(master_overstock_value)} − understock "
-            f"{_fmt_money(total_understock_value)} = "
-            f"**{_fmt_money(net_over_position)}** genuinely tied "
-            f"up above target (this equals master on-hand "
-            f"{_fmt_money(master_onhand_value)} − Optimum).\n\n"
-            f"That's why Excess is larger than Current − Optimum "
-            f"({_fmt_money(total_onhand_value - total_target_value)}) "
-            f"— Excess never nets the under-stocked SKUs back in. "
-            f"**Net working capital you could actually free ≈ "
-            f"{_fmt_money(_net_cash_freeable)}**.\n\n"
-            f"Current value is higher again because it spans ALL "
-            f"SKUs at CIN7 FIFO cost, while Optimum / Excess / "
-            f"Understock are master-SKU figures using cost-chain "
-            f"fallbacks.")
-
-    # v2.67.178 — Glide path to engine-derived optimum (replaces
-    # the old hard-coded $600k target). The engine's Optimum tile
-    # above is the goal; this strip shows the gap + projection.
-    #
-    # Projection: at the trailing-90-day rate of slow-mover
-    # clearance, how many months until current → optimum?
-    # Anchors on the "Slow movers cleared" math used by the
-    # Slow Movers page so the figures are tied together.
-    _optimum = max(1.0, float(total_target_value))
-    _gap = total_onhand_value - _optimum
-    _pct_of_optimum = (total_onhand_value / _optimum * 100
-                          if _optimum else 0)
-    if _gap > 0:
-        # Above target — show projection-to-optimum based on
-        # recent slow-mover clearance velocity.
-        try:
-            _warns_proj = db.get_dormancy_warnings() or {}
-        except Exception:
-            _warns_proj = {}
-        try:
-            _today = pd.Timestamp(datetime.now().date())
-            _ninety = _today - pd.Timedelta(days=90)
-            _clr = _compute_slow_mover_clearance(
-                stock, sale_lines, products, _warns_proj,
-                _ninety, _today)
-            _monthly_clearance = float(
-                _clr.get("cost_value") or 0) / 3.0
-        except Exception:
-            _monthly_clearance = 0.0
-        if _monthly_clearance > 0:
-            _months_to_optimum = _gap / _monthly_clearance
-            _eta_text = (
-                f" · at trailing-90d clearance rate of "
-                f"${_monthly_clearance:,.0f}/mo, gap closes in "
-                f"~**{_months_to_optimum:.1f} months**")
-        else:
-            _eta_text = (
-                " · no slow-mover sales in trailing 90d — "
-                "ETA can't be computed; lean on AI-Assistant + "
-                "promotions to drive clearance")
-        st.progress(min(1.0, _optimum / total_onhand_value),
-                     text=(f"Current stock is "
-                              f"${_gap:,.0f} **above optimum** "
-                              f"(${_optimum:,.0f}) "
-                              f"— {_pct_of_optimum:.0f}% of "
-                              f"optimum{_eta_text}"))
-    else:
-        st.progress(min(1.0, _pct_of_optimum / 100),
-                     text=(f"Current stock is "
-                              f"{_pct_of_optimum:.0f}% of "
-                              f"optimum (${_optimum:,.0f}) "
-                              f"— you're **under** by "
-                              f"${-_gap:,.0f}. Keep ordering "
-                              f"per the recommendations above."))
-
-    # --- Supplier configuration ----------------------------------------
-    st.markdown("### :gear: Supplier configuration")
-    with st.expander("Configure lead times, MOQ/MOV, freight per supplier"):
-        actor_o = st.session_state.get("current_user", "").strip()
-        if not actor_o:
-            st.caption("Enter your name in the sidebar to edit.")
-        else:
-            # Known suppliers — same top-15-by-spend + alphabetical
-            # ordering as the main PO dropdown for consistency.
-            known = set()
-            if not suppliers.empty and "Name" in suppliers.columns:
-                known.update(suppliers["Name"].dropna().astype(str).tolist())
-            known.update(engine_df["Supplier"].unique().tolist())
-            known.update(supp_configs.keys())
-            known.discard("(unassigned)")
-            known_list = list(known)
-
-            # Rank by spend (reuse spend_by_supplier computed above in
-            # the main PO dropdown if available, otherwise rebuild).
-            _spend_map = dict(spend_by_supplier) if 'spend_by_supplier' in dir() else {}
-            if not _spend_map and not purchase_lines.empty:
-                _pl = purchase_lines.copy()
-                _pl["Total"] = _to_num(_pl["Total"]).fillna(0)
-                _spend_map = _pl.groupby("Supplier")["Total"].sum().to_dict()
-
-            ranked_cfg = sorted(
-                [(s, _spend_map.get(s, 0)) for s in known_list],
-                key=lambda x: -x[1],
-            )
-            top15_cfg = [s for s, _ in ranked_cfg[:15]
-                          if _spend_map.get(s, 0) > 0]
-            rest_cfg = sorted([s for s in known_list if s not in top15_cfg])
-
-            def _cfg_label(s):
-                sp = _spend_map.get(s, 0)
-                if s in top15_cfg and sp > 0:
-                    return f"{s}  —  ${sp:,.0f} spend"
-                return s
-
-            cfg_options = top15_cfg + rest_cfg
-            cfg_labels = [_cfg_label(s) for s in cfg_options]
-            cfg_label_to_sup = dict(zip(cfg_labels, cfg_options))
-
-            def _cfg_supplier_from_label(label: object) -> str:
-                label_s = str(label or "").strip()
-                if label_s in cfg_label_to_sup:
-                    return cfg_label_to_sup[label_s]
-                if "  —  $" in label_s:
-                    return label_s.split("  —  $", 1)[0].strip()
-                return label_s
-
-            def _cfg_label_for_supplier(supplier_name: str) -> str | None:
-                for label, mapped_supplier in cfg_label_to_sup.items():
-                    if mapped_supplier == supplier_name:
-                        return label
-                return None
-
-            # Keep supplier config aligned with the Draft PO supplier by
-            # default. The config form renders above the PO supplier
-            # picker, so read the picker from session_state. This prevents
-            # the "editing Neonica while drafting Snapfix" trap Andrew
-            # hit on 2026-07-02.
-            _active_po_supplier = str(
-                st.session_state.get("ordering_active_supplier") or ""
-            ).strip()
-            if not _active_po_supplier:
-                _active_po_supplier = _cfg_supplier_from_label(
-                    st.session_state.get("ord_supplier_label"))
-            if _active_po_supplier not in cfg_options:
-                _active_po_supplier = ""
-            _active_po_label = (
-                _cfg_label_for_supplier(_active_po_supplier)
-                if _active_po_supplier else None
-            )
-            _follow_key = "sc_follow_draft_supplier"
-            if _follow_key not in st.session_state:
-                st.session_state[_follow_key] = True
-            if (_active_po_label
-                    and st.session_state.get(_follow_key, True)):
-                st.session_state["sc_sup_label"] = _active_po_label
-
-            scol1, scol2 = st.columns([1.2, 2.8])
-            cfg_label_pick = scol1.selectbox(
-                "Supplier to configure  "
-                "(top 15 by 12mo spend, then A-Z)",
-                cfg_labels, key="sc_sup_label",
-            )
-            cfg_supplier = cfg_label_to_sup[cfg_label_pick]
-            cfg_supplier_key = " ".join(str(cfg_supplier).split()).strip()
-            existing = supp_configs.get(
-                cfg_supplier_key, supp_configs.get(cfg_supplier, {}))
-            follow_draft_supplier = scol2.checkbox(
-                "Keep Supplier configuration aligned with Draft PO supplier",
-                key=_follow_key,
-                help=(
-                    "When this is on, the supplier config form follows the "
-                    "supplier selected in Draft PO by supplier. Turn it off "
-                    "only when you intentionally want to edit a different "
-                    "supplier's defaults."
-                ),
-            )
-            _config_supplier_mismatch = bool(
-                _active_po_supplier and cfg_supplier != _active_po_supplier)
-            if _active_po_supplier and follow_draft_supplier:
-                scol2.caption(
-                    f"Draft PO supplier: **{_active_po_supplier}**. "
-                    "Supplier configuration is following it.")
-            elif _config_supplier_mismatch:
-                scol2.warning(
-                    f"Draft PO supplier is **{_active_po_supplier}**, but "
-                    f"this form is editing **{cfg_supplier}**.")
-
-            # v2.67.347 — widget keys are supplier-specific so switching
-            # suppliers in the picker properly re-renders the fields
-            # with that supplier's persisted values. James 2026-06-02:
-            # safety changes appeared to "not save" — likely because
-            # Streamlit's session_state on static keys (sc_sfA etc.)
-            # kept showing a previously-edited supplier's value, so a
-            # save wrote that value back unchanged.
-            _sk = (
-                "".join(ch if ch.isalnum() else "_"
-                        for ch in (cfg_supplier or "_"))
-                .strip("_")[:60]
-            )
-
-            # Loud current-supplier banner so the buyer can never miss
-            # which supplier they're editing.
-            st.info(
-                f"⚙️ Editing config for **{cfg_supplier}** — "
-                "all fields below reflect THIS supplier's saved values."
-            )
-            # v2.67.349 — diagnostic for "save persisted but engine
-            # doesn't see it" scenarios (invisible-char mismatch).
-            with st.expander(
-                "🔬 Diagnose supplier-name match", expanded=False,
-            ):
-                _cs_repr = repr(cfg_supplier)
-                _cs_norm = " ".join(str(cfg_supplier).split()).strip()
-                st.markdown(
-                    f"- Picker selection raw `repr()`: `{_cs_repr}`\n"
-                    f"- Canonicalised: `{_cs_norm!r}`"
-                )
-                # Engine-resolved supplier strings for SKUs assigned
-                # to this supplier (any variant).
-                if "engine_df" in dir() and not engine_df.empty:
-                    _eng_sups = (
-                        engine_df["Supplier"].dropna().astype(str)
-                        .unique().tolist())
-                    _matches = [
-                        s for s in _eng_sups
-                        if (" ".join(s.split()).strip()
-                            == _cs_norm)
-                    ]
-                    _close = [
-                        s for s in _eng_sups
-                        if s.strip().lower() == _cs_norm.lower()
-                        and s not in _matches
-                    ]
-                    st.markdown(
-                        f"- Engine-side variants matching this "
-                        f"canonical name: **{len(_matches)}**\n"
-                        + "\n".join(
-                            f"  - `{r!r}`" for r in _matches[:5])
-                    )
-                    if _close:
-                        st.warning(
-                            "Other engine strings that almost match "
-                            "(case- or whitespace-different) — these "
-                            "would have been MISSED before v2.67.349 "
-                            "normalisation:\n"
-                            + "\n".join(f"  - `{r!r}`" for r in _close[:5])
-                        )
-                st.caption(
-                    "If you see `repr()` values that look identical "
-                    "in the UI but differ (e.g. one has `\\xa0` for "
-                    "non-breaking space), that's the invisible-char "
-                    "mismatch the v2.67.349 normalisation handles."
-                )
-            # v2.67.347 — surface the last save message across the
-            # rerun so the buyer SEES proof of what was written. Then
-            # clear it so it doesn't linger forever.
-            _last_msg = st.session_state.pop("_sc_last_save_msg", None)
-            if _last_msg:
-                st.success(_last_msg)
-
-            # v2.67.357 — wrap supplier config in st.form() to fix
-            # the commit-on-blur race that silently reverted typed
-            # safety/review changes to defaults. Pre-357 the
-            # number_input widgets relied on commit-on-blur: clicking
-            # Save without first tabbing out of a field sent the click
-            # event WITHOUT the pending widget value, so the server-
-            # side handler read the OLD (default) value from
-            # session_state and wrote that back to DB. James 2026-06-
-            # 03 confirmed via the post-save banner: "Saved Topmet
-            # Light (EUR) ... safety A/B/C 30/20/15%" even after
-            # typing different values. st.form is the native
-            # Streamlit primitive for batched save-button forms —
-            # submit commits all widget values atomically.
-            with st.form(f"sc_main_{_sk}", clear_on_submit=False):
-                cc1, cc2, cc3 = st.columns(3)
-                lt_sea = cc1.number_input(
-                    "Lead time SEA (days)",
-                    min_value=1, max_value=200,
-                    value=int(existing.get("lead_time_sea_days") or 35),
-                    key=f"sc_sea_{_sk}",
-                )
-                lt_air = cc2.number_input(
-                    "Lead time AIR (days; 0 = not offered)",
-                    min_value=0, max_value=60,
-                    value=int(existing.get("lead_time_air_days") or 0),
-                    key=f"sc_air_{_sk}",
-                )
-                air_def = cc3.selectbox(
-                    "Air eligible by default?",
-                    ["No", "Yes"],
-                    index=int(bool(existing.get("air_eligible_default"))),
-                    key=f"sc_air_def_{_sk}",
-                )
-
-                cd1, cd2, cd3 = st.columns(3)
-                air_max = cd1.number_input(
-                    "Air MAX length (mm; 0 = any)",
-                    min_value=0, max_value=5000,
-                    value=int(existing.get("air_max_length_mm") or 0),
-                    help="For UPS etc., items longer than this are sea-only. "
-                         "E.g. Topmet UPS caps at ~2200mm.",
-                    key=f"sc_airmax_{_sk}",
-                )
-                moq = cd2.number_input(
-                    "MOQ units",
-                    min_value=0.0, max_value=10000.0,
-                    value=float(existing.get("moq_units") or 0),
-                    key=f"sc_moq_{_sk}",
-                )
-                pref_freight = cd3.selectbox(
-                    "Preferred freight",
-                    ["sea", "air", "mixed"],
-                    index=(["sea","air","mixed"].index(
-                        existing.get("preferred_freight") or "sea")),
-                    key=f"sc_pref_{_sk}",
-                )
-
-                ce1, ce2, ce3 = st.columns(3)
-                mov = ce1.number_input(
-                    "MOV amount", min_value=0.0, max_value=100000.0,
-                    value=float(existing.get("mov_amount") or 0),
-                    key=f"sc_mov_{_sk}",
-                )
-                mov_ccy = ce2.text_input(
-                    "MOV currency",
-                    value=existing.get("mov_currency") or "USD",
-                    key=f"sc_movccy_{_sk}",
-                )
-
-                st.markdown("**ABC safety factors & review days** "
-                             "(override the defaults for this supplier)")
-                sf_cols = st.columns(6)
-                sf_A = sf_cols[0].number_input("Safety A (%)",
-                                                min_value=0.0, max_value=100.0,
-                                                value=float(existing.get("safety_pct_A") or 30.0),
-                                                key=f"sc_sfA_{_sk}")
-                sf_B = sf_cols[1].number_input("Safety B (%)",
-                                                min_value=0.0, max_value=100.0,
-                                                value=float(existing.get("safety_pct_B") or 20.0),
-                                                key=f"sc_sfB_{_sk}")
-                sf_C = sf_cols[2].number_input("Safety C (%)",
-                                                min_value=0.0, max_value=100.0,
-                                                value=float(existing.get("safety_pct_C") or 15.0),
-                                                key=f"sc_sfC_{_sk}")
-                rv_A = sf_cols[3].number_input("Review A (d)",
-                                                min_value=1, max_value=180,
-                                                value=int(existing.get("review_days_A") or 14),
-                                                key=f"sc_rvA_{_sk}")
-                rv_B = sf_cols[4].number_input("Review B (d)",
-                                                min_value=1, max_value=180,
-                                                value=int(existing.get("review_days_B") or 30),
-                                                key=f"sc_rvB_{_sk}")
-                rv_C = sf_cols[5].number_input("Review C (d)",
-                                                min_value=1, max_value=180,
-                                                value=int(existing.get("review_days_C") or 45),
-                                                key=f"sc_rvC_{_sk}")
-
-                # v2.67.283 — order cadence. The real interval between
-                # reorders with this supplier. Drives the reorder
-                # engine's review period — the leanest, highest-impact
-                # cashflow lever (carry stock only until the NEXT order,
-                # not a generic 30-45 days).
-                st.markdown("**Order cadence** — how often you actually "
-                             "place orders with this supplier")
-                oc_cols = st.columns([2, 4])
-                order_cadence = oc_cols[0].number_input(
-                    "Order cadence (days)",
-                    min_value=0, max_value=180,
-                    value=int(existing.get("order_cadence_days") or 0),
-                    key=f"sc_cadence_{_sk}",
-                    help="The real gap between reorders — e.g. 7 if you "
-                         "order this supplier weekly. The engine then "
-                         "stocks only enough to bridge to the next "
-                         "order, not a generic 30-45 days. 0 = not set "
-                         "(falls back to the ABC-class review days).",
-                )
-                oc_cols[1].caption(
-                    ":information_source: Set this for your regular "
-                    "suppliers — Neonica, Topmet, Luz Negra, LEDsOn are "
-                    "ordered weekly, so set them to **7**. This is the "
-                    "biggest single lever for freeing cash tied up in "
-                    "stock; the per-SKU reorder explanation shows the "
-                    "effect.")
-
-                # 100%-dropship supplier toggle (v2.67.357: moved INTO
-                # the main form so it commits atomically with all the
-                # other config fields on Save). Pre-357 it lived below
-                # holiday closures.
-                st.markdown("**Dropship default**")
-                ds_col = st.columns([2, 4])
-                ds_default = ds_col[0].toggle(
-                    "All items from this supplier are dropship",
-                    value=bool(existing.get("dropship_default") or 0),
-                    key=f"sc_dropship_default_{_sk}",
-                    help="Use for suppliers where we never stock anything "
-                         "(e.g. Gyford). Every SKU whose primary supplier is "
-                         "this one will be treated as dropship — engine zeros "
-                         "target stock and reorder qty. You can still flag "
-                         "individual SKUs as dropship via the Ordering table "
-                         "for suppliers that are a mix.",
-                )
-                ds_col[1].caption(
-                    ":information_source: This only affects the local app's "
-                    "reorder logic. It doesn't write anything back to CIN7 — "
-                    "that integration is a separate phase."
-                )
-
-                # v2.67.357 — form_submit_button. Replaces the previous
-                # plain st.button; commits every widget above atomically.
-                # Named `sc_submitted` (not just `submitted`) because
-                # the holiday Add sub-form below reuses the variable
-                # name `submitted` for its own form_submit_button —
-                # without the rename the handler below would fire on
-                # any holiday-Add click.
-                _mismatch_ack = True
-                if _config_supplier_mismatch:
-                    _mismatch_ack = st.checkbox(
-                        f"I understand this will change {cfg_supplier}, "
-                        f"not the Draft PO supplier {_active_po_supplier}.",
-                        key=f"sc_mismatch_ack_{_sk}",
-                    )
-                sc_submitted = st.form_submit_button(
-                    "Save supplier config", type="primary")
-
-            # ------------------------------------------------------
-            # v2.67.284 — supplier holiday closures
-            # ------------------------------------------------------
-            # Buyers can add as many closure periods as they need
-            # (summer shutdowns, Chinese New Year, public holidays).
-            # The reorder engine adds any closed days within an
-            # order's cover window to the target, so an order
-            # placed before a shutdown auto-bridges it. ISO week
-            # numbers are shown next to dates because that's how
-            # buyers and European suppliers think.
-            st.markdown("**Holiday closures** — periods this "
-                         "supplier is shut")
-            st.caption(
-                ":information_source: The reorder engine adds the "
-                "closed days within an order's cover window to the "
-                "target — so an order placed before a shutdown "
-                "auto-bridges it. The per-SKU reorder explanation "
-                "names the closure (e.g. *'Topmet closed Wk 32–34: "
-                "+14 units cover'*).")
-
-            # --- Existing closures (read + delete) ----------------
-            existing_closures = db.get_supplier_holidays(cfg_supplier)
-            today_d = date.today()
-            this_week = today_d.isocalendar()[1]
-            st.caption(f"Today is **{today_d.isoformat()}** "
-                         f"(Wk {this_week}).")
-            if existing_closures:
-                hdr = st.columns([2, 2, 1, 4, 1])
-                hdr[0].markdown("**Start**")
-                hdr[1].markdown("**End**")
-                hdr[2].markdown("**Weeks**")
-                hdr[3].markdown("**Label**")
-                hdr[4].markdown("**·**")
-                for hol in existing_closures:
-                    s = hol.get("start_date")
-                    e = hol.get("end_date")
-                    if isinstance(s, str):
-                        try:
-                            s = date.fromisoformat(s[:10])
-                        except ValueError:
-                            continue
-                    if isinstance(e, str):
-                        try:
-                            e = date.fromisoformat(e[:10])
-                        except ValueError:
-                            continue
-                    ws = s.isocalendar()[1]
-                    we = e.isocalendar()[1]
-                    wk_str = (f"Wk {ws}" if ws == we
-                              else f"Wk {ws}-{we}")
-                    row_cols = st.columns([2, 2, 1, 4, 1])
-                    row_cols[0].write(s.isoformat())
-                    row_cols[1].write(e.isoformat())
-                    row_cols[2].write(wk_str)
-                    row_cols[3].write(hol.get("label") or "—")
-                    if row_cols[4].button(
-                            "🗑", key=f"del_hol_{hol['id']}",
-                            help="Remove this closure"):
-                        db.delete_supplier_holiday(
-                            int(hol["id"]), actor=actor_o)
-                        # v2.67.288 — NO _safe_cache_clear() here.
-                        # db.get_supplier_holidays() and
-                        # db.all_supplier_holidays_by_supplier() are
-                        # uncached direct reads — they pick up the
-                        # change on the next render. A global cache
-                        # clear evicts the ABC engine + every other
-                        # cached frame, which forces an expensive
-                        # rebuild on top of the still-resident old
-                        # caches and triggers Render memory crashes.
-                        st.rerun()
-            else:
-                st.caption("No closures recorded for this supplier "
-                             "yet. Add one below.")
-
-            # --- Add closure form ---------------------------------
-            with st.form(
-                    f"add_holiday_{cfg_supplier}",
-                    clear_on_submit=True):
-                fc = st.columns([2, 2, 1, 3, 1])
-                new_start = fc[0].date_input(
-                    "Closure start",
-                    value=today_d,
-                    key=f"hol_start_{cfg_supplier}",
-                )
-                new_end = fc[1].date_input(
-                    "Closure end",
-                    value=today_d,
-                    key=f"hol_end_{cfg_supplier}",
-                )
-                # Live week preview — buyer sees the ISO week range
-                # update as they pick dates (rerun on submit; this
-                # shows the *current* selection's weeks).
-                _ws = new_start.isocalendar()[1]
-                _we = new_end.isocalendar()[1]
-                _wk_preview = (f"Wk {_ws}" if _ws == _we
-                                else f"Wk {_ws}-{_we}")
-                fc[2].write(_wk_preview)
-                new_label = fc[3].text_input(
-                    "Label",
-                    placeholder="e.g. summer shutdown",
-                    key=f"hol_label_{cfg_supplier}",
-                )
-                submitted = fc[4].form_submit_button(
-                    "Add", type="primary")
-                if submitted:
-                    if new_end < new_start:
-                        st.error("End date is before start date.")
-                    else:
-                        db.add_supplier_holiday(
-                            cfg_supplier,
-                            new_start, new_end,
-                            label=(new_label or "").strip(),
-                            actor=actor_o)
-                        # v2.67.288 — NO _safe_cache_clear() here.
-                        # The closure list is read directly from
-                        # the DB on every render; clearing every
-                        # cache forced engine + apply to rebuild
-                        # while the old caches were still resident,
-                        # doubling memory and crashing Render.
-                        st.success(
-                            f"Added closure: {new_start} → "
-                            f"{new_end} ({_wk_preview})")
-                        st.rerun()
-
-            # v2.67.357 — old standalone Dropship section + Save
-            # button removed; both moved INSIDE the main st.form
-            # above so they commit atomically. Handler below now
-            # runs `if sc_submitted:` against the form_submit_button.
-            if (sc_submitted and _config_supplier_mismatch
-                    and not _mismatch_ack):
-                st.error(
-                    "Not saved: Supplier configuration is editing "
-                    f"{cfg_supplier}, while the Draft PO supplier is "
-                    f"{_active_po_supplier}. Tick the confirmation box "
-                    "or turn alignment back on."
-                )
-                sc_submitted = False
-            if sc_submitted:
-                _ss = st.session_state
-                _sfA_save = float(_ss.get(f"sc_sfA_{_sk}", sf_A))
-                _sfB_save = float(_ss.get(f"sc_sfB_{_sk}", sf_B))
-                _sfC_save = float(_ss.get(f"sc_sfC_{_sk}", sf_C))
-                _rvA_save = int(_ss.get(f"sc_rvA_{_sk}", rv_A))
-                _rvB_save = int(_ss.get(f"sc_rvB_{_sk}", rv_B))
-                _rvC_save = int(_ss.get(f"sc_rvC_{_sk}", rv_C))
-                _ltsea_save = int(_ss.get(f"sc_sea_{_sk}", lt_sea))
-                _ltair_save = int(_ss.get(f"sc_air_{_sk}", lt_air))
-                _airmax_save = int(_ss.get(f"sc_airmax_{_sk}", air_max))
-                _moq_save = float(_ss.get(f"sc_moq_{_sk}", moq))
-                _mov_save = float(_ss.get(f"sc_mov_{_sk}", mov))
-                _existing_moq_save = float(existing.get("moq_units") or 0)
-                _existing_mov_save = float(existing.get("mov_amount") or 0)
-                _minimums_preserved = []
-                if _moq_save <= 0 and _existing_moq_save > 0:
-                    _moq_save = _existing_moq_save
-                    _minimums_preserved.append("MOQ")
-                if _mov_save <= 0 and _existing_mov_save > 0:
-                    _mov_save = _existing_mov_save
-                    _minimums_preserved.append("MOV")
-                _movccy_save = (_ss.get(f"sc_movccy_{_sk}", mov_ccy)
-                                or "USD")
-                _pref_save = (_ss.get(f"sc_pref_{_sk}", pref_freight)
-                              or "sea")
-                _airdef_save = _ss.get(f"sc_air_def_{_sk}", air_def)
-                _cadence_save = int(_ss.get(
-                    f"sc_cadence_{_sk}", order_cadence))
-                _ds_save = bool(_ss.get(
-                    f"sc_dropship_default_{_sk}", ds_default))
-                # Show what we're ABOUT to write — buyer can spot a
-                # widget-state lag before the DB even gets touched.
-                st.caption(
-                    f"💾 Writing to **{cfg_supplier}**: "
-                    f"safety A/B/C = {_sfA_save:.0f}/{_sfB_save:.0f}/"
-                    f"{_sfC_save:.0f}%  ·  sea LT {_ltsea_save}d  ·  "
-                    f"cadence {_cadence_save}d"
-                )
-                if _minimums_preserved:
-                    st.caption(
-                        "Protected existing "
-                        + "/".join(_minimums_preserved)
-                        + " from being cleared by a zero reload."
-                    )
-                db.set_supplier_config(
-                    cfg_supplier_key or cfg_supplier,
-                    lead_time_sea_days=_ltsea_save,
-                    lead_time_air_days=(_ltair_save
-                                         if _ltair_save > 0 else None),
-                    air_eligible_default=(1 if _airdef_save == "Yes"
-                                           else 0),
-                    air_max_length_mm=(_airmax_save
-                                        if _airmax_save > 0 else None),
-                    moq_units=_moq_save if _moq_save > 0 else None,
-                    mov_amount=_mov_save if _mov_save > 0 else None,
-                    mov_currency=_movccy_save or None,
-                    preferred_freight=_pref_save,
-                    safety_pct_A=_sfA_save,
-                    safety_pct_B=_sfB_save,
-                    safety_pct_C=_sfC_save,
-                    review_days_A=_rvA_save,
-                    review_days_B=_rvB_save,
-                    review_days_C=_rvC_save,
-                    order_cadence_days=(_cadence_save
-                                         if _cadence_save > 0 else None),
-                    dropship_default=1 if _ds_save else 0,
-                    actor=actor_o,
-                )
-                # v2.67.289 — NO _safe_cache_clear() here.
-                # db.all_supplier_configs() is an uncached direct
-                # DB read, so the engine picks up the new cadence
-                # on the next render automatically. A GLOBAL cache
-                # clear evicts the ABC engine + every other frame,
-                # which causes a rebuild on top of still-resident
-                # caches and crashes Render's 2GB memory ceiling.
-                # v2.67.318 — explicitly drop the reorder cache-skip
-                # signature so the NEXT render is GUARANTEED to re-run
-                # _compute_target_and_reorder with the new config.
-                # v2.67.346 — also clear the engine's cache_resource
-                # so any derived columns that depend on supplier cfg
-                # (avg_daily/target/Status ladder) rebuild from scratch.
-                # James 2026-06-02: config saves were still leaving
-                # the table looking stale. A TARGETED clear of just
-                # _get_engine_df (not the global cache_data store) is
-                # safe — only one engine in memory at a time, no
-                # multi-frame pile-up that triggers the 2GB ceiling.
-                st.session_state.pop("_reorder_apply_sig", None)
-                try:
-                    _get_engine_df.clear()
-                except Exception:  # noqa: BLE001
-                    pass
-                st.session_state["_engine_last_built_at"] = datetime.now()
-                # v2.67.347 — verbose confirmation so the buyer can SEE
-                # which supplier got which values. Previously a tight
-                # "Saved config for {supplier}" hid whether the
-                # numbers actually changed. Persist the message across
-                # the rerun so it's still visible after the page
-                # rebuilds.
-                _confirm = (
-                    f"✅ Saved **{cfg_supplier}**: "
-                    f"sea LT {_ltsea_save}d · air LT "
-                    f"{_ltair_save if _ltair_save > 0 else '—'}d · "
-                    f"safety A/B/C {_sfA_save:.0f}/{_sfB_save:.0f}/"
-                    f"{_sfC_save:.0f}% · review A/B/C "
-                    f"{_rvA_save}/{_rvB_save}/{_rvC_save}d · cadence "
-                    f"{_cadence_save if _cadence_save > 0 else '—'}d"
-                )
-                st.session_state["_sc_last_save_msg"] = _confirm
-                st.success(_confirm)
-                st.rerun()
-
-            # Current config table
-            if supp_configs:
-                cfg_rows = []
-                for name, c in sorted(supp_configs.items()):
-                    cfg_rows.append({
-                        "Supplier": name,
-                        "Sea LT": c.get("lead_time_sea_days"),
-                        "Air LT": (str(c.get("lead_time_air_days"))
-                                    if c.get("lead_time_air_days") else "—"),
-                        "Air elig.": "Yes" if c.get("air_eligible_default") else "No",
-                        "Air max len": (str(c.get("air_max_length_mm"))
-                                         if c.get("air_max_length_mm") else "—"),
-                        "Cadence": (f"{c.get('order_cadence_days')}d"
-                                     if c.get("order_cadence_days")
-                                     else "—"),
-                        "MOQ": (str(c.get("moq_units"))
-                                 if c.get("moq_units") else "—"),
-                        "MOV": (f"{c.get('mov_currency') or ''}"
-                                f"{c.get('mov_amount') or '—'}"),
-                        "Pref freight": c.get("preferred_freight"),
-                        "Dropship": ("📦 all items"
-                                      if c.get("dropship_default") else ""),
-                    })
-                st.dataframe(pd.DataFrame(cfg_rows),
-                             width="stretch", hide_index=True)
-
-    # --- Assign products to a supplier (v2.67.321) ---------------------
-    # Replaces the old read-only "supplier-assignment audit" (removed —
-    # James 2026-05-28: "the audit is useless, it does not work"). It
-    # only DIAGNOSED the gap and gave no way to fix it; worse, the only
-    # per-SKU override UI was on the LED Tubes page with a TUBE-ONLY SKU
-    # picker, so non-tube products (LED-POLI-MOUNT, LED-HR-MAX-2,
-    # LED-NEON-FLEX-NICHO-*, etc. — Neonica's neon/profile range) could
-    # never be assigned through the app at all. That's why they never
-    # appeared under "Neonica Polska Sp. z o.o.".
-    #
-    # This tool writes per-SKU overrides — the TOP resolution tier
-    # (override > CIN7-native > family-rule > PO-history > unassigned) —
-    # so pasted SKUs land under the chosen supplier IMMEDIATELY,
-    # regardless of CIN7 product-master or PO-history state. Paste,
-    # pick, Assign.
-    # v2.67.322 — unassigned-supplier count, shown on the expander
-    # label so James can see the scope at a glance (he asked "how many
-    # other items aren't assigned"). A SKU is "(unassigned)" ONLY when
-    # CIN7's own product.Suppliers array is empty for it AND there's no
-    # PO history / override — i.e. CIN7 itself has no supplier on the
-    # product. Our records already match CIN7's product master; the
-    # parser reads the exact `SupplierName` key CIN7 returns. We split
-    # the count into "with demand" (worth assigning) vs total so the
-    # number isn't inflated by dead/accessory SKUs.
-    _orderable_all = engine_df[~engine_df["is_non_master_tube"].fillna(False)]
-    _unassigned_all = _orderable_all[
-        _orderable_all["Supplier"] == "(unassigned)"]
-    _unassigned_demand = _unassigned_all[
-        _unassigned_all.get(
-            "effective_units_12mo", pd.Series(dtype=float)).fillna(0) > 0]
-    _n_unassigned = len(_unassigned_all)
-    _n_unassigned_demand = len(_unassigned_demand)
-    _assign_hdr = (
-        f"🏷️ Assign products to a supplier — "
-        f"{_n_unassigned_demand} unassigned with demand"
-        + (f" ({_n_unassigned} total)" if _n_unassigned
-           != _n_unassigned_demand else "")
-    )
-    with st.expander(_assign_hdr, expanded=False):
-        st.caption(
-            f"**{_n_unassigned} orderable SKUs are unassigned** "
-            f"({_n_unassigned_demand} of them sold something in the last "
-            f"12 months — those are the ones worth assigning). A SKU is "
-            f"unassigned only when **CIN7's own product record has no "
-            f"supplier** set on it (empty Suppliers) and we've never "
-            f"raised a PO for it. Our resolution reads CIN7's product "
-            f"`Suppliers` field directly, so once you set the supplier in "
-            f"CIN7 it flows through on the next daily product sync (7 AM) "
-            f"— or assign it here for an immediate override."
-        )
-        if _n_unassigned_demand and st.checkbox(
-            f"📋 Show the {_n_unassigned_demand} unassigned SKUs with "
-            f"demand (copy into the box below)",
-            key="show_unassigned_list"):
-            _ua_cols = [c for c in
-                        ["SKU", "Name", "effective_units_12mo",
-                         "customers_12mo", "OnHand"]
-                        if c in _unassigned_demand.columns]
-            st.dataframe(
-                _unassigned_demand[_ua_cols].sort_values(
-                    "effective_units_12mo", ascending=False).rename(
-                    columns={"effective_units_12mo": "12mo units",
-                             "customers_12mo": "customers"}),
-                hide_index=True, use_container_width=True, height=300)
-        _actor_assign = st.session_state.get("current_user", "").strip()
-        if not _actor_assign:
-            st.caption("Enter your name in the sidebar to assign suppliers.")
-        else:
-            # Supplier options: master file + already-resolved buckets +
-            # existing overrides.
-            _known_sups = set()
-            if not suppliers.empty and "Name" in suppliers.columns:
-                _known_sups.update(
-                    suppliers["Name"].dropna().astype(str).tolist())
-            _known_sups.update(
-                s for s in engine_df["Supplier"].unique()
-                if s and s != "(unassigned)")
-            _known_sups.update(db.all_sku_supplier_overrides().values())
-            _known_sups = sorted(x for x in _known_sups if x)
-            st.markdown(
-                "Paste one or more **SKUs** (one per line), pick the "
-                "**supplier**, and Assign. This sets a per-SKU override — "
-                "the highest-priority rule — so the products show under "
-                "that supplier's reorder view immediately, even if CIN7's "
-                "product record or PO history says otherwise."
-            )
-            ac1, ac2 = st.columns([2, 2])
-            _sku_paste = ac1.text_area(
-                "SKUs (one per line)", height=170,
-                key="bulk_assign_skus",
-                placeholder=("LED-POLI-MOUNT\nLED-HR-MAX-2\n"
-                             "LED-NEON-FLEX-NICHO-3000K-1"),
-            )
-            _sup_choice = (ac2.selectbox(
-                "Supplier", _known_sups, key="bulk_assign_supplier")
-                if _known_sups else None)
-            _assign_note = ac2.text_input(
-                "Note (optional)", key="bulk_assign_note",
-                placeholder="e.g. Neonica neon/profile range")
-            if ac2.button(
-                "Assign these SKUs", key="bulk_assign_go", type="primary",
-                disabled=not (_sku_paste.strip() and _sup_choice),
-            ):
-                _skus = [s.strip() for s in _sku_paste.splitlines()
-                         if s.strip()]
-                _valid = set(engine_df["SKU"].astype(str))
-                _done, _unknown = [], []
-                for _sk in _skus:
-                    if _sk in _valid:
-                        db.set_sku_supplier(
-                            _sk, _sup_choice, _actor_assign, _assign_note)
-                        _done.append(_sk)
-                    else:
-                        _unknown.append(_sk)
-                if _done:
-                    st.success(
-                        f"Assigned {len(_done)} SKU(s) to "
-                        f"**{_sup_choice}**. Rebuilding engine…")
-                if _unknown:
-                    st.warning(
-                        "Not found in the catalog (check spelling — the "
-                        "SKU must match exactly): " + ", ".join(_unknown))
-                if _done:
-                    # Override is read at engine-compute time, so the
-                    # engine must rebuild for the new bucket to appear.
-                    st.session_state.pop("_reorder_apply_sig", None)
-                    try:
-                        _get_engine_df.clear()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    st.rerun()
-            # Current overrides + clear control.
-            _curr_over = db.all_sku_supplier_overrides()
-            if _curr_over:
-                st.markdown("**Current per-SKU overrides**")
-                st.dataframe(
-                    pd.DataFrame(
-                        [{"SKU": k, "Supplier": v}
-                         for k, v in sorted(_curr_over.items())]),
-                    hide_index=True, use_container_width=True, height=200)
-                cc1, cc2 = st.columns([2, 1])
-                _clear_pick = cc1.selectbox(
-                    "Clear an override", ["—"] + sorted(_curr_over.keys()),
-                    key="bulk_clear_pick")
-                if cc2.button("Clear override", key="bulk_clear_go",
-                               disabled=(_clear_pick == "—")):
-                    db.clear_sku_supplier(_clear_pick, _actor_assign)
-                    st.session_state.pop("_reorder_apply_sig", None)
-                    try:
-                        _get_engine_df.clear()
-                    except Exception:  # noqa: BLE001
-                        pass
-                    st.rerun()
-
+    _ctx = _build_ordering_context()
+    engine_df = _ctx.engine_df
+    supp_configs = _ctx.supp_configs
+    closures_by_supplier = _ctx.closures_by_supplier
+    ip_lead_times_by_sku = _ctx.ip_lead_times_by_sku
+    sku_buying_settings = _ctx.sku_buying_settings
+    dropship_skus = _ctx.dropship_skus
+    excluded_skus = _ctx.excluded_skus
+    latest_notes_map = _ctx.latest_notes_map
+    dormancy_warnings_map = _ctx.dormancy_warnings_map
+    _compute_target_and_reorder = _ctx.compute_target_and_reorder
+    _sku_buying_values = _ctx.sku_buying_values
+    _ceil_to_multiple = _ctx.ceil_to_multiple
+    _render_sku_detail = _ctx.render_sku_detail
+
+    # v2.67.xxx -- Stock optimisation overview and Supplier configuration
+    # used to render inline here; both moved to their own pages under
+    # Buying (see PAGE_GROUPS in app_config.py) so buyers can reach this
+    # workbench without scrolling past periodic/admin content. See
+    # _build_ordering_context for the shared setup all three pages use.
     # --- Supplier-focused view -----------------------------------------
     st.markdown("### :clipboard: Draft PO — by supplier")
 
@@ -19476,6 +18514,1084 @@ elif page == "Ordering":
 # Future: Meta Ads (when OAuth is provisioned), Pinterest, TikTok.
 # Each new platform writes into ad_campaigns_daily with its own
 # 'platform' tag; this page auto-picks them up.
+
+
+# ---------------------------------------------------------------------------
+# Page: Stock Optimisation (split out of Ordering -- see _build_ordering_
+# context's docstring and the Ordering elif's own comment for why)
+# ---------------------------------------------------------------------------
+elif page == "Stock Optimisation":
+    _ctx = _build_ordering_context()
+    engine_df = _ctx.engine_df
+    supp_configs = _ctx.supp_configs
+    closures_by_supplier = _ctx.closures_by_supplier
+    ip_lead_times_by_sku = _ctx.ip_lead_times_by_sku
+    sku_buying_settings = _ctx.sku_buying_settings
+    dropship_skus = _ctx.dropship_skus
+    excluded_skus = _ctx.excluded_skus
+    latest_notes_map = _ctx.latest_notes_map
+    dormancy_warnings_map = _ctx.dormancy_warnings_map
+    _compute_target_and_reorder = _ctx.compute_target_and_reorder
+    _sku_buying_values = _ctx.sku_buying_values
+    _ceil_to_multiple = _ctx.ceil_to_multiple
+    _render_sku_detail = _ctx.render_sku_detail
+
+    # --- Top-of-page stock optimisation headline -----------------------
+    st.markdown("### :moneybag: Stock optimisation overview")
+
+    # Master-only view for TARGET calculations (non-masters have
+    # target=0; they roll their demand up to masters). But CURRENT
+    # stock value sums across ALL SKUs because physical cuts held
+    # from returns/over-production are real working capital.
+    master_only = engine_df[~engine_df["is_non_master_tube"]]
+
+    # v2.67.37 — headline must match CIN7 / Overview / Monthly
+    # Metrics. Use the shared `_headline_stock_value` helper which
+    # sums CIN7's StockOnHand directly (no AverageCost fallback).
+    # The richer per-SKU `OnHandValue` column on engine_df (with
+    # family/category-median fallbacks for missing costs) is still
+    # used downstream for excess/optimum calculations — those need
+    # a sensible number for every row, but the headline does not.
+    # Sum-of-OnHandValue and headline differ by exactly the dollar
+    # contribution of SKUs where CIN7 hasn't published a FIFO value
+    # but our cost chain estimated one.
+    total_onhand_value = _headline_stock_value(stock, products)
+    # Internal/diagnostic: total-with-fallback for cost-coverage
+    # logging. NOT shown as the headline tile.
+    total_onhand_value_with_fallback = float(engine_df["OnHandValue"].sum())
+
+    # Optimum / target: master SKUs only (non-masters have target=0).
+    total_target_value = float(master_only["TargetValue"].sum())
+
+    # Excess — two-part definition:
+    #   Masters: OnHandValue above TargetValue (classic overstock)
+    #   Non-masters: OnHandValue ONLY IF direct sales == 0 (true dead
+    #     physical cuts; cuts with their own direct sales are treated
+    #     as working inventory, not excess)
+    def _row_excess_value(r):
+        if bool(r.get("is_non_master_tube")):
+            if float(r.get("units_12mo") or 0) == 0:
+                return float(r.get("OnHandValue") or 0)
+            return 0.0  # has direct sales → working inventory
+        # Master
+        ohv = float(r.get("OnHandValue") or 0)
+        tv = float(r.get("TargetValue") or 0)
+        return max(0.0, ohv - tv)
+
+    engine_df["row_excess_value"] = engine_df.apply(
+        _row_excess_value, axis=1)
+    total_excess_value = float(engine_df["row_excess_value"].sum())
+
+    # v2.67.282 — Understock counterpart. "Excess" floors every SKU
+    # at zero, so it only counts SKUs OVER target and never nets the
+    # ones UNDER it. Without this half the tiles look contradictory:
+    # Current − Optimum (a NET figure) never equals Excess (a GROSS
+    # one). Understock = master SKUs below TargetValue, summed — the
+    # cash you'd redeploy bringing them up to target.
+    def _row_understock_value(r):
+        if bool(r.get("is_non_master_tube")):
+            return 0.0  # non-masters roll up; target = 0
+        ohv = float(r.get("OnHandValue") or 0)
+        tv = float(r.get("TargetValue") or 0)
+        return max(0.0, tv - ohv)
+
+    engine_df["row_understock_value"] = engine_df.apply(
+        _row_understock_value, axis=1)
+    total_understock_value = float(
+        engine_df["row_understock_value"].sum())
+    # Master-only overstock for the EXACT reconciliation identity:
+    #   master_overstock − understock == master_onhand − optimum.
+    master_overstock_value = float(
+        engine_df.loc[~engine_df["is_non_master_tube"],
+                       "row_excess_value"].sum())
+    master_onhand_value = float(master_only["OnHandValue"].sum())
+    net_over_position = master_overstock_value - total_understock_value
+
+    # Dead stock: zero effective demand AND physical stock held.
+    # For masters, use the engine's Status flag. For non-masters,
+    # also include them if they have physical stock but zero direct sales.
+    dead_master_value = float(
+        master_only.loc[master_only["Status"] == "💀 Dead stock",
+                         "OnHandValue"].sum()
+    )
+    dead_cut_value = float(
+        engine_df.loc[
+            engine_df["is_non_master_tube"]
+            & (engine_df["units_12mo"] == 0)
+            & (engine_df["OnHandValue"] > 0),
+            "OnHandValue",
+        ].sum()
+    )
+    dead_value = dead_master_value + dead_cut_value
+
+    # Cost-coverage diagnostics across MASTERS (what drives optimum)
+    cov = master_only["CostBasisDetail"].value_counts().to_dict()
+    direct_c = cov.get("direct", 0)
+    fam_c = cov.get("family-median", 0)
+    cat_c = cov.get("category-median", 0)
+    unk_c = cov.get("unknown", 0)
+
+    # v2.67.305 — tucked into a collapsed expander. Pre-cleanup
+    # the cost-basis caption sat between the section header and
+    # the five metric tiles as a wall of small grey text, making
+    # the page feel busy and pushing the tiles below the fold on
+    # smaller laptops. Staff don't need this detail at first
+    # glance — it's a finance-trust note. One click to expand.
+    with st.expander(
+            "ℹ️ Cost basis coverage & scope notes",
+            expanded=False):
+        st.markdown(
+            f"**Cost basis coverage (masters, drives Optimum)**: "
+            f"direct CIN7 cost on **{direct_c:,}**; "
+            f"family-median fallback on {fam_c:,}; "
+            f"category-median fallback on {cat_c:,}; "
+            f"no cost info (contribute $0 to Optimum) on "
+            f"**{unk_c:,}**.\n\n"
+            f"**Scope note**: Current value sums across all "
+            f"{len(engine_df):,} SKUs (real physical dollars); "
+            f"Optimum across {len(master_only):,} masters only "
+            f"(non-masters roll up to their masters)."
+        )
+
+    oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+    # v2.67.37 — headline now ties to Overview + Monthly Metrics.
+    # Help text spells out the tie-out so the buyer trusts it.
+    _fallback_delta = total_onhand_value_with_fallback - total_onhand_value
+    oc1.metric("Current stock value",
+               _fmt_money(total_onhand_value),
+               help=(
+                   "CIN7's FIFO inventory value (sum of StockOnHand "
+                   "across all SKUs). MATCHES the Overview page's "
+                   "'Stock value (FIFO, CIN7)' tile and the Monthly "
+                   "Metrics report (commissions reference). v2.67.37 "
+                   "unified the three so they tie out exactly. "
+                   f"For internal diagnostics, an OnHand × cost-chain "
+                   f"fallback estimate would add "
+                   f"~{_fmt_money(_fallback_delta)} for SKUs where "
+                   "CIN7 hasn't published a FIFO number — that "
+                   "estimate is used for per-SKU excess/optimum "
+                   "math, NOT the headline."))
+    oc2.metric("Optimum stock value",
+               _fmt_money(total_target_value),
+               help="Sum of target_stock × AverageCost per SKU. "
+                    "This is what your working capital should be at.")
+    oc3.metric("Excess (cash to free up)",
+               _fmt_money(total_excess_value),
+               delta=f"{total_excess_value/total_onhand_value*100:.1f}% of current"
+                     if total_onhand_value else None,
+               delta_color="inverse",
+               help="OnHand beyond target stock, by SKU, summed. "
+                    "The money sitting on shelves that doesn't need to be.")
+    oc4.metric("Understock (cash to redeploy)",
+               _fmt_money(total_understock_value),
+               help="Master SKUs sitting BELOW target stock, by "
+                    "SKU, summed — the working capital you'd "
+                    "redeploy to bring them up to target. The "
+                    "counterpart to Excess: netting the two "
+                    "(Excess − Understock) gives your TRUE "
+                    "over-position, which Current − Optimum on "
+                    "its own doesn't reveal.")
+    oc5.metric("Dead stock (zero demand, holding stock)",
+               _fmt_money(dead_value),
+               help="Two buckets combined: "
+                    "(1) MASTER SKUs with zero effective 12-month demand "
+                    "(direct + migrated + rolled-up) AND physical stock. "
+                    "(2) Non-master variants with physical stock AND zero "
+                    "direct sales. "
+                    "Non-masters that HAVE direct sales are treated as "
+                    "working inventory, not dead.")
+
+    # v2.67.305 — reconciliation moved into a collapsed expander.
+    # Pre-cleanup this was 6+ lines of small math text directly
+    # under the tile row — useful for finance, noise for buying
+    # staff. Top-line takeaway lives in the expander label so the
+    # reader sees the key number without expanding.
+    _net_cash_freeable = (
+        total_excess_value - total_understock_value)
+    with st.expander(
+            f"📐 How these tiles reconcile · net cash you "
+            f"could actually free ≈ "
+            f"{_fmt_money(_net_cash_freeable)}",
+            expanded=False):
+        st.markdown(
+            f"**Excess ({_fmt_money(total_excess_value)})** is "
+            f"the GROSS cash recoverable by selling every "
+            f"over-target SKU down to target. **Understock "
+            f"({_fmt_money(total_understock_value)})** is what "
+            f"you'd re-spend bringing under-target SKUs UP to "
+            f"target.\n\n"
+            f"Across master SKUs: overstock "
+            f"{_fmt_money(master_overstock_value)} − understock "
+            f"{_fmt_money(total_understock_value)} = "
+            f"**{_fmt_money(net_over_position)}** genuinely tied "
+            f"up above target (this equals master on-hand "
+            f"{_fmt_money(master_onhand_value)} − Optimum).\n\n"
+            f"That's why Excess is larger than Current − Optimum "
+            f"({_fmt_money(total_onhand_value - total_target_value)}) "
+            f"— Excess never nets the under-stocked SKUs back in. "
+            f"**Net working capital you could actually free ≈ "
+            f"{_fmt_money(_net_cash_freeable)}**.\n\n"
+            f"Current value is higher again because it spans ALL "
+            f"SKUs at CIN7 FIFO cost, while Optimum / Excess / "
+            f"Understock are master-SKU figures using cost-chain "
+            f"fallbacks.")
+
+    # v2.67.178 — Glide path to engine-derived optimum (replaces
+    # the old hard-coded $600k target). The engine's Optimum tile
+    # above is the goal; this strip shows the gap + projection.
+    #
+    # Projection: at the trailing-90-day rate of slow-mover
+    # clearance, how many months until current → optimum?
+    # Anchors on the "Slow movers cleared" math used by the
+    # Slow Movers page so the figures are tied together.
+    _optimum = max(1.0, float(total_target_value))
+    _gap = total_onhand_value - _optimum
+    _pct_of_optimum = (total_onhand_value / _optimum * 100
+                          if _optimum else 0)
+    if _gap > 0:
+        # Above target — show projection-to-optimum based on
+        # recent slow-mover clearance velocity.
+        try:
+            _warns_proj = db.get_dormancy_warnings() or {}
+        except Exception:
+            _warns_proj = {}
+        try:
+            _today = pd.Timestamp(datetime.now().date())
+            _ninety = _today - pd.Timedelta(days=90)
+            _clr = _compute_slow_mover_clearance(
+                stock, sale_lines, products, _warns_proj,
+                _ninety, _today)
+            _monthly_clearance = float(
+                _clr.get("cost_value") or 0) / 3.0
+        except Exception:
+            _monthly_clearance = 0.0
+        if _monthly_clearance > 0:
+            _months_to_optimum = _gap / _monthly_clearance
+            _eta_text = (
+                f" · at trailing-90d clearance rate of "
+                f"${_monthly_clearance:,.0f}/mo, gap closes in "
+                f"~**{_months_to_optimum:.1f} months**")
+        else:
+            _eta_text = (
+                " · no slow-mover sales in trailing 90d — "
+                "ETA can't be computed; lean on AI-Assistant + "
+                "promotions to drive clearance")
+        st.progress(min(1.0, _optimum / total_onhand_value),
+                     text=(f"Current stock is "
+                              f"${_gap:,.0f} **above optimum** "
+                              f"(${_optimum:,.0f}) "
+                              f"— {_pct_of_optimum:.0f}% of "
+                              f"optimum{_eta_text}"))
+    else:
+        st.progress(min(1.0, _pct_of_optimum / 100),
+                     text=(f"Current stock is "
+                              f"{_pct_of_optimum:.0f}% of "
+                              f"optimum (${_optimum:,.0f}) "
+                              f"— you're **under** by "
+                              f"${-_gap:,.0f}. Keep ordering "
+                              f"per the recommendations above."))
+
+
+
+# ---------------------------------------------------------------------------
+# Page: Supplier Setup (split out of Ordering -- lead times, MOQ/MOV,
+# freight, holiday closures, and product-to-supplier assignment. Distinct
+# from "Supplier Pricing", which covers tier prices/setup fees/pack qty.)
+# ---------------------------------------------------------------------------
+elif page == "Supplier Setup":
+    _ctx = _build_ordering_context()
+    engine_df = _ctx.engine_df
+    supp_configs = _ctx.supp_configs
+    closures_by_supplier = _ctx.closures_by_supplier
+    ip_lead_times_by_sku = _ctx.ip_lead_times_by_sku
+    sku_buying_settings = _ctx.sku_buying_settings
+    dropship_skus = _ctx.dropship_skus
+    excluded_skus = _ctx.excluded_skus
+    latest_notes_map = _ctx.latest_notes_map
+    dormancy_warnings_map = _ctx.dormancy_warnings_map
+    _compute_target_and_reorder = _ctx.compute_target_and_reorder
+    _sku_buying_values = _ctx.sku_buying_values
+    _ceil_to_multiple = _ctx.ceil_to_multiple
+    _render_sku_detail = _ctx.render_sku_detail
+
+    # --- Supplier configuration ----------------------------------------
+    st.markdown("### :gear: Supplier configuration")
+    with st.expander("Configure lead times, MOQ/MOV, freight per supplier"):
+        actor_o = st.session_state.get("current_user", "").strip()
+        if not actor_o:
+            st.caption("Enter your name in the sidebar to edit.")
+        else:
+            # Known suppliers — same top-15-by-spend + alphabetical
+            # ordering as the main PO dropdown for consistency.
+            known = set()
+            if not suppliers.empty and "Name" in suppliers.columns:
+                known.update(suppliers["Name"].dropna().astype(str).tolist())
+            known.update(engine_df["Supplier"].unique().tolist())
+            known.update(supp_configs.keys())
+            known.discard("(unassigned)")
+            known_list = list(known)
+
+            # Rank by spend (reuse spend_by_supplier computed above in
+            # the main PO dropdown if available, otherwise rebuild).
+            _spend_map = dict(spend_by_supplier) if 'spend_by_supplier' in dir() else {}
+            if not _spend_map and not purchase_lines.empty:
+                _pl = purchase_lines.copy()
+                _pl["Total"] = _to_num(_pl["Total"]).fillna(0)
+                _spend_map = _pl.groupby("Supplier")["Total"].sum().to_dict()
+
+            ranked_cfg = sorted(
+                [(s, _spend_map.get(s, 0)) for s in known_list],
+                key=lambda x: -x[1],
+            )
+            top15_cfg = [s for s, _ in ranked_cfg[:15]
+                          if _spend_map.get(s, 0) > 0]
+            rest_cfg = sorted([s for s in known_list if s not in top15_cfg])
+
+            def _cfg_label(s):
+                sp = _spend_map.get(s, 0)
+                if s in top15_cfg and sp > 0:
+                    return f"{s}  —  ${sp:,.0f} spend"
+                return s
+
+            cfg_options = top15_cfg + rest_cfg
+            cfg_labels = [_cfg_label(s) for s in cfg_options]
+            cfg_label_to_sup = dict(zip(cfg_labels, cfg_options))
+
+            def _cfg_supplier_from_label(label: object) -> str:
+                label_s = str(label or "").strip()
+                if label_s in cfg_label_to_sup:
+                    return cfg_label_to_sup[label_s]
+                if "  —  $" in label_s:
+                    return label_s.split("  —  $", 1)[0].strip()
+                return label_s
+
+            def _cfg_label_for_supplier(supplier_name: str) -> str | None:
+                for label, mapped_supplier in cfg_label_to_sup.items():
+                    if mapped_supplier == supplier_name:
+                        return label
+                return None
+
+            # Keep supplier config aligned with the Draft PO supplier by
+            # default. The config form renders above the PO supplier
+            # picker, so read the picker from session_state. This prevents
+            # the "editing Neonica while drafting Snapfix" trap Andrew
+            # hit on 2026-07-02.
+            _active_po_supplier = str(
+                st.session_state.get("ordering_active_supplier") or ""
+            ).strip()
+            if not _active_po_supplier:
+                _active_po_supplier = _cfg_supplier_from_label(
+                    st.session_state.get("ord_supplier_label"))
+            if _active_po_supplier not in cfg_options:
+                _active_po_supplier = ""
+            _active_po_label = (
+                _cfg_label_for_supplier(_active_po_supplier)
+                if _active_po_supplier else None
+            )
+            _follow_key = "sc_follow_draft_supplier"
+            if _follow_key not in st.session_state:
+                st.session_state[_follow_key] = True
+            if (_active_po_label
+                    and st.session_state.get(_follow_key, True)):
+                st.session_state["sc_sup_label"] = _active_po_label
+
+            scol1, scol2 = st.columns([1.2, 2.8])
+            cfg_label_pick = scol1.selectbox(
+                "Supplier to configure  "
+                "(top 15 by 12mo spend, then A-Z)",
+                cfg_labels, key="sc_sup_label",
+            )
+            cfg_supplier = cfg_label_to_sup[cfg_label_pick]
+            cfg_supplier_key = " ".join(str(cfg_supplier).split()).strip()
+            existing = supp_configs.get(
+                cfg_supplier_key, supp_configs.get(cfg_supplier, {}))
+            follow_draft_supplier = scol2.checkbox(
+                "Keep Supplier configuration aligned with Draft PO supplier",
+                key=_follow_key,
+                help=(
+                    "When this is on, the supplier config form follows the "
+                    "supplier selected in Draft PO by supplier. Turn it off "
+                    "only when you intentionally want to edit a different "
+                    "supplier's defaults."
+                ),
+            )
+            _config_supplier_mismatch = bool(
+                _active_po_supplier and cfg_supplier != _active_po_supplier)
+            if _active_po_supplier and follow_draft_supplier:
+                scol2.caption(
+                    f"Draft PO supplier: **{_active_po_supplier}**. "
+                    "Supplier configuration is following it.")
+            elif _config_supplier_mismatch:
+                scol2.warning(
+                    f"Draft PO supplier is **{_active_po_supplier}**, but "
+                    f"this form is editing **{cfg_supplier}**.")
+
+            # v2.67.347 — widget keys are supplier-specific so switching
+            # suppliers in the picker properly re-renders the fields
+            # with that supplier's persisted values. James 2026-06-02:
+            # safety changes appeared to "not save" — likely because
+            # Streamlit's session_state on static keys (sc_sfA etc.)
+            # kept showing a previously-edited supplier's value, so a
+            # save wrote that value back unchanged.
+            _sk = (
+                "".join(ch if ch.isalnum() else "_"
+                        for ch in (cfg_supplier or "_"))
+                .strip("_")[:60]
+            )
+
+            # Loud current-supplier banner so the buyer can never miss
+            # which supplier they're editing.
+            st.info(
+                f"⚙️ Editing config for **{cfg_supplier}** — "
+                "all fields below reflect THIS supplier's saved values."
+            )
+            # v2.67.349 — diagnostic for "save persisted but engine
+            # doesn't see it" scenarios (invisible-char mismatch).
+            with st.expander(
+                "🔬 Diagnose supplier-name match", expanded=False,
+            ):
+                _cs_repr = repr(cfg_supplier)
+                _cs_norm = " ".join(str(cfg_supplier).split()).strip()
+                st.markdown(
+                    f"- Picker selection raw `repr()`: `{_cs_repr}`\n"
+                    f"- Canonicalised: `{_cs_norm!r}`"
+                )
+                # Engine-resolved supplier strings for SKUs assigned
+                # to this supplier (any variant).
+                if "engine_df" in dir() and not engine_df.empty:
+                    _eng_sups = (
+                        engine_df["Supplier"].dropna().astype(str)
+                        .unique().tolist())
+                    _matches = [
+                        s for s in _eng_sups
+                        if (" ".join(s.split()).strip()
+                            == _cs_norm)
+                    ]
+                    _close = [
+                        s for s in _eng_sups
+                        if s.strip().lower() == _cs_norm.lower()
+                        and s not in _matches
+                    ]
+                    st.markdown(
+                        f"- Engine-side variants matching this "
+                        f"canonical name: **{len(_matches)}**\n"
+                        + "\n".join(
+                            f"  - `{r!r}`" for r in _matches[:5])
+                    )
+                    if _close:
+                        st.warning(
+                            "Other engine strings that almost match "
+                            "(case- or whitespace-different) — these "
+                            "would have been MISSED before v2.67.349 "
+                            "normalisation:\n"
+                            + "\n".join(f"  - `{r!r}`" for r in _close[:5])
+                        )
+                st.caption(
+                    "If you see `repr()` values that look identical "
+                    "in the UI but differ (e.g. one has `\\xa0` for "
+                    "non-breaking space), that's the invisible-char "
+                    "mismatch the v2.67.349 normalisation handles."
+                )
+            # v2.67.347 — surface the last save message across the
+            # rerun so the buyer SEES proof of what was written. Then
+            # clear it so it doesn't linger forever.
+            _last_msg = st.session_state.pop("_sc_last_save_msg", None)
+            if _last_msg:
+                st.success(_last_msg)
+
+            # v2.67.357 — wrap supplier config in st.form() to fix
+            # the commit-on-blur race that silently reverted typed
+            # safety/review changes to defaults. Pre-357 the
+            # number_input widgets relied on commit-on-blur: clicking
+            # Save without first tabbing out of a field sent the click
+            # event WITHOUT the pending widget value, so the server-
+            # side handler read the OLD (default) value from
+            # session_state and wrote that back to DB. James 2026-06-
+            # 03 confirmed via the post-save banner: "Saved Topmet
+            # Light (EUR) ... safety A/B/C 30/20/15%" even after
+            # typing different values. st.form is the native
+            # Streamlit primitive for batched save-button forms —
+            # submit commits all widget values atomically.
+            with st.form(f"sc_main_{_sk}", clear_on_submit=False):
+                cc1, cc2, cc3 = st.columns(3)
+                lt_sea = cc1.number_input(
+                    "Lead time SEA (days)",
+                    min_value=1, max_value=200,
+                    value=int(existing.get("lead_time_sea_days") or 35),
+                    key=f"sc_sea_{_sk}",
+                )
+                lt_air = cc2.number_input(
+                    "Lead time AIR (days; 0 = not offered)",
+                    min_value=0, max_value=60,
+                    value=int(existing.get("lead_time_air_days") or 0),
+                    key=f"sc_air_{_sk}",
+                )
+                air_def = cc3.selectbox(
+                    "Air eligible by default?",
+                    ["No", "Yes"],
+                    index=int(bool(existing.get("air_eligible_default"))),
+                    key=f"sc_air_def_{_sk}",
+                )
+
+                cd1, cd2, cd3 = st.columns(3)
+                air_max = cd1.number_input(
+                    "Air MAX length (mm; 0 = any)",
+                    min_value=0, max_value=5000,
+                    value=int(existing.get("air_max_length_mm") or 0),
+                    help="For UPS etc., items longer than this are sea-only. "
+                         "E.g. Topmet UPS caps at ~2200mm.",
+                    key=f"sc_airmax_{_sk}",
+                )
+                moq = cd2.number_input(
+                    "MOQ units",
+                    min_value=0.0, max_value=10000.0,
+                    value=float(existing.get("moq_units") or 0),
+                    key=f"sc_moq_{_sk}",
+                )
+                pref_freight = cd3.selectbox(
+                    "Preferred freight",
+                    ["sea", "air", "mixed"],
+                    index=(["sea","air","mixed"].index(
+                        existing.get("preferred_freight") or "sea")),
+                    key=f"sc_pref_{_sk}",
+                )
+
+                ce1, ce2, ce3 = st.columns(3)
+                mov = ce1.number_input(
+                    "MOV amount", min_value=0.0, max_value=100000.0,
+                    value=float(existing.get("mov_amount") or 0),
+                    key=f"sc_mov_{_sk}",
+                )
+                mov_ccy = ce2.text_input(
+                    "MOV currency",
+                    value=existing.get("mov_currency") or "USD",
+                    key=f"sc_movccy_{_sk}",
+                )
+
+                st.markdown("**ABC safety factors & review days** "
+                             "(override the defaults for this supplier)")
+                sf_cols = st.columns(6)
+                sf_A = sf_cols[0].number_input("Safety A (%)",
+                                                min_value=0.0, max_value=100.0,
+                                                value=float(existing.get("safety_pct_A") or 30.0),
+                                                key=f"sc_sfA_{_sk}")
+                sf_B = sf_cols[1].number_input("Safety B (%)",
+                                                min_value=0.0, max_value=100.0,
+                                                value=float(existing.get("safety_pct_B") or 20.0),
+                                                key=f"sc_sfB_{_sk}")
+                sf_C = sf_cols[2].number_input("Safety C (%)",
+                                                min_value=0.0, max_value=100.0,
+                                                value=float(existing.get("safety_pct_C") or 15.0),
+                                                key=f"sc_sfC_{_sk}")
+                rv_A = sf_cols[3].number_input("Review A (d)",
+                                                min_value=1, max_value=180,
+                                                value=int(existing.get("review_days_A") or 14),
+                                                key=f"sc_rvA_{_sk}")
+                rv_B = sf_cols[4].number_input("Review B (d)",
+                                                min_value=1, max_value=180,
+                                                value=int(existing.get("review_days_B") or 30),
+                                                key=f"sc_rvB_{_sk}")
+                rv_C = sf_cols[5].number_input("Review C (d)",
+                                                min_value=1, max_value=180,
+                                                value=int(existing.get("review_days_C") or 45),
+                                                key=f"sc_rvC_{_sk}")
+
+                # v2.67.283 — order cadence. The real interval between
+                # reorders with this supplier. Drives the reorder
+                # engine's review period — the leanest, highest-impact
+                # cashflow lever (carry stock only until the NEXT order,
+                # not a generic 30-45 days).
+                st.markdown("**Order cadence** — how often you actually "
+                             "place orders with this supplier")
+                oc_cols = st.columns([2, 4])
+                order_cadence = oc_cols[0].number_input(
+                    "Order cadence (days)",
+                    min_value=0, max_value=180,
+                    value=int(existing.get("order_cadence_days") or 0),
+                    key=f"sc_cadence_{_sk}",
+                    help="The real gap between reorders — e.g. 7 if you "
+                         "order this supplier weekly. The engine then "
+                         "stocks only enough to bridge to the next "
+                         "order, not a generic 30-45 days. 0 = not set "
+                         "(falls back to the ABC-class review days).",
+                )
+                oc_cols[1].caption(
+                    ":information_source: Set this for your regular "
+                    "suppliers — Neonica, Topmet, Luz Negra, LEDsOn are "
+                    "ordered weekly, so set them to **7**. This is the "
+                    "biggest single lever for freeing cash tied up in "
+                    "stock; the per-SKU reorder explanation shows the "
+                    "effect.")
+
+                # 100%-dropship supplier toggle (v2.67.357: moved INTO
+                # the main form so it commits atomically with all the
+                # other config fields on Save). Pre-357 it lived below
+                # holiday closures.
+                st.markdown("**Dropship default**")
+                ds_col = st.columns([2, 4])
+                ds_default = ds_col[0].toggle(
+                    "All items from this supplier are dropship",
+                    value=bool(existing.get("dropship_default") or 0),
+                    key=f"sc_dropship_default_{_sk}",
+                    help="Use for suppliers where we never stock anything "
+                         "(e.g. Gyford). Every SKU whose primary supplier is "
+                         "this one will be treated as dropship — engine zeros "
+                         "target stock and reorder qty. You can still flag "
+                         "individual SKUs as dropship via the Ordering table "
+                         "for suppliers that are a mix.",
+                )
+                ds_col[1].caption(
+                    ":information_source: This only affects the local app's "
+                    "reorder logic. It doesn't write anything back to CIN7 — "
+                    "that integration is a separate phase."
+                )
+
+                # v2.67.357 — form_submit_button. Replaces the previous
+                # plain st.button; commits every widget above atomically.
+                # Named `sc_submitted` (not just `submitted`) because
+                # the holiday Add sub-form below reuses the variable
+                # name `submitted` for its own form_submit_button —
+                # without the rename the handler below would fire on
+                # any holiday-Add click.
+                _mismatch_ack = True
+                if _config_supplier_mismatch:
+                    _mismatch_ack = st.checkbox(
+                        f"I understand this will change {cfg_supplier}, "
+                        f"not the Draft PO supplier {_active_po_supplier}.",
+                        key=f"sc_mismatch_ack_{_sk}",
+                    )
+                sc_submitted = st.form_submit_button(
+                    "Save supplier config", type="primary")
+
+            # ------------------------------------------------------
+            # v2.67.284 — supplier holiday closures
+            # ------------------------------------------------------
+            # Buyers can add as many closure periods as they need
+            # (summer shutdowns, Chinese New Year, public holidays).
+            # The reorder engine adds any closed days within an
+            # order's cover window to the target, so an order
+            # placed before a shutdown auto-bridges it. ISO week
+            # numbers are shown next to dates because that's how
+            # buyers and European suppliers think.
+            st.markdown("**Holiday closures** — periods this "
+                         "supplier is shut")
+            st.caption(
+                ":information_source: The reorder engine adds the "
+                "closed days within an order's cover window to the "
+                "target — so an order placed before a shutdown "
+                "auto-bridges it. The per-SKU reorder explanation "
+                "names the closure (e.g. *'Topmet closed Wk 32–34: "
+                "+14 units cover'*).")
+
+            # --- Existing closures (read + delete) ----------------
+            existing_closures = db.get_supplier_holidays(cfg_supplier)
+            today_d = date.today()
+            this_week = today_d.isocalendar()[1]
+            st.caption(f"Today is **{today_d.isoformat()}** "
+                         f"(Wk {this_week}).")
+            if existing_closures:
+                hdr = st.columns([2, 2, 1, 4, 1])
+                hdr[0].markdown("**Start**")
+                hdr[1].markdown("**End**")
+                hdr[2].markdown("**Weeks**")
+                hdr[3].markdown("**Label**")
+                hdr[4].markdown("**·**")
+                for hol in existing_closures:
+                    s = hol.get("start_date")
+                    e = hol.get("end_date")
+                    if isinstance(s, str):
+                        try:
+                            s = date.fromisoformat(s[:10])
+                        except ValueError:
+                            continue
+                    if isinstance(e, str):
+                        try:
+                            e = date.fromisoformat(e[:10])
+                        except ValueError:
+                            continue
+                    ws = s.isocalendar()[1]
+                    we = e.isocalendar()[1]
+                    wk_str = (f"Wk {ws}" if ws == we
+                              else f"Wk {ws}-{we}")
+                    row_cols = st.columns([2, 2, 1, 4, 1])
+                    row_cols[0].write(s.isoformat())
+                    row_cols[1].write(e.isoformat())
+                    row_cols[2].write(wk_str)
+                    row_cols[3].write(hol.get("label") or "—")
+                    if row_cols[4].button(
+                            "🗑", key=f"del_hol_{hol['id']}",
+                            help="Remove this closure"):
+                        db.delete_supplier_holiday(
+                            int(hol["id"]), actor=actor_o)
+                        # v2.67.288 — NO _safe_cache_clear() here.
+                        # db.get_supplier_holidays() and
+                        # db.all_supplier_holidays_by_supplier() are
+                        # uncached direct reads — they pick up the
+                        # change on the next render. A global cache
+                        # clear evicts the ABC engine + every other
+                        # cached frame, which forces an expensive
+                        # rebuild on top of the still-resident old
+                        # caches and triggers Render memory crashes.
+                        st.rerun()
+            else:
+                st.caption("No closures recorded for this supplier "
+                             "yet. Add one below.")
+
+            # --- Add closure form ---------------------------------
+            with st.form(
+                    f"add_holiday_{cfg_supplier}",
+                    clear_on_submit=True):
+                fc = st.columns([2, 2, 1, 3, 1])
+                new_start = fc[0].date_input(
+                    "Closure start",
+                    value=today_d,
+                    key=f"hol_start_{cfg_supplier}",
+                )
+                new_end = fc[1].date_input(
+                    "Closure end",
+                    value=today_d,
+                    key=f"hol_end_{cfg_supplier}",
+                )
+                # Live week preview — buyer sees the ISO week range
+                # update as they pick dates (rerun on submit; this
+                # shows the *current* selection's weeks).
+                _ws = new_start.isocalendar()[1]
+                _we = new_end.isocalendar()[1]
+                _wk_preview = (f"Wk {_ws}" if _ws == _we
+                                else f"Wk {_ws}-{_we}")
+                fc[2].write(_wk_preview)
+                new_label = fc[3].text_input(
+                    "Label",
+                    placeholder="e.g. summer shutdown",
+                    key=f"hol_label_{cfg_supplier}",
+                )
+                submitted = fc[4].form_submit_button(
+                    "Add", type="primary")
+                if submitted:
+                    if new_end < new_start:
+                        st.error("End date is before start date.")
+                    else:
+                        db.add_supplier_holiday(
+                            cfg_supplier,
+                            new_start, new_end,
+                            label=(new_label or "").strip(),
+                            actor=actor_o)
+                        # v2.67.288 — NO _safe_cache_clear() here.
+                        # The closure list is read directly from
+                        # the DB on every render; clearing every
+                        # cache forced engine + apply to rebuild
+                        # while the old caches were still resident,
+                        # doubling memory and crashing Render.
+                        st.success(
+                            f"Added closure: {new_start} → "
+                            f"{new_end} ({_wk_preview})")
+                        st.rerun()
+
+            # v2.67.357 — old standalone Dropship section + Save
+            # button removed; both moved INSIDE the main st.form
+            # above so they commit atomically. Handler below now
+            # runs `if sc_submitted:` against the form_submit_button.
+            if (sc_submitted and _config_supplier_mismatch
+                    and not _mismatch_ack):
+                st.error(
+                    "Not saved: Supplier configuration is editing "
+                    f"{cfg_supplier}, while the Draft PO supplier is "
+                    f"{_active_po_supplier}. Tick the confirmation box "
+                    "or turn alignment back on."
+                )
+                sc_submitted = False
+            if sc_submitted:
+                _ss = st.session_state
+                _sfA_save = float(_ss.get(f"sc_sfA_{_sk}", sf_A))
+                _sfB_save = float(_ss.get(f"sc_sfB_{_sk}", sf_B))
+                _sfC_save = float(_ss.get(f"sc_sfC_{_sk}", sf_C))
+                _rvA_save = int(_ss.get(f"sc_rvA_{_sk}", rv_A))
+                _rvB_save = int(_ss.get(f"sc_rvB_{_sk}", rv_B))
+                _rvC_save = int(_ss.get(f"sc_rvC_{_sk}", rv_C))
+                _ltsea_save = int(_ss.get(f"sc_sea_{_sk}", lt_sea))
+                _ltair_save = int(_ss.get(f"sc_air_{_sk}", lt_air))
+                _airmax_save = int(_ss.get(f"sc_airmax_{_sk}", air_max))
+                _moq_save = float(_ss.get(f"sc_moq_{_sk}", moq))
+                _mov_save = float(_ss.get(f"sc_mov_{_sk}", mov))
+                _existing_moq_save = float(existing.get("moq_units") or 0)
+                _existing_mov_save = float(existing.get("mov_amount") or 0)
+                _minimums_preserved = []
+                if _moq_save <= 0 and _existing_moq_save > 0:
+                    _moq_save = _existing_moq_save
+                    _minimums_preserved.append("MOQ")
+                if _mov_save <= 0 and _existing_mov_save > 0:
+                    _mov_save = _existing_mov_save
+                    _minimums_preserved.append("MOV")
+                _movccy_save = (_ss.get(f"sc_movccy_{_sk}", mov_ccy)
+                                or "USD")
+                _pref_save = (_ss.get(f"sc_pref_{_sk}", pref_freight)
+                              or "sea")
+                _airdef_save = _ss.get(f"sc_air_def_{_sk}", air_def)
+                _cadence_save = int(_ss.get(
+                    f"sc_cadence_{_sk}", order_cadence))
+                _ds_save = bool(_ss.get(
+                    f"sc_dropship_default_{_sk}", ds_default))
+                # Show what we're ABOUT to write — buyer can spot a
+                # widget-state lag before the DB even gets touched.
+                st.caption(
+                    f"💾 Writing to **{cfg_supplier}**: "
+                    f"safety A/B/C = {_sfA_save:.0f}/{_sfB_save:.0f}/"
+                    f"{_sfC_save:.0f}%  ·  sea LT {_ltsea_save}d  ·  "
+                    f"cadence {_cadence_save}d"
+                )
+                if _minimums_preserved:
+                    st.caption(
+                        "Protected existing "
+                        + "/".join(_minimums_preserved)
+                        + " from being cleared by a zero reload."
+                    )
+                db.set_supplier_config(
+                    cfg_supplier_key or cfg_supplier,
+                    lead_time_sea_days=_ltsea_save,
+                    lead_time_air_days=(_ltair_save
+                                         if _ltair_save > 0 else None),
+                    air_eligible_default=(1 if _airdef_save == "Yes"
+                                           else 0),
+                    air_max_length_mm=(_airmax_save
+                                        if _airmax_save > 0 else None),
+                    moq_units=_moq_save if _moq_save > 0 else None,
+                    mov_amount=_mov_save if _mov_save > 0 else None,
+                    mov_currency=_movccy_save or None,
+                    preferred_freight=_pref_save,
+                    safety_pct_A=_sfA_save,
+                    safety_pct_B=_sfB_save,
+                    safety_pct_C=_sfC_save,
+                    review_days_A=_rvA_save,
+                    review_days_B=_rvB_save,
+                    review_days_C=_rvC_save,
+                    order_cadence_days=(_cadence_save
+                                         if _cadence_save > 0 else None),
+                    dropship_default=1 if _ds_save else 0,
+                    actor=actor_o,
+                )
+                # v2.67.289 — NO _safe_cache_clear() here.
+                # db.all_supplier_configs() is an uncached direct
+                # DB read, so the engine picks up the new cadence
+                # on the next render automatically. A GLOBAL cache
+                # clear evicts the ABC engine + every other frame,
+                # which causes a rebuild on top of still-resident
+                # caches and crashes Render's 2GB memory ceiling.
+                # v2.67.318 — explicitly drop the reorder cache-skip
+                # signature so the NEXT render is GUARANTEED to re-run
+                # _compute_target_and_reorder with the new config.
+                # v2.67.346 — also clear the engine's cache_resource
+                # so any derived columns that depend on supplier cfg
+                # (avg_daily/target/Status ladder) rebuild from scratch.
+                # James 2026-06-02: config saves were still leaving
+                # the table looking stale. A TARGETED clear of just
+                # _get_engine_df (not the global cache_data store) is
+                # safe — only one engine in memory at a time, no
+                # multi-frame pile-up that triggers the 2GB ceiling.
+                st.session_state.pop("_reorder_apply_sig", None)
+                try:
+                    _get_engine_df.clear()
+                except Exception:  # noqa: BLE001
+                    pass
+                st.session_state["_engine_last_built_at"] = datetime.now()
+                # v2.67.347 — verbose confirmation so the buyer can SEE
+                # which supplier got which values. Previously a tight
+                # "Saved config for {supplier}" hid whether the
+                # numbers actually changed. Persist the message across
+                # the rerun so it's still visible after the page
+                # rebuilds.
+                _confirm = (
+                    f"✅ Saved **{cfg_supplier}**: "
+                    f"sea LT {_ltsea_save}d · air LT "
+                    f"{_ltair_save if _ltair_save > 0 else '—'}d · "
+                    f"safety A/B/C {_sfA_save:.0f}/{_sfB_save:.0f}/"
+                    f"{_sfC_save:.0f}% · review A/B/C "
+                    f"{_rvA_save}/{_rvB_save}/{_rvC_save}d · cadence "
+                    f"{_cadence_save if _cadence_save > 0 else '—'}d"
+                )
+                st.session_state["_sc_last_save_msg"] = _confirm
+                st.success(_confirm)
+                st.rerun()
+
+            # Current config table
+            if supp_configs:
+                cfg_rows = []
+                for name, c in sorted(supp_configs.items()):
+                    cfg_rows.append({
+                        "Supplier": name,
+                        "Sea LT": c.get("lead_time_sea_days"),
+                        "Air LT": (str(c.get("lead_time_air_days"))
+                                    if c.get("lead_time_air_days") else "—"),
+                        "Air elig.": "Yes" if c.get("air_eligible_default") else "No",
+                        "Air max len": (str(c.get("air_max_length_mm"))
+                                         if c.get("air_max_length_mm") else "—"),
+                        "Cadence": (f"{c.get('order_cadence_days')}d"
+                                     if c.get("order_cadence_days")
+                                     else "—"),
+                        "MOQ": (str(c.get("moq_units"))
+                                 if c.get("moq_units") else "—"),
+                        "MOV": (f"{c.get('mov_currency') or ''}"
+                                f"{c.get('mov_amount') or '—'}"),
+                        "Pref freight": c.get("preferred_freight"),
+                        "Dropship": ("📦 all items"
+                                      if c.get("dropship_default") else ""),
+                    })
+                st.dataframe(pd.DataFrame(cfg_rows),
+                             width="stretch", hide_index=True)
+
+    # --- Assign products to a supplier (v2.67.321) ---------------------
+    # Replaces the old read-only "supplier-assignment audit" (removed —
+    # James 2026-05-28: "the audit is useless, it does not work"). It
+    # only DIAGNOSED the gap and gave no way to fix it; worse, the only
+    # per-SKU override UI was on the LED Tubes page with a TUBE-ONLY SKU
+    # picker, so non-tube products (LED-POLI-MOUNT, LED-HR-MAX-2,
+    # LED-NEON-FLEX-NICHO-*, etc. — Neonica's neon/profile range) could
+    # never be assigned through the app at all. That's why they never
+    # appeared under "Neonica Polska Sp. z o.o.".
+    #
+    # This tool writes per-SKU overrides — the TOP resolution tier
+    # (override > CIN7-native > family-rule > PO-history > unassigned) —
+    # so pasted SKUs land under the chosen supplier IMMEDIATELY,
+    # regardless of CIN7 product-master or PO-history state. Paste,
+    # pick, Assign.
+    # v2.67.322 — unassigned-supplier count, shown on the expander
+    # label so James can see the scope at a glance (he asked "how many
+    # other items aren't assigned"). A SKU is "(unassigned)" ONLY when
+    # CIN7's own product.Suppliers array is empty for it AND there's no
+    # PO history / override — i.e. CIN7 itself has no supplier on the
+    # product. Our records already match CIN7's product master; the
+    # parser reads the exact `SupplierName` key CIN7 returns. We split
+    # the count into "with demand" (worth assigning) vs total so the
+    # number isn't inflated by dead/accessory SKUs.
+    _orderable_all = engine_df[~engine_df["is_non_master_tube"].fillna(False)]
+    _unassigned_all = _orderable_all[
+        _orderable_all["Supplier"] == "(unassigned)"]
+    _unassigned_demand = _unassigned_all[
+        _unassigned_all.get(
+            "effective_units_12mo", pd.Series(dtype=float)).fillna(0) > 0]
+    _n_unassigned = len(_unassigned_all)
+    _n_unassigned_demand = len(_unassigned_demand)
+    _assign_hdr = (
+        f"🏷️ Assign products to a supplier — "
+        f"{_n_unassigned_demand} unassigned with demand"
+        + (f" ({_n_unassigned} total)" if _n_unassigned
+           != _n_unassigned_demand else "")
+    )
+    with st.expander(_assign_hdr, expanded=False):
+        st.caption(
+            f"**{_n_unassigned} orderable SKUs are unassigned** "
+            f"({_n_unassigned_demand} of them sold something in the last "
+            f"12 months — those are the ones worth assigning). A SKU is "
+            f"unassigned only when **CIN7's own product record has no "
+            f"supplier** set on it (empty Suppliers) and we've never "
+            f"raised a PO for it. Our resolution reads CIN7's product "
+            f"`Suppliers` field directly, so once you set the supplier in "
+            f"CIN7 it flows through on the next daily product sync (7 AM) "
+            f"— or assign it here for an immediate override."
+        )
+        if _n_unassigned_demand and st.checkbox(
+            f"📋 Show the {_n_unassigned_demand} unassigned SKUs with "
+            f"demand (copy into the box below)",
+            key="show_unassigned_list"):
+            _ua_cols = [c for c in
+                        ["SKU", "Name", "effective_units_12mo",
+                         "customers_12mo", "OnHand"]
+                        if c in _unassigned_demand.columns]
+            st.dataframe(
+                _unassigned_demand[_ua_cols].sort_values(
+                    "effective_units_12mo", ascending=False).rename(
+                    columns={"effective_units_12mo": "12mo units",
+                             "customers_12mo": "customers"}),
+                hide_index=True, use_container_width=True, height=300)
+        _actor_assign = st.session_state.get("current_user", "").strip()
+        if not _actor_assign:
+            st.caption("Enter your name in the sidebar to assign suppliers.")
+        else:
+            # Supplier options: master file + already-resolved buckets +
+            # existing overrides.
+            _known_sups = set()
+            if not suppliers.empty and "Name" in suppliers.columns:
+                _known_sups.update(
+                    suppliers["Name"].dropna().astype(str).tolist())
+            _known_sups.update(
+                s for s in engine_df["Supplier"].unique()
+                if s and s != "(unassigned)")
+            _known_sups.update(db.all_sku_supplier_overrides().values())
+            _known_sups = sorted(x for x in _known_sups if x)
+            st.markdown(
+                "Paste one or more **SKUs** (one per line), pick the "
+                "**supplier**, and Assign. This sets a per-SKU override — "
+                "the highest-priority rule — so the products show under "
+                "that supplier's reorder view immediately, even if CIN7's "
+                "product record or PO history says otherwise."
+            )
+            ac1, ac2 = st.columns([2, 2])
+            _sku_paste = ac1.text_area(
+                "SKUs (one per line)", height=170,
+                key="bulk_assign_skus",
+                placeholder=("LED-POLI-MOUNT\nLED-HR-MAX-2\n"
+                             "LED-NEON-FLEX-NICHO-3000K-1"),
+            )
+            _sup_choice = (ac2.selectbox(
+                "Supplier", _known_sups, key="bulk_assign_supplier")
+                if _known_sups else None)
+            _assign_note = ac2.text_input(
+                "Note (optional)", key="bulk_assign_note",
+                placeholder="e.g. Neonica neon/profile range")
+            if ac2.button(
+                "Assign these SKUs", key="bulk_assign_go", type="primary",
+                disabled=not (_sku_paste.strip() and _sup_choice),
+            ):
+                _skus = [s.strip() for s in _sku_paste.splitlines()
+                         if s.strip()]
+                _valid = set(engine_df["SKU"].astype(str))
+                _done, _unknown = [], []
+                for _sk in _skus:
+                    if _sk in _valid:
+                        db.set_sku_supplier(
+                            _sk, _sup_choice, _actor_assign, _assign_note)
+                        _done.append(_sk)
+                    else:
+                        _unknown.append(_sk)
+                if _done:
+                    st.success(
+                        f"Assigned {len(_done)} SKU(s) to "
+                        f"**{_sup_choice}**. Rebuilding engine…")
+                if _unknown:
+                    st.warning(
+                        "Not found in the catalog (check spelling — the "
+                        "SKU must match exactly): " + ", ".join(_unknown))
+                if _done:
+                    # Override is read at engine-compute time, so the
+                    # engine must rebuild for the new bucket to appear.
+                    st.session_state.pop("_reorder_apply_sig", None)
+                    try:
+                        _get_engine_df.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    st.rerun()
+            # Current overrides + clear control.
+            _curr_over = db.all_sku_supplier_overrides()
+            if _curr_over:
+                st.markdown("**Current per-SKU overrides**")
+                st.dataframe(
+                    pd.DataFrame(
+                        [{"SKU": k, "Supplier": v}
+                         for k, v in sorted(_curr_over.items())]),
+                    hide_index=True, use_container_width=True, height=200)
+                cc1, cc2 = st.columns([2, 1])
+                _clear_pick = cc1.selectbox(
+                    "Clear an override", ["—"] + sorted(_curr_over.keys()),
+                    key="bulk_clear_pick")
+                if cc2.button("Clear override", key="bulk_clear_go",
+                               disabled=(_clear_pick == "—")):
+                    db.clear_sku_supplier(_clear_pick, _actor_assign)
+                    st.session_state.pop("_reorder_apply_sig", None)
+                    try:
+                        _get_engine_df.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    st.rerun()
+
 elif page == "Ad-Umpire":
     st.header(":dart: Ad-Umpire")
     st.caption(

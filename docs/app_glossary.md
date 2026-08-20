@@ -12,7 +12,7 @@ rank + 40% of 12-month quantity rank):
 
 #### Lead time (LT)
 How long from placing the PO to receiving the goods. Set per supplier
-in the Supplier configuration expander below. Air vs sea toggles use
+on the **Supplier Setup** page. Air vs sea toggles use
 different LTs; the engine picks the faster one when the supplier offers
 air AND the item qualifies. Inventory Planner can still provide an
 observed lead-time duration, and a SKU-level **Sku LT** can be set in
