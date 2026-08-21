@@ -18,6 +18,22 @@ fly:
   - `datetime('now',
        '-' || ? || ' hours')`
                          →  `(NOW() - INTERVAL '1 hour' * ?)`
+  - `date('now',
+       '-' || ? || ' days')`
+                         →  `(NOW() - INTERVAL '1 day' * ?)`
+                            (same rewrite as the `datetime(...)`
+                            form above — Postgres compares
+                            `date` columns against a timestamptz
+                            expression without an explicit cast)
+  - `ROUND(expr, n)`     →  `ROUND((expr)::numeric, n)`
+                            (Postgres only defines
+                            `round(numeric [, int])` — there is
+                            no `round(double precision, int)`
+                            overload, so `ROUND(SUM(real_col), 2)`
+                            errors on Postgres with "function
+                            round(double precision, integer) does
+                            not exist" even though it works fine
+                            on SQLite)
   - `INSERT OR IGNORE`   →  `INSERT … ON CONFLICT DO NOTHING`
   - `PRAGMA …`           →  no-op (Postgres handles concurrency)
   - `executescript(s)`   →  split on `;` and run each non-blank
@@ -92,6 +108,20 @@ _DT_PARAM_RE = re.compile(
 _DT_NOW_RE = re.compile(
     r"datetime\(\s*'now'\s*\)", re.IGNORECASE)
 
+# date('now', '-' || ? || ' UNIT')  →  (NOW() - INTERVAL '1 UNIT' * ?)
+# Same rewrite as _DT_PARAM_RE above, just for the `date(...)` spelling.
+# `\bdate\(` (not `datetime\(`) so it can't partially match inside a
+# `datetime(...)` call — that one is handled separately by _DT_PARAM_RE.
+_DATE_PARAM_RE = re.compile(
+    r"\bdate\(\s*'now'\s*,\s*'-'\s*\|\|\s*\?\s*\|\|\s*"
+    r"'\s+(days?|hours?|minutes?|seconds?)\s*'\s*\)",
+    re.IGNORECASE)
+
+# ROUND( — matched, then the argument list is walked by hand below
+# (_rewrite_round) since it can nest arbitrarily, e.g.
+# ROUND(SUM(revenue_ga4) / SUM(spend), 2).
+_ROUND_RE = re.compile(r"\bROUND\s*\(", re.IGNORECASE)
+
 # INSERT OR IGNORE INTO foo  →  INSERT INTO foo … ON CONFLICT DO NOTHING
 # (the ON CONFLICT clause is appended at the END of the statement,
 # not inline)
@@ -117,9 +147,14 @@ def _rewrite_pg(sql: str) -> str:
         return f"(NOW() - INTERVAL '1 {unit}' * ?)"
 
     s = _DT_PARAM_RE.sub(_dt_param_sub, s)
+    s = _DATE_PARAM_RE.sub(_dt_param_sub, s)
 
     # 2) datetime('now')  →  NOW()
     s = _DT_NOW_RE.sub("NOW()", s)
+
+    # 2b) ROUND(expr, n) → ROUND((expr)::numeric, n) — see
+    # _rewrite_round for why (no round(double precision, int) in PG).
+    s = _rewrite_round(s)
 
     # 3) INSERT OR IGNORE INTO … VALUES (…)
     #    → INSERT INTO … VALUES (…) ON CONFLICT DO NOTHING
@@ -147,6 +182,62 @@ def _rewrite_pg(sql: str) -> str:
     # occur in db.py today, defensive coding is cheap.
     s = _swap_qmark_to_pct(s)
     return s
+
+
+def _rewrite_round(sql: str) -> str:
+    """ROUND(expr[, n]) → ROUND((expr)::numeric[, n]).
+
+    Postgres only defines round(numeric) / round(numeric, int) —
+    no round(double precision, int) overload — so ROUND(SUM(x), 2)
+    over a REAL/DOUBLE PRECISION column (e.g. ad_campaigns_daily.spend)
+    fails with "function round(double precision, integer) does not
+    exist". SQLite's round() accepts any numeric type, so casting to
+    ::numeric is a no-op there and safe on both backends.
+
+    The argument list can nest parens (SUM(x), SUM(x) / SUM(y), …) so
+    a fixed regex can't isolate it — this walks paren depth by hand to
+    find the matching close-paren and the top-level comma that splits
+    the value expression from the optional precision argument."""
+    out: List[str] = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        m = _ROUND_RE.match(sql, i)
+        if not m:
+            out.append(sql[i])
+            i += 1
+            continue
+        start = m.end()  # just after the opening '('
+        depth = 1
+        j = start
+        last_top_comma = None
+        while j < n and depth > 0:
+            c = sql[j]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif c == "," and depth == 1:
+                last_top_comma = j
+            j += 1
+        if depth != 0:
+            # Unbalanced parens — leave untouched rather than
+            # produce broken SQL.
+            out.append(sql[i:start])
+            i = start
+            continue
+        close = j
+        if last_top_comma is not None:
+            expr = sql[start:last_top_comma].strip()
+            precision = sql[last_top_comma + 1:close].strip()
+            out.append(f"ROUND(({expr})::numeric, {precision})")
+        else:
+            expr = sql[start:close].strip()
+            out.append(f"ROUND(({expr})::numeric)")
+        i = close + 1
+    return "".join(out)
 
 
 def _swap_qmark_to_pct(sql: str) -> str:
@@ -566,6 +657,19 @@ def _selftest() -> int:
             "(NOW() - INTERVAL '1 hour' * %s) LIMIT %s"),
         ("INSERT INTO foo (a) VALUES (?) RETURNING id",
             "INSERT INTO foo (a) VALUES (%s) RETURNING id"),
+        ("SELECT * FROM foo WHERE date >= "
+          "date('now', '-' || ? || ' days')",
+            "SELECT * FROM foo WHERE date >= "
+            "(NOW() - INTERVAL '1 day' * %s)"),
+        ("SELECT ROUND(SUM(spend), 2) AS total_spend FROM foo",
+            "SELECT ROUND((SUM(spend))::numeric, 2) AS total_spend "
+            "FROM foo"),
+        ("SELECT ROUND(SUM(revenue_ga4) / SUM(spend), 2) AS roas "
+          "FROM foo",
+            "SELECT ROUND((SUM(revenue_ga4) / SUM(spend))::numeric, "
+            "2) AS roas FROM foo"),
+        ("SELECT ROUND(price) FROM foo",
+            "SELECT ROUND((price)::numeric) FROM foo"),
     ]
     fails = 0
     for sql_in, expected in tests:
