@@ -7424,7 +7424,7 @@ def get_ad_overview(engine_df: pd.DataFrame,
         "FROM ad_campaigns_daily "
         "WHERE date >= date('now', '-' || ? || ' days') "
         + ("AND platform = ?" if platform != "all" else "")
-        + " GROUP BY platform, campaign_id "
+        + " GROUP BY platform, campaign_id, campaign_name, campaign_type "
         "ORDER BY spend DESC LIMIT 5")
     p2 = [days]
     if platform != "all":
@@ -7496,7 +7496,7 @@ def get_campaign_performance(engine_df: pd.DataFrame,
         "       ELSE NULL END AS cpc "
         "FROM ad_campaigns_daily "
         f"WHERE {' AND '.join(where_parts)} "
-        "GROUP BY platform, campaign_id "
+        "GROUP BY platform, campaign_id, campaign_name, campaign_type "
         f"ORDER BY {sort_sql} "
         "LIMIT ?")
     params.append(limit)
@@ -7537,7 +7537,7 @@ def find_campaigns_to_cut(engine_df: pd.DataFrame,
         "       ELSE NULL END AS ga4_roas "
         "FROM ad_campaigns_daily "
         "WHERE date >= date('now', '-' || ? || ' days') "
-        "GROUP BY platform, campaign_id "
+        "GROUP BY platform, campaign_id, campaign_name, campaign_type "
         "HAVING SUM(spend) >= ? "
         "   AND (SUM(revenue_ga4) / NULLIF(SUM(spend), 0)) < ? "
         "ORDER BY ga4_roas ASC, spend DESC")
@@ -7579,7 +7579,7 @@ def find_campaigns_to_scale(engine_df: pd.DataFrame,
         "       COUNT(DISTINCT date) AS active_days "
         "FROM ad_campaigns_daily "
         "WHERE date >= date('now', '-' || ? || ' days') "
-        "GROUP BY platform, campaign_id "
+        "GROUP BY platform, campaign_id, campaign_name, campaign_type "
         "HAVING SUM(spend) >= ? "
         "   AND (SUM(revenue_ga4) / NULLIF(SUM(spend), 0)) >= ? "
         "ORDER BY ga4_roas DESC, spend DESC")
@@ -7627,7 +7627,7 @@ def attribution_sanity_check(engine_df: pd.DataFrame,
         "       ELSE NULL END AS inflation_ratio "
         "FROM ad_campaigns_daily "
         f"WHERE {' AND '.join(where_parts)} "
-        "GROUP BY platform, campaign_id "
+        "GROUP BY platform, campaign_id, campaign_name, campaign_type "
         "HAVING SUM(spend) > 0 ")
     if not campaign_id:
         sql += ("AND (SUM(revenue_platform) / NULLIF(SUM(revenue_ga4), "

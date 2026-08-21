@@ -3754,7 +3754,8 @@ def get_ad_attribution_for_sku(sku: str, days: int = 30) -> list:
         "  AND ad.date = acs.date "
         "WHERE acs.sku = ? "
         "  AND acs.date >= date('now', '-' || ? || ' days') "
-        "GROUP BY ad.platform, ad.campaign_id "
+        "GROUP BY ad.platform, ad.campaign_id, "
+        "         ad.campaign_name, ad.campaign_type "
         "ORDER BY sku_spend DESC NULLS LAST")
     with connect() as c:
         rows = c.execute(sql, (sku, days)).fetchall()
