@@ -8250,6 +8250,11 @@ def _build_ordering_context() -> "SimpleNamespace":
     latest_notes_map = _shared_db.latest_notes_map
     dormancy_warnings_map = _shared_db.dormancy_warnings_map
     dropship_skus = _shared_db.dropship_skus
+    cin7_always_ds = _shared_db.cin7_always_ds
+    cin7_no_ds = _shared_db.cin7_no_ds
+    cin7_tag_ds = _shared_db.cin7_tag_ds
+    per_sku_ds = _shared_db.per_sku_ds
+    not_ds_overrides = _shared_db.not_ds_overrides
     supp_configs = _shared_db.supp_configs
     closures_by_supplier = _shared_db.closures_by_supplier
     ip_lead_times_by_sku = _shared_db.ip_lead_times_by_sku
