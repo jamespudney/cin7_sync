@@ -819,6 +819,35 @@ ABC-bucket composition. Two additions, both on the Ordering page:
   (positive = underfunded, fund it; negative = that class is carrying
   more than its own SKUs need). Pure reporting over existing engine
   columns — no new math, no change to reorder suggestions.
+  **v2.67.385** — added a **"Target cover (days)"** column: that
+  class's Target $ expressed as days of that class's own trailing-12mo
+  COGS. The per-class version of the turns caution below — shows
+  directly which class (A/B/C) the engine's target is thin for,
+  instead of only the blended company-wide figure.
+
+#### Optimum turns caution banner (v2.67.385)
+The Ordering page's "Turns & cover check" section shows a `st.warning`
+when the engine-derived Optimum implies **more than 6.0× turns**
+(under ~61 days of cover). The 6.0× line is Viktor's own threshold
+from his inventory memo — above it, this business's real lead-time
+profile (94% fill rate, up to ~60-day sea receipt on the largest
+supplier line) risks stockouts; 4–4.5× was his recommended band
+(James confirmed agreement with Viktor's $525-575K / 4.0-4.4 turns
+target on 2026-08-25). This is data-driven, not a static claim — it
+only fires when `master_turns_optimum` (masters-only trailing-12mo
+COGS ÷ TargetValue) actually crosses the line.
+
+Important nuance the banner text spells out: this does NOT mean any
+single SKU's `target_stock` is below its own lead-time demand — the
+per-SKU formula (`lead_time_demand + safety_stock + review_period_demand
++ holiday_cover`) guarantees every SKU's target covers at least its
+own lead time, by construction. The warning is about the
+DOLLAR-WEIGHTED BLEND across all SKUs running tighter than a sane
+turns rate — likely because supplier lead-time / safety% / review-day
+settings are calibrated thin somewhere, not evidence of one bug. The
+"Optimum stock value" and "Excess (cash to free up)" tiles both link
+to this section in their help text, since Excess is measured against
+Optimum and inherits whatever calibration issue Optimum has.
 
 #### Overview "Stock health" panel — Target / Current / Dead / moved this month (v2.67.381)
 A review of the dashboard's inventory reports found Target and Dead
