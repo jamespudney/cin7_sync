@@ -9996,6 +9996,7 @@ def _build_ordering_context() -> "SimpleNamespace":
         latest_notes_map=latest_notes_map,
         dormancy_warnings_map=dormancy_warnings_map,
         compute_target_and_reorder=_compute_target_and_reorder,
+        status_fn=_status,
         sku_buying_values=_sku_buying_values,
         ceil_to_multiple=_ceil_to_multiple,
         render_sku_detail=_render_sku_detail,
@@ -13967,6 +13968,7 @@ elif page == "Ordering":
     latest_notes_map = _ctx.latest_notes_map
     dormancy_warnings_map = _ctx.dormancy_warnings_map
     _compute_target_and_reorder = _ctx.compute_target_and_reorder
+    _status = _ctx.status_fn
     _sku_buying_values = _ctx.sku_buying_values
     _ceil_to_multiple = _ctx.ceil_to_multiple
     _render_sku_detail = _ctx.render_sku_detail
@@ -18917,6 +18919,7 @@ elif page == "Stock Optimisation":
     latest_notes_map = _ctx.latest_notes_map
     dormancy_warnings_map = _ctx.dormancy_warnings_map
     _compute_target_and_reorder = _ctx.compute_target_and_reorder
+    _status = _ctx.status_fn
     _sku_buying_values = _ctx.sku_buying_values
     _ceil_to_multiple = _ctx.ceil_to_multiple
     _render_sku_detail = _ctx.render_sku_detail
@@ -19403,6 +19406,7 @@ elif page == "Supplier Setup":
     latest_notes_map = _ctx.latest_notes_map
     dormancy_warnings_map = _ctx.dormancy_warnings_map
     _compute_target_and_reorder = _ctx.compute_target_and_reorder
+    _status = _ctx.status_fn
     _sku_buying_values = _ctx.sku_buying_values
     _ceil_to_multiple = _ctx.ceil_to_multiple
     _render_sku_detail = _ctx.render_sku_detail
