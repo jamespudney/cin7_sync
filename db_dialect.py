@@ -605,8 +605,29 @@ def connect() -> Iterator[Any]:
         # autocommit=True matches sqlite isolation_level=None
         # behaviour (each statement commits immediately unless
         # wrapped in an explicit transaction by the caller).
-        raw = psycopg.connect(url, autocommit=True,
-                                  row_factory=dict_row)
+        #
+        # v2.67.383 — connect_timeout + statement_timeout. Neither
+        # was ever set, so ANY blocking call (server unreachable, a
+        # lock wait on a migration DDL statement, a slow query) could
+        # hang forever with no client-side recovery. Traced from a
+        # live incident: warm_engine.py's background ABC refresh
+        # subprocess got stuck "running" for 50+ minutes — long past
+        # its 45-minute stale-lock reclaim window, because that
+        # reclaim only fires once the holder PID is actually dead
+        # (see engine_refresh_lock.py), and a hung-but-alive process
+        # never dies on its own. statement_timeout is set via libpq's
+        # startup `options` so it applies to every statement on this
+        # connection without an extra round-trip; both values are
+        # env-configurable in case a legitimately slow query (a big
+        # migration, a wide aggregate) needs more room.
+        _pg_connect_timeout_s = int(
+            os.environ.get("DB_CONNECT_TIMEOUT_S", "15") or 15)
+        _pg_statement_timeout_ms = int(
+            os.environ.get("DB_STATEMENT_TIMEOUT_MS", "60000") or 60000)
+        raw = psycopg.connect(
+            url, autocommit=True, row_factory=dict_row,
+            connect_timeout=_pg_connect_timeout_s,
+            options=f"-c statement_timeout={_pg_statement_timeout_ms}")
         wrapper = _PgConnection(raw)
         try:
             yield wrapper
