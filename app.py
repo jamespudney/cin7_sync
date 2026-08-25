@@ -10462,13 +10462,20 @@ if page == "Overview":
         _target_snap = db.get_latest_ordering_target_snapshot()
     except Exception:  # noqa: BLE001
         _target_snap = {}
-    if not _engine_for_health.empty and "is_dead" in _engine_for_health.columns:
+    _dead_data_available = (
+        not _engine_for_health.empty
+        and "is_dead" in _engine_for_health.columns)
+    if _dead_data_available:
         _dead_mask_ov = _engine_for_health["is_dead"].fillna(False).astype(bool)
         _dead_skus_ov = int(_dead_mask_ov.sum())
         _dead_value_ov = float(
             _engine_for_health.loc[_dead_mask_ov, "OnHandValue"]
             .fillna(0).sum())
     else:
+        # v2.67.382 — `is_dead` is new; a snapshot written by the warm
+        # job BEFORE this shipped won't have the column yet. Show "—"
+        # rather than a confidently wrong "$0" — a genuine zero and
+        # "we don't have this data yet" must never look the same.
         _dead_skus_ov, _dead_value_ov = 0, 0.0
 
     sh1, sh2, sh3, sh4 = st.columns(4)
@@ -10495,22 +10502,34 @@ if page == "Overview":
         "Current stock value", _fmt_money(stock_value),
         help="CIN7 FIFO value across all SKUs — matches the 'Stock "
              "value (FIFO, CIN7)' tile above.")
-    sh3.metric(
-        "Dead stock (zero 12mo demand, holding stock)",
-        _fmt_money(_dead_value_ov),
-        help=(
-            f"{_fmt_number(_dead_skus_ov)} SKUs with zero visible "
-            "12mo demand (direct + migrated + rolled-up) and "
-            "physical stock on hand — matches the Ordering page's "
-            "'Dead stock' tile. A LEVEL signal: distinct from the "
-            "dormancy-based 'Slow stock' panel below, which is a "
-            "VELOCITY-drop signal. The two populations overlap but "
-            "are not the same SKUs."))
+    if _dead_data_available:
+        sh3.metric(
+            "Dead stock (zero 12mo demand, holding stock)",
+            _fmt_money(_dead_value_ov),
+            help=(
+                f"{_fmt_number(_dead_skus_ov)} SKUs with zero visible "
+                "12mo demand (direct + migrated + rolled-up) and "
+                "physical stock on hand — matches the Ordering page's "
+                "'Dead stock' tile. A LEVEL signal: distinct from the "
+                "dormancy-based 'Slow stock' panel below, which is a "
+                "VELOCITY-drop signal. The two populations overlap but "
+                "are not the same SKUs."))
+    else:
+        sh3.metric(
+            "Dead stock (zero 12mo demand, holding stock)", "—",
+            help="The engine snapshot the app is currently serving "
+                 "predates this tile — it doesn't have the `is_dead` "
+                 "column yet. Updates automatically on the next "
+                 "background engine recompute; no action needed.")
     try:
         _dead_prev_month = db.get_previous_month_dead_stock_value()
     except Exception:  # noqa: BLE001
         _dead_prev_month = {}
-    if _dead_prev_month and _dead_prev_month.get("value_on_shelf") is not None:
+    if not _dead_data_available:
+        sh4.metric("Dead stock — moved this month", "—",
+                     help="Waiting on the same engine snapshot as the "
+                          "Dead stock tile to the left.")
+    elif _dead_prev_month and _dead_prev_month.get("value_on_shelf") is not None:
         _dprev_v = float(_dead_prev_month["value_on_shelf"] or 0)
         _ddelta = _dead_value_ov - _dprev_v
         _dprev_date = str(_dead_prev_month.get("snapshot_date") or "")[:10]
