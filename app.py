@@ -3438,9 +3438,16 @@ def _load_longest_assemblies_cached(fingerprint: tuple) -> pd.DataFrame:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:
         return pd.DataFrame()
-    for days, mtime, p in files:
-        if p == base_file or mtime <= base_mtime:
-            continue
+    # Append newer files oldest-first so the most recent file's row is
+    # physically last in the frame — required for the drop_duplicates
+    # keep="last" below to actually keep the most recent file's row.
+    # glob() order is filesystem-dependent, not chronological, so this
+    # must be sorted explicitly rather than relied on from iteration order.
+    newer = sorted(
+        (f for f in files if f[2] != base_file and f[1] > base_mtime),
+        key=lambda x: x[1],
+    )
+    for days, mtime, p in newer:
         try:
             more = pd.read_csv(p, low_memory=False)
             base = pd.concat([base, more], ignore_index=True)
