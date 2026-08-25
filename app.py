@@ -7754,6 +7754,50 @@ def _abc_engine(products: pd.DataFrame,
     df["DoC_days"] = df.apply(
         lambda r: (r["OnHand"] / r["avg_daily"])
         if r["avg_daily"] > 0 else None, axis=1)
+    # v2.67.381 — "sold, but slow cover" flag. Distinct from `is_dormant`
+    # (a VELOCITY signal — 90d demand dropped vs the 12mo baseline) and
+    # from Dead stock (zero 12mo demand). This is a LEVEL signal: the
+    # SKU has real 12mo demand and never dropped, but is still carrying
+    # more than a year of cover at its current sell-through rate. A flat,
+    # low-velocity SKU never trips dormancy yet can sit on 18+ months of
+    # stock — this flag exists so that cash doesn't hide from both signals
+    # at once. Threshold: >365 days of cover at avg_daily.
+    df["over_12mo_cover"] = (
+        (df["effective_units_12mo"] > 0)
+        & (_to_num(df["DoC_days"]).fillna(0) > 365)
+        & (_to_num(df["OnHand"]).fillna(0) > 0)
+    )
+    # v2.67.381 — warm-safe Dead-stock flag, exact mirror of the
+    # "💀 Dead stock" tier in the Ordering page's `_status()` (line
+    # ~13114: `visible_12mo <= 0 and onhand > 0`, where visible_12mo
+    # is the max of effective/lineage/raw 12mo units — the same three
+    # columns used here). `_status()` itself can't move out of the
+    # Ordering page (it also needs target_stock/Available, which need
+    # supplier config data the warm job doesn't load), but the Dead
+    # tier specifically only needs columns already computed above, so
+    # it's split out here as its own column. This makes "Dead stock"
+    # available on every page — including Overview, which previously
+    # had no reliable way to show it without the Ordering page having
+    # run first in the same session.
+    df["_visible_units_12mo"] = df[
+        ["effective_units_12mo", "lineage_units_12mo", "units_12mo"]
+    ].apply(pd.to_numeric, errors="coerce").fillna(0).max(axis=1)
+    _is_master_row = ~df.get(
+        "is_non_master_tube", pd.Series(False, index=df.index)).fillna(False)
+    _has_onhand_row = _to_num(df["OnHand"]).fillna(0) > 0
+    df["is_dead"] = (
+        # Masters: no visible 12mo demand at all (direct + lineage +
+        # rolled-up), still physically on the shelf.
+        (_is_master_row & (df["_visible_units_12mo"] <= 0) & _has_onhand_row)
+        # Non-master cuts: also dead if THEY have zero own direct sales
+        # and physical stock — a child with its own direct sales is
+        # working inventory even when its master shows no demand.
+        # Mirrors the Ordering page's dead_cut_value condition
+        # (`is_non_master_tube & units_12mo == 0`).
+        | (~_is_master_row
+            & (_to_num(df["units_12mo"]).fillna(0) <= 0)
+            & _has_onhand_row)
+    )
 
     # 9b. Cost fields kept separate:
     #
@@ -7925,6 +7969,20 @@ def _abc_engine(products: pd.DataFrame,
                 .fillna(0).sum())
             db.record_slow_mover_value_snapshot(
                 _v_skus_count, _v_units, _v_value)
+        except Exception:  # noqa: BLE001
+            pass
+        # v2.67.381 — same snapshot pattern for DEAD stock (`is_dead`
+        # above), a separate population from the dormancy set. Powers
+        # the "Dead stock" tile's month-over-month caption on Overview.
+        try:
+            _dead_snap_df = df.loc[df["is_dead"].fillna(False).astype(bool)]
+            db.record_dead_stock_value_snapshot(
+                int(len(_dead_snap_df)),
+                float(_dead_snap_df.get(
+                    "OnHand", pd.Series(dtype=float)).fillna(0).sum()),
+                float(_dead_snap_df.get(
+                    "OnHandValue", pd.Series(dtype=float)).fillna(0).sum()),
+            )
         except Exception:  # noqa: BLE001
             pass
     except Exception:  # noqa: BLE001
@@ -10386,13 +10444,120 @@ if page == "Overview":
 
     st.divider()
 
+    # v2.67.381 — consolidated stock-health panel: Target / Current /
+    # Dead / Dead-stock movement, together in one place on the front
+    # page. Added after a review found Target and Dead stock only
+    # ever showed on the Ordering page (both depend on columns that
+    # page computes itself), and the "Cleared this month" figure in
+    # the Slow-mover panel below is scoped to the DORMANT (velocity-
+    # drop) set, not Dead (zero-demand) stock — so there was
+    # previously no reliable place to see these four numbers together,
+    # or to answer "how much dead stock have we moved" at all.
+    st.subheader("📦 Stock health: target vs. current vs. dead")
+    try:
+        _engine_for_health = _get_engine_df()
+    except Exception:  # noqa: BLE001
+        _engine_for_health = pd.DataFrame()
+    try:
+        _target_snap = db.get_latest_ordering_target_snapshot()
+    except Exception:  # noqa: BLE001
+        _target_snap = {}
+    if not _engine_for_health.empty and "is_dead" in _engine_for_health.columns:
+        _dead_mask_ov = _engine_for_health["is_dead"].fillna(False).astype(bool)
+        _dead_skus_ov = int(_dead_mask_ov.sum())
+        _dead_value_ov = float(
+            _engine_for_health.loc[_dead_mask_ov, "OnHandValue"]
+            .fillna(0).sum())
+    else:
+        _dead_skus_ov, _dead_value_ov = 0, 0.0
+
+    sh1, sh2, sh3, sh4 = st.columns(4)
+    if _target_snap:
+        sh1.metric(
+            "Target stock (Optimum)",
+            _fmt_money(float(_target_snap.get("target_value") or 0)),
+            help=(
+                "Sum of target_stock × cost across master SKUs, from "
+                "the reorder engine (lead time + safety + review + "
+                "holiday cover) — same figure as the Ordering page's "
+                "'Optimum stock value' tile. Only updates when the "
+                "Ordering page runs (it needs supplier lead-time "
+                "config the background sync doesn't load) — as of "
+                f"{str(_target_snap.get('captured_at'))[:16]}, "
+                f"{_fmt_number(int(_target_snap.get('master_sku_count') or 0))} "
+                "master SKUs."))
+    else:
+        sh1.metric(
+            "Target stock (Optimum)", "—",
+            help="No snapshot yet — visit the Ordering page once to "
+                 "populate this.")
+    sh2.metric(
+        "Current stock value", _fmt_money(stock_value),
+        help="CIN7 FIFO value across all SKUs — matches the 'Stock "
+             "value (FIFO, CIN7)' tile above.")
+    sh3.metric(
+        "Dead stock (zero 12mo demand, holding stock)",
+        _fmt_money(_dead_value_ov),
+        help=(
+            f"{_fmt_number(_dead_skus_ov)} SKUs with zero visible "
+            "12mo demand (direct + migrated + rolled-up) and "
+            "physical stock on hand — matches the Ordering page's "
+            "'Dead stock' tile. A LEVEL signal: distinct from the "
+            "dormancy-based 'Slow stock' panel below, which is a "
+            "VELOCITY-drop signal. The two populations overlap but "
+            "are not the same SKUs."))
+    try:
+        _dead_prev_month = db.get_previous_month_dead_stock_value()
+    except Exception:  # noqa: BLE001
+        _dead_prev_month = {}
+    if _dead_prev_month and _dead_prev_month.get("value_on_shelf") is not None:
+        _dprev_v = float(_dead_prev_month["value_on_shelf"] or 0)
+        _ddelta = _dead_value_ov - _dprev_v
+        _dprev_date = str(_dead_prev_month.get("snapshot_date") or "")[:10]
+        sh4.metric(
+            "Dead stock — moved this month",
+            f"{'−' if _ddelta < 0 else '+'}{_fmt_money(abs(_ddelta))}",
+            help=(
+                "Net change in Dead stock value vs the previous "
+                "calendar month. Negative = shrank (cleared/sold — "
+                "good); positive = grew (more SKUs went dead). A NET "
+                "figure, not a sales total — it doesn't distinguish "
+                f"'sold off' from 'newly gone dead'. Prev month "
+                f"({_dprev_date}): {_fmt_money(_dprev_v)}."))
+        if _ddelta < 0:
+            _darrow, _dcolour, _dverb = (
+                "↓", "#16a34a", "down vs prev month (cleared)")
+        elif _ddelta > 0:
+            _darrow, _dcolour, _dverb = (
+                "↑", "#dc2626", "up vs prev month (more went dead)")
+        else:
+            _darrow, _dcolour, _dverb = (
+                "→", "#6b7280", "unchanged vs prev month")
+        sh4.markdown(
+            f"<small style='color:{_dcolour};'>{_darrow} {_dverb}"
+            "</small>", unsafe_allow_html=True)
+    else:
+        sh4.metric("Dead stock — moved this month", "—",
+                     help="Appears once a snapshot exists from last "
+                          "month (one snapshot per day from the "
+                          "daily engine recompute).")
+    st.caption(
+        "Target/Current/Dead figures above use the same definitions "
+        "as the Ordering page tiles. See **🪫 Slow-mover stock "
+        "reduction** below for the broader dormancy-based (velocity-"
+        "drop) clearance figure — a different, larger population "
+        "than Dead stock, tracked separately because it catches SKUs "
+        "that slowed down without going to zero.")
+
+    st.divider()
+
     # v2.67.38 — slow-mover stock-reduction panel. Surfaces what we
     # cleared this month and what's still flagged dormant. The big
     # strategic driver of this app is shrinking stock holding — give
     # this its own visible block on the front page so the team sees
     # it every day.
     st.divider()
-    st.subheader("🪫 Slow-mover stock reduction")
+    st.subheader("🪫 Slow-mover stock reduction (dormancy / velocity-drop)")
     try:
         _dormancy_w = db.get_dormancy_warnings()
     except Exception:  # noqa: BLE001
@@ -18740,6 +18905,17 @@ elif page == "Stock Optimisation":
     )
     dead_value = dead_master_value + dead_cut_value
 
+    # v2.67.381 — persist the aggregate totals so Overview can show
+    # Target stock without needing this page to have run in-session.
+    # Cheap (one upsert); best-effort — a write failure here must
+    # never break the Ordering page itself.
+    try:
+        db.record_ordering_target_snapshot(
+            len(master_only), total_target_value, master_onhand_value,
+            total_excess_value, total_understock_value)
+    except Exception:  # noqa: BLE001
+        pass
+
     # Cost-coverage diagnostics across MASTERS (what drives optimum)
     cov = master_only["CostBasisDetail"].value_counts().to_dict()
     direct_c = cov.get("direct", 0)
@@ -18851,6 +19027,102 @@ elif page == "Stock Optimisation":
             f"SKUs at CIN7 FIFO cost, while Optimum / Excess / "
             f"Understock are master-SKU figures using cost-chain "
             f"fallbacks.")
+
+    # v2.67.381 — Turns / days-on-hand cross-check + a third dead-stock
+    # tier ("sold, but slow cover") + an ABC now-vs-target table. Added
+    # after comparing our bottom-up (per-SKU target) reasoning against
+    # an external top-down inventory analysis (turns-based, ABC-bucket
+    # composition). Deliberately does NOT introduce a second hardcoded
+    # "target turns" number — v2.67.178 already replaced a hardcoded
+    # $600k target with the engine-derived Optimum, and a hardcoded
+    # turns target would reopen the same problem. Instead, turns/DOH
+    # are shown as two readings of the SAME numbers already on this
+    # page (Current vs Optimum), just in the units buyers and finance
+    # actually reason in.
+    trailing_12mo_cogs = float(master_only["annual_value"].sum())
+    master_turns_current = (
+        trailing_12mo_cogs / master_onhand_value
+        if master_onhand_value else None)
+    master_turns_optimum = (
+        trailing_12mo_cogs / total_target_value
+        if total_target_value else None)
+    doh_current = (365.0 / master_turns_current
+                   if master_turns_current else None)
+    doh_optimum = (365.0 / master_turns_optimum
+                   if master_turns_optimum else None)
+    over_12mo_cover_value = float(
+        master_only.loc[master_only["over_12mo_cover"], "OnHandValue"].sum())
+    over_12mo_cover_count = int(master_only["over_12mo_cover"].sum())
+
+    st.markdown("#### 📊 Turns & cover check")
+    tc1, tc2, tc3 = st.columns(3)
+
+    def _turns_text(t):
+        return f"{t:.2f}×" if t else "—"
+
+    def _doh_text(d):
+        return f"{d:.0f}d" if d else "—"
+
+    tc1.metric(
+        "Inventory turns — current → optimum",
+        f"{_turns_text(master_turns_current)} → "
+        f"{_turns_text(master_turns_optimum)}",
+        help=(
+            "Trailing-12mo COGS ÷ stock value, masters only (same "
+            "population + cost basis as Optimum/Excess/Understock "
+            "above). COGS = sum of effective_units_12mo × "
+            "AverageCost across master SKUs — the same per-SKU cost "
+            "the engine already uses, not a blended margin estimate. "
+            "'Optimum' reading swaps the denominator for the "
+            "engine's TargetValue sum, i.e. the turns rate you'd be "
+            "running AT the engine's own lead-time-derived target — "
+            "not an independent hardcoded turns goal."))
+    tc2.metric(
+        "Days on hand — current → optimum",
+        f"{_doh_text(doh_current)} → {_doh_text(doh_optimum)}",
+        help="365 ÷ turns, same two readings as the turns tile.")
+    tc3.metric(
+        "Sold, but >12mo cover",
+        _fmt_money(over_12mo_cover_value),
+        help=(
+            f"{over_12mo_cover_count:,} master SKUs with real 12mo "
+            "demand (not Dead stock) but more than a year of cover "
+            "at current sell-through. A LEVEL signal, distinct from "
+            "the dormancy flag driving Slow Movers (a VELOCITY-drop "
+            "signal) — a flat, low-velocity SKU never trips "
+            "dormancy but can still carry 18+ months of stock. "
+            "Not a subset of Dead stock or Excess above; check "
+            "separately."))
+
+    # --- ABC now-vs-target composition -----------------------------
+    _abc_summary = (
+        master_only.groupby("ABC")
+        .agg(SKUs=("SKU", "count"),
+             **{"Now $": ("OnHandValue", "sum"),
+                "Target $": ("TargetValue", "sum")})
+        .reindex(["A", "B", "C"])
+        .fillna(0)
+    )
+    _abc_summary["Move needed"] = (
+        _abc_summary["Target $"] - _abc_summary["Now $"])
+    _abc_summary = _abc_summary.reset_index()
+    with st.expander(
+            "📋 ABC composition — now vs. optimum target", expanded=False):
+        st.caption(
+            "Masters only, same scope as the tiles above. 'Move "
+            "needed' > 0 means that class is under its engine "
+            "target in aggregate (fund it); < 0 means it's over "
+            "(the class is carrying more than its own SKUs need).")
+        st.dataframe(
+            _abc_summary,
+            hide_index=True,
+            column_config={
+                "SKUs": st.column_config.NumberColumn(format="%d"),
+                "Now $": st.column_config.NumberColumn(format="$%.0f"),
+                "Target $": st.column_config.NumberColumn(format="$%.0f"),
+                "Move needed": st.column_config.NumberColumn(
+                    format="$%.0f"),
+            })
 
     # v2.67.178 — Glide path to engine-derived optimum (replaces
     # the old hard-coded $600k target). The engine's Optimum tile
@@ -26309,7 +26581,7 @@ elif page == "Slow Movers":
             "OnHandValue", pd.Series(dtype=float))).fillna(0).sum())
     _avg_days = (float(_slow_df["days_dormant"].mean())
                   if not _slow_df.empty else 0.0)
-    _hc1, _hc2, _hc3, _hc4 = st.columns(4)
+    _hc1, _hc2, _hc3, _hc4, _hc5 = st.columns(5)
     _hc1.metric("Slow parent / standalone SKUs",
                   _fmt_number(_total_skus),
                   help=("Active warnings filtered to parents + "
@@ -26325,6 +26597,31 @@ elif page == "Slow Movers":
                   help=("Mean of (today - first_seen_dormant_at) "
                         "across all flagged SKUs. Higher = more "
                         "urgent to clear."))
+    # v2.67.381 — this page is otherwise driven entirely by the
+    # dormancy flag, a VELOCITY signal (90d demand dropped vs the
+    # 12mo baseline). A flat, low-velocity SKU never trips that flag
+    # but can still be sitting on 18+ months of stock — a LEVEL
+    # signal the rest of this page has no visibility into. Shown as
+    # its own tile, NOT folded into the totals above, and excludes
+    # SKUs already counted there (no double-count with the dormancy
+    # list).
+    _over12_mask = (
+        engine_df["over_12mo_cover"].fillna(False)
+        & ~engine_df["is_non_master_tube"].fillna(False)
+        & ~engine_df["SKU"].astype(str).isin(_slow_skus_all)
+    )
+    _over12_count = int(_over12_mask.sum())
+    _over12_value = float(
+        engine_df.loc[_over12_mask, "OnHandValue"].sum())
+    _hc5.metric(
+        "Also carrying >12mo cover",
+        _fmt_money(_over12_value),
+        help=(
+            f"{_over12_count:,} master/standalone SKUs NOT already "
+            "flagged above — real 12mo demand, never dropped enough "
+            "to trip dormancy, but still >365 days of cover at "
+            "current sell-through. Worth a look even though the "
+            "velocity-based flag above didn't catch them."))
 
     # --- Family resolution ---
     if "Family" in _slow_df.columns:

@@ -771,6 +771,44 @@ CREATE TABLE IF NOT EXISTS slow_mover_value_snapshots (
     captured_at           TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v2.67.381 — daily snapshot of DEAD stock value (zero 12mo demand AND
+-- OnHand > 0). Distinct from slow_mover_value_snapshots above, which
+-- tracks the DORMANT set (a velocity-drop signal) — Dead is a LEVEL
+-- signal (no demand at all) and the two populations only partially
+-- overlap. Written from _abc_engine's warm-job tail (same place the
+-- slow-mover snapshot is written) using columns already computed
+-- there, so this is available on every page without needing the
+-- Ordering page to have run first in-session. Used purely for the
+-- month-over-month delta caption — the LIVE tile value is always
+-- computed fresh from engine_df, same pattern as slow-mover.
+CREATE TABLE IF NOT EXISTS dead_stock_value_snapshots (
+    snapshot_date         DATE PRIMARY KEY,
+    skus_count            INTEGER,
+    units_on_hand         REAL,
+    value_on_shelf        REAL,
+    captured_at           TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
+-- v2.67.381 — daily snapshot of the Ordering page's aggregate
+-- target/current/excess/understock totals (masters only, cost-chain
+-- valuation — same scope as the Ordering page tiles). Unlike Dead/Slow
+-- stock, target_stock genuinely cannot move into the warm job: it
+-- depends on supplier lead times, MOQ/EOQ and IP-observed lead times
+-- that only get loaded when the Ordering page renders. So this table
+-- is written FROM the Ordering page each time it runs, and read by
+-- Overview as a best-effort "last known" figure with an explicit
+-- "as of <captured_at>" freshness caption — it can lag if nobody has
+-- opened Ordering recently, which is why it's not warm-job-backed.
+CREATE TABLE IF NOT EXISTS ordering_target_snapshots (
+    snapshot_date          DATE PRIMARY KEY,
+    master_sku_count       INTEGER,
+    target_value           REAL,   -- sum(TargetValue) across masters — "Optimum"
+    onhand_value_masters   REAL,   -- sum(OnHandValue) across masters
+    excess_value           REAL,
+    understock_value       REAL,
+    captured_at            TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ============================================================
 -- v2.67.57 — Slack integration
 -- ============================================================
@@ -4208,6 +4246,29 @@ _PG_POST_CUTOVER_TABLES = [
       """
       CREATE INDEX IF NOT EXISTS idx_assembly_component_consumption_completion
           ON assembly_component_consumption(completion_date);
+      """),
+    # v2.67.381 — Dead/Target stock snapshots (Overview consolidation).
+    ("dead_stock_value_snapshots",
+      """
+      CREATE TABLE IF NOT EXISTS dead_stock_value_snapshots (
+          snapshot_date  DATE PRIMARY KEY,
+          skus_count     INTEGER,
+          units_on_hand  DOUBLE PRECISION,
+          value_on_shelf DOUBLE PRECISION,
+          captured_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("ordering_target_snapshots",
+      """
+      CREATE TABLE IF NOT EXISTS ordering_target_snapshots (
+          snapshot_date        DATE PRIMARY KEY,
+          master_sku_count     INTEGER,
+          target_value         DOUBLE PRECISION,
+          onhand_value_masters DOUBLE PRECISION,
+          excess_value         DOUBLE PRECISION,
+          understock_value     DOUBLE PRECISION,
+          captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
       """),
 ]
 
@@ -8927,6 +8988,130 @@ def list_slow_mover_snapshots(limit: int = 730) -> list:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# v2.67.381 — Dead stock value snapshots (LEVEL signal: zero 12mo demand).
+# Exact mirror of the slow-mover pair above — see
+# dead_stock_value_snapshots' CREATE TABLE comment for why this exists
+# as a separate table rather than reusing slow_mover_value_snapshots.
+# ---------------------------------------------------------------------------
+
+def record_dead_stock_value_snapshot(skus_count: int,
+                                        units_on_hand: float,
+                                        value_on_shelf: float
+                                        ) -> None:
+    """Called from _abc_engine's warm-job tail, right after the
+    slow-mover snapshot write. One row per calendar date — same-day
+    re-runs overwrite (last-write-wins)."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO dead_stock_value_snapshots
+                (snapshot_date, skus_count, units_on_hand,
+                 value_on_shelf, captured_at)
+            VALUES
+                (date('now'), ?, ?, ?, datetime('now'))
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                skus_count     = excluded.skus_count,
+                units_on_hand  = excluded.units_on_hand,
+                value_on_shelf = excluded.value_on_shelf,
+                captured_at    = excluded.captured_at
+            """,
+            (int(skus_count), float(units_on_hand),
+             float(value_on_shelf)),
+        )
+
+
+def get_previous_month_dead_stock_value() -> dict:
+    """Most-recent snapshot from the calendar month preceding today's,
+    or {} if none. Used by the Overview Dead-stock tile to render a
+    month-over-month delta caption — same logic as
+    get_previous_month_slow_mover_value()."""
+    from datetime import date as _date
+    today = _date.today()
+    first_of_this_month = today.replace(day=1)
+    if first_of_this_month.month == 1:
+        first_of_prev_month = first_of_this_month.replace(
+            year=first_of_this_month.year - 1, month=12)
+    else:
+        first_of_prev_month = first_of_this_month.replace(
+            month=first_of_this_month.month - 1)
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT snapshot_date, skus_count, units_on_hand,
+                   value_on_shelf
+              FROM dead_stock_value_snapshots
+             WHERE snapshot_date >= ?
+               AND snapshot_date < ?
+             ORDER BY snapshot_date DESC
+             LIMIT 1
+            """,
+            (first_of_prev_month.isoformat(),
+              first_of_this_month.isoformat()),
+        ).fetchone()
+    if not row:
+        return {}
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# v2.67.381 — Ordering-page target/current/excess/understock snapshot.
+# See ordering_target_snapshots' CREATE TABLE comment for why this is
+# written from the Ordering page rather than the warm job.
+# ---------------------------------------------------------------------------
+
+def record_ordering_target_snapshot(master_sku_count: int,
+                                       target_value: float,
+                                       onhand_value_masters: float,
+                                       excess_value: float,
+                                       understock_value: float
+                                       ) -> None:
+    """Called from the Ordering page tile block on every render (cheap:
+    one upsert). One row per calendar date, last-write-wins."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO ordering_target_snapshots
+                (snapshot_date, master_sku_count, target_value,
+                 onhand_value_masters, excess_value, understock_value,
+                 captured_at)
+            VALUES
+                (date('now'), ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                master_sku_count     = excluded.master_sku_count,
+                target_value         = excluded.target_value,
+                onhand_value_masters = excluded.onhand_value_masters,
+                excess_value         = excluded.excess_value,
+                understock_value     = excluded.understock_value,
+                captured_at          = excluded.captured_at
+            """,
+            (int(master_sku_count), float(target_value),
+             float(onhand_value_masters), float(excess_value),
+             float(understock_value)),
+        )
+
+
+def get_latest_ordering_target_snapshot() -> dict:
+    """Most recent row regardless of age — the Overview panel shows
+    its captured_at as an explicit freshness caption rather than
+    silently going stale. Returns {} if the Ordering page has never
+    run since this table was added."""
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT snapshot_date, master_sku_count, target_value,
+                   onhand_value_masters, excess_value,
+                   understock_value, captured_at
+              FROM ordering_target_snapshots
+             ORDER BY snapshot_date DESC
+             LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return {}
+    return dict(row)
 
 
 def flag_sku_as_slow_mover(sku: str, user_id: str = "") -> None:
