@@ -19069,9 +19069,19 @@ elif page == "Stock Optimisation":
                    if master_turns_current else None)
     doh_optimum = (365.0 / master_turns_optimum
                    if master_turns_optimum else None)
-    over_12mo_cover_value = float(
-        master_only.loc[master_only["over_12mo_cover"], "OnHandValue"].sum())
-    over_12mo_cover_count = int(master_only["over_12mo_cover"].sum())
+    # v2.67.382 — `over_12mo_cover` is new; guard direct indexing so a
+    # snapshot written by the warm job BEFORE it shipped (no such
+    # column yet) shows "—" here instead of crashing the whole
+    # Ordering page with a bare KeyError. Same fix as the Slow Movers
+    # page's "Also carrying >12mo cover" tile.
+    _cover_col_available = "over_12mo_cover" in master_only.columns
+    if _cover_col_available:
+        over_12mo_cover_value = float(
+            master_only.loc[
+                master_only["over_12mo_cover"], "OnHandValue"].sum())
+        over_12mo_cover_count = int(master_only["over_12mo_cover"].sum())
+    else:
+        over_12mo_cover_value, over_12mo_cover_count = 0.0, 0
 
     st.markdown("#### 📊 Turns & cover check")
     tc1, tc2, tc3 = st.columns(3)
@@ -19100,18 +19110,26 @@ elif page == "Stock Optimisation":
         "Days on hand — current → optimum",
         f"{_doh_text(doh_current)} → {_doh_text(doh_optimum)}",
         help="365 ÷ turns, same two readings as the turns tile.")
-    tc3.metric(
-        "Sold, but >12mo cover",
-        _fmt_money(over_12mo_cover_value),
-        help=(
-            f"{over_12mo_cover_count:,} master SKUs with real 12mo "
-            "demand (not Dead stock) but more than a year of cover "
-            "at current sell-through. A LEVEL signal, distinct from "
-            "the dormancy flag driving Slow Movers (a VELOCITY-drop "
-            "signal) — a flat, low-velocity SKU never trips "
-            "dormancy but can still carry 18+ months of stock. "
-            "Not a subset of Dead stock or Excess above; check "
-            "separately."))
+    if _cover_col_available:
+        tc3.metric(
+            "Sold, but >12mo cover",
+            _fmt_money(over_12mo_cover_value),
+            help=(
+                f"{over_12mo_cover_count:,} master SKUs with real 12mo "
+                "demand (not Dead stock) but more than a year of cover "
+                "at current sell-through. A LEVEL signal, distinct from "
+                "the dormancy flag driving Slow Movers (a VELOCITY-drop "
+                "signal) — a flat, low-velocity SKU never trips "
+                "dormancy but can still carry 18+ months of stock. "
+                "Not a subset of Dead stock or Excess above; check "
+                "separately."))
+    else:
+        tc3.metric(
+            "Sold, but >12mo cover", "—",
+            help="The engine snapshot the app is currently serving "
+                 "predates this tile — it doesn't have the "
+                 "`over_12mo_cover` column yet. Updates automatically "
+                 "on the next background engine recompute.")
 
     # --- ABC now-vs-target composition -----------------------------
     _abc_summary = (
@@ -26624,23 +26642,37 @@ elif page == "Slow Movers":
     # its own tile, NOT folded into the totals above, and excludes
     # SKUs already counted there (no double-count with the dormancy
     # list).
-    _over12_mask = (
-        engine_df["over_12mo_cover"].fillna(False)
-        & ~engine_df["is_non_master_tube"].fillna(False)
-        & ~engine_df["SKU"].astype(str).isin(_slow_skus_all)
-    )
-    _over12_count = int(_over12_mask.sum())
-    _over12_value = float(
-        engine_df.loc[_over12_mask, "OnHandValue"].sum())
-    _hc5.metric(
-        "Also carrying >12mo cover",
-        _fmt_money(_over12_value),
-        help=(
-            f"{_over12_count:,} master/standalone SKUs NOT already "
-            "flagged above — real 12mo demand, never dropped enough "
-            "to trip dormancy, but still >365 days of cover at "
-            "current sell-through. Worth a look even though the "
-            "velocity-based flag above didn't catch them."))
+    # v2.67.382 — `over_12mo_cover` is new; a snapshot written by the
+    # warm job BEFORE it shipped won't have the column, and direct
+    # indexing (engine_df["over_12mo_cover"]) raised a bare KeyError
+    # that crashed the whole page. Guard it the same way the Overview
+    # "Dead stock" tile guards `is_dead` — show "—" until the next
+    # background engine recompute catches up.
+    if "over_12mo_cover" in engine_df.columns:
+        _over12_mask = (
+            engine_df["over_12mo_cover"].fillna(False)
+            & ~engine_df["is_non_master_tube"].fillna(False)
+            & ~engine_df["SKU"].astype(str).isin(_slow_skus_all)
+        )
+        _over12_count = int(_over12_mask.sum())
+        _over12_value = float(
+            engine_df.loc[_over12_mask, "OnHandValue"].sum())
+        _hc5.metric(
+            "Also carrying >12mo cover",
+            _fmt_money(_over12_value),
+            help=(
+                f"{_over12_count:,} master/standalone SKUs NOT already "
+                "flagged above — real 12mo demand, never dropped enough "
+                "to trip dormancy, but still >365 days of cover at "
+                "current sell-through. Worth a look even though the "
+                "velocity-based flag above didn't catch them."))
+    else:
+        _hc5.metric(
+            "Also carrying >12mo cover", "—",
+            help="The engine snapshot the app is currently serving "
+                 "predates this tile — it doesn't have the "
+                 "`over_12mo_cover` column yet. Updates automatically "
+                 "on the next background engine recompute.")
 
     # --- Family resolution ---
     if "Family" in _slow_df.columns:
