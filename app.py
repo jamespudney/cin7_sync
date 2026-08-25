@@ -3422,16 +3422,24 @@ def _load_longest_assemblies_cached(fingerprint: tuple) -> pd.DataFrame:
             "ParentQuantity", "ComponentProductID", "ComponentSKU",
             "ComponentName", "Quantity", "Unit", "Cost", "BinID", "Bin",
         ])
-    # Largest window first, then more-recent smaller files unioned
-    files.sort(key=lambda x: (-x[0], -x[1]))
-    base_file = files[0][2]
-    base_mtime = files[0][1]
+    # Pick the base as the LARGEST file among those sharing the widest
+    # window label, not merely the most recent one. A same-window resync
+    # that gets interrupted (crash/redeploy mid-run) leaves a small
+    # partial file whose mtime is newer than the complete file from a
+    # prior successful run — picking by recency alone silently discards
+    # real history (v2.67.393: a July 2 partial 365d resync with 899
+    # rows outranked the June 2 complete 365d backfill with 23,369 rows
+    # for 54 days, because the old mtime-only tie-break preferred it).
+    max_days = max(f[0] for f in files)
+    same_window = [f for f in files if f[0] == max_days]
+    base_days, base_mtime, base_file = max(
+        same_window, key=lambda x: x[2].stat().st_size)
     try:
         base = pd.read_csv(base_file, low_memory=False)
     except Exception:
         return pd.DataFrame()
-    for days, mtime, p in files[1:]:
-        if mtime <= base_mtime:
+    for days, mtime, p in files:
+        if p == base_file or mtime <= base_mtime:
             continue
         try:
             more = pd.read_csv(p, low_memory=False)
