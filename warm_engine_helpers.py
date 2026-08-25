@@ -145,12 +145,21 @@ def warm() -> dict[str, Any]:
         stock["Available"] = pd.to_numeric(
             stock["Available"], errors="coerce").fillna(0)
 
+    # v2.67.394 — fetch manual overrides for the BOM-rollup demand
+    # heuristic before the warm compute, so a human correction always
+    # takes effect on the next engine refresh.
+    try:
+        import db as _db_overrides
+        demand_overrides = _db_overrides.count_own_demand_overrides()
+    except Exception:  # noqa: BLE001
+        demand_overrides = {}
+
     # The actual warm. _abc_engine is @st.cache_data; calling it
     # populates the disk cache and we also write the portable CSV
     # snapshot the web app prefers.
     result_df = _abc_engine(
         products, stock, sale_lines, purchase_lines,
-        assemblies_df=assemblies)
+        assemblies_df=assemblies, demand_overrides=demand_overrides)
     out_path = OUTPUT_DIR / "engine_output.csv"
     tmp_path = OUTPUT_DIR / "engine_output.tmp.csv"
     result_df.to_csv(tmp_path, index=False)

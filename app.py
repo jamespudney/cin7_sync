@@ -3002,7 +3002,7 @@ def _normalise_engine_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     for col in ("trend_12m", "trend_24m"):
         if col in df.columns:
             df[col] = df[col].apply(_parse_engine_list_cell)
-    for col in ("is_dormant", "is_non_master_tube"):
+    for col in ("is_dormant", "is_non_master_tube", "demand_reclassified"):
         if col in df.columns:
             df[col] = df[col].apply(_parse_engine_bool_cell)
     return df
@@ -5468,7 +5468,8 @@ def _abc_engine(products: pd.DataFrame,
                 sale_lines: pd.DataFrame,
                 purchase_lines: pd.DataFrame,
                 window_days: int = 365,
-                assemblies_df: Optional[pd.DataFrame] = None
+                assemblies_df: Optional[pd.DataFrame] = None,
+                demand_overrides: Optional[dict] = None,
                 ) -> pd.DataFrame:
     """Compute per-SKU ABC, velocity, target, reorder for Stock items.
     Uses hybrid ABC: 60% value + 40% qty percentile rank.
@@ -5481,7 +5482,14 @@ def _abc_engine(products: pd.DataFrame,
     sold directly). Components with assembly data are EXCLUDED from
     the downstream BOM-rollup unit passes to avoid double-counting
     (the BOM rollup adds kit-sales × ratio, which is the SAME demand
-    the assembly task already records as ground truth)."""
+    the assembly task already records as ground truth).
+
+    v2.67.394 — demand_overrides: optional {sku: bool} from
+    db.count_own_demand_overrides(). Overrides the automatic
+    component-count heuristic in _global_is_master() for a specific
+    SKU: True forces "count this SKU's own demand" (genuine
+    assembly), False forces "zero it, roll up to components"
+    (bulk-roll/cut)."""
     # 1. Filter to Stock items only (already done by global filter)
     product_cols = ["SKU", "Name", "Type", "Category", "Brand",
                     "Status", "AverageCost",
@@ -6329,19 +6337,44 @@ def _abc_engine(products: pd.DataFrame,
             (_base_sku, _master_sku, 1.0 / float(_pack_size), _pack_size))
     pack_rollup_child_skus = {child for child, _, _, _ in pack_rollup_rules}
 
+    # v2.67.394 — SKUs whose own demand is being counted specifically
+    # because of the multi-component BOM heuristic below (not an
+    # explicit CIN7 sourcing rule, manual override, or supplier
+    # assignment). Surfaced as df["demand_reclassified"] for the Demand
+    # Reclassification Review page so a human can sanity-check/override
+    # any that look wrong.
+    _demand_reclass_skus: set = set()
+
     def _global_is_master(sku: str) -> bool:
-        """A SKU is a MASTER (orderable) if there's evidence it's bought
-        from a supplier, AND it's not explicitly marked as assembled-from.
-        Detection priority:
+        """A SKU is a MASTER (orderable, counts its own demand) if
+        there's evidence it's bought from a supplier, AND it's not
+        explicitly marked as assembled-from. Detection priority:
+          0. Explicit human override (sku_policy_overrides
+             .count_own_demand) → always wins
           1. Supplier assigned in CIN7 → likely master (can still be
              overridden by explicit Assemble-from rule — see #2)
           2. Rule says 'Assemble from X' → non-master (wins over #1;
              e.g. MP variants can have a supplier but the rule tells us
              they're assembled, not bought)
           3. Rule says 'Purchased full length' → master
-          4. BillOfMaterial=True or appears in BOMs as assembly → non-master
+          4. BillOfMaterial=True or appears in BOMs as assembly with
+             exactly ONE component → non-master (bulk-roll/cut
+             pattern: a length-cut of one shared master roll, which
+             shouldn't be independently reordered — you buy the roll,
+             not "3ft of it"). A BOM with TWO OR MORE components is a
+             genuine multi-part assembly (e.g. a corner connector
+             built from a strip + a cover) with its own independent
+             demand — v2.67.394 stopped zeroing these; they fall
+             through to #1/#5 below instead. The proportional rollup
+             to each component still happens separately (see the
+             rollup loop below) — that supply signal is unaffected,
+             this only changes whether the SKU's OWN sales are zeroed.
           5. Default → master (no evidence of assembly)
         """
+        # 0: Explicit human override always wins
+        override = (demand_overrides or {}).get(sku)
+        if override is not None:
+            return override
         rule = rule_by_sku.get(sku, {})
         # Sellable child SKU whose demand is planned through an exact
         # -X<number> purchase pack. This prevents duplicate target/reorder
@@ -6354,11 +6387,15 @@ def _abc_engine(products: pd.DataFrame,
         # 3: Explicit Purchased full length
         if rule.get("IsMaster"):
             return True
-        # 4: BOM flag or BOM-has-components
-        if bom_flag_by_sku.get(sku):
+        # 4: BOM flag or BOM-has-components, single-component only
+        # (see docstring #4 above for why 2+ components is exempt)
+        n_bom_components = len(bom_components_by_asm.get(sku, []))
+        if n_bom_components == 1:
             return False
-        if sku in bom_components_by_asm:
+        if n_bom_components == 0 and bom_flag_by_sku.get(sku):
             return False
+        if n_bom_components >= 2:
+            _demand_reclass_skus.add(sku)
         # 1: Supplier assigned (without any Assemble-from / BOM evidence)
         if sku in has_cin7_supplier:
             return True
@@ -6815,6 +6852,15 @@ def _abc_engine(products: pd.DataFrame,
         return not _global_is_master(sku)
 
     df["is_non_master_tube"] = df["SKU"].apply(_final_is_non_master)
+
+    # v2.67.394 — surfaced for the Demand Reclassification Review page.
+    # bom_component_count uses bom_components_by_asm directly (not
+    # _find_all_masters_for_assembly's fallback methods) since the
+    # heuristic in _global_is_master only looks at real BOM rows.
+    df["demand_reclassified"] = df["SKU"].apply(
+        lambda s: s in _demand_reclass_skus)
+    df["bom_component_count"] = df["SKU"].apply(
+        lambda s: len(bom_components_by_asm.get(s, [])))
 
     # Effective units_12mo for reorder math:
     # - Non-master tubes → 0 (their demand is rolled up into the master)
@@ -8046,9 +8092,13 @@ def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
     _start_background_engine_refresh("engine snapshot requested but missing")
     if os.environ.get("ABC_ALLOW_FOREGROUND_COMPUTE") != "1":
         return pd.DataFrame()
+    try:
+        _demand_overrides = db.count_own_demand_overrides()
+    except Exception:  # noqa: BLE001
+        _demand_overrides = {}
     return _normalise_engine_snapshot(_abc_engine(
         products, stock, sale_lines, purchase_lines,
-        assemblies_df=assemblies))
+        assemblies_df=assemblies, demand_overrides=_demand_overrides))
 
 
 def _get_engine_df() -> "pd.DataFrame":
@@ -24477,6 +24527,104 @@ elif page == "Kits & Fixtures":
                     f"signal — customers keep building that exact combo. "
                     f"Pre-building those saves the most fulfillment time."
                 )
+
+# ---------------------------------------------------------------------------
+# Page: Demand Reclassification Review (v2.67.394)
+# ---------------------------------------------------------------------------
+# Safety net for the multi-component BOM demand fix: a SKU with a BOM
+# containing 2+ components (a genuine assembly, e.g. a corner connector
+# built from a strip + a cover) now counts its own effective_units_12mo
+# instead of being zeroed and rolled entirely into its raw materials'
+# demand — see _global_is_master() in _abc_engine(). This page lists
+# every SKU currently reclassified by that heuristic (as opposed to an
+# explicit CIN7 BOM Rule / sourcing rule) so a human can sanity-check it,
+# plus lets anyone force either direction with a per-SKU override that
+# always wins over both the heuristic and CIN7's rule.
+
+elif page == "Demand Reclassification Review":
+    st.header(":mag: Demand Reclassification Review")
+    st.caption(
+        "SKUs whose own demand is now counted because they have a "
+        "multi-component BOM, rather than being zeroed and rolled "
+        "entirely into their raw materials' demand. The best long-term "
+        "fix is tagging these correctly in CIN7's BOM Rule field "
+        "(AdditionalAttribute1, e.g. `Logic: Purchased full length`) — "
+        "this heuristic is the automatic fallback for SKUs not yet "
+        "tagged there."
+    )
+
+    _engine_df_review = _get_engine_df()
+    if _engine_df_review.empty:
+        st.warning("Engine data not available yet.")
+        st.stop()
+
+    _actor_review = (
+        st.session_state.get("current_user", "").strip() or "anonymous")
+
+    _reclass_df = pd.DataFrame()
+    if "demand_reclassified" in _engine_df_review.columns:
+        _reclass_df = _engine_df_review[
+            _engine_df_review["demand_reclassified"] == True  # noqa: E712
+        ].copy()
+
+    st.metric("SKUs reclassified by the heuristic", len(_reclass_df))
+
+    if _reclass_df.empty:
+        st.info(
+            "No SKUs currently reclassified by the multi-component BOM "
+            "heuristic.")
+    else:
+        _cols_show = [c for c in [
+            "SKU", "Name", "ABC", "Status", "effective_units_12mo",
+            "bom_component_count", "BOMType",
+        ] if c in _reclass_df.columns]
+        st.dataframe(
+            _reclass_df[_cols_show].sort_values(
+                "effective_units_12mo", ascending=False),
+            width="stretch", hide_index=True,
+            column_config={
+                "effective_units_12mo": st.column_config.NumberColumn(
+                    "Effective 12mo units", format="%.1f"),
+                "bom_component_count": st.column_config.NumberColumn(
+                    "BOM components", format="%.0f"),
+            },
+        )
+
+    st.divider()
+    st.markdown("### Set or clear a manual override")
+    st.caption(
+        "Forcing True counts this SKU's own demand (genuine assembly). "
+        "Forcing False zeroes it and rolls it up into its components "
+        "(bulk-roll/cut). Clearing goes back to CIN7's BOM Rule / the "
+        "automatic heuristic. This always wins over both."
+    )
+    _ov_c1, _ov_c2, _ov_c3 = st.columns([2, 2, 1])
+    _ov_sku = _ov_c1.text_input("SKU", key="reclass_override_sku")
+    _ov_choice = _ov_c2.selectbox(
+        "Override",
+        ["(no override)", "True — count its own demand",
+         "False — zero it, roll up to components"],
+        key="reclass_override_choice")
+    if _ov_c3.button("Save", key="reclass_override_save",
+                      disabled=not _ov_sku.strip()):
+        _val = {
+            "(no override)": None,
+            "True — count its own demand": True,
+            "False — zero it, roll up to components": False,
+        }[_ov_choice]
+        db.set_count_own_demand_override(
+            _ov_sku.strip(), _val, _actor_review)
+        st.success(f"Saved override for {_ov_sku.strip()}: {_val}")
+        st.rerun()
+
+    _active_overrides = db.count_own_demand_overrides()
+    if _active_overrides:
+        st.markdown("### Active overrides")
+        st.dataframe(
+            pd.DataFrame(
+                [{"SKU": k, "Override": v}
+                 for k, v in _active_overrides.items()]),
+            width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------------------
 # Page: AI Assistant
