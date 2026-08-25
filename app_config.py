@@ -105,6 +105,7 @@ PAGE_GROUPS = OrderedDict({
         "Ordering",
         "Stock Optimisation",
         "Finishing Work Orders",
+        "865FabLab Production",
         "Slow Movers",
         "Supplier Setup",
         "Supplier Pricing",
@@ -147,6 +148,11 @@ PAGE_DESCRIPTIONS = {
     ),
     "Finishing Work Orders": (
         "BOM-driven coating/anodizing work queue for finished SKU replenishment."
+    ),
+    "865FabLab Production": (
+        "Monthly batch planner for toll-manufactured accessory corners: "
+        "demand forecast, raw-material coverage check, order tracking, "
+        "and receiving checklist."
     ),
     "Slow Movers": "Stock-reduction workspace: dormant SKUs, value tied up, dismiss/flag.",
     "Supplier Setup": (

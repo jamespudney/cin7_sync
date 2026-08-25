@@ -48,6 +48,7 @@ from app_config import (
 )
 from app_pages.data_health import render_data_health
 from app_pages.coating_work_orders import render_anodizing_powder_coating
+from app_pages.fablab_work_orders import render_fablab_work_orders
 from app_pages.my_profile import render_my_profile
 from app_pages.ordering_layout import ORDERING_PO_EDITOR_VIEW
 from app_pages.overview_actions import render_attention_queue
@@ -26598,6 +26599,22 @@ elif page in ("Finishing Work Orders", "Anodizing & Powder coating"):
         fmt_number=_fmt_number,
         fmt_money=_fmt_money,
         rows_selector=rows_selector,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page: 865FabLab Production — toll-manufactured accessory corners.
+# See app_pages/fablab_work_orders.py for the full workflow.
+# ---------------------------------------------------------------------------
+
+elif page == "865FabLab Production":
+    render_fablab_work_orders(
+        products=products,
+        stock=stock,
+        engine_df=_get_engine_df(),
+        bom_parents=BOM_PARENTS,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
     )
 
 
