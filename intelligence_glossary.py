@@ -783,6 +783,90 @@ basis (CIN7 FIFO vs cost-chain fallbacks), so the tiles never
 tie to the exact dollar — the bridge caption under the tiles
 states the live numbers.
 
+#### Turns / days-on-hand check, and the `over_12mo_cover` flag (v2.67.381)
+Added after comparing the engine's bottom-up (per-SKU target) reasoning
+against an external top-down inventory analysis built on turns and
+ABC-bucket composition. Two additions, both on the Ordering page:
+
+- **Inventory turns / days-on-hand — current → optimum.** Trailing-12mo
+  COGS ÷ stock value, masters only (same population + cost basis as
+  Optimum/Excess/Understock). COGS = `sum(effective_units_12mo ×
+  AverageCost)` across master SKUs (the `annual_value` engine column —
+  the same per-SKU cost the engine already uses for ABC, not a blended
+  margin estimate). The "optimum" reading swaps the denominator for
+  `TargetValue` — i.e. the turns rate you'd be running AT the engine's
+  own lead-time-derived target. This deliberately does NOT introduce a
+  second, independent hardcoded turns target: v2.67.178 already
+  replaced a hardcoded $600k stock target with the engine-derived
+  Optimum, and a hardcoded turns number would reopen the same problem.
+  Turns/DOH are just the Current/Optimum tiles read in the units buyers
+  and finance reason in.
+- **`over_12mo_cover` (engine column)** — a SKU has real 12mo demand
+  (excludes 💀 Dead stock) but `DoC_days` (OnHand ÷ avg_daily) exceeds
+  365. This is a LEVEL signal, distinct from `is_dormant` (a VELOCITY
+  signal: 90d demand dropped ~80% vs the 12mo baseline — see "Slow
+  movers / dormancy" above). A flat, low-velocity SKU never trips
+  dormancy — nothing *dropped* — but can still be sitting on 18+
+  months of stock at its steady rate. Surfaced as its own "Sold, but
+  >12mo cover" tile on the Ordering page (masters only, not a subset of
+  Excess or Dead stock — check separately) and as an "Also carrying
+  >12mo cover" tile on the Slow Movers page, where it explicitly
+  excludes SKUs already in the dormancy-flagged list so the two
+  signals don't double-count.
+- **ABC now-vs-target table** — an expander on the Ordering page below
+  the tiles: per ABC class (masters only), SKU count, current
+  OnHandValue, TargetValue, and the $ move needed to close the gap
+  (positive = underfunded, fund it; negative = that class is carrying
+  more than its own SKUs need). Pure reporting over existing engine
+  columns — no new math, no change to reorder suggestions.
+
+#### Overview "Stock health" panel — Target / Current / Dead / moved this month (v2.67.381)
+A review of the dashboard's inventory reports found Target and Dead
+stock only ever shown on the Ordering page, and no reliable "how much
+dead stock have we moved" anywhere — the Overview "Cleared this
+month" tile is scoped to the DORMANT (velocity-drop) set, not to Dead
+(zero-demand) stock. This panel puts all four numbers together on the
+front page:
+
+- **Target stock (Optimum)** — read from `ordering_target_snapshots`
+  (a new table), written by the Ordering page every time it renders.
+  Target stock genuinely can't move into the warm background job — it
+  needs supplier lead times, MOQ/EOQ and IP-observed lead times that
+  only get loaded when the Ordering page runs — so this figure can lag
+  if nobody has opened Ordering recently. The tile shows an explicit
+  "as of `<captured_at>`" caption rather than silently going stale,
+  and reads "—" if the Ordering page has never run since this table
+  was added.
+- **Current stock value** — the same `_headline_stock_value` used
+  everywhere else (CIN7 FIFO across all SKUs).
+- **Dead stock** — the new `is_dead` engine column (warm-job safe:
+  computed inside `_abc_engine` itself from columns already available
+  there, unlike `Status`/`target_stock`, which need Ordering-page-only
+  data). Exact parity with the Ordering page's Dead-stock tile: for
+  master SKUs, no visible 12mo demand (direct + lineage + rolled-up)
+  AND physical stock; for non-master cuts, zero OWN direct sales AND
+  physical stock (a cut with its own direct sales is working
+  inventory even when its master shows none).
+- **Dead stock — moved this month** — a NET month-over-month delta on
+  Dead stock value, from a new `dead_stock_value_snapshots` table
+  (exact mirror of the existing `slow_mover_value_snapshots`
+  mechanism, written from `_abc_engine`'s warm-job tail so it's always
+  fresh). Negative = shrank (cleared/sold, good); positive = grew
+  (more SKUs went dead). This is a NET figure, not a sales total — it
+  doesn't distinguish "sold off" from "newly gone dead" within the
+  month. A true sales-attributed "Dead stock cleared" figure (mirroring
+  `_compute_slow_mover_clearance`) would need a persisted "which SKUs
+  were dead as of period start" set — not built yet, since a live
+  recompute of `is_dead` would always show ~$0 cleared (any SKU that
+  sold this month is, by definition, no longer zero-demand in the
+  current snapshot).
+
+Dead stock (a LEVEL signal — zero demand) and the Slow-mover panel
+below it (a VELOCITY signal — 90d demand dropped vs the 12mo baseline)
+are DIFFERENT, overlapping-but-not-identical populations. Both panels
+stay on Overview, clearly labelled apart, rather than merging into one
+number that would hide which kind of "stuck stock" problem it is.
+
 #### Reorder engine: cadence + holiday cover + IP lead times (v2.67.283-285)
 The reorder engine's target stock is built from four components,
 in this order:
