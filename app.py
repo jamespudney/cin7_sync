@@ -8916,6 +8916,21 @@ def _build_ordering_context() -> "SimpleNamespace":
         rollup_in = float(row.get("tube_rollup_in", 0))
         eff_u = float(row.get("effective_units_12mo", units_12mo_total))
 
+        # v2.67.390 — this panel used to format every one of these
+        # quantities with `.0f` (zero decimals). Fine for regular
+        # unit-count SKUs, but silently misleading for bulk-roll /
+        # fractional consumption (e.g. 0.42 of a 100m roll consumed by
+        # one cut task) — `.0f` rounds those straight to "0", making
+        # real, recent activity look identical to genuinely zero
+        # activity. Confirmed live: a completed assembly task from 4
+        # days prior, quantity 0.42, displayed as "Assembly
+        # consumption: +0 units" — indistinguishable from no activity
+        # at all. Whole-number values still display cleanly (39, not
+        # 39.00); only genuinely fractional ones gain decimals.
+        def _fmt_units(v: float) -> str:
+            v = float(v)
+            return f"{v:.0f}" if v == int(v) else f"{v:.2f}"
+
         demand_lines = [f"**Supplier**: {supplier or 'unassigned'}\n"]
         if row.get("is_non_master_tube"):
             demand_lines.append(
@@ -8927,8 +8942,8 @@ def _build_ordering_context() -> "SimpleNamespace":
         else:
             demand_lines.append(
                 f"**Velocity breakdown** (12mo → effective "
-                f"{eff_u:.0f} units):\n"
-                f"- Direct sales of this SKU: **{direct_u:.0f}** units\n"
+                f"{_fmt_units(eff_u)} units):\n"
+                f"- Direct sales of this SKU: **{_fmt_units(direct_u)}** units\n"
             )
             if asm_u > 0:
                 # v2.67.334 — assembly (FG-XXXX) consumption: every kit
@@ -8938,24 +8953,24 @@ def _build_ordering_context() -> "SimpleNamespace":
                 # counting the same demand twice).
                 demand_lines.append(
                     f"- Assembly consumption (FG- tasks): "
-                    f"**+{asm_u:.0f}** units "
+                    f"**+{_fmt_units(asm_u)}** units "
                     f"(ground truth — kits built using this part)\n"
                 )
             if mig_in > 0:
                 demand_lines.append(
                     f"- Migrated IN from retiring SKUs: "
-                    f"**+{mig_in:.0f}** units "
+                    f"**+{_fmt_units(mig_in)}** units "
                     f"({row.get('migrated_from') or 'see below'})\n"
                 )
             if mig_out > 0:
                 demand_lines.append(
                     f"- Migrated OUT (share going to successor): "
-                    f"**−{mig_out:.0f}** units\n"
+                    f"**−{_fmt_units(mig_out)}** units\n"
                 )
             if rollup_in > 0:
                 demand_lines.append(
                     f"- Demand rollup IN from variants / packs / cuts: "
-                    f"**+{rollup_in:.0f}** units "
+                    f"**+{_fmt_units(rollup_in)}** units "
                     f"(see tube_rollup_notes)\n"
                 )
 
@@ -8973,9 +8988,9 @@ def _build_ordering_context() -> "SimpleNamespace":
             demand_lines.append(
                 f"\n**💤 Dormant detection**:\n"
                 f"- 12mo effective rate: **{rate_12mo_daily:.2f} units/day** "
-                f"(based on {eff_12mo_d:.0f} units over 365d)\n"
+                f"(based on {_fmt_units(eff_12mo_d)} units over 365d)\n"
                 f"- Last 90d effective rate: **{rate_90d_daily:.3f} units/day** "
-                f"(based on {eff_90d_d:.0f} units over 90d)\n"
+                f"(based on {_fmt_units(eff_90d_d)} units over 90d)\n"
                 f"- Ratio: **{ratio_pct:.1f}%** of historical rate "
                 f"(threshold for dormancy: <20%)\n"
                 f"- **Engine override**: using 90d rate instead of 12mo rate, "
@@ -9965,8 +9980,16 @@ def _build_ordering_context() -> "SimpleNamespace":
                                 _adisp["Quantity"], errors="coerce"
                             ).fillna(0).sum())
                             _parents_n = _adisp["ParentSKU"].nunique()
+                            # v2.67.390 — same fractional-quantity fix
+                            # as the Velocity breakdown above: `.0f`
+                            # rounded small bulk-roll consumption
+                            # (e.g. 0.42) straight to "0 units",
+                            # indistinguishable from no activity.
+                            _q_total_disp = (
+                                f"{_q_total:.0f}" if _q_total == int(_q_total)
+                                else f"{_q_total:.2f}")
                             st.caption(
-                                f"**Total consumed: {_q_total:.0f} "
+                                f"**Total consumed: {_q_total_disp} "
                                 f"units across {len(_adisp)} tasks**  ·  "
                                 f"Distinct parent kits: {_parents_n}"
                             )

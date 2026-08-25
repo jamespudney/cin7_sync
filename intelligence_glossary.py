@@ -1013,6 +1013,35 @@ config-independent columns) — it just guarantees the config-dependent
 columns are always freshly computed for whichever supplier is on
 screen, regardless of snapshot staleness.
 
+#### Bug #3: Inspect-a-SKU panel rounded fractional quantities to "0" (fixed v2.67.390)
+Found while investigating whether bulk-roll cut/kit demand was being
+lost, not just displayed wrong. A real, COMPLETED assembly task
+(4 days old) consuming 0.42 of a 100m master roll displayed as
+"Assembly consumption (FG- tasks): +0 units" — indistinguishable
+from no activity at all. Confirmed via direct query against the live
+`assembly_component_consumption` table: the real stored quantity was
+0.42, not 0. Every fractional-quantity line in this panel (effective
+units, direct sales, assembly consumption, migration in/out, rollup
+in, and the dormancy-detection basis numbers) used `.0f` (zero
+decimal places) — harmless for normal whole-unit SKUs, but silently
+hides real activity for bulk-roll / fractional consumption, which is
+exactly the population most likely to look "dead" from small numbers
+in the first place.
+
+Important: this traced as a **display-only** bug, not a demand-
+calculation bug. The same panel's "Target stock: 0.1" line already
+showed real fractional precision, and `effective_units_12mo` (the
+column that actually drives target_stock/reorder/dormancy/is_dead)
+is a float column computed upstream in `_abc_engine`, unaffected by
+how a later `st.markdown()` call chooses to format it. Whole-number
+kit consumption (verified against a second SKU: 39 real units across
+24 tasks) displayed correctly even before this fix — only genuinely
+fractional quantities were affected.
+
+Fix: `_fmt_units()` helper — whole numbers still show as `39`, not
+`39.00`; fractional values show 2 decimals (`0.42`) instead of
+rounding to `0`. Applied to every quantity line in the panel.
+
 - **Holiday cover** = `avg_daily × closure_days_in_window`,
   where `closure_days` is the count of days within the upcoming
   `lead_time + review` window that overlap any of the supplier's
