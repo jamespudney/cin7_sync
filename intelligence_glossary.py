@@ -937,6 +937,46 @@ in this order:
   supplier weekly, set their cadence to 7 — each order then
   carries only 7d of next-cycle stock instead of 30-45d. Set in
   Supplier settings → "Order cadence (days)".
+
+#### Bug: per-supplier safety%/review-days silently ignored since the Postgres cutover (fixed v2.67.388)
+Found 2026-08-25 while investigating why raising Neonica/Topmet/Luz
+Negra's safety% in Supplier Setup had no visible effect on the
+Ordering page. `all_supplier_configs()` returns a dict keyed by the
+**actual Postgres column names**, which are lowercase
+(`safety_pct_a`, `review_days_a`, etc. — renamed from the original
+mixed-case SQLite naming during the Postgres migration, see
+`_PG_POST_CUTOVER_TABLES` in db.py). But every reader of that dict —
+the reorder engine (`_compute_target_and_reorder`'s `safety_pct` /
+`abc_review_days` lookup), the alternate freight-override recompute
+path, the pull-forward window default, AND the Supplier Setup form
+itself — looked up the OLD mixed-case keys (`"safety_pct_A"` etc.).
+`dict.get()` on a missing key returns `None` silently, so every one
+of these fell back to the hardcoded global default (30/20/15%,
+14/30/45 days) — meaning **no per-supplier safety%/review-days
+override has taken effect for any supplier since the Postgres
+cutover**, regardless of what was saved. `order_cadence_days` and
+every other supplier_config field were unaffected (never had
+mixed-case names).
+
+The Supplier Setup form was also silently destructive: it displays
+the (wrong, default) value in the input box, and Save writes back
+whatever's in that box — so opening the page for any supplier and
+clicking Save, without knowing the displayed number was wrong, would
+overwrite a real saved override with the generic default.
+
+This is very likely a major contributor to the company-wide
+"Optimum implies unrealistically few turns" finding from the same
+investigation (see "Optimum turns caution banner" above) — not a
+single bad number, but every supplier's hand-tuned safety margin
+being silently discarded for as long as this has been broken.
+
+Fix: all 19 lookups (`.get("safety_pct_A")` etc.) corrected to the
+real lowercase column names. No data was lost — the underlying saved
+values were always correct in the database; only the *reads* were
+broken. Anyone who saved Supplier Setup for a supplier while this bug
+was live may have unknowingly reset that supplier's safety%/review-
+days to the defaults — worth spot-checking suppliers with a save
+history against what was actually intended.
 - **Holiday cover** = `avg_daily × closure_days_in_window`,
   where `closure_days` is the count of days within the upcoming
   `lead_time + review` window that overlap any of the supplier's

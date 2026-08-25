@@ -8554,9 +8554,9 @@ def _build_ordering_context() -> "SimpleNamespace":
         # Safety factor by class
         abc = row.get("ABC") or "C"
         safety_pct = {
-            "A": cfg.get("safety_pct_A") or 30.0,
-            "B": cfg.get("safety_pct_B") or 20.0,
-            "C": cfg.get("safety_pct_C") or 15.0,
+            "A": cfg.get("safety_pct_a") or 30.0,
+            "B": cfg.get("safety_pct_b") or 20.0,
+            "C": cfg.get("safety_pct_c") or 15.0,
         }.get(abc, 20.0)
         # v2.67.283 — review period = the supplier's ACTUAL reorder
         # cadence when configured (e.g. 7 for a weekly supplier).
@@ -8564,9 +8564,9 @@ def _build_ordering_context() -> "SimpleNamespace":
         # a generic 30-45d of next-cycle stock when you actually
         # reorder weekly is the single biggest cash drag.
         abc_review_days = {
-            "A": cfg.get("review_days_A") or 14,
-            "B": cfg.get("review_days_B") or 30,
-            "C": cfg.get("review_days_C") or 45,
+            "A": cfg.get("review_days_a") or 14,
+            "B": cfg.get("review_days_b") or 30,
+            "C": cfg.get("review_days_c") or 45,
         }.get(abc, 30)
         _cadence = cfg.get("order_cadence_days")
         if _cadence and int(_cadence) > 0:
@@ -14514,14 +14514,14 @@ elif page == "Ordering":
                 new_lt = sku_lt_override
             abc = row.get("ABC") or "C"
             safety_pct = {
-                "A": cfg_sel.get("safety_pct_A") or 30.0,
-                "B": cfg_sel.get("safety_pct_B") or 20.0,
-                "C": cfg_sel.get("safety_pct_C") or 15.0,
+                "A": cfg_sel.get("safety_pct_a") or 30.0,
+                "B": cfg_sel.get("safety_pct_b") or 20.0,
+                "C": cfg_sel.get("safety_pct_c") or 15.0,
             }.get(abc, 20.0)
             review_days = {
-                "A": cfg_sel.get("review_days_A") or 14,
-                "B": cfg_sel.get("review_days_B") or 30,
-                "C": cfg_sel.get("review_days_C") or 45,
+                "A": cfg_sel.get("review_days_a") or 14,
+                "B": cfg_sel.get("review_days_b") or 30,
+                "C": cfg_sel.get("review_days_c") or 45,
             }.get(abc, 30)
             _cadence = cfg_sel.get("order_cadence_days")
             if _cadence and int(_cadence) > 0:
@@ -17265,7 +17265,7 @@ elif page == "Ordering":
         _cfg = supp_configs.get(sel_sup, {})
         raw_days = (
             _cfg.get("order_cadence_days")
-            or _cfg.get("review_days_A")
+            or _cfg.get("review_days_a")
             or 21
         )
         try:
@@ -19630,27 +19630,27 @@ elif page == "Supplier Setup":
                 sf_cols = st.columns(6)
                 sf_A = sf_cols[0].number_input("Safety A (%)",
                                                 min_value=0.0, max_value=100.0,
-                                                value=float(existing.get("safety_pct_A") or 30.0),
+                                                value=float(existing.get("safety_pct_a") or 30.0),
                                                 key=f"sc_sfA_{_sk}")
                 sf_B = sf_cols[1].number_input("Safety B (%)",
                                                 min_value=0.0, max_value=100.0,
-                                                value=float(existing.get("safety_pct_B") or 20.0),
+                                                value=float(existing.get("safety_pct_b") or 20.0),
                                                 key=f"sc_sfB_{_sk}")
                 sf_C = sf_cols[2].number_input("Safety C (%)",
                                                 min_value=0.0, max_value=100.0,
-                                                value=float(existing.get("safety_pct_C") or 15.0),
+                                                value=float(existing.get("safety_pct_c") or 15.0),
                                                 key=f"sc_sfC_{_sk}")
                 rv_A = sf_cols[3].number_input("Review A (d)",
                                                 min_value=1, max_value=180,
-                                                value=int(existing.get("review_days_A") or 14),
+                                                value=int(existing.get("review_days_a") or 14),
                                                 key=f"sc_rvA_{_sk}")
                 rv_B = sf_cols[4].number_input("Review B (d)",
                                                 min_value=1, max_value=180,
-                                                value=int(existing.get("review_days_B") or 30),
+                                                value=int(existing.get("review_days_b") or 30),
                                                 key=f"sc_rvB_{_sk}")
                 rv_C = sf_cols[5].number_input("Review C (d)",
                                                 min_value=1, max_value=180,
-                                                value=int(existing.get("review_days_C") or 45),
+                                                value=int(existing.get("review_days_c") or 45),
                                                 key=f"sc_rvC_{_sk}")
 
                 # v2.67.283 — order cadence. The real interval between
