@@ -19082,7 +19082,12 @@ elif page == "Stock Optimisation":
             f"could actually free ≈ "
             f"{_fmt_money(_net_cash_freeable)}",
             expanded=False):
-        st.markdown(
+        # v2.67.386 — same LaTeX gotcha as the glide-path progress
+        # text below (a bare `$...$` pair in Streamlit markdown
+        # renders as inline math): this block has 7 `_fmt_money()`
+        # calls, so it was rendering as garbled equation fragments
+        # instead of dollar figures. Escape after building the string.
+        _reconcile_md = (
             f"**Excess ({_fmt_money(total_excess_value)})** is "
             f"the GROSS cash recoverable by selling every "
             f"over-target SKU down to target. **Understock "
@@ -19104,6 +19109,7 @@ elif page == "Stock Optimisation":
             f"SKUs at CIN7 FIFO cost, while Optimum / Excess / "
             f"Understock are master-SKU figures using cost-chain "
             f"fallbacks.")
+        st.markdown(_reconcile_md.replace("$", "\\$"))
 
     # v2.67.381 — Turns / days-on-hand cross-check + a third dead-stock
     # tier ("sold, but slow cover") + an ABC now-vs-target table. Added
@@ -19309,23 +19315,32 @@ elif page == "Stock Optimisation":
                 " · no slow-mover sales in trailing 90d — "
                 "ETA can't be computed; lean on AI-Assistant + "
                 "promotions to drive clearance")
-        # v2.67.385 — st.progress's `text` param renders as PLAIN
-        # TEXT, not Markdown. The old **bold** markers showed up as
-        # literal asterisks in the UI instead of bold — dropped here.
+        # v2.67.386 — st.progress's `text` still runs through
+        # Streamlit's markdown/LaTeX text renderer even though it
+        # doesn't support **bold** — a bare `$...$` pair gets read as
+        # inline LaTeX math (same gotcha already documented + fixed
+        # at v2.67.208 for a caption elsewhere on this page). Three
+        # dollar signs here meant the text between the 1st and 2nd
+        # got silently rendered as an equation. Escape every literal
+        # `$` as `\$` right before handing the string to st.progress.
+        _progress_text = (
+            f"Current stock is "
+            f"${_gap:,.0f} above optimum "
+            f"(${_optimum:,.0f}) "
+            f"— {_pct_of_optimum:.0f}% of "
+            f"optimum{_eta_text}")
         st.progress(min(1.0, _optimum / total_onhand_value),
-                     text=(f"Current stock is "
-                              f"${_gap:,.0f} above optimum "
-                              f"(${_optimum:,.0f}) "
-                              f"— {_pct_of_optimum:.0f}% of "
-                              f"optimum{_eta_text}"))
+                     text=_progress_text.replace("$", "\\$"))
     else:
+        _progress_text = (
+            f"Current stock is "
+            f"{_pct_of_optimum:.0f}% of "
+            f"optimum (${_optimum:,.0f}) "
+            f"— you're under by "
+            f"${-_gap:,.0f}. Keep ordering "
+            f"per the recommendations above.")
         st.progress(min(1.0, _pct_of_optimum / 100),
-                     text=(f"Current stock is "
-                              f"{_pct_of_optimum:.0f}% of "
-                              f"optimum (${_optimum:,.0f}) "
-                              f"— you're under by "
-                              f"${-_gap:,.0f}. Keep ordering "
-                              f"per the recommendations above."))
+                     text=_progress_text.replace("$", "\\$"))
 
 
 
