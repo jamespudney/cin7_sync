@@ -14482,6 +14482,42 @@ elif page == "Ordering":
 
     all_supplier_df = _normalise_ordering_supplier_df(all_supplier_df)
 
+    # v2.67.389 — the materialized ordering_supplier_snapshot (written
+    # by the warm job right after _abc_engine, BEFORE this page's own
+    # supplier-config-aware target_stock/excess/Status computation
+    # ever runs) never carries target_stock, excess_value, excess_units,
+    # or Status. _normalise_ordering_supplier_df silently defaults
+    # target_stock/excess_value to 0.0 and Status to "⚪ No demand, no
+    # stock" for every row when those columns are missing — meaning
+    # the supplier-wide tiles below were structurally incapable of
+    # reflecting ANY Supplier Setup change (lead time, safety%,
+    # cadence) and Dead stock always read $0 (nothing could ever
+    # match "💀 Dead stock" against a Status that defaults to "No
+    # demand, no stock" for 100% of rows). Confirmed live via Neonica
+    # after correcting their safety%/cadence: Excess didn't move.
+    #
+    # Fix: reapply the real per-SKU calculation to just this one
+    # supplier's rows (cheap — hundreds, not thousands), regardless of
+    # whether the data came from the snapshot or the live engine_df
+    # fallback. Same functions, same pattern as the main engine_df
+    # apply above — this is not a new formula, just making sure it
+    # actually runs for the supplier currently on screen.
+    if not all_supplier_df.empty:
+        _applied_sw = all_supplier_df.apply(_compute_target_and_reorder, axis=1)
+        all_supplier_df["target_stock"] = _applied_sw.apply(lambda x: x["target_stock"])
+        all_supplier_df["reorder_qty"] = _applied_sw.apply(lambda x: x["reorder_qty"])
+        all_supplier_df["vendor_lead_time_days"] = _applied_sw.apply(
+            lambda x: x["vendor_lead_time_days"])
+        all_supplier_df["lead_time_days"] = _applied_sw.apply(lambda x: x["lead_time_days"])
+        all_supplier_df["sku_lead_time_days"] = _applied_sw.apply(
+            lambda x: x["sku_lead_time_days"])
+        all_supplier_df["sku_moq"] = _applied_sw.apply(lambda x: x["sku_moq"])
+        all_supplier_df["sku_eoq_qty"] = _applied_sw.apply(lambda x: x["sku_eoq_qty"])
+        all_supplier_df["freight_mode"] = _applied_sw.apply(lambda x: x["freight_mode"])
+        all_supplier_df["excess_units"] = _applied_sw.apply(lambda x: x["excess_units"])
+        all_supplier_df["excess_value"] = _applied_sw.apply(lambda x: x["excess_value"])
+        all_supplier_df["Status"] = all_supplier_df.apply(_status, axis=1)
+
     # --- Apply per-SKU freight overrides (team buyers can flip per row)
     # State shape: session_state["freight_overrides"][sel_sup] = {sku: mode}
     if "freight_overrides" not in st.session_state:

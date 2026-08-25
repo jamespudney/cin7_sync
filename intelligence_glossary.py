@@ -977,6 +977,42 @@ broken. Anyone who saved Supplier Setup for a supplier while this bug
 was live may have unknowingly reset that supplier's safety%/review-
 days to the defaults — worth spot-checking suppliers with a save
 history against what was actually intended.
+
+#### Bug #2: Ordering page's per-supplier tiles never reflected Supplier Setup at all (fixed v2.67.389)
+Found immediately after fixing the bug above, when a corrected
+Neonica safety%/cadence still didn't move that supplier's Excess
+tile. Root cause is structural, not the same bug: the per-supplier
+view (`all_supplier_df`, feeding the "SKUs we source from them /
+Current stock value / Excess stock / Dead stock" tiles on the
+Ordering page) is usually populated from `ordering_supplier_rows`, a
+materialized snapshot written by the warm job right after
+`_abc_engine()` runs — **before** this page's own
+`_compute_target_and_reorder`/`_status` calculation exists at all.
+`target_stock` and `excess_value` are not columns `_abc_engine`
+produces (they need `supp_configs` + IP lead times, which the warm
+job doesn't load), so `_normalise_ordering_supplier_df` silently
+defaulted them to 0.0 — except `excess_value`/`excess_units`
+specifically, which the snapshot DID carry, but as `_abc_engine`'s
+own naive definition (`max(0, OnHand − effective_units_12mo)`, no
+lead time/safety%/cadence involved). `Status` isn't in the snapshot
+either, defaulting to "⚪ No demand, no stock" for every row — so
+"💀 Dead stock" could never match, which is why the Dead stock tile
+read $0 for Neonica despite real dead stock existing.
+
+Net effect: the per-supplier tiles were structurally incapable of
+reflecting ANY Supplier Setup change (lead time, safety%, cadence) —
+not because of bug #1, but by construction. This was true before
+today and remains true for any supplier not specifically fixed below.
+
+Fix: reapply `_compute_target_and_reorder` and `_status` to
+`all_supplier_df` right after it's loaded (from the snapshot OR the
+live fallback) and normalised — cheap, since it's scoped to one
+supplier's rows (hundreds), not the whole catalog. This doesn't
+change the snapshot mechanism itself (still used for the cheap,
+config-independent columns) — it just guarantees the config-dependent
+columns are always freshly computed for whichever supplier is on
+screen, regardless of snapshot staleness.
+
 - **Holiday cover** = `avg_daily × closure_days_in_window`,
   where `closure_days` is the count of days within the upcoming
   `lead_time + review` window that overlap any of the supplier's
