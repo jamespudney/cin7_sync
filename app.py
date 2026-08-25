@@ -10478,6 +10478,35 @@ if page == "Overview":
         # "we don't have this data yet" must never look the same.
         _dead_skus_ov, _dead_value_ov = 0, 0.0
 
+    # v2.67.384 — Viktor turns-based target, used ONLY as a fallback
+    # while the precise engine-derived Optimum snapshot doesn't exist
+    # yet (no Ordering page visit this deploy). Viktor's memo derived
+    # 4.2 turns from this business's actual lead-time profile (94%
+    # fill rate, ~19-day air / ~60-day sea median receipt on Luz
+    # Negra, the largest single supplier line) — see his memo's
+    # "Why 4.2 turns and not 6" section. Formula: target $ = trailing
+    # 12mo COGS ÷ target turns. COGS uses `annual_value`
+    # (effective_units_12mo × AverageCost), masters only to avoid
+    # double-counting rollup children — the same scope and same
+    # column already used for the Ordering page's own turns tile, so
+    # the two stay consistent once both are visible. This does NOT
+    # replace the engine-derived Optimum once it exists — that one is
+    # per-SKU, lead-time-and-safety-stock-aware, and strictly more
+    # precise. It only fills the gap so this tile is never a bare "—".
+    VIKTOR_TARGET_TURNS = 4.2
+    _viktor_target_value = None
+    if not _engine_for_health.empty and "annual_value" in _engine_for_health.columns:
+        _cogs_for_viktor = float(
+            _engine_for_health.loc[
+                ~_engine_for_health.get(
+                    "is_non_master_tube",
+                    pd.Series(False, index=_engine_for_health.index)
+                ).fillna(False),
+                "annual_value",
+            ].sum())
+        if _cogs_for_viktor > 0:
+            _viktor_target_value = _cogs_for_viktor / VIKTOR_TARGET_TURNS
+
     sh1, sh2, sh3, sh4 = st.columns(4)
     if _target_snap:
         sh1.metric(
@@ -10493,11 +10522,31 @@ if page == "Overview":
                 f"{str(_target_snap.get('captured_at'))[:16]}, "
                 f"{_fmt_number(int(_target_snap.get('master_sku_count') or 0))} "
                 "master SKUs."))
+    elif _viktor_target_value is not None:
+        sh1.metric(
+            "Target stock (turns estimate)",
+            _fmt_money(_viktor_target_value),
+            help=(
+                f"ESTIMATE, not the engine-derived Optimum: trailing "
+                f"12mo COGS ÷ {VIKTOR_TARGET_TURNS} turns. The "
+                f"{VIKTOR_TARGET_TURNS}-turns target comes from "
+                "Viktor's inventory analysis, sized to this "
+                "business's actual lead-time profile (94% fill rate, "
+                "~19d air / ~60d sea median receipt on the largest "
+                "supplier line) — tighter would risk stockouts on "
+                "A-items, looser leaves cash idle. Replaced "
+                "automatically by the precise per-SKU engine Optimum "
+                "once you visit the Ordering page."))
+        sh1.markdown(
+            "<small style='color:#6b7280;'>turns-based estimate — "
+            "visit Ordering for the precise figure</small>",
+            unsafe_allow_html=True)
     else:
         sh1.metric(
             "Target stock (Optimum)", "—",
-            help="No snapshot yet — visit the Ordering page once to "
-                 "populate this.")
+            help="No data yet for either the engine-derived Optimum "
+                 "or the turns-based estimate — the engine snapshot "
+                 "may not have run yet.")
     sh2.metric(
         "Current stock value", _fmt_money(stock_value),
         help="CIN7 FIFO value across all SKUs — matches the 'Stock "
