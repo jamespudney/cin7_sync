@@ -18985,14 +18985,23 @@ elif page == "Stock Optimisation":
     oc2.metric("Optimum stock value",
                _fmt_money(total_target_value),
                help="Sum of target_stock × AverageCost per SKU. "
-                    "This is what your working capital should be at.")
+                    "This is what your working capital should be at. "
+                    "⚠️ Sanity-check this against the turns/days-on-"
+                    "hand cross-check further down this page — if "
+                    "Optimum implies fewer turns-days than your real "
+                    "supplier lead times support, it's calibrated too "
+                    "tight and Excess (right) will read high.")
     oc3.metric("Excess (cash to free up)",
                _fmt_money(total_excess_value),
                delta=f"{total_excess_value/total_onhand_value*100:.1f}% of current"
                      if total_onhand_value else None,
                delta_color="inverse",
                help="OnHand beyond target stock, by SKU, summed. "
-                    "The money sitting on shelves that doesn't need to be.")
+                    "The money sitting on shelves that doesn't need to "
+                    "be — AS MEASURED AGAINST Optimum (left). If "
+                    "Optimum is too tight, this number is inflated; "
+                    "see the turns/cover check below before acting on "
+                    "it at face value.")
     oc4.metric("Understock (cash to redeploy)",
                _fmt_money(total_understock_value),
                help="Master SKUs sitting BELOW target stock, by "
@@ -19131,17 +19140,60 @@ elif page == "Stock Optimisation":
                  "`over_12mo_cover` column yet. Updates automatically "
                  "on the next background engine recompute.")
 
+    # v2.67.385 — data-driven caution, not a static claim. Fires only
+    # when the numbers actually disagree. Threshold (6.0x) is
+    # Viktor's own reasoning from his inventory memo: 6 turns implies
+    # a stock level tight enough to risk stockouts on A-items given
+    # this business's real lead times (94% fill rate, up to ~60-day
+    # sea receipt on the largest supplier line); 4-4.5x is the
+    # defensible band he recommended. This does NOT mean any single
+    # SKU's own target_stock is below its own lead-time demand — the
+    # per-SKU formula (lead_time_demand + safety + review + holiday)
+    # guarantees that by construction. It means the DOLLAR-WEIGHTED
+    # BLEND across all SKUs is tighter than a sanity-checked turns
+    # rate would suggest — worth a look at whether safety%/review-day
+    # defaults or supplier lead-time configs are calibrated thin
+    # across the board, not evidence of a single bug.
+    if master_turns_optimum and master_turns_optimum > 6.0:
+        st.warning(
+            f"⚠️ The engine's own Optimum implies "
+            f"**{master_turns_optimum:.1f}× turns / "
+            f"{doh_optimum:.0f} days of cover** — above the "
+            "6× ceiling Viktor's memo flagged as stockout-risk "
+            "territory for this business's lead-time profile "
+            "(4–4.5× was his recommended band). This doesn't mean "
+            "any individual SKU is under-covered for its own lead "
+            "time — the per-SKU formula guarantees that — but the "
+            "dollar-weighted blend across all SKUs is unusually "
+            "tight. The 'Excess (cash to free up)' tile above is "
+            "measured against this Optimum, so it may be "
+            "overstated. Check the ABC table below for which class "
+            "the tightness concentrates in, and consider reviewing "
+            "supplier lead-time / safety% / review-day settings in "
+            "Supplier Setup before acting on Excess at face value.")
+
     # --- ABC now-vs-target composition -----------------------------
     _abc_summary = (
         master_only.groupby("ABC")
         .agg(SKUs=("SKU", "count"),
              **{"Now $": ("OnHandValue", "sum"),
-                "Target $": ("TargetValue", "sum")})
+                "Target $": ("TargetValue", "sum"),
+                "12mo COGS": ("annual_value", "sum")})
         .reindex(["A", "B", "C"])
         .fillna(0)
     )
     _abc_summary["Move needed"] = (
         _abc_summary["Target $"] - _abc_summary["Now $"])
+    # Implied days of cover the Target $ represents for that class,
+    # given that class's own trailing-12mo COGS. The direct diagnostic
+    # for "which ABC class is the engine target too thin for" — e.g.
+    # A-items showing 18 days here against a 60-day sea lead time is
+    # the concrete, per-class version of the caution above.
+    _abc_summary["Target cover (days)"] = _abc_summary.apply(
+        lambda r: (r["Target $"] / (r["12mo COGS"] / 365.0))
+        if r["12mo COGS"] > 0 else None,
+        axis=1)
+    _abc_summary = _abc_summary.drop(columns=["12mo COGS"])
     _abc_summary = _abc_summary.reset_index()
     with st.expander(
             "📋 ABC composition — now vs. optimum target", expanded=False):
@@ -19149,7 +19201,12 @@ elif page == "Stock Optimisation":
             "Masters only, same scope as the tiles above. 'Move "
             "needed' > 0 means that class is under its engine "
             "target in aggregate (fund it); < 0 means it's over "
-            "(the class is carrying more than its own SKUs need).")
+            "(the class is carrying more than its own SKUs need). "
+            "'Target cover (days)' is that class's Target $ expressed "
+            "as days of that class's own trailing-12mo COGS — compare "
+            "against your suppliers' actual lead times (Supplier "
+            "Setup) to see whether the target itself looks thin, "
+            "independent of what's currently on the shelf.")
         st.dataframe(
             _abc_summary,
             hide_index=True,
@@ -19157,6 +19214,8 @@ elif page == "Stock Optimisation":
                 "SKUs": st.column_config.NumberColumn(format="%d"),
                 "Now $": st.column_config.NumberColumn(format="$%.0f"),
                 "Target $": st.column_config.NumberColumn(format="$%.0f"),
+                "Target cover (days)": st.column_config.NumberColumn(
+                    format="%.0f"),
                 "Move needed": st.column_config.NumberColumn(
                     format="$%.0f"),
             })
@@ -19195,15 +19254,18 @@ elif page == "Stock Optimisation":
             _eta_text = (
                 f" · at trailing-90d clearance rate of "
                 f"${_monthly_clearance:,.0f}/mo, gap closes in "
-                f"~**{_months_to_optimum:.1f} months**")
+                f"~{_months_to_optimum:.1f} months")
         else:
             _eta_text = (
                 " · no slow-mover sales in trailing 90d — "
                 "ETA can't be computed; lean on AI-Assistant + "
                 "promotions to drive clearance")
+        # v2.67.385 — st.progress's `text` param renders as PLAIN
+        # TEXT, not Markdown. The old **bold** markers showed up as
+        # literal asterisks in the UI instead of bold — dropped here.
         st.progress(min(1.0, _optimum / total_onhand_value),
                      text=(f"Current stock is "
-                              f"${_gap:,.0f} **above optimum** "
+                              f"${_gap:,.0f} above optimum "
                               f"(${_optimum:,.0f}) "
                               f"— {_pct_of_optimum:.0f}% of "
                               f"optimum{_eta_text}"))
@@ -19212,7 +19274,7 @@ elif page == "Stock Optimisation":
                      text=(f"Current stock is "
                               f"{_pct_of_optimum:.0f}% of "
                               f"optimum (${_optimum:,.0f}) "
-                              f"— you're **under** by "
+                              f"— you're under by "
                               f"${-_gap:,.0f}. Keep ordering "
                               f"per the recommendations above."))
 
