@@ -863,9 +863,19 @@ front page:
   needs supplier lead times, MOQ/EOQ and IP-observed lead times that
   only get loaded when the Ordering page runs — so this figure can lag
   if nobody has opened Ordering recently. The tile shows an explicit
-  "as of `<captured_at>`" caption rather than silently going stale,
-  and reads "—" if the Ordering page has never run since this table
-  was added.
+  "as of `<captured_at>`" caption rather than silently going stale.
+  **v2.67.384** — rather than read "—" until someone visits Ordering,
+  the tile falls back to a **Viktor turns-based estimate**: trailing
+  12mo COGS (`annual_value`, masters only) ÷ 4.2 turns. The 4.2 figure
+  is Viktor's, sized to this business's actual lead-time profile (94%
+  fill rate, ~19d air / ~60d sea median receipt on the largest
+  supplier line) — see his memo's "Why 4.2 turns and not 6" section.
+  Labelled "Target stock (turns estimate)" with its own caption so
+  it's never confused with the precise per-SKU figure, and gets
+  replaced by the real Optimum automatically the moment
+  `ordering_target_snapshots` has a row. Only reads bare "—" if
+  neither source has data (e.g. the engine snapshot itself hasn't run
+  yet).
 - **Current stock value** — the same `_headline_stock_value` used
   everywhere else (CIN7 FIFO across all SKUs).
 - **Dead stock** — the new `is_dead` engine column (warm-job safe:
