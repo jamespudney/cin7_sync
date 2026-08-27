@@ -429,34 +429,47 @@ def _render_line_editor(
         st.dataframe(lines_df, use_container_width=True, hide_index=True)
 
 
-def _render_stock_adjustment_push(
+def _render_finished_goods_push(
         draft_id: int, bom_parents: dict, actor: str) -> None:
-    """Push a received 865FabLab order to CIN7 as a DRAFT stock
-    adjustment. Mirrors the Ordering page's PO push UX: a button opens a
-    confirmation expander (nothing happens on the first click), the
-    computed current -> new quantities are always shown (a read-only
-    dry-run -- no POST) before an explicit acknowledgement gates the one
-    real "Confirm push" button. CIN7 always receives Status=DRAFT -- a
-    human still reviews/authorises in CIN7 before it affects the books."""
+    """Push a received 865FabLab order to CIN7 as Finished Goods
+    (Assembly) tasks -- one per finished SKU line. CIN7 auto-consumes
+    the product's own linked BOM and adds the finished stock; this also
+    means the batch shows up in the ABC engine's ground-truth assembly-
+    consumption demand signal for the raw materials, not just a stock
+    change. Status is always COMPLETED (James's explicit choice,
+    2026-08-27) -- the safety checkpoint is entirely in this UI: a
+    button opens a confirmation expander (nothing happens on the first
+    click), an ESTIMATED consumption preview is shown (CIN7 has no
+    dry-run for this endpoint, so this is our own BOM estimate, not a
+    guarantee), then an explicit acknowledgement gates the one real
+    "Confirm push" button."""
     import db
-    from cin7_post_stockadjustment import push_stock_adjustment
+    from cin7_post_finishedgoods import push_finished_goods, estimate_consumption
 
-    st.markdown("#### \U0001f680 Push adjustment to CIN7")
+    st.markdown("#### \U0001f680 Push to CIN7 as Finished Goods")
 
-    existing = db.list_fablab_stock_adjustments(draft_id)
-    pushed = [r for r in existing if r["status"] == "pushed"]
-    if pushed:
-        p = pushed[0]
+    lines = db.get_po_draft_lines(draft_id)
+    pushed_skus = {
+        r["sku"] for r in db.list_fablab_finished_goods_pushes(draft_id)
+        if r["status"] == "pushed"
+    }
+    remaining = {s: q for s, q in lines.items() if s not in pushed_skus}
+
+    if pushed_skus:
+        done_rows = [
+            r for r in db.list_fablab_finished_goods_pushes(draft_id)
+            if r["status"] == "pushed"
+        ]
         st.success(
-            f"Already pushed — CIN7 stocktake **{p['cin7_stocktake_number']}** "
-            f"(task {p['cin7_task_id']}) by {p['pushed_by']} on "
-            f"{str(p['pushed_at'])[:16]}. It's a DRAFT in CIN7 — "
-            "complete/authorise it there once you've verified it.")
+            "Already pushed: " + ", ".join(
+                f"**{r['sku']}** (CIN7 {r['cin7_assembly_number']})"
+                for r in done_rows))
+    if not remaining:
         return
 
-    show_key = f"fablab_adj_show_{draft_id}"
-    if st.button("\U0001f680 Push receiving adjustment to CIN7",
-                 key=f"fablab_adj_btn_{draft_id}"):
+    show_key = f"fablab_fg_show_{draft_id}"
+    if st.button("\U0001f680 Push remaining line(s) to CIN7",
+                 key=f"fablab_fg_btn_{draft_id}"):
         st.session_state[show_key] = True
 
     if not st.session_state.get(show_key):
@@ -464,60 +477,46 @@ def _render_stock_adjustment_push(
 
     with st.expander(f"Push order #{draft_id} to CIN7?", expanded=True):
         st.caption(
-            "Computes each SKU's LIVE current CIN7 quantity and the new "
-            "total after this order's +finished/−materials adjustment, "
-            "then posts a DRAFT stock adjustment to CIN7 — you (or your "
-            "team) still review and authorise it there before it "
-            "affects the books.")
-        # Read-only preview: apply=False never POSTs, only the live GETs
-        # needed to compute current -> new quantities. Safe to run every
-        # time this expander is open so the numbers stay fresh.
-        with st.spinner("Checking live CIN7 quantities…"):
-            preview_result = push_stock_adjustment(
-                draft_id, bom_parents, actor=actor, apply=False)
+            "Creates a Finished Goods task in CIN7 for each SKU below — "
+            "COMPLETED immediately: CIN7 consumes the product's own "
+            "linked BOM and adds the finished stock in one step. The "
+            "estimate below is OUR calculation from the same BOM data "
+            "the planner uses — CIN7 computes the actual consumption "
+            "from its own linked BOM at push time, which is "
+            "authoritative and may differ slightly if a BOM sync is "
+            "stale.")
+        for sku, qty in remaining.items():
+            est = estimate_consumption(sku, qty, bom_parents)
+            st.markdown(f"**{sku}** × {qty:g}")
+            if est:
+                st.dataframe(pd.DataFrame(est), use_container_width=True,
+                             hide_index=True)
+            else:
+                st.caption("No BOM components found for this SKU.")
 
-        if preview_result.preview:
-            st.markdown("**Computed lines (current → new on-hand):**")
-            st.dataframe(
-                pd.DataFrame(preview_result.preview),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Current": st.column_config.NumberColumn(format="%.2f"),
-                    "Delta": st.column_config.NumberColumn(format="%.2f"),
-                    "New": st.column_config.NumberColumn(format="%.2f"),
-                })
-
-        if preview_result.errors:
-            for err in preview_result.errors:
-                st.error(err)
-            return
-
-        st.info(
-            "Review the current → new quantities above — an "
-            "unexpectedly large jump usually means the order quantity "
-            "is wrong. Tick the box below once they look right.")
         ack = st.checkbox(
-            "I've checked the quantities above and understand this "
-            "creates a real DRAFT stock adjustment in CIN7. It still "
-            "needs review/authorisation in CIN7 before it affects the "
-            "books.",
-            key=f"fablab_adj_ack_{draft_id}")
+            "I've checked the estimate above and understand this "
+            "creates real, COMPLETED Finished Goods tasks in CIN7 — "
+            "stock changes immediately, no further review step there.",
+            key=f"fablab_fg_ack_{draft_id}")
         if st.button("Confirm push", type="primary", disabled=not ack,
-                     key=f"fablab_adj_confirm_{draft_id}"):
+                     key=f"fablab_fg_confirm_{draft_id}"):
             with st.spinner("Posting to CIN7…"):
-                real = push_stock_adjustment(
+                results = push_finished_goods(
                     draft_id, bom_parents, actor=actor, apply=True)
-            if real.ok:
-                st.success(
-                    f"Pushed — CIN7 stocktake "
-                    f"**{real.cin7_stocktake_number}**. It's a DRAFT — "
-                    "complete/authorise it in CIN7 once you've "
-                    "verified it.")
+            any_ok = False
+            for r in results:
+                if r.ok:
+                    any_ok = True
+                    st.success(
+                        f"{r.sku}: pushed — CIN7 assembly "
+                        f"**{r.cin7_assembly_number}**.")
+                else:
+                    for err in r.errors:
+                        st.error(err)
+            if any_ok:
                 st.session_state[show_key] = False
                 st.rerun()
-            else:
-                for err in real.errors:
-                    st.error(err)
 
 
 def _render_receiving_checklist(
@@ -574,7 +573,7 @@ def _render_receiving_checklist(
                  hide_index=True)
 
     st.divider()
-    _render_stock_adjustment_push(draft_id, bom_parents, actor)
+    _render_finished_goods_push(draft_id, bom_parents, actor)
 
 
 # ── Main render ──────────────────────────────────────────────────────────
