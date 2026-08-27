@@ -596,6 +596,25 @@ CREATE TABLE IF NOT EXISTS po_draft_lines (
 CREATE INDEX IF NOT EXISTS ix_po_draft_lines_draft
     ON po_draft_lines(draft_id);
 
+-- v2.67.395 — records of pushing an 865FabLab order's receiving
+-- adjustment to CIN7 (see cin7_post_stockadjustment.py). draft_id
+-- points at the po_drafts row for that order. lines_json is a
+-- snapshot of exactly what was sent, for audit -- there's no
+-- separate line-item table for this the way po_draft_lines is for POs.
+CREATE TABLE IF NOT EXISTS fablab_stock_adjustments (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id               INTEGER NOT NULL,
+    status                 TEXT    NOT NULL,   -- 'pushed' | 'failed'
+    cin7_task_id           TEXT,
+    cin7_stocktake_number  TEXT,
+    lines_json             TEXT,
+    pushed_at              TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    pushed_by              TEXT,
+    FOREIGN KEY (draft_id) REFERENCES po_drafts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_fablab_stock_adjustments_draft
+    ON fablab_stock_adjustments(draft_id);
+
 -- AI Q&A audit log. Every question the AI Assistant page processes
 -- gets a row here: prompt, what tools it called, what it answered,
 -- how confident it was, and any thumbs-up/down feedback the user gave.
@@ -4297,6 +4316,25 @@ _PG_POST_CUTOVER_TABLES = [
     ("sku_policy_overrides_count_own_demand",
       "ALTER TABLE sku_policy_overrides "
       "ADD COLUMN IF NOT EXISTS count_own_demand BOOLEAN;"),
+    # v2.67.395 — 865FabLab CIN7 stock-adjustment push records.
+    ("fablab_stock_adjustments",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_stock_adjustments (
+          id                     BIGSERIAL PRIMARY KEY,
+          draft_id               BIGINT NOT NULL,
+          status                 TEXT   NOT NULL,
+          cin7_task_id           TEXT,
+          cin7_stocktake_number  TEXT,
+          lines_json             TEXT,
+          pushed_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          pushed_by              TEXT
+      );
+      """),
+    ("fablab_stock_adjustments_index",
+      """
+      CREATE INDEX IF NOT EXISTS ix_fablab_stock_adjustments_draft
+          ON fablab_stock_adjustments(draft_id);
+      """),
 ]
 
 
@@ -7196,6 +7234,52 @@ def rename_po_draft(draft_id: int, new_name: str, actor: str) -> None:
             ("po_draft.rename", actor, str(draft_id),
              f"-> {new_name!r}"),
         )
+
+
+# ---------------------------------------------------------------------------
+# 865FabLab CIN7 stock-adjustment push records (v2.67.395)
+# ---------------------------------------------------------------------------
+
+def record_fablab_stock_adjustment_push(
+        draft_id: int, *,
+        status: str,
+        cin7_task_id: Optional[str],
+        cin7_stocktake_number: Optional[str],
+        lines: list,
+        actor: str,
+) -> int:
+    """Record the outcome of a cin7_post_stockadjustment.push_stock_adjustment
+    call. status is 'pushed' or 'failed'. lines is JSON-encoded verbatim
+    for audit -- there's no separate line-item table for this, unlike
+    po_draft_lines for PO drafts."""
+    with connect() as c:
+        cur = c.execute(
+            """
+            INSERT INTO fablab_stock_adjustments
+                (draft_id, status, cin7_task_id, cin7_stocktake_number,
+                 lines_json, pushed_by)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (draft_id, status, cin7_task_id, cin7_stocktake_number,
+             json.dumps(lines), actor),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("fablab_stock_adjustment.push", actor, str(draft_id),
+             f"status={status} cin7_task_id={cin7_task_id}"),
+        )
+        return cur.lastrowid
+
+
+def list_fablab_stock_adjustments(draft_id: int) -> List[sqlite3.Row]:
+    """All push attempts for one 865FabLab order, most recent first."""
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM fablab_stock_adjustments WHERE draft_id = ? "
+            "ORDER BY pushed_at DESC",
+            (draft_id,),
+        ).fetchall()
 
 
 # ---------------------------------------------------------------------------

@@ -429,7 +429,99 @@ def _render_line_editor(
         st.dataframe(lines_df, use_container_width=True, hide_index=True)
 
 
-def _render_receiving_checklist(bom_parents: dict, product_map: dict) -> None:
+def _render_stock_adjustment_push(
+        draft_id: int, bom_parents: dict, actor: str) -> None:
+    """Push a received 865FabLab order to CIN7 as a DRAFT stock
+    adjustment. Mirrors the Ordering page's PO push UX: a button opens a
+    confirmation expander (nothing happens on the first click), the
+    computed current -> new quantities are always shown (a read-only
+    dry-run -- no POST) before an explicit acknowledgement gates the one
+    real "Confirm push" button. CIN7 always receives Status=DRAFT -- a
+    human still reviews/authorises in CIN7 before it affects the books."""
+    import db
+    from cin7_post_stockadjustment import push_stock_adjustment
+
+    st.markdown("#### \U0001f680 Push adjustment to CIN7")
+
+    existing = db.list_fablab_stock_adjustments(draft_id)
+    pushed = [r for r in existing if r["status"] == "pushed"]
+    if pushed:
+        p = pushed[0]
+        st.success(
+            f"Already pushed — CIN7 stocktake **{p['cin7_stocktake_number']}** "
+            f"(task {p['cin7_task_id']}) by {p['pushed_by']} on "
+            f"{str(p['pushed_at'])[:16]}. It's a DRAFT in CIN7 — "
+            "complete/authorise it there once you've verified it.")
+        return
+
+    show_key = f"fablab_adj_show_{draft_id}"
+    if st.button("\U0001f680 Push receiving adjustment to CIN7",
+                 key=f"fablab_adj_btn_{draft_id}"):
+        st.session_state[show_key] = True
+
+    if not st.session_state.get(show_key):
+        return
+
+    with st.expander(f"Push order #{draft_id} to CIN7?", expanded=True):
+        st.caption(
+            "Computes each SKU's LIVE current CIN7 quantity and the new "
+            "total after this order's +finished/−materials adjustment, "
+            "then posts a DRAFT stock adjustment to CIN7 — you (or your "
+            "team) still review and authorise it there before it "
+            "affects the books.")
+        # Read-only preview: apply=False never POSTs, only the live GETs
+        # needed to compute current -> new quantities. Safe to run every
+        # time this expander is open so the numbers stay fresh.
+        with st.spinner("Checking live CIN7 quantities…"):
+            preview_result = push_stock_adjustment(
+                draft_id, bom_parents, actor=actor, apply=False)
+
+        if preview_result.preview:
+            st.markdown("**Computed lines (current → new on-hand):**")
+            st.dataframe(
+                pd.DataFrame(preview_result.preview),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Current": st.column_config.NumberColumn(format="%.2f"),
+                    "Delta": st.column_config.NumberColumn(format="%.2f"),
+                    "New": st.column_config.NumberColumn(format="%.2f"),
+                })
+
+        if preview_result.errors:
+            for err in preview_result.errors:
+                st.error(err)
+            return
+
+        st.info(
+            "Review the current → new quantities above — an "
+            "unexpectedly large jump usually means the order quantity "
+            "is wrong. Tick the box below once they look right.")
+        ack = st.checkbox(
+            "I've checked the quantities above and understand this "
+            "creates a real DRAFT stock adjustment in CIN7. It still "
+            "needs review/authorisation in CIN7 before it affects the "
+            "books.",
+            key=f"fablab_adj_ack_{draft_id}")
+        if st.button("Confirm push", type="primary", disabled=not ack,
+                     key=f"fablab_adj_confirm_{draft_id}"):
+            with st.spinner("Posting to CIN7…"):
+                real = push_stock_adjustment(
+                    draft_id, bom_parents, actor=actor, apply=True)
+            if real.ok:
+                st.success(
+                    f"Pushed — CIN7 stocktake "
+                    f"**{real.cin7_stocktake_number}**. It's a DRAFT — "
+                    "complete/authorise it in CIN7 once you've "
+                    "verified it.")
+                st.session_state[show_key] = False
+                st.rerun()
+            else:
+                for err in real.errors:
+                    st.error(err)
+
+
+def _render_receiving_checklist(
+        bom_parents: dict, product_map: dict, actor: str) -> None:
     import db
 
     st.markdown("### \U0001f4e5 Receiving checklist")
@@ -480,6 +572,9 @@ def _render_receiving_checklist(bom_parents: dict, product_map: dict) -> None:
     ]
     st.dataframe(pd.DataFrame(consumed_rows), use_container_width=True,
                  hide_index=True)
+
+    st.divider()
+    _render_stock_adjustment_push(draft_id, bom_parents, actor)
 
 
 # ── Main render ──────────────────────────────────────────────────────────
@@ -581,4 +676,4 @@ def render_fablab_work_orders(
             draft_id, can_edit, current_user, edited_planner, product_map)
 
     st.divider()
-    _render_receiving_checklist(bom_parents, product_map)
+    _render_receiving_checklist(bom_parents, product_map, current_user)
