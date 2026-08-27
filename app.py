@@ -23804,7 +23804,7 @@ elif page == "Product Detail":
                 cols[0].markdown(
                     f"🚩 **{f['flag_type']}** "
                     f"— set by *{f['set_by']}* on "
-                    f"{f['set_at'][:16]}"
+                    f"{str(f['set_at'])[:16]}"
                     + (f"  —  _{f['notes']}_" if f['notes'] else "")
                 )
                 if actor and cols[1].button("Clear", key=f"clrflag_{f['id']}"):
@@ -23835,7 +23835,7 @@ elif page == "Product Detail":
             for n in notes:
                 cols = st.columns([10, 1])
                 cols[0].markdown(
-                    f"_{n['created_at'][:16]} — **{n['author']}**_"
+                    f"_{str(n['created_at'])[:16]} — **{n['author']}**_"
                     + (f"  `{n['tags']}`" if n['tags'] else "")
                     + f"\n\n{n['body']}"
                 )
@@ -24240,7 +24240,7 @@ elif page == "Kits & Fixtures":
                     cc1, cc2 = st.columns([8, 1])
                     cc1.markdown(
                         f"🚩 **{f['sku']}** — {f['flag_type']} "
-                        f"_(set by {f['set_by']} on {f['set_at'][:16]})_"
+                        f"_(set by {f['set_by']} on {str(f['set_at'])[:16]})_"
                         + (f"  —  _{f['notes']}_" if f['notes'] else "")
                     )
                     if cc2.button("Clear", key=f"kf_clr_{f['id']}"):
