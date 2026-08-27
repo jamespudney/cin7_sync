@@ -96,13 +96,28 @@ def _master_sku(variant: dict) -> Optional[str]:
 
 
 def _vendor_name(variant: dict) -> Optional[str]:
-    """Best-effort vendor name from connections[0]."""
+    """Best-effort vendor name for this variant.
+
+    v2.67.387 — was reading connections[0].vendor_name / .vendor,
+    which don't exist in IP's actual schema (confirmed live against
+    the real API: every one of 13,125 synced rows had a null vendor,
+    and this was the reason — a 100% silent failure). The real path
+    is connections[0].vendors[0].vendor: each connection carries a
+    `vendors` LIST of per-vendor cost entries, not a single vendor
+    field directly on the connection. `linked_by: "master_sku"` /
+    `connection_main: true` marks the primary connection, and cost
+    entries within `vendors` don't self-identify a "primary" one, so
+    this takes the first entry — sufficient for the common one-vendor-
+    per-SKU case this app actually has."""
     conns = variant.get("connections") or []
-    if conns and isinstance(conns[0], dict):
-        return (conns[0].get("vendor_name")
-                or conns[0].get("vendor")
-                or None)
-    return None
+    if not conns or not isinstance(conns[0], dict):
+        return None
+    vendors = conns[0].get("vendors") or []
+    if vendors and isinstance(vendors[0], dict):
+        return vendors[0].get("vendor") or None
+    # Fallback to the old (likely-dead) paths in case some accounts'
+    # schema really does put it there directly.
+    return conns[0].get("vendor_name") or conns[0].get("vendor") or None
 
 
 def _collect_warehouse_blocks(variant: dict) -> List[dict]:
