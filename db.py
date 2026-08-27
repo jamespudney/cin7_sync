@@ -596,6 +596,30 @@ CREATE TABLE IF NOT EXISTS po_draft_lines (
 CREATE INDEX IF NOT EXISTS ix_po_draft_lines_draft
     ON po_draft_lines(draft_id);
 
+-- v2.67.395 — records of pushing an 865FabLab order's receiving as a
+-- CIN7 Finished Goods (Assembly) task (see cin7_post_finishedgoods.py).
+-- draft_id points at the po_drafts row for that order. One row per
+-- finished SKU pushed (an order can have more than one line, and CIN7's
+-- /finishedGoods endpoint is one task per product). response_json is a
+-- snapshot of CIN7's response (OrderLines/PickLines/Transactions) for
+-- audit -- there's no separate line-item table for this the way
+-- po_draft_lines is for POs.
+CREATE TABLE IF NOT EXISTS fablab_finished_goods_pushes (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id               INTEGER NOT NULL,
+    sku                    TEXT    NOT NULL,
+    quantity               REAL,
+    status                 TEXT    NOT NULL,   -- 'pushed' | 'failed'
+    cin7_task_id           TEXT,
+    cin7_assembly_number   TEXT,               -- e.g. "FG-00016"
+    response_json          TEXT,
+    pushed_at              TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    pushed_by              TEXT,
+    FOREIGN KEY (draft_id) REFERENCES po_drafts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_fablab_finished_goods_pushes_draft
+    ON fablab_finished_goods_pushes(draft_id);
+
 -- AI Q&A audit log. Every question the AI Assistant page processes
 -- gets a row here: prompt, what tools it called, what it answered,
 -- how confident it was, and any thumbs-up/down feedback the user gave.
@@ -4297,6 +4321,27 @@ _PG_POST_CUTOVER_TABLES = [
     ("sku_policy_overrides_count_own_demand",
       "ALTER TABLE sku_policy_overrides "
       "ADD COLUMN IF NOT EXISTS count_own_demand BOOLEAN;"),
+    # v2.67.395 — 865FabLab CIN7 Finished Goods (Assembly) push records.
+    ("fablab_finished_goods_pushes",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_finished_goods_pushes (
+          id                     BIGSERIAL PRIMARY KEY,
+          draft_id               BIGINT NOT NULL,
+          sku                    TEXT   NOT NULL,
+          quantity               DOUBLE PRECISION,
+          status                 TEXT   NOT NULL,
+          cin7_task_id           TEXT,
+          cin7_assembly_number   TEXT,
+          response_json          TEXT,
+          pushed_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          pushed_by              TEXT
+      );
+      """),
+    ("fablab_finished_goods_pushes_index",
+      """
+      CREATE INDEX IF NOT EXISTS ix_fablab_finished_goods_pushes_draft
+          ON fablab_finished_goods_pushes(draft_id);
+      """),
 ]
 
 
@@ -7196,6 +7241,54 @@ def rename_po_draft(draft_id: int, new_name: str, actor: str) -> None:
             ("po_draft.rename", actor, str(draft_id),
              f"-> {new_name!r}"),
         )
+
+
+# ---------------------------------------------------------------------------
+# 865FabLab CIN7 Finished Goods (Assembly) push records (v2.67.395)
+# ---------------------------------------------------------------------------
+
+def record_fablab_finished_goods_push(
+        draft_id: int, sku: str, quantity: float, *,
+        status: str,
+        cin7_task_id: Optional[str],
+        cin7_assembly_number: Optional[str],
+        response: dict,
+        actor: str,
+) -> int:
+    """Record the outcome of one cin7_post_finishedgoods.push_finished_goods
+    call for one SKU. status is 'pushed' or 'failed'. response is CIN7's
+    JSON response (or the built request body on failure before POST),
+    JSON-encoded verbatim for audit -- there's no separate line-item
+    table for this, unlike po_draft_lines for PO drafts."""
+    with connect() as c:
+        cur = c.execute(
+            """
+            INSERT INTO fablab_finished_goods_pushes
+                (draft_id, sku, quantity, status, cin7_task_id,
+                 cin7_assembly_number, response_json, pushed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (draft_id, sku, quantity, status, cin7_task_id,
+             cin7_assembly_number, json.dumps(response), actor),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("fablab_finished_goods.push", actor, f"{draft_id}/{sku}",
+             f"status={status} cin7_task_id={cin7_task_id} "
+             f"assembly={cin7_assembly_number}"),
+        )
+        return cur.lastrowid
+
+
+def list_fablab_finished_goods_pushes(draft_id: int) -> List[sqlite3.Row]:
+    """All push attempts for one 865FabLab order, most recent first."""
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM fablab_finished_goods_pushes WHERE draft_id = ? "
+            "ORDER BY pushed_at DESC",
+            (draft_id,),
+        ).fetchall()
 
 
 # ---------------------------------------------------------------------------

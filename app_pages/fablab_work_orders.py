@@ -429,7 +429,98 @@ def _render_line_editor(
         st.dataframe(lines_df, use_container_width=True, hide_index=True)
 
 
-def _render_receiving_checklist(bom_parents: dict, product_map: dict) -> None:
+def _render_finished_goods_push(
+        draft_id: int, bom_parents: dict, actor: str) -> None:
+    """Push a received 865FabLab order to CIN7 as Finished Goods
+    (Assembly) tasks -- one per finished SKU line. CIN7 auto-consumes
+    the product's own linked BOM and adds the finished stock; this also
+    means the batch shows up in the ABC engine's ground-truth assembly-
+    consumption demand signal for the raw materials, not just a stock
+    change. Status is always COMPLETED (James's explicit choice,
+    2026-08-27) -- the safety checkpoint is entirely in this UI: a
+    button opens a confirmation expander (nothing happens on the first
+    click), an ESTIMATED consumption preview is shown (CIN7 has no
+    dry-run for this endpoint, so this is our own BOM estimate, not a
+    guarantee), then an explicit acknowledgement gates the one real
+    "Confirm push" button."""
+    import db
+    from cin7_post_finishedgoods import push_finished_goods, estimate_consumption
+
+    st.markdown("#### \U0001f680 Push to CIN7 as Finished Goods")
+
+    lines = db.get_po_draft_lines(draft_id)
+    pushed_skus = {
+        r["sku"] for r in db.list_fablab_finished_goods_pushes(draft_id)
+        if r["status"] == "pushed"
+    }
+    remaining = {s: q for s, q in lines.items() if s not in pushed_skus}
+
+    if pushed_skus:
+        done_rows = [
+            r for r in db.list_fablab_finished_goods_pushes(draft_id)
+            if r["status"] == "pushed"
+        ]
+        st.success(
+            "Already pushed: " + ", ".join(
+                f"**{r['sku']}** (CIN7 {r['cin7_assembly_number']})"
+                for r in done_rows))
+    if not remaining:
+        return
+
+    show_key = f"fablab_fg_show_{draft_id}"
+    if st.button("\U0001f680 Push remaining line(s) to CIN7",
+                 key=f"fablab_fg_btn_{draft_id}"):
+        st.session_state[show_key] = True
+
+    if not st.session_state.get(show_key):
+        return
+
+    with st.expander(f"Push order #{draft_id} to CIN7?", expanded=True):
+        st.caption(
+            "Creates a Finished Goods task in CIN7 for each SKU below — "
+            "COMPLETED immediately: CIN7 consumes the product's own "
+            "linked BOM and adds the finished stock in one step. The "
+            "estimate below is OUR calculation from the same BOM data "
+            "the planner uses — CIN7 computes the actual consumption "
+            "from its own linked BOM at push time, which is "
+            "authoritative and may differ slightly if a BOM sync is "
+            "stale.")
+        for sku, qty in remaining.items():
+            est = estimate_consumption(sku, qty, bom_parents)
+            st.markdown(f"**{sku}** × {qty:g}")
+            if est:
+                st.dataframe(pd.DataFrame(est), use_container_width=True,
+                             hide_index=True)
+            else:
+                st.caption("No BOM components found for this SKU.")
+
+        ack = st.checkbox(
+            "I've checked the estimate above and understand this "
+            "creates real, COMPLETED Finished Goods tasks in CIN7 — "
+            "stock changes immediately, no further review step there.",
+            key=f"fablab_fg_ack_{draft_id}")
+        if st.button("Confirm push", type="primary", disabled=not ack,
+                     key=f"fablab_fg_confirm_{draft_id}"):
+            with st.spinner("Posting to CIN7…"):
+                results = push_finished_goods(
+                    draft_id, bom_parents, actor=actor, apply=True)
+            any_ok = False
+            for r in results:
+                if r.ok:
+                    any_ok = True
+                    st.success(
+                        f"{r.sku}: pushed — CIN7 assembly "
+                        f"**{r.cin7_assembly_number}**.")
+                else:
+                    for err in r.errors:
+                        st.error(err)
+            if any_ok:
+                st.session_state[show_key] = False
+                st.rerun()
+
+
+def _render_receiving_checklist(
+        bom_parents: dict, product_map: dict, actor: str) -> None:
     import db
 
     st.markdown("### \U0001f4e5 Receiving checklist")
@@ -480,6 +571,9 @@ def _render_receiving_checklist(bom_parents: dict, product_map: dict) -> None:
     ]
     st.dataframe(pd.DataFrame(consumed_rows), use_container_width=True,
                  hide_index=True)
+
+    st.divider()
+    _render_finished_goods_push(draft_id, bom_parents, actor)
 
 
 # ── Main render ──────────────────────────────────────────────────────────
@@ -581,4 +675,4 @@ def render_fablab_work_orders(
             draft_id, can_edit, current_user, edited_planner, product_map)
 
     st.divider()
-    _render_receiving_checklist(bom_parents, product_map)
+    _render_receiving_checklist(bom_parents, product_map, current_user)
