@@ -517,9 +517,9 @@ def render_fablab_work_orders(
     st.markdown("### \U0001f4cb Production planner")
     weeks_cover = st.number_input(
         "Weeks of cover per batch", min_value=1.0, max_value=12.0,
-        value=4.0, step=1.0, key="fablab_weeks_cover",
+        value=6.0, step=1.0, key="fablab_weeks_cover",
         help="Suggested batch qty tops up on-hand stock to this many "
-             "weeks of forecast demand — default ~1 month.")
+             "weeks of forecast demand — default ~6 weeks.")
 
     planner_df = build_planner_table(
         flagged_skus, products, stock, engine_df, bom_parents, weeks_cover)
