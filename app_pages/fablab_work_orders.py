@@ -107,8 +107,15 @@ def build_planner_table(
         stk = stock_map.get(sku, {})
         name = eng.get("Name") or prod.get("Name") or ""
 
-        on_hand = _num(eng.get(
-            "Available", stk.get("Available", stk.get("OnHand", 0))))
+        # v2.67.394 — real physical stock, not the engine's phantom/
+        # derivable "Available" figure. For a BOM/assembly SKU,
+        # "Available" reflects how many COULD be built from raw
+        # materials on hand, not units actually sitting on a shelf —
+        # using it here suppressed the suggested batch even when zero
+        # real finished units existed (confirmed on
+        # LED-UNI-TILE12-180-FLAT270: Product Detail's real stock
+        # position showed OnHand 0 vs "Available" 76).
+        on_hand = _num(eng.get("OnHand", stk.get("OnHand", 0)))
         units_12mo = _num(eng.get(
             "effective_units_12mo", eng.get("units_12mo", 0)))
         monthly_demand = units_12mo / 12.0

@@ -119,6 +119,7 @@ PAGE_GROUPS = OrderedDict({
         "Kits & Fixtures",
         "LED Tubes",
         "Demand Signals",
+        "Demand Reclassification Review",
     ],
     "Sales & Marketing": [
         "Sales Recent",
@@ -168,6 +169,11 @@ PAGE_DESCRIPTIONS = {
     "Kits & Fixtures": "Pre-built kits, components, build candidates.",
     "LED Tubes": "Tube families, MP variants, migration forecast.",
     "Demand Signals": "Track customer interest before it shows up in sales.",
+    "Demand Reclassification Review": (
+        "SKUs whose own demand is now counted (not zeroed into a raw "
+        "material's demand) because of the multi-component BOM "
+        "heuristic — review and override per SKU if needed."
+    ),
     "Sales Recent": "Recent sales feed + filters.",
     "Monthly Metrics": "Month-over-month KPI report — commission reference.",
     "Ad-Umpire": "Paid-ads dashboard: Google Ads + GA4 attribution + ROAS.",

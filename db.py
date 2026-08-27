@@ -371,6 +371,10 @@ CREATE TABLE IF NOT EXISTS sku_policy_overrides (
     target_days_of_cover REAL,                  -- alternative: days of cover
     default_freight_mode TEXT,                  -- 'sea' / 'air' / 'mixed'
     service_level_pct REAL,                     -- 0-100
+    count_own_demand INTEGER,                   -- override for BOM-rollup
+                                                  -- heuristic: NULL=auto,
+                                                  -- 1=force count own,
+                                                  -- 0=force zero+rollup
     set_by          TEXT    NOT NULL,
     set_at          TIMESTAMP NOT NULL DEFAULT (datetime('now')),
     expires_at      TIMESTAMP,
@@ -1655,6 +1659,20 @@ def _migrate_supplier_cadence(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE supplier_config ADD COLUMN "
                 "order_cadence_days INTEGER")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_sku_policy_overrides_count_own_demand(
+        conn: sqlite3.Connection) -> None:
+    """Add count_own_demand to older sku_policy_overrides tables."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('sku_policy_overrides')").fetchall()}
+        if "count_own_demand" not in cols:
+            conn.execute(
+                "ALTER TABLE sku_policy_overrides ADD COLUMN "
+                "count_own_demand INTEGER")
     except sqlite3.Error:
         pass
 
@@ -4270,6 +4288,15 @@ _PG_POST_CUTOVER_TABLES = [
           captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       """),
+    # v2.67.394 — manual override for the BOM-rollup demand-zeroing
+    # heuristic (see _global_is_master in app.py). NULL = use the
+    # automatic component-count heuristic; TRUE = force "count this
+    # SKU's own demand" (genuine assembly); FALSE = force "zero it,
+    # roll up to components" (bulk-roll/cut). A human call always
+    # wins over the heuristic.
+    ("sku_policy_overrides_count_own_demand",
+      "ALTER TABLE sku_policy_overrides "
+      "ADD COLUMN IF NOT EXISTS count_own_demand BOOLEAN;"),
 ]
 
 
@@ -4360,6 +4387,7 @@ def connect() -> Iterator[sqlite3.Connection]:
             pass
         conn.executescript(_SCHEMA)
         _migrate_ui_prefs_widths(conn)
+        _migrate_sku_policy_overrides_count_own_demand(conn)
         _migrate_supplier_dropship(conn)
         _migrate_supplier_stockout_recovery(conn)
         _migrate_supplier_cadence(conn)
@@ -4560,6 +4588,50 @@ def set_policy_override(
              f"dos={target_days_of_cover} mode={default_freight_mode} "
              f"sl={service_level_pct}"),
         )
+
+
+def set_count_own_demand_override(
+    sku: str, value: Optional[bool], set_by: str,
+) -> None:
+    """Override the BOM-rollup demand heuristic for one SKU (see
+    _global_is_master in app.py). value=True forces "count this SKU's
+    own demand" (genuine assembly); value=False forces "zero it, roll
+    up to components" (bulk-roll/cut); value=None clears the override
+    (back to the automatic component-count heuristic). Only touches
+    this one column -- other sku_policy_overrides fields (abc_class,
+    targets, etc.) are left untouched, since a caller here may not
+    know about those and set_policy_override()'s full-row UPSERT would
+    otherwise clobber them."""
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO sku_policy_overrides (sku, count_own_demand, set_by)
+            VALUES (?, ?, ?)
+            ON CONFLICT(sku) DO UPDATE SET
+                count_own_demand = excluded.count_own_demand,
+                set_by = excluded.set_by,
+                set_at = datetime('now')
+            """,
+            (sku, value, set_by),
+        )
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("policy.count_own_demand", set_by, sku, f"value={value}"),
+        )
+
+
+def count_own_demand_overrides() -> dict:
+    """{sku: True/False} for SKUs with an explicit count_own_demand
+    override set. SKUs not present here use the automatic heuristic."""
+    out: dict = {}
+    with connect() as c:
+        for row in c.execute(
+            "SELECT sku, count_own_demand FROM sku_policy_overrides "
+            "WHERE count_own_demand IS NOT NULL"
+        ):
+            out[row["sku"]] = bool(row["count_own_demand"])
+    return out
 
 
 def get_policy_override(sku: str) -> Optional[sqlite3.Row]:
