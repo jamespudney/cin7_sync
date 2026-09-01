@@ -20,6 +20,8 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
+from engine.sku_rules import parse_corner_bom_rule
+
 FABLAB_SUPPLIER = "865FabLab"
 FABLAB_FLAG_TYPE = "865FabLab build"
 
@@ -134,6 +136,9 @@ def build_planner_table(
         else:
             status = "Raw short"
 
+        rule = parse_corner_bom_rule(
+            prod.get("AdditionalAttribute1"), prod.get("AdditionalAttribute2"))
+
         rows.append({
             "SKU": sku,
             "Name": name,
@@ -145,6 +150,7 @@ def build_planner_table(
             "Buildable from stock": round(buildable, 1),
             "Materials status": status,
             "Materials": "\n".join(material_bits),
+            "BOM rule": rule["RuleCode"] if rule else "",
         })
 
     df = pd.DataFrame(rows)
@@ -188,6 +194,39 @@ def build_materials_rollup(
     if not df.empty:
         df = df.sort_values("Short by", ascending=False)
     return df
+
+
+# ── Corner BOM rules (build instructions) ───────────────────────────────
+
+def _render_bom_rule_instructions(
+        flagged_skus: list[str], product_map: dict) -> None:
+    """Per-SKU build instructions for the flagged corner variant, keyed
+    off the SR2xx rule code in AdditionalAttribute2 (see
+    engine.sku_rules.CORNER_BOM_RULES). Reference material for placing
+    the order with 865FabLab and for the receiving checklist."""
+    rows = []
+    for sku in flagged_skus:
+        prod = product_map.get(sku, {})
+        rule = parse_corner_bom_rule(
+            prod.get("AdditionalAttribute1"), prod.get("AdditionalAttribute2"))
+        if rule:
+            rows.append((sku, prod.get("Name") or "", rule))
+
+    st.markdown("### \U0001f4dd BOM rule / build instructions")
+    if not rows:
+        st.caption(
+            "No flagged SKU has a recognized SR2xx rule code yet — set "
+            "AdditionalAttribute2 (rule code) and AdditionalAttribute1 "
+            "(rule name) in CIN7 to see build instructions here.")
+        return
+
+    for sku, name, rule in rows:
+        with st.expander(
+                f"{sku} — {rule['RuleCode']}: {rule['Name']}"):
+            if name:
+                st.caption(name)
+            for i, step in enumerate(rule["Instructions"], start=1):
+                st.markdown(f"{i}. {step}")
 
 
 # ── Build-list manager (flags) ─────────────────────────────────────────
@@ -608,6 +647,10 @@ def render_fablab_work_orders(
             "LED-UNI-TILE12-180-FLAT270) to start planning.")
         return
 
+    product_map = _rows_by_sku(products)
+    _render_bom_rule_instructions(flagged_skus, product_map)
+    st.divider()
+
     st.markdown("### \U0001f4cb Production planner")
     weeks_cover = st.number_input(
         "Weeks of cover per batch", min_value=1.0, max_value=12.0,
@@ -669,7 +712,6 @@ def render_fablab_work_orders(
     st.divider()
     st.markdown("### \U0001f4e6 Place order with 865FabLab")
     draft_id, can_edit, _is_submitted = _render_draft_lifecycle(current_user)
-    product_map = _rows_by_sku(products)
     if draft_id:
         _render_line_editor(
             draft_id, can_edit, current_user, edited_planner, product_map)

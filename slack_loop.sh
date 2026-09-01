@@ -183,6 +183,7 @@ last_semrush_epoch=0
 last_googleads_epoch=0
 last_ga4_epoch=0
 last_merchant_epoch=0      # v2.67.118 Google Merchant Center
+last_fablab_autotag_epoch=0  # 2026-09-01 865FabLab corner auto-tag
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
@@ -454,6 +455,22 @@ while true; do
         last_merchant_epoch=$(date -u +%s)
         _run_bg "merchant_sync" \
             "python merchant_sync.py daily --days 7"
+    fi
+
+    # 2026-09-01 — 865FabLab corner auto-tag: any new "Corner Connector"
+    # SKU under Wired4Signs USA whose description mentions a diffuser
+    # gets SR200 + Supplier=865FabLab in CIN7, and is added to the
+    # app's own build list. Anything without "diffuser" in the
+    # description is logged and left untouched for manual review (see
+    # fablab_corner_autotag.py docstring — plain 3D-printed plastic
+    # connectors don't fit any SR2xx rule).
+    seconds_since_fablab_autotag=$(( now_epoch - last_fablab_autotag_epoch ))
+    if [ "$seconds_since_fablab_autotag" -ge 86400 ] \
+            && [ -n "${CIN7_ACCOUNT_ID:-}" ] \
+            && [ -n "${CIN7_APPLICATION_KEY:-}" ]; then
+        last_fablab_autotag_epoch=$(date -u +%s)
+        _run_bg "fablab_corner_autotag" \
+            "python fablab_corner_autotag.py run"
     fi
 
     # v2.67.130 PO dispatch reminders — when a PO transitions to

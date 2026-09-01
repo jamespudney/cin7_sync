@@ -37,6 +37,7 @@ from engine.sku_rules import (
     _parse_strip_base,
     _parse_tube_sku,
     is_bulk_strip_roll_length,
+    parse_corner_bom_rule,
     parse_pack_purchase_sku,
     parse_sourcing_rule,
 )
@@ -2932,6 +2933,16 @@ class SkuRuleTests(unittest.TestCase):
         self.assertIsNone(parse_pack_purchase_sku("SNFX-L-CR-SCKT"))
         self.assertIsNone(parse_pack_purchase_sku("SNFX-L-CR-SCKT-X1"))
         self.assertIsNone(parse_pack_purchase_sku("SNFX-L-CR-SCKT-01X2"))
+
+    def test_corner_bom_rule_looks_up_known_codes_only(self) -> None:
+        rule = parse_corner_bom_rule("Premade corner with diffuser", "SR200")
+        self.assertEqual(rule["RuleCode"], "SR200")
+        self.assertEqual(rule["Name"], "Premade corner with diffuser")
+        self.assertTrue(rule["Instructions"])
+
+        self.assertIsNone(parse_corner_bom_rule("anything", "SR999"))
+        self.assertIsNone(parse_corner_bom_rule("", ""))
+        self.assertIsNone(parse_corner_bom_rule(None, None))
 
 
 if __name__ == "__main__":

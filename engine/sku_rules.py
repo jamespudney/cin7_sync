@@ -309,3 +309,75 @@ def parse_pack_purchase_sku(sku: str) -> Optional[tuple[str, int]]:
     if not base or pack_size <= 1:
         return None
     return base, pack_size
+
+
+# ---------------------------------------------------------------------------
+# 865FabLab corner BOM rules
+#
+# Convention (2026-09-01, James): AdditionalAttribute2 = machine-readable
+# rule code, AdditionalAttribute1 = human-readable rule name. Scoped to
+# 865FabLab premade-corner SKUs only — do NOT read these off SKUs that
+# already use AdditionalAttribute1 for a Family code (see docs/glossary.md,
+# "Family"). This is a separate convention from the sourcing-rule "Rule:
+# X | Logic: Y" text parsed by parse_sourcing_rule() above.
+# ---------------------------------------------------------------------------
+
+CORNER_BOM_RULES: dict[str, dict] = {
+    "SR200": {
+        "name": "Premade corner with diffuser",
+        "instructions": [
+            "Take the premade corner piece from stock.",
+            "Fit the diffuser into the corner's channel, seated flush "
+            "along the full profile.",
+            "Check for gaps or misalignment at the diffuser-to-profile "
+            "joint.",
+            "Package as a finished good.",
+        ],
+    },
+    "SR201": {
+        "name": "Premade corner with diffuser and OEM joint plate(s)",
+        "instructions": [
+            "Take the premade corner piece from stock.",
+            "Fit the diffuser into the corner's channel, seated flush "
+            "along the full profile.",
+            "Attach the OEM joint plate(s) to the corner, aligned to the "
+            "OEM profile joint and fastened per spec.",
+            "Confirm the plate(s) are secure and don't obstruct the "
+            "diffuser.",
+            "Package as a finished good.",
+        ],
+    },
+    "SR202": {
+        "name": "Premade corner with diffuser and ACM plate",
+        "instructions": [
+            "Take the premade corner piece from stock.",
+            "Fit the diffuser into the corner's channel, seated flush "
+            "along the full profile.",
+            "Attach the ACM plate to the corner, flush-mounted and "
+            "fastened per spec.",
+            "Check alignment and finish quality.",
+            "Package as a finished good.",
+        ],
+    },
+}
+
+
+def parse_corner_bom_rule(attr1: Optional[str],
+                           attr2: Optional[str]) -> Optional[dict]:
+    """Look up a product's 865FabLab corner BOM rule.
+
+    ``attr2`` (AdditionalAttribute2) carries the rule code, e.g. "SR200".
+    Returns ``None`` if attr2 doesn't match a known code — the registry
+    above is the only source of truth for instructions, so an unrecognized
+    or blank code means "no rule", not a guess from attr1's free text.
+    """
+    code = (attr2 or "").strip().upper()
+    rule = CORNER_BOM_RULES.get(code)
+    if not rule:
+        return None
+    return {
+        "RuleCode": code,
+        "Name": rule["name"],
+        "Instructions": rule["instructions"],
+        "Attr1Name": (attr1 or "").strip() or None,
+    }
