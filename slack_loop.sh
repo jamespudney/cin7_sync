@@ -184,6 +184,8 @@ last_googleads_epoch=0
 last_ga4_epoch=0
 last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 last_fablab_autotag_epoch=0  # 2026-09-01 865FabLab corner auto-tag
+last_fablab_stock_alert_epoch=0       # 2026-09-01 865FabLab stock-drop alerts
+last_fablab_alert_replies_epoch=0     # 2026-09-02 865FabLab Slack-reply approval poll
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
@@ -471,6 +473,27 @@ while true; do
         last_fablab_autotag_epoch=$(date -u +%s)
         _run_bg "fablab_corner_autotag" \
             "python fablab_corner_autotag.py run"
+    fi
+
+    # 2026-09-01/02 — 865FabLab stock-drop alerts. Daily: scan flagged
+    # SKUs for a suggested batch and post a new alert (deduped — see
+    # fablab_stock_alerts table). Every 5 min: poll each active alert's
+    # thread for an "approve" reply and push a real CIN7 Draft PO if
+    # found (same conversations.replies pattern as the stock-issue
+    # reply poll below — Slack doesn't return plain in-thread replies
+    # via conversations.history, so a dedicated poll is required).
+    seconds_since_fablab_stock_alert=$(( now_epoch - last_fablab_stock_alert_epoch ))
+    if [ "$seconds_since_fablab_stock_alert" -ge 86400 ]; then
+        last_fablab_stock_alert_epoch=$(date -u +%s)
+        _run_bg "fablab_stock_alert" \
+            "python fablab_stock_alert.py run"
+    fi
+
+    seconds_since_fablab_alert_replies=$(( now_epoch - last_fablab_alert_replies_epoch ))
+    if [ "$seconds_since_fablab_alert_replies" -ge 300 ]; then
+        last_fablab_alert_replies_epoch=$(date -u +%s)
+        _run_bg "fablab_alert_check_replies" \
+            "python fablab_stock_alert.py check-replies"
     fi
 
     # v2.67.130 PO dispatch reminders — when a PO transitions to

@@ -1362,7 +1362,15 @@ CREATE TABLE IF NOT EXISTS fablab_stock_alerts (
     posted_ts        TEXT,
     posted_at        TIMESTAMP NOT NULL DEFAULT (datetime('now')),
     cleared_at       TIMESTAMP,
-    error_msg        TEXT
+    error_msg        TEXT,
+    -- 2026-09-02 — Slack reply-based approval (see fablab_stock_alert.py
+    -- check-replies). approved_at is the idempotency guard: once set,
+    -- never re-scan this alert's thread for an approval reply again.
+    approved_at      TIMESTAMP,
+    approved_by      TEXT,
+    cin7_po_id       TEXT,
+    cin7_po_number   TEXT,
+    approval_error   TEXT
 );
 
 -- v2.67.126 Slack OAuth user tokens (for Viktor bridge from
@@ -1927,6 +1935,30 @@ def _migrate_po_dispatch_reminders_escalation(
             conn.execute(
                 "ALTER TABLE po_dispatch_reminders ADD COLUMN "
                 "escalation_reason TEXT")
+    except sqlite3.Error:
+        pass
+
+
+def _migrate_fablab_stock_alerts_approval(
+        conn: sqlite3.Connection) -> None:
+    """2026-09-02 — add Slack reply-approval columns to existing
+    fablab_stock_alerts tables (see fablab_stock_alert.py check-replies
+    and the module docstring in db.py's _SCHEMA)."""
+    try:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('fablab_stock_alerts')").fetchall()}
+        if not cols:
+            return  # table doesn't exist yet — fresh schema already has it
+        for col, ddl in (
+            ("approved_at", "TIMESTAMP"),
+            ("approved_by", "TEXT"),
+            ("cin7_po_id", "TEXT"),
+            ("cin7_po_number", "TEXT"),
+            ("approval_error", "TEXT"),
+        ):
+            if col not in cols:
+                conn.execute(
+                    f"ALTER TABLE fablab_stock_alerts ADD COLUMN {col} {ddl}")
     except sqlite3.Error:
         pass
 
@@ -3101,6 +3133,37 @@ def clear_fablab_stock_alert(sku: str) -> None:
             "UPDATE fablab_stock_alerts SET cleared_at = datetime('now') "
             "WHERE sku = ? AND cleared_at IS NULL",
             (sku,))
+
+
+def list_active_fablab_stock_alerts_for_approval() -> List[sqlite3.Row]:
+    """Alerts still below reorder level (not yet cleared) that haven't
+    been approved via a Slack reply yet. Used by
+    fablab_stock_alert.py's check-replies poller."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT * FROM fablab_stock_alerts "
+            "WHERE cleared_at IS NULL AND approved_at IS NULL"
+        ).fetchall()
+    return rows
+
+
+def record_fablab_stock_alert_approval(
+        sku: str, approved_by: str,
+        cin7_po_id: Optional[str] = None,
+        cin7_po_number: Optional[str] = None,
+        error_msg: Optional[str] = None) -> None:
+    """Stamp an alert as approved (or attempted) via a Slack reply --
+    the idempotency guard so the same reply never triggers a second
+    CIN7 PO push. Pass error_msg (and leave cin7_po_id/number None) if
+    the push failed; the row stays approved_at-set either way so we
+    don't retry indefinitely on a bad SKU."""
+    with connect() as c:
+        c.execute(
+            "UPDATE fablab_stock_alerts SET "
+            "approved_at = datetime('now'), approved_by = ?, "
+            "cin7_po_id = ?, cin7_po_number = ?, approval_error = ? "
+            "WHERE sku = ?",
+            (approved_by, cin7_po_id, cin7_po_number, error_msg, sku))
 
 
 # ---------------------------------------------------------------------------
@@ -4422,6 +4485,19 @@ _PG_POST_CUTOVER_TABLES = [
           error_msg        TEXT
       );
       """),
+    # 2026-09-02 — Slack reply-based approval columns (see
+    # fablab_stock_alert.py check-replies). approved_at is the
+    # idempotency guard: once set, never re-scan this alert's thread
+    # for an approval reply again.
+    ("fablab_stock_alerts_approval",
+      """
+      ALTER TABLE fablab_stock_alerts
+          ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS approved_by TEXT,
+          ADD COLUMN IF NOT EXISTS cin7_po_id TEXT,
+          ADD COLUMN IF NOT EXISTS cin7_po_number TEXT,
+          ADD COLUMN IF NOT EXISTS approval_error TEXT;
+      """),
 ]
 
 
@@ -4523,6 +4599,7 @@ def connect() -> Iterator[sqlite3.Connection]:
         _migrate_ad_campaigns_daily_drop_spend_notnull(conn)  # v2.67.107
         _migrate_ad_campaign_skus_free_listings(conn)  # v2.67.118
         _migrate_po_dispatch_reminders_escalation(conn)  # v2.67.131
+        _migrate_fablab_stock_alerts_approval(conn)  # 2026-09-02
         yield conn
     finally:
         conn.close()

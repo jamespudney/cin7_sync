@@ -200,41 +200,66 @@ def build_materials_rollup(
 
 def _render_bom_rule_instructions(
         flagged_skus: list[str], product_map: dict) -> None:
-    """Per-SKU build instructions for the flagged corner variant, keyed
-    off the SR2xx rule code in AdditionalAttribute2 (see
-    engine.sku_rules.CORNER_BOM_RULES). Reference material for placing
-    the order with 865FabLab and for the receiving checklist."""
-    rows = []
+    """Build instructions grouped by rule code (SR200/SR201/SR202), not by
+    SKU — the instructions text is identical for every SKU sharing a rule,
+    so a per-SKU expander (one per flagged SKU) just repeats the same few
+    paragraphs N times. Grouping collapses this to at most 3 expanders
+    regardless of how many SKUs are flagged."""
+    by_rule: dict[str, dict] = {}
+    unrecognized: list[tuple[str, str]] = []
     for sku in flagged_skus:
         prod = product_map.get(sku, {})
         rule = parse_corner_bom_rule(
             prod.get("AdditionalAttribute1"), prod.get("AdditionalAttribute2"))
         if rule:
-            rows.append((sku, prod.get("Name") or "", rule))
+            entry = by_rule.setdefault(rule["RuleCode"], {
+                "name": rule["Name"], "instructions": rule["Instructions"],
+                "skus": []})
+            entry["skus"].append((sku, prod.get("Name") or ""))
+        else:
+            unrecognized.append((sku, prod.get("Name") or ""))
 
-    st.markdown("### \U0001f4dd BOM rule / build instructions")
-    if not rows:
+    if not by_rule:
         st.caption(
             "No flagged SKU has a recognized SR2xx rule code yet — set "
             "AdditionalAttribute2 (rule code) and AdditionalAttribute1 "
             "(rule name) in CIN7 to see build instructions here.")
         return
 
-    for sku, name, rule in rows:
+    for rule_code in sorted(by_rule):
+        entry = by_rule[rule_code]
         with st.expander(
-                f"{sku} — {rule['RuleCode']}: {rule['Name']}"):
-            if name:
-                st.caption(name)
-            for i, step in enumerate(rule["Instructions"], start=1):
+                f"{rule_code}: {entry['name']} ({len(entry['skus'])} SKUs)"):
+            for i, step in enumerate(entry["instructions"], start=1):
                 st.markdown(f"{i}. {step}")
+            st.dataframe(
+                pd.DataFrame(entry["skus"], columns=["SKU", "Name"]),
+                use_container_width=True, hide_index=True)
+
+    if unrecognized:
+        with st.expander(
+                f"⚠ {len(unrecognized)} SKU(s) with no recognized rule"):
+            st.dataframe(
+                pd.DataFrame(unrecognized, columns=["SKU", "Name"]),
+                use_container_width=True, hide_index=True)
 
 
 # ── Build-list manager (flags) ─────────────────────────────────────────
 
-def _render_build_list_manager(products: pd.DataFrame, actor: str) -> list[str]:
+def _get_flagged_skus() -> list[str]:
+    import db
+    flag_rows = [f for f in db.list_flags(active_only=True)
+                 if f["flag_type"] == FABLAB_FLAG_TYPE]
+    return sorted({r["sku"] for r in flag_rows})
+
+
+def _render_build_list_manager(
+        products: pd.DataFrame, actor: str, product_map: dict) -> None:
+    """Search/add + a compact, filterable, bulk-removable grid — replaces
+    the old one-row-plus-button-per-SKU list, which became unusable once
+    the build list passed 100+ SKUs."""
     import db
 
-    st.markdown("### \U0001f527 865FabLab build list")
     st.caption(
         "Flag which finished SKUs are toll-manufactured at 865FabLab. "
         "This is manually curated — CIN7 has no supplier set for these "
@@ -244,39 +269,69 @@ def _render_build_list_manager(products: pd.DataFrame, actor: str) -> list[str]:
     flag_rows = [f for f in db.list_flags(active_only=True)
                  if f["flag_type"] == FABLAB_FLAG_TYPE]
     flagged_skus = sorted({r["sku"] for r in flag_rows})
+    id_by_sku = {r["sku"]: r["id"] for r in flag_rows}
 
-    c1, c2 = st.columns(2)
-    with c1:
-        search = st.text_input(
-            "Search SKU or name to add", key="fablab_add_search")
-        if search and products is not None and not products.empty:
-            q = search.strip()
-            mask = (
-                products["SKU"].astype(str).str.contains(
-                    q, case=False, na=False)
-                | products["Name"].astype(str).str.contains(
-                    q, case=False, na=False)
-            )
-            matches = products[mask].head(15)
-            for _, row in matches.iterrows():
-                sku = str(row["SKU"])
-                mc1, mc2 = st.columns([4, 1])
-                mc1.write(f"**{sku}** — {row.get('Name', '')}")
-                if sku in flagged_skus:
-                    mc2.write("✓ added")
-                elif mc2.button("+ Add", key=f"fablab_add_{sku}"):
-                    db.set_flag(sku, FABLAB_FLAG_TYPE, actor)
-                    st.rerun()
-    with c2:
-        st.write(f"**Currently flagged ({len(flagged_skus)}):**")
-        for r in flag_rows:
-            rc1, rc2 = st.columns([4, 1])
-            rc1.write(r["sku"])
-            if rc2.button("Remove", key=f"fablab_remove_{r['id']}"):
-                db.clear_flag(r["id"], actor)
+    search = st.text_input("Search SKU or name to add", key="fablab_add_search")
+    if search and products is not None and not products.empty:
+        q = search.strip()
+        mask = (
+            products["SKU"].astype(str).str.contains(q, case=False, na=False)
+            | products["Name"].astype(str).str.contains(
+                q, case=False, na=False)
+        )
+        matches = products[mask].head(15)
+        for _, row in matches.iterrows():
+            sku = str(row["SKU"])
+            mc1, mc2 = st.columns([4, 1])
+            mc1.write(f"**{sku}** — {row.get('Name', '')}")
+            if sku in flagged_skus:
+                mc2.write("✓ added")
+            elif mc2.button("+ Add", key=f"fablab_add_{sku}"):
+                db.set_flag(sku, FABLAB_FLAG_TYPE, actor)
                 st.rerun()
 
-    return flagged_skus
+    st.markdown(f"**Currently flagged ({len(flagged_skus)}):**")
+    filter_q = st.text_input(
+        "Filter flagged list", key="fablab_flagged_filter",
+        placeholder="Filter by SKU, name, or rule code")
+    grid_rows = []
+    for sku in flagged_skus:
+        prod = product_map.get(sku, {})
+        rule = parse_corner_bom_rule(
+            prod.get("AdditionalAttribute1"), prod.get("AdditionalAttribute2"))
+        grid_rows.append({
+            "SKU": sku,
+            "Name": prod.get("Name") or "",
+            "Rule": rule["RuleCode"] if rule else "",
+            "Remove?": False,
+        })
+    grid_df = pd.DataFrame(grid_rows)
+    if filter_q and not grid_df.empty:
+        q = filter_q.strip()
+        mask = (
+            grid_df["SKU"].str.contains(q, case=False, na=False)
+            | grid_df["Name"].str.contains(q, case=False, na=False)
+            | grid_df["Rule"].str.contains(q, case=False, na=False)
+        )
+        grid_df = grid_df[mask]
+
+    if grid_df.empty:
+        st.caption("No flagged SKUs match." if filter_q else "None flagged yet.")
+        return
+
+    edited = st.data_editor(
+        grid_df, key="fablab_build_list_editor", use_container_width=True,
+        hide_index=True, disabled=["SKU", "Name", "Rule"],
+        column_config={"Remove?": st.column_config.CheckboxColumn("Remove?")})
+    to_remove = edited[edited["Remove?"] == True]  # noqa: E712
+    if st.button(f"\U0001f5d1 Remove selected ({len(to_remove)})",
+                 disabled=to_remove.empty, key="fablab_remove_selected"):
+        for sku in to_remove["SKU"]:
+            flag_id = id_by_sku.get(sku)
+            if flag_id:
+                db.clear_flag(flag_id, actor)
+        st.success(f"Removed {len(to_remove)} SKU(s).")
+        st.rerun()
 
 
 # ── Order (po_drafts) lifecycle ─────────────────────────────────────────
@@ -710,26 +765,33 @@ def render_fablab_work_orders(
     )
 
     current_user = st.session_state.get("current_user", "").strip() or "anonymous"
-
-    flagged_skus = _render_build_list_manager(products, current_user)
-    st.divider()
+    product_map = _rows_by_sku(products)
+    flagged_skus = _get_flagged_skus()
 
     if not flagged_skus:
         st.info(
-            "No SKUs flagged yet — add one above (e.g. "
-            "LED-UNI-TILE12-180-FLAT270) to start planning.")
+            "No SKUs flagged yet — open **⚙️ Manage build list** below to "
+            "add one (e.g. LED-UNI-TILE12-180-FLAT270) to start planning.")
+        with st.expander("⚙️ Manage build list (0 SKUs)"):
+            _render_build_list_manager(products, current_user, product_map)
         return
 
-    product_map = _rows_by_sku(products)
-    _render_bom_rule_instructions(flagged_skus, product_map)
-    st.divider()
-
+    # ── Production planner (top — this is what a buyer opens the page for) ──
     st.markdown("### \U0001f4cb Production planner")
-    weeks_cover = st.number_input(
-        "Weeks of cover per batch", min_value=1.0, max_value=12.0,
-        value=6.0, step=1.0, key="fablab_weeks_cover",
-        help="Suggested batch qty tops up on-hand stock to this many "
-             "weeks of forecast demand — default ~6 weeks.")
+    pc1, pc2, pc3 = st.columns([2, 2, 3])
+    with pc1:
+        weeks_cover = st.number_input(
+            "Weeks of cover per batch", min_value=1.0, max_value=12.0,
+            value=6.0, step=1.0, key="fablab_weeks_cover",
+            help="Suggested batch qty tops up on-hand stock to this many "
+                 "weeks of forecast demand — default ~6 weeks.")
+    with pc2:
+        action_only = st.checkbox(
+            "Action needed only", value=True, key="fablab_action_only",
+            help="Hide SKUs with no suggested batch this cycle.")
+    with pc3:
+        search = st.text_input(
+            "Search SKU, name, or rule", key="fablab_planner_search")
 
     planner_df = build_planner_table(
         flagged_skus, products, stock, engine_df, bom_parents, weeks_cover)
@@ -737,13 +799,25 @@ def render_fablab_work_orders(
         st.warning("No data for flagged SKUs.")
         return
 
-    planner_df["Batch qty"] = planner_df["Suggested batch"]
+    view = planner_df
+    if action_only:
+        view = view[view["Suggested batch"].fillna(0) > 0]
+    if search:
+        q = search.strip()
+        mask = pd.Series(False, index=view.index)
+        for col in ("SKU", "Name", "BOM rule"):
+            mask |= view[col].astype(str).str.contains(
+                q, case=False, na=False)
+        view = view[mask]
+
+    view = view.copy()
+    view["Batch qty"] = view["Suggested batch"]
     edited_planner = st.data_editor(
-        planner_df,
+        view,
         key="fablab_planner_editor",
         use_container_width=True,
         hide_index=True,
-        disabled=[c for c in planner_df.columns if c != "Batch qty"],
+        disabled=[c for c in view.columns if c != "Batch qty"],
         column_config={
             "On hand": st.column_config.NumberColumn(format="%.1f"),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
@@ -757,15 +831,23 @@ def render_fablab_work_orders(
 
     n_short = int((edited_planner["Materials status"] == "Raw short").sum())
     mcol1, mcol2, mcol3 = st.columns(3)
-    mcol1.metric("Flagged SKUs", fmt_number(len(edited_planner)))
+    mcol1.metric("Flagged SKUs", fmt_number(len(planner_df)))
     mcol2.metric(
         "Units in this batch",
         fmt_number(edited_planner["Batch qty"].fillna(0).sum()))
     mcol3.metric("Raw short", fmt_number(n_short))
 
+    # ── Materials shortfall ──────────────────────────────────────────────
     st.divider()
     st.markdown("### \U0001f9f1 Materials shortfall")
+    # Base qty for every flagged SKU (including any hidden by the
+    # "Action needed only" / search filters above) is its suggested
+    # batch; only override with an edit for rows currently visible in
+    # the editor -- otherwise filtering the view would silently drop
+    # hidden SKUs' raw-material needs from the rollup below.
     batch_qtys = dict(
+        zip(planner_df["SKU"], planner_df["Suggested batch"].fillna(0)))
+    batch_qtys.update(
         zip(edited_planner["SKU"], edited_planner["Batch qty"].fillna(0)))
     stock_map = _stock_by_sku(stock)
     rollup_df = build_materials_rollup(
@@ -782,6 +864,7 @@ def render_fablab_work_orders(
                 "these before placing the 865FabLab batch:")
         st.dataframe(rollup_df, use_container_width=True, hide_index=True)
 
+    # ── Place order with 865FabLab ───────────────────────────────────────
     st.divider()
     st.markdown("### \U0001f4e6 Place order with 865FabLab")
     draft_id, can_edit, _is_submitted = _render_draft_lifecycle(current_user)
@@ -791,5 +874,14 @@ def render_fablab_work_orders(
         if can_edit:
             _render_push_po_to_cin7(draft_id, current_user)
 
+    # ── Receiving checklist ──────────────────────────────────────────────
     st.divider()
     _render_receiving_checklist(bom_parents, product_map, current_user)
+
+    # ── Admin: build list + instructions (collapsed, rarely touched) ────
+    st.divider()
+    with st.expander(f"⚙️ Manage build list ({len(flagged_skus)} SKUs)"):
+        _render_build_list_manager(products, current_user, product_map)
+    st.markdown("### \U0001f4dd Build instructions")
+    st.caption("Grouped by rule — click a rule to see its steps and SKUs.")
+    _render_bom_rule_instructions(flagged_skus, product_map)
