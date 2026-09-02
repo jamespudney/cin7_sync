@@ -288,28 +288,45 @@ def _resolve_products(skus: list, headers: dict, log=None,
 
 def _supplier_cost_for(prod: dict, supplier_id: Optional[str],
                         supplier_name: Optional[str]) -> Optional[float]:
-    """Return the supplier-specific Cost from prod['Suppliers'] for the
+    """Return the supplier-specific cost from prod['Suppliers'] for the
     given supplier (matched by ID first, then name). None if no match.
-    The matched value is what CIN7 uses internally when building a PO
-    line — sending anything else risks the 'Total doesn't match'
-    rejection we hit on PO-7076."""
+
+    Prefers FixedCost ("Fixed Price" in CIN7's UI) over Cost ("Latest
+    Price") when FixedCost is set and non-zero -- Fixed Price is a
+    deliberate buyer-set value CIN7 never auto-overwrites from purchase
+    history, whereas Latest Price drifts with the last transaction.
+    865FabLab's per-unit labor fee is set via Fixed Price (2026-09-01)
+    since there's no real purchase history to derive a Latest Price
+    from. Falls back to Cost, then to the caller's AverageCost fallback,
+    same as before this changed. Sending anything CIN7 doesn't expect
+    risks the 'Total doesn't match' rejection we hit on PO-7076."""
     suppliers = prod.get("Suppliers") or []
     if not suppliers:
         return None
+
+    def _cost_of(s: dict) -> Optional[float]:
+        fixed_cost = s.get("FixedCost")
+        if fixed_cost is not None and float(fixed_cost) > 0:
+            return float(fixed_cost)
+        cost = s.get("Cost")
+        if cost is not None:
+            return float(cost)
+        return None
+
     sid_l = str(supplier_id or "").strip().lower()
     sname_l = str(supplier_name or "").strip().lower()
     for s in suppliers:
         if sid_l and str(s.get("SupplierID") or "").lower() == sid_l:
-            cost = s.get("Cost")
-            if cost is not None:
-                return float(cost)
+            found = _cost_of(s)
+            if found is not None:
+                return found
     # Fallback to name match
     for s in suppliers:
         if sname_l and str(
                 s.get("SupplierName") or "").strip().lower() == sname_l:
-            cost = s.get("Cost")
-            if cost is not None:
-                return float(cost)
+            found = _cost_of(s)
+            if found is not None:
+                return found
     return None
 
 

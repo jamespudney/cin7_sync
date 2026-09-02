@@ -1350,6 +1350,21 @@ CREATE TABLE IF NOT EXISTS po_dispatch_reminders (
 CREATE INDEX IF NOT EXISTS idx_po_dispatch_reminders_recent
     ON po_dispatch_reminders(posted_at DESC);
 
+-- 2026-09-01 865FabLab stock-drop alerts. One row per SKU; cleared_at
+-- NULL means "already notified, still below reorder level" (don't
+-- re-post daily). Set cleared_at once the suggested batch clears to
+-- <= 0 (stock replenished or a batch was ordered) so a future re-drop
+-- notifies again.
+CREATE TABLE IF NOT EXISTS fablab_stock_alerts (
+    sku              TEXT    PRIMARY KEY,
+    suggested_batch  REAL,
+    posted_channel   TEXT,
+    posted_ts        TEXT,
+    posted_at        TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    cleared_at       TIMESTAMP,
+    error_msg        TEXT
+);
+
 -- v2.67.126 Slack OAuth user tokens (for Viktor bridge from
 -- dashboard). Each staff member who wants the dashboard to
 -- forward marketing questions to Viktor on their behalf
@@ -3039,6 +3054,56 @@ def record_po_dispatch_escalation(po_number: str,
 
 
 # ---------------------------------------------------------------------------
+# 865FabLab stock-drop alerts (2026-09-01)
+# ---------------------------------------------------------------------------
+def fablab_stock_alert_active(sku: str) -> bool:
+    """True if this SKU already has an unresolved (uncleared) alert
+    posted — i.e. don't post again, it's still below the reorder
+    level and the team already knows."""
+    with connect() as c:
+        r = c.execute(
+            "SELECT 1 FROM fablab_stock_alerts "
+            "WHERE sku = ? AND cleared_at IS NULL",
+            (sku,)).fetchone()
+    return r is not None
+
+
+def record_fablab_stock_alert(sku: str, suggested_batch: float,
+                                     posted_channel: Optional[str],
+                                     posted_ts: Optional[str],
+                                     error_msg: Optional[str] = None
+                                     ) -> None:
+    """Record (or re-activate) an alert for this SKU. Re-activating
+    clears any prior cleared_at so a fresh drop-below-level always
+    shows as active until clear_fablab_stock_alert() is called."""
+    with connect() as c:
+        c.execute(
+            "INSERT INTO fablab_stock_alerts "
+            "(sku, suggested_batch, posted_channel, posted_ts, "
+            " error_msg, posted_at, cleared_at) "
+            "VALUES (?, ?, ?, ?, ?, datetime('now'), NULL) "
+            "ON CONFLICT(sku) DO UPDATE SET "
+            "  suggested_batch=excluded.suggested_batch, "
+            "  posted_channel=excluded.posted_channel, "
+            "  posted_ts=excluded.posted_ts, "
+            "  error_msg=excluded.error_msg, "
+            "  posted_at=excluded.posted_at, "
+            "  cleared_at=NULL",
+            (sku, suggested_batch, posted_channel, posted_ts, error_msg))
+
+
+def clear_fablab_stock_alert(sku: str) -> None:
+    """Mark this SKU's alert cleared -- suggested batch is back to
+    <= 0 (restocked or a batch was ordered). A future drop posts a
+    fresh alert instead of staying silent forever."""
+    with connect() as c:
+        c.execute(
+            "UPDATE fablab_stock_alerts SET cleared_at = datetime('now') "
+            "WHERE sku = ? AND cleared_at IS NULL",
+            (sku,))
+
+
+# ---------------------------------------------------------------------------
 # Viktor bridge — Slack user OAuth tokens (v2.67.126)
 # ---------------------------------------------------------------------------
 def upsert_slack_user_token(user_id: int, slack_user_id: str,
@@ -4341,6 +4406,21 @@ _PG_POST_CUTOVER_TABLES = [
       """
       CREATE INDEX IF NOT EXISTS ix_fablab_finished_goods_pushes_draft
           ON fablab_finished_goods_pushes(draft_id);
+      """),
+    # 2026-09-01 — 865FabLab stock-drop alerts (see _SCHEMA for the
+    # SQLite-side definition and the module docstring in
+    # fablab_stock_alert.py).
+    ("fablab_stock_alerts",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_stock_alerts (
+          sku              TEXT PRIMARY KEY,
+          suggested_batch  DOUBLE PRECISION,
+          posted_channel   TEXT,
+          posted_ts        TEXT,
+          posted_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          cleared_at       TIMESTAMPTZ,
+          error_msg        TEXT
+      );
       """),
 ]
 

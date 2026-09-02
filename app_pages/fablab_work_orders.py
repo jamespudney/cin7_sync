@@ -468,6 +468,79 @@ def _render_line_editor(
         st.dataframe(lines_df, use_container_width=True, hide_index=True)
 
 
+def _render_push_po_to_cin7(draft_id: int, actor: str) -> None:
+    """Push this draft to CIN7 as a real Draft Advanced Purchase, using
+    the same validated flow as the main Ordering page
+    (cin7_post_po.push_po_draft) -- resolves SKUs to CIN7 ProductIDs,
+    stops at CIN7 status DRAFT (never auto-authorises; a human reviews
+    in CIN7 first). Only usable now that 865FabLab is a real CIN7
+    supplier (2026-09-01) -- before that, CIN7's supplier resolution
+    would have failed with 'not found'."""
+    import db
+
+    saved = db.get_po_draft_lines(draft_id)
+    if not saved:
+        return
+
+    st.markdown("#### \U0001f4e4 Push order to CIN7")
+    st.caption(
+        "Creates a real Draft Purchase in CIN7 for supplier 865FabLab "
+        "-- stays in DRAFT status, never auto-authorised. Review "
+        "pricing in CIN7 before authorising: these SKUs don't have a "
+        "per-unit 865FabLab labor cost set on their Supplier link yet, "
+        "so CIN7 will fall back to each product's AverageCost, which "
+        "is likely NOT what 865FabLab actually charges for the build.")
+
+    show_key = f"fablab_po_push_show_{draft_id}"
+    if st.button("\U0001f4e4 Push to CIN7 as Draft PO",
+                 key=f"fablab_po_push_btn_{draft_id}"):
+        st.session_state[show_key] = True
+    if not st.session_state.get(show_key):
+        return
+
+    with st.expander(f"Push order #{draft_id} to CIN7?", expanded=True):
+        dry_run = st.checkbox(
+            "Dry-run (validate + preview only, don't post)",
+            value=True, key=f"fablab_po_push_dry_{draft_id}")
+        ack = st.checkbox(
+            "I understand this creates a real Draft PO in CIN7 and "
+            "will review/fix pricing there before authorising.",
+            key=f"fablab_po_push_ack_{draft_id}")
+        if st.button("Confirm push", type="primary",
+                     disabled=(not ack) and not dry_run,
+                     key=f"fablab_po_push_confirm_{draft_id}"):
+            from cin7_post_po import push_po_draft
+            with st.spinner("Talking to CIN7 — this can take "
+                             "10-60 seconds..."):
+                result = push_po_draft(
+                    draft_id, actor=actor, apply=not dry_run,
+                    require_mov=False)
+            if result.ok:
+                if dry_run:
+                    st.success(
+                        f"Dry-run passed at stage `{result.stage}`. "
+                        "Uncheck dry-run and confirm again to actually "
+                        "push.")
+                    with st.expander("Lines that would be sent"):
+                        st.json(
+                            (result.order_response or {}).get(
+                                "lines", []))
+                else:
+                    st.success(
+                        f"CIN7 PO **#{result.cin7_po_number}** created "
+                        "in DRAFT status. Review and AUTHORISE in "
+                        "CIN7 to send to 865FabLab.")
+                    st.session_state[show_key] = False
+                    st.rerun()
+            else:
+                st.error(f"Push did not complete. Stopped at stage "
+                         f"`{result.stage}`.")
+                for err in result.errors:
+                    st.error(f"• {err}")
+            for warning in result.warnings:
+                st.warning(warning)
+
+
 def _render_finished_goods_push(
         draft_id: int, bom_parents: dict, actor: str) -> None:
     """Push a received 865FabLab order to CIN7 as Finished Goods
@@ -715,6 +788,8 @@ def render_fablab_work_orders(
     if draft_id:
         _render_line_editor(
             draft_id, can_edit, current_user, edited_planner, product_map)
+        if can_edit:
+            _render_push_po_to_cin7(draft_id, current_user)
 
     st.divider()
     _render_receiving_checklist(bom_parents, product_map, current_user)
