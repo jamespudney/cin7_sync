@@ -737,7 +737,56 @@ this is the **Optimum stock value** tile on the Ordering page
 and the target the glide-path projects toward (v2.67.178 — no
 more hardcoded $600k constant).
 
-#### Optimum stock value (the glide-path target, v2.67.178)
+#### Stock goal, Reorder level, Excess — the stock-goal model (2026-09-03)
+Supersedes "Optimum stock value" below. Defined once in
+`engine/stock_goal.py` and used by the Command Centre, the Stock
+Optimisation headline, the per-vendor tiles on Ordering, and the
+daily `stock_goal_snapshots` table, so the same SKU set gives the
+same dollars on every page.
+
+- **Reorder level (order-up-to)** — the engine's `target_stock`:
+  `avg_daily × LT × (1 + safety%) + avg_daily × review_days` (+ holiday
+  cover, MOQ/EOQ lifts, and now a **range floor**: a live A/B/C SKU
+  targets at least one unit, or one pack/EOQ when set; bulk-roll
+  masters and Project rows are exempt). This is *when and how much to
+  buy*. It is NOT a stock budget — summed over the business it came to
+  ~24 days of cover, because anything selling <~10/yr rounded to a
+  target below one unit and the model assumes weekly fractional buys.
+- **ABCD** — the engine's cumulative-value ABC puts every zero-demand
+  SKU in C. **D** = ABC "C" with no visible 12-month demand; C keeps
+  only SKUs that actually moved. Dead stock = D with stock on hand.
+- **Stock goal** — per SKU, the LARGEST of: class days of cover ×
+  planning rate (A 50d, B 75d, C 150d, D 0 — `DEFAULT_COVER_DAYS`),
+  the reorder level, and the range floor. Zero for dropship, archived
+  (do-not-reorder) and discontinued SKUs and for non-master
+  cuts/variants (their demand rolls up). Planning rate = engine
+  `avg_daily`, clamped to 0 when the SKU had 12-month demand but nothing
+  in the last 90 days (ended project). Valued at the Ordering page's
+  `EffectiveUnitCost` chain (FIFO per unit → AverageCost → family /
+  category median), or FIFO → AverageCost → FixedCost before that
+  chain exists (warm job).
+- **Excess** — `max(0, OnHand − goal) × unit cost`, per SKU, summed.
+  Gross. Non-master cuts with their own direct sales are never excess
+  (working inventory); dropship stock is never excess (in transit).
+  Dead stock is included (goal $0).
+- **Understock** — `max(0, goal − OnHand) × unit cost`. Excess −
+  Understock = the net cash that could actually be freed.
+- **Turns / days on hand** — trailing-12mo COGS (`annual_value` =
+  effective_units_12mo × AverageCost) ÷ Current, and ÷ Goal. The COGS
+  proxy includes some rollup double-count, so read turns as ±0.2.
+
+Why the old per-vendor figures didn't add up: `excess_value` had three
+definitions — the engine baseline (stock above 12 months of demand),
+the Ordering per-SKU calc (stock above reorder level) and the Stock
+Optimisation headline (a third variant) — and the supplier-wide tile
+showed whichever had been written last, while its Dead tile keyed on
+the Status label. All three now call `stock_health_summary()`.
+
+#### Optimum stock value (the glide-path target, v2.67.178 — SUPERSEDED 2026-09-03)
+Renamed **Reorder level (order-up-to)** and no longer the glide-path
+target; the glide path now runs to **Stock goal** (section above).
+Historical description follows.
+
 **`sum(target_stock × EffectiveUnitCost across masters only)`**
 
 What working capital SHOULD be tied up at, per the engine. The

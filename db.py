@@ -837,6 +837,29 @@ CREATE TABLE IF NOT EXISTS ordering_target_snapshots (
     captured_at            TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 2026-09-03 — daily snapshot of the stock-goal model
+-- (engine/stock_goal.py): Current / Goal / Reorder level / Excess /
+-- Understock / Dead plus the per-class breakdown as JSON. Written by
+-- the warm job (reorder_level_value NULL — it needs supplier config)
+-- and overwritten by the Ordering/Stock Optimisation page when it
+-- runs (full figures). Read by the Command Centre and the glide-path
+-- chart. One row per calendar date, last-write-wins.
+CREATE TABLE IF NOT EXISTS stock_goal_snapshots (
+    snapshot_date        DATE PRIMARY KEY,
+    sku_count            INTEGER,
+    current_value        REAL,
+    goal_value           REAL,
+    reorder_level_value  REAL,
+    excess_value         REAL,
+    understock_value     REAL,
+    dead_value           REAL,
+    dead_sku_count       INTEGER,
+    annual_cogs          REAL,
+    by_class_json        TEXT,
+    source               TEXT,
+    captured_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ============================================================
 -- v2.67.57 — Slack integration
 -- ============================================================
@@ -4437,6 +4460,25 @@ _PG_POST_CUTOVER_TABLES = [
           onhand_value_masters DOUBLE PRECISION,
           excess_value         DOUBLE PRECISION,
           understock_value     DOUBLE PRECISION,
+          captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    # 2026-09-03 — stock-goal model daily snapshot (see _SCHEMA note).
+    ("stock_goal_snapshots",
+      """
+      CREATE TABLE IF NOT EXISTS stock_goal_snapshots (
+          snapshot_date        DATE PRIMARY KEY,
+          sku_count            INTEGER,
+          current_value        DOUBLE PRECISION,
+          goal_value           DOUBLE PRECISION,
+          reorder_level_value  DOUBLE PRECISION,
+          excess_value         DOUBLE PRECISION,
+          understock_value     DOUBLE PRECISION,
+          dead_value           DOUBLE PRECISION,
+          dead_sku_count       INTEGER,
+          annual_cogs          DOUBLE PRECISION,
+          by_class_json        TEXT,
+          source               TEXT,
           captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       """),
@@ -9413,6 +9455,96 @@ def record_ordering_target_snapshot(master_sku_count: int,
              float(onhand_value_masters), float(excess_value),
              float(understock_value)),
         )
+
+
+def record_stock_goal_snapshot(summary: dict, source: str = "") -> None:
+    """Persist one stock_health_summary() dict (engine/stock_goal.py).
+    One row per calendar date, last-write-wins. The warm job writes a
+    row without reorder_level_value (None); the Ordering page writes
+    the full row later the same day and wins — unless the warm job
+    runs again afterwards, in which case keep the page's reorder
+    level rather than overwriting it with NULL."""
+    import json as _json
+    by_class = _json.dumps(summary.get("by_class") or [], default=str)
+    rl = summary.get("reorder_level_value")
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO stock_goal_snapshots
+                (snapshot_date, sku_count, current_value, goal_value,
+                 reorder_level_value, excess_value, understock_value,
+                 dead_value, dead_sku_count, annual_cogs, by_class_json,
+                 source, captured_at)
+            VALUES
+                (date('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                sku_count           = excluded.sku_count,
+                current_value       = excluded.current_value,
+                goal_value          = excluded.goal_value,
+                reorder_level_value = COALESCE(excluded.reorder_level_value,
+                                               stock_goal_snapshots.reorder_level_value),
+                excess_value        = excluded.excess_value,
+                understock_value    = excluded.understock_value,
+                dead_value          = excluded.dead_value,
+                dead_sku_count      = excluded.dead_sku_count,
+                annual_cogs         = excluded.annual_cogs,
+                by_class_json       = excluded.by_class_json,
+                source              = excluded.source,
+                captured_at         = excluded.captured_at
+            """,
+            (int(summary.get("sku_count") or 0),
+             float(summary.get("current_value") or 0),
+             float(summary.get("goal_value") or 0),
+             (float(rl) if rl is not None else None),
+             float(summary.get("excess_value") or 0),
+             float(summary.get("understock_value") or 0),
+             float(summary.get("dead_value") or 0),
+             int(summary.get("dead_sku_count") or 0),
+             float(summary.get("annual_cogs") or 0),
+             by_class, str(source or "")),
+        )
+
+
+def get_latest_stock_goal_snapshot() -> dict:
+    """Most recent stock_goal_snapshots row (by_class decoded), or {}."""
+    import json as _json
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT snapshot_date, sku_count, current_value, goal_value,
+                   reorder_level_value, excess_value, understock_value,
+                   dead_value, dead_sku_count, annual_cogs, by_class_json,
+                   source, captured_at
+              FROM stock_goal_snapshots
+             ORDER BY snapshot_date DESC
+             LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return {}
+    out = dict(row)
+    try:
+        out["by_class"] = _json.loads(out.pop("by_class_json") or "[]")
+    except (TypeError, ValueError):
+        out["by_class"] = []
+    return out
+
+
+def list_stock_goal_snapshots(limit: int = 400) -> list:
+    """Oldest→newest rows for the glide-path chart."""
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT snapshot_date, current_value, goal_value,
+                   reorder_level_value, excess_value, understock_value,
+                   dead_value
+              FROM stock_goal_snapshots
+             ORDER BY snapshot_date DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
 
 
 def get_latest_ordering_target_snapshot() -> dict:

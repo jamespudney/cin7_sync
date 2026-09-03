@@ -65,6 +65,17 @@ from engine.sku_rules import _parse_tube_sku
 from engine.sku_rules import is_bulk_strip_roll_length
 from engine.sku_rules import parse_pack_purchase_sku
 from engine.sku_rules import parse_sourcing_rule
+from engine.stock_goal import (
+    DEFAULT_COVER_DAYS,
+    abcd_class,
+    compute_stock_goal,
+    excess_and_understock,
+    goal_units,
+    planning_avg_daily,
+    range_floor_units,
+    stock_health_summary,
+    unit_cost_for_goal,
+)
 from engine.reorder_math import (
     excess_units_over_target,
     fractional_bulk_order_allowed,
@@ -5459,6 +5470,124 @@ if stock_only and _filtered_count > 0:
 # inputs haven't changed, so this lift adds zero compute cost.
 # ===========================================================================
 
+def _effective_dropship_sets(products_df: pd.DataFrame,
+                             supp_configs: dict) -> dict:
+    """Effective dropship set — combined from 4 sources (RULES.md §5.4).
+
+    Priority / merging logic:
+      1. CIN7 DropShipMode = "Always Drop Ship"  → dropship (authoritative)
+      2. CIN7 Tags contains "Dropship"           → dropship (belt-and-braces)
+      3. Per-SKU app flag in `flags` table       → dropship (user override)
+      4. Supplier-level `dropship_default`       → dropship, UNLESS CIN7
+                                                   explicitly says
+                                                   "No Drop Ship" for that
+                                                   individual SKU
+    minus the user's explicit "Not dropship" overrides.
+
+    Shared by the ABC engine (goal = 0 for dropship SKUs) and the
+    Ordering context so both pages zero the same SKUs. Returns the
+    component sets too because the Ordering page shows them.
+    """
+    cin7_always_ds: set = set()
+    cin7_no_ds: set = set()
+    cin7_tag_ds: set = set()
+    if products_df is not None and not products_df.empty:
+        _skus = products_df.get("SKU", pd.Series(dtype=object)).astype(str)
+        _modes = products_df.get(
+            "DropShipMode", pd.Series("", index=products_df.index)
+        ).fillna("").astype(str).str.strip()
+        _tags = products_df.get(
+            "Tags", pd.Series("", index=products_df.index)
+        ).fillna("").astype(str).str.lower()
+        for sku, mode, tags in zip(_skus, _modes, _tags):
+            if not sku or sku == "nan":
+                continue
+            if mode == "Always Drop Ship":
+                cin7_always_ds.add(sku)
+            elif mode == "No Drop Ship":
+                cin7_no_ds.add(sku)
+            if "dropship" in tags:
+                cin7_tag_ds.add(sku)
+
+    per_sku_ds = set(db.all_dropship_skus())
+    not_ds_overrides = set(db.all_not_dropship_skus())
+
+    _dropship_suppliers = {
+        name for name, cfg in (supp_configs or {}).items()
+        if cfg.get("dropship_default")
+    }
+    supplier_ds_skus: set = set()
+    if (_dropship_suppliers and products_df is not None
+            and not products_df.empty and "Suppliers" in products_df.columns):
+        for _, p in products_df.iterrows():
+            sups_raw = p.get("Suppliers")
+            if sups_raw is None or (isinstance(sups_raw, float)
+                                    and pd.isna(sups_raw)) or not sups_raw:
+                continue
+            try:
+                sups = (json.loads(sups_raw)
+                        if isinstance(sups_raw, str) else sups_raw)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(sups, list) or not sups:
+                continue
+            primary = next(
+                (s for s in sups if s.get("IsDefault")), sups[0])
+            supp_name = primary.get("SupplierName") or ""
+            if supp_name in _dropship_suppliers:
+                supplier_ds_skus.add(str(p.get("SKU") or ""))
+
+    dropship_skus = (
+        cin7_always_ds
+        | cin7_tag_ds
+        | per_sku_ds
+        | (supplier_ds_skus - cin7_no_ds)
+    ) - not_ds_overrides
+    return {
+        "dropship_skus": dropship_skus,
+        "cin7_always_ds": cin7_always_ds,
+        "cin7_no_ds": cin7_no_ds,
+        "cin7_tag_ds": cin7_tag_ds,
+        "per_sku_ds": per_sku_ds,
+        "not_ds_overrides": not_ds_overrides,
+    }
+
+
+def _zero_goal_sku_set(products_df: pd.DataFrame) -> dict:
+    """SKUs that carry NO stock goal: dropship (order-on-demand),
+    do-not-reorder (buyer archived) and discontinued — the same three
+    exclusions the Ordering page applies to target_stock / reorder_qty.
+    Returns {"zero_goal": set, "dropship": set}; dropship stock is also
+    never counted as excess (RULES 5.4), archived/discontinued stock is
+    (the buyer wants to see it for clean-up)."""
+    out: set = set()
+    dropship: set = set()
+    try:
+        supp_configs = db.all_supplier_configs()
+    except Exception:  # noqa: BLE001
+        supp_configs = {}
+    try:
+        dropship = set(
+            _effective_dropship_sets(products_df, supp_configs)["dropship_skus"])
+        out |= dropship
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out |= {str(s) for s in db.all_do_not_reorder_skus()}
+    except Exception:  # noqa: BLE001
+        pass
+    if products_df is not None and not products_df.empty:
+        _name = products_df.get(
+            "Name", pd.Series("", index=products_df.index)).astype(str)
+        _status = products_df.get(
+            "Status", pd.Series("", index=products_df.index)).astype(str)
+        _disc = (_name.str.contains(r"\[Discontinued\]", case=False,
+                                   regex=True, na=False)
+                 | (_status.str.lower() == "discontinued"))
+        out |= set(products_df.loc[_disc, "SKU"].astype(str))
+    return {"zero_goal": out, "dropship": dropship}
+
+
 @st.cache_data(
     persist="disk",
     show_spinner="Computing ABC engine…",
@@ -7919,37 +8048,41 @@ def _abc_engine(products: pd.DataFrame,
     else:
         df["OnHandValue"] = 0.0
 
-    # v2.67.47 — naive excess_units / excess_value baseline.
-    # The Ordering page later OVERWRITES these with a more precise
-    # version that factors supplier lead times, freight modes,
-    # safety stock, etc. (target_stock = LT × avg + safety + review).
-    # But that calculation depends on supplier configs loaded inside
-    # the Ordering page elif — Slow Movers + Overview can't access
-    # it. So we set a baseline here using a much simpler heuristic
-    # (OnHand minus 12mo effective demand) so excess columns are
-    # always populated. Once the user visits the Ordering page in
-    # the same session, the cached engine_df gets the precise
-    # versions on top — Slow Movers picks those up automatically.
+    # v2.67.47 → 2026-09-03 stock-goal model. The old baseline here was
+    # "OnHand minus 12mo effective demand", while the Ordering page
+    # overwrote excess with "OnHand minus target_stock" once it ran —
+    # so the per-vendor Excess tile and the Command Centre disagreed
+    # with the Ordering headline depending on which page had been
+    # opened first. Excess is now defined ONCE, in engine/stock_goal.py,
+    # as stock above the SKU's *goal* (class days-of-cover, at least the
+    # reorder level, at least one unit/pack for a live SKU). The
+    # Ordering page re-runs compute_stock_goal after target_stock is
+    # known so goal also covers the reorder level; the definition of
+    # excess does not change between pages any more.
+    # NOTE: is_dead / _visible_units_12mo are computed a few lines
+    # above; ABCD (D = no visible 12mo demand) is derived from them.
+    try:
+        _zero_goal_skus = _zero_goal_sku_set(products)
+    except Exception:  # noqa: BLE001
+        _zero_goal_skus = {"zero_goal": set(), "dropship": set()}
+    try:
+        _pack_by_sku = {
+            str(r["sku"]): (r.get("eoq_qty") or r.get("pack_qty") or 0)
+            for r in db.all_sku_pack()
+        }
+    except Exception:  # noqa: BLE001
+        _pack_by_sku = {}
+    df = compute_stock_goal(df, pack_qty_by_sku=_pack_by_sku,
+                            zero_goal_skus=_zero_goal_skus["zero_goal"],
+                            no_excess_skus=_zero_goal_skus["dropship"])
+    _excess_val, _under_val = excess_and_understock(df)
     _onh = pd.to_numeric(
         df.get("OnHand", pd.Series(0.0, index=df.index)),
         errors="coerce").fillna(0)
-    _eff_12mo = pd.to_numeric(
-        df.get("effective_units_12mo",
-                pd.Series(0.0, index=df.index)),
-        errors="coerce").fillna(0)
-    df["excess_units"] = (_onh - _eff_12mo).clip(lower=0)
-    # Per-unit cost from OnHandValue / OnHand when both are
-    # positive; otherwise fall back to AverageCost.
-    _ohv_for_cost = pd.to_numeric(
-        df.get("OnHandValue", pd.Series(0.0, index=df.index)),
-        errors="coerce").fillna(0)
-    _per_unit = (_ohv_for_cost / _onh.where(_onh > 0, 1)).where(
-        _onh > 0, 0)
-    _avgcost_fallback = pd.to_numeric(
-        df.get("AverageCost", pd.Series(0.0, index=df.index)),
-        errors="coerce").fillna(0)
-    _per_unit = _per_unit.where(_per_unit > 0, _avgcost_fallback)
-    df["excess_value"] = (df["excess_units"] * _per_unit).round(2)
+    _goal_u = pd.to_numeric(df["goal_units"], errors="coerce").fillna(0)
+    df["excess_units"] = (_onh - _goal_u).clip(lower=0)
+    df["excess_value"] = _excess_val.round(2)
+    df["understock_value"] = _under_val.round(2)
 
     # v2.67.36 — record dormancy provenance. Write today's
     # is_dormant snapshot to the sku_dormancy_log table so the
@@ -8202,76 +8335,15 @@ def _load_ordering_shared_db_state() -> "SimpleNamespace":
     except Exception:  # noqa: BLE001
         dormancy_warnings_map = {}
 
-    # --- Effective dropship set — combined from 4 sources -----------
-    # Priority / merging logic (documented in RULES.md §5.4):
-    #   1. CIN7 DropShipMode = "Always Drop Ship"  → dropship (authoritative)
-    #   2. CIN7 Tags contains "Dropship"           → dropship (belt-and-braces)
-    #   3. Per-SKU app flag in `flags` table       → dropship (user override)
-    #   4. Supplier-level `dropship_default`       → dropship, UNLESS CIN7
-    #                                                 explicitly says
-    #                                                 "No Drop Ship" for that
-    #                                                 individual SKU
-    #
-    # This way CIN7 is the source of truth but the buyer has escape
-    # hatches for edge cases without having to fix CIN7 first.
-    cin7_always_ds: set = set()
-    cin7_no_ds: set = set()
-    cin7_tag_ds: set = set()
-    if not products.empty:
-        for idx, p in products.iterrows():
-            sku = str(p.get("SKU") or "")
-            if not sku:
-                continue
-            mode = str(p.get("DropShipMode") or "").strip()
-            if mode == "Always Drop Ship":
-                cin7_always_ds.add(sku)
-            elif mode == "No Drop Ship":
-                cin7_no_ds.add(sku)
-            tags = str(p.get("Tags") or "").lower()
-            if "dropship" in tags:
-                cin7_tag_ds.add(sku)
-
-    per_sku_ds = set(db.all_dropship_skus())
-    # Overrides — user explicitly wants these NOT dropship despite CIN7
-    # saying so. Candidates for CIN7 write-back (see pending-writes
-    # expander below the PO editor).
-    not_ds_overrides = set(db.all_not_dropship_skus())
-
-    # Supplier-level dropship_default
+    # --- Effective dropship set — shared helper (RULES.md §5.4) -------
     supp_configs = db.all_supplier_configs()
-    _dropship_suppliers = {
-        name for name, cfg in supp_configs.items()
-        if cfg.get("dropship_default")
-    }
-    supplier_ds_skus: set = set()
-    if _dropship_suppliers and not products.empty:
-        for _, p in products.iterrows():
-            sups_raw = p.get("Suppliers")
-            if pd.isna(sups_raw) or not sups_raw:
-                continue
-            try:
-                sups = (json.loads(sups_raw)
-                          if isinstance(sups_raw, str) else sups_raw)
-            except Exception:
-                continue
-            if not isinstance(sups, list) or not sups:
-                continue
-            primary = next(
-                (s for s in sups if s.get("IsDefault")), sups[0])
-            supp_name = primary.get("SupplierName") or ""
-            if supp_name in _dropship_suppliers:
-                supplier_ds_skus.add(str(p.get("SKU") or ""))
-
-    # Combine: CIN7 signals + app overrides, with CIN7 "No Drop Ship"
-    # winning over supplier-level default (but NOT over per-SKU flag).
-    # Subtract the user's "Not dropship" overrides at the end — they're
-    # the user's explicit intent that these SKUs should be stocked.
-    dropship_skus = (
-        cin7_always_ds
-        | cin7_tag_ds
-        | per_sku_ds
-        | (supplier_ds_skus - cin7_no_ds)
-    ) - not_ds_overrides
+    _ds = _effective_dropship_sets(products, supp_configs)
+    cin7_always_ds = _ds["cin7_always_ds"]
+    cin7_no_ds = _ds["cin7_no_ds"]
+    cin7_tag_ds = _ds["cin7_tag_ds"]
+    per_sku_ds = _ds["per_sku_ds"]
+    not_ds_overrides = _ds["not_ds_overrides"]
+    dropship_skus = _ds["dropship_skus"]
 
     # v2.67.284 — load supplier holidays once for the engine
     # (closures used per-row inside _compute_target_and_reorder).
@@ -8766,6 +8838,30 @@ def _build_ordering_context() -> "SimpleNamespace":
         is_project_row = (str(row.get("trend_flag") or "")
                           == "🎯 Project")
         target_policy_notes = []
+        # 2026-09-03 range floor (engine/stock_goal.py). A live SKU
+        # that sells fewer than ~10 units/yr used to get a target of
+        # 0.2–0.9 units, i.e. "carry nothing", which is how 1,706
+        # active SKUs holding $295k showed as pure excess. Hold at
+        # least one unit (or one pack/EOQ) while the SKU has a live
+        # planning rate. Bulk-roll masters and Project rows are
+        # exempt (see range_floor_units).
+        _abcd_for_floor = str(row.get("ABCD") or "")
+        if not _abcd_for_floor or _abcd_for_floor == "nan":
+            _abcd_for_floor = abcd_class(
+                abc, row.get("_visible_units_12mo",
+                             row.get("effective_units_12mo")))
+        # Planning rate for the floor = unadjusted 12mo rate, clamped to
+        # 0 when nothing moved in 90 days — NOT the dormancy-zeroed
+        # avg_daily, otherwise a C SKU selling 4/yr would never be held.
+        _plan_rate_for_floor = planning_avg_daily(
+            avg_daily, row.get("effective_units_12mo"),
+            row.get("effective_units_90d"),
+            avg_daily_base=row.get("avg_daily_base"))
+        _range_floor = range_floor_units(
+            _plan_rate_for_floor, _abcd_for_floor,
+            pack_qty=sku_eoq,
+            is_project=is_project_row,
+            is_bulk_master=bool(row.get("is_bulk_master", False)))
         if not is_project_row:
             if sku_moq > 0 and target < sku_moq:
                 target = sku_moq
@@ -8778,6 +8874,12 @@ def _build_ordering_context() -> "SimpleNamespace":
                         f"SKU EOQ rounds target to {rounded_target:g} "
                         f"(multiple of {sku_eoq:g})")
                     target = rounded_target
+            if _range_floor > 0 and target < _range_floor:
+                target = _range_floor
+                target_policy_notes.append(
+                    f"range floor lifts target to {_range_floor:g} "
+                    f"(keep one {'pack' if sku_eoq > 0 else 'unit'} of a "
+                    f"live SKU)")
         onhand = row["OnHand"]
         allocated = float(row.get("Allocated") or 0)
         available = float(row.get("Available") or 0)
@@ -8918,17 +9020,33 @@ def _build_ordering_context() -> "SimpleNamespace":
         elif reorder:
             reorder = round(float(reorder), 2)
 
-        # Excess = OnHand beyond target. For bulk masters, ignore
-        # non-actionable residue below 5m so 0.002 rolls left on a 100m
-        # SKU doesn't show as "Overstocked" / "$5 tied up".
+        # Excess = OnHand beyond the SKU's GOAL (engine/stock_goal.py):
+        # class days-of-cover, never below the reorder level (target)
+        # nor the range floor. Measuring excess against the bare
+        # reorder level called ~$600k of $700k "excess"; the goal is
+        # the figure the business actually wants to hold, and it is
+        # the same definition the Command Centre and per-vendor tiles
+        # use. For bulk masters, ignore non-actionable residue below 5m
+        # so 0.002 rolls left on a 100m SKU doesn't show as
+        # "Overstocked" / "$5 tied up".
+        _goal_for_excess = goal_units(
+            _plan_rate_for_floor, _abcd_for_floor,
+            reorder_level=target, floor=_range_floor)
         excess_units = excess_units_over_target(
-            onhand, target,
+            onhand, _goal_for_excess,
             is_bulk_master=is_bulk,
             bulk_length_m=bulk_len_m,
         )
-        excess_value = excess_units * row["AverageCost"]
+        _unit_cost = unit_cost_for_goal(
+            onhand, row.get("OnHandValue"), row["AverageCost"],
+            row.get("FixedCost"))
+        excess_value = excess_units * _unit_cost
         result = {
             "target_stock": target,
+            "goal_units": _goal_for_excess,
+            "goal_value": _goal_for_excess * _unit_cost,
+            "unit_cost_for_goal": _unit_cost,
+            "range_floor_units": _range_floor,
             "reorder_qty": reorder,
             "vendor_lead_time_days": vendor_lead_time_days,
             "lead_time_days": lead_time_days,
@@ -9413,8 +9531,12 @@ def _build_ordering_context() -> "SimpleNamespace":
                    and 0 < reorder < float(moq))
                else "")
             + f"\n\n"
-            f"**Excess stock** (over target): {excess_units:.0f} units × "
-            f"${row['AverageCost']:.2f} = **${excess_value:,.0f} tied up**"
+            f"**Stock goal**: {_goal_for_excess:.1f} units = max("
+            f"{DEFAULT_COVER_DAYS.get(_abcd_for_floor, DEFAULT_COVER_DAYS['C']):g}d "
+            f"cover for class {_abcd_for_floor or '—'} × {_plan_rate_for_floor:.3f}/day, "
+            f"reorder level {target:.1f}, range floor {_range_floor:g})\n\n"
+            f"**Excess stock** (over goal): {excess_units:.0f} units × "
+            f"${_unit_cost:.2f} = **${excess_value:,.0f} tied up**"
         )
         result["calc_trace"] = trace
         return result
@@ -9431,7 +9553,8 @@ def _build_ordering_context() -> "SimpleNamespace":
     _reorder_cols = ("target_stock", "reorder_qty",
                        "vendor_lead_time_days", "lead_time_days",
                        "sku_lead_time_days", "sku_moq", "sku_eoq_qty",
-                       "freight_mode", "excess_units", "excess_value")
+                       "freight_mode", "excess_units", "excess_value",
+                       "goal_units", "goal_value")
     try:
         _cache_sig = json.dumps({
             "supp": supp_configs,
@@ -9462,6 +9585,10 @@ def _build_ordering_context() -> "SimpleNamespace":
         engine_df["freight_mode"] = applied.apply(lambda x: x["freight_mode"])
         engine_df["excess_units"] = applied.apply(lambda x: x["excess_units"])
         engine_df["excess_value"] = applied.apply(lambda x: x["excess_value"])
+        engine_df["goal_units"] = applied.apply(lambda x: x["goal_units"])
+        engine_df["goal_value"] = applied.apply(lambda x: x["goal_value"])
+        engine_df["range_floor_units"] = applied.apply(
+            lambda x: x["range_floor_units"])
         if _cache_sig is not None:
             st.session_state["_reorder_apply_sig"] = _cache_sig
     # Never keep per-SKU markdown traces on the table DataFrame. They are
@@ -9561,6 +9688,40 @@ def _build_ordering_context() -> "SimpleNamespace":
     engine_df["TargetValue"] = (
         engine_df["target_stock"] * engine_df["EffectiveUnitCost"]
     )
+    # 2026-09-03 — goal pass with the reorder level now known. Re-run
+    # the shared goal model so goal_units = max(class cover, target,
+    # range floor) and value it at the same EffectiveUnitCost chain as
+    # TargetValue (family/category medians included), so Goal, Reorder
+    # level, Excess and Understock on this page, the Command Centre and
+    # the per-vendor tiles are all the same arithmetic.
+    try:
+        _zero_goal = _zero_goal_sku_set(products)
+    except Exception:  # noqa: BLE001
+        _zero_goal = {"zero_goal": set(dropship_skus), "dropship": set(dropship_skus)}
+    _pack_for_goal = {
+        str(k): (v.get("eoq_qty") or v.get("pack_qty") or 0)
+        for k, v in (sku_buying_settings or {}).items()
+    }
+    engine_df = compute_stock_goal(
+        engine_df, pack_qty_by_sku=_pack_for_goal,
+        zero_goal_skus=_zero_goal["zero_goal"] | set(dropship_skus),
+        no_excess_skus=_zero_goal["dropship"] | set(dropship_skus))
+    _eff_cost = pd.to_numeric(
+        engine_df["EffectiveUnitCost"], errors="coerce").fillna(0)
+    engine_df["unit_cost_for_goal"] = _eff_cost
+    engine_df["goal_value"] = (
+        pd.to_numeric(engine_df["goal_units"], errors="coerce").fillna(0)
+        * _eff_cost)
+    engine_df["TargetValue"] = (
+        pd.to_numeric(engine_df["target_stock"], errors="coerce").fillna(0)
+        * _eff_cost)
+    _exc_val, _und_val = excess_and_understock(engine_df)
+    engine_df["excess_units"] = (
+        pd.to_numeric(engine_df["OnHand"], errors="coerce").fillna(0)
+        - pd.to_numeric(engine_df["goal_units"], errors="coerce").fillna(0)
+    ).clip(lower=0)
+    engine_df["excess_value"] = _exc_val
+    engine_df["understock_value"] = _und_val
     # Status — must use EFFECTIVE units (direct + migrated + rollup),
     # otherwise masters with rolled-up demand (e.g. Sierra65-W-2, strip
     # bulk rolls) get wrongly flagged as Dead Stock.
@@ -10543,145 +10704,117 @@ if page == "Overview":
     # drop) set, not Dead (zero-demand) stock — so there was
     # previously no reliable place to see these four numbers together,
     # or to answer "how much dead stock have we moved" at all.
-    st.subheader("📦 Stock health: target vs. current vs. dead")
+    st.subheader("📦 Stock health: goal vs. current vs. dead")
+    # 2026-09-03 — figures come from engine/stock_goal.stock_health_summary,
+    # the same function the Stock Optimisation headline and the
+    # per-vendor tiles use. Prefer a live compute on the engine
+    # snapshot the app is serving (cheap: vectorised over the frame);
+    # fall back to the persisted daily snapshot when the engine frame
+    # isn't available. The Reorder level needs supplier config that
+    # only the Ordering pages load, so it is taken from the latest
+    # persisted snapshot with an explicit "as of" caption.
     try:
         _engine_for_health = _get_engine_df()
     except Exception:  # noqa: BLE001
         _engine_for_health = pd.DataFrame()
     try:
-        _target_snap = db.get_latest_ordering_target_snapshot()
+        _goal_snap = db.get_latest_stock_goal_snapshot()
     except Exception:  # noqa: BLE001
-        _target_snap = {}
-    _dead_data_available = (
-        not _engine_for_health.empty
-        and "is_dead" in _engine_for_health.columns)
+        _goal_snap = {}
+    _health_cc = {}
+    if (not _engine_for_health.empty
+            and "goal_units" in _engine_for_health.columns):
+        try:
+            _health_cc = stock_health_summary(_engine_for_health, scope="all")
+        except Exception:  # noqa: BLE001
+            _health_cc = {}
+    if not _health_cc and _goal_snap:
+        _health_cc = dict(_goal_snap)
+    _dead_data_available = bool(_health_cc)
+    _dead_value_ov = float(_health_cc.get("dead_value") or 0.0)
+    _dead_skus_ov = int(_health_cc.get("dead_sku_count") or 0)
+    _goal_value_cc = float(_health_cc.get("goal_value") or 0.0)
+    _reorder_level_cc = _health_cc.get("reorder_level_value")
+    _reorder_asof = ""
+    if _reorder_level_cc is None and _goal_snap:
+        _reorder_level_cc = _goal_snap.get("reorder_level_value")
+        _reorder_asof = str(_goal_snap.get("captured_at") or "")[:16]
+    _excess_cc = float(_health_cc.get("excess_value") or 0.0)
+    _under_cc = float(_health_cc.get("understock_value") or 0.0)
+
+    sh1, sh2, sh3, sh4, sh5 = st.columns(5)
     if _dead_data_available:
-        _dead_mask_ov = _engine_for_health["is_dead"].fillna(False).astype(bool)
-        _dead_skus_ov = int(_dead_mask_ov.sum())
-        _dead_value_ov = float(
-            _engine_for_health.loc[_dead_mask_ov, "OnHandValue"]
-            .fillna(0).sum())
-    else:
-        # v2.67.382 — `is_dead` is new; a snapshot written by the warm
-        # job BEFORE this shipped won't have the column yet. Show "—"
-        # rather than a confidently wrong "$0" — a genuine zero and
-        # "we don't have this data yet" must never look the same.
-        _dead_skus_ov, _dead_value_ov = 0, 0.0
-
-    # v2.67.384 — Viktor turns-based target, used ONLY as a fallback
-    # while the precise engine-derived Optimum snapshot doesn't exist
-    # yet (no Ordering page visit this deploy). Viktor's memo derived
-    # 4.2 turns from this business's actual lead-time profile (94%
-    # fill rate, ~19-day air / ~60-day sea median receipt on Luz
-    # Negra, the largest single supplier line) — see his memo's
-    # "Why 4.2 turns and not 6" section. Formula: target $ = trailing
-    # 12mo COGS ÷ target turns. COGS uses `annual_value`
-    # (effective_units_12mo × AverageCost), masters only to avoid
-    # double-counting rollup children — the same scope and same
-    # column already used for the Ordering page's own turns tile, so
-    # the two stay consistent once both are visible. This does NOT
-    # replace the engine-derived Optimum once it exists — that one is
-    # per-SKU, lead-time-and-safety-stock-aware, and strictly more
-    # precise. It only fills the gap so this tile is never a bare "—".
-    VIKTOR_TARGET_TURNS = 4.2
-    _viktor_target_value = None
-    if not _engine_for_health.empty and "annual_value" in _engine_for_health.columns:
-        _cogs_for_viktor = float(
-            _engine_for_health.loc[
-                ~_engine_for_health.get(
-                    "is_non_master_tube",
-                    pd.Series(False, index=_engine_for_health.index)
-                ).fillna(False),
-                "annual_value",
-            ].sum())
-        if _cogs_for_viktor > 0:
-            _viktor_target_value = _cogs_for_viktor / VIKTOR_TARGET_TURNS
-
-    sh1, sh2, sh3, sh4 = st.columns(4)
-    if _target_snap:
         sh1.metric(
-            "Target stock (Optimum)",
-            _fmt_money(float(_target_snap.get("target_value") or 0)),
+            "Stock goal",
+            _fmt_money(_goal_value_cc),
+            delta=f"{_goal_value_cc - stock_value:+,.0f} vs current",
+            delta_color="off",
             help=(
-                "Sum of target_stock × cost across master SKUs, from "
-                "the reorder engine (lead time + safety + review + "
-                "holiday cover) — same figure as the Ordering page's "
-                "'Optimum stock value' tile. Only updates when the "
-                "Ordering page runs (it needs supplier lead-time "
-                "config the background sync doesn't load) — as of "
-                f"{str(_target_snap.get('captured_at'))[:16]}, "
-                f"{_fmt_number(int(_target_snap.get('master_sku_count') or 0))} "
-                "master SKUs."))
-    elif _viktor_target_value is not None:
-        sh1.metric(
-            "Target stock (turns estimate)",
-            _fmt_money(_viktor_target_value),
-            help=(
-                f"ESTIMATE, not the engine-derived Optimum: trailing "
-                f"12mo COGS ÷ {VIKTOR_TARGET_TURNS} turns. The "
-                f"{VIKTOR_TARGET_TURNS}-turns target comes from "
-                "Viktor's inventory analysis, sized to this "
-                "business's actual lead-time profile (94% fill rate, "
-                "~19d air / ~60d sea median receipt on the largest "
-                "supplier line) — tighter would risk stockouts on "
-                "A-items, looser leaves cash idle. Replaced "
-                "automatically by the precise per-SKU engine Optimum "
-                "once you visit the Ordering page."))
-        sh1.markdown(
-            "<small style='color:#6b7280;'>turns-based estimate — "
-            "visit Ordering for the precise figure</small>",
-            unsafe_allow_html=True)
+                "What the business should carry: per SKU the larger of "
+                f"class days-of-cover (A {DEFAULT_COVER_DAYS['A']:g}d / "
+                f"B {DEFAULT_COVER_DAYS['B']:g}d / C {DEFAULT_COVER_DAYS['C']:g}d, "
+                "D = no 12-month demand = 0), the reorder level, and one "
+                "unit/pack of every live SKU. Same figure as Stock "
+                "Optimisation's 'Stock goal' and the sum of the "
+                "per-vendor goals on Ordering."))
     else:
-        sh1.metric(
-            "Target stock (Optimum)", "—",
-            help="No data yet for either the engine-derived Optimum "
-                 "or the turns-based estimate — the engine snapshot "
-                 "may not have run yet.")
+        sh1.metric("Stock goal", "—",
+                   help="No engine snapshot with goal columns yet — "
+                        "appears after the next background engine "
+                        "recompute.")
     sh2.metric(
         "Current stock value", _fmt_money(stock_value),
         help="CIN7 FIFO value across all SKUs — matches the 'Stock "
              "value (FIFO, CIN7)' tile above.")
-    if _dead_data_available:
+    if _reorder_level_cc is not None:
         sh3.metric(
+            "Reorder level (order-up-to)",
+            _fmt_money(float(_reorder_level_cc)),
+            help=(
+                "Sum of the engine's per-SKU target_stock × cost — the "
+                "level each SKU is topped up to when a PO is raised "
+                "(lead time + safety + review period). A buying trigger, "
+                "not a stock budget; previously shown here as 'Target "
+                "stock (Optimum)'. Needs supplier lead-time config, so it "
+                "refreshes when Ordering / Stock Optimisation runs"
+                + (f" — as of {_reorder_asof}." if _reorder_asof else ".")))
+    else:
+        sh3.metric("Reorder level (order-up-to)", "—",
+                   help="Appears once Ordering or Stock Optimisation has "
+                        "run since this version was deployed.")
+    if _dead_data_available:
+        sh4.metric(
+            "Excess above goal · Understock",
+            f"{_fmt_money(_excess_cc)} · {_fmt_money(_under_cc)}",
+            delta=f"net freeable ≈ {_fmt_money(_excess_cc - _under_cc)}",
+            delta_color="off",
+            help=("Excess = stock above each SKU's goal (gross). "
+                  "Understock = goal not on the shelf. Dead stock is "
+                  "part of Excess (its goal is $0)."))
+        sh5.metric(
             "Dead stock (zero 12mo demand, holding stock)",
             _fmt_money(_dead_value_ov),
             help=(
                 f"{_fmt_number(_dead_skus_ov)} SKUs with zero visible "
                 "12mo demand (direct + migrated + rolled-up) and "
-                "physical stock on hand — matches the Ordering page's "
-                "'Dead stock' tile. A LEVEL signal: distinct from the "
-                "dormancy-based 'Slow stock' panel below, which is a "
-                "VELOCITY-drop signal. The two populations overlap but "
-                "are not the same SKUs."))
+                "physical stock on hand — matches the Stock "
+                "Optimisation 'Dead stock' tile. A LEVEL signal: "
+                "distinct from the dormancy-based 'Slow stock' panel "
+                "below, which is a VELOCITY-drop signal."))
     else:
-        sh3.metric(
-            "Dead stock (zero 12mo demand, holding stock)", "—",
-            help="The engine snapshot the app is currently serving "
-                 "predates this tile — it doesn't have the `is_dead` "
-                 "column yet. Updates automatically on the next "
-                 "background engine recompute; no action needed.")
+        sh4.metric("Excess above goal · Understock", "—")
+        sh5.metric("Dead stock (zero 12mo demand, holding stock)", "—",
+                   help="Waiting on the next background engine recompute.")
+
     try:
         _dead_prev_month = db.get_previous_month_dead_stock_value()
     except Exception:  # noqa: BLE001
         _dead_prev_month = {}
-    if not _dead_data_available:
-        sh4.metric("Dead stock — moved this month", "—",
-                     help="Waiting on the same engine snapshot as the "
-                          "Dead stock tile to the left.")
-    elif _dead_prev_month and _dead_prev_month.get("value_on_shelf") is not None:
+    if (_dead_data_available and _dead_prev_month
+            and _dead_prev_month.get("value_on_shelf") is not None):
         _dprev_v = float(_dead_prev_month["value_on_shelf"] or 0)
         _ddelta = _dead_value_ov - _dprev_v
         _dprev_date = str(_dead_prev_month.get("snapshot_date") or "")[:10]
-        sh4.metric(
-            "Dead stock — moved this month",
-            f"{'−' if _ddelta < 0 else '+'}{_fmt_money(abs(_ddelta))}",
-            help=(
-                "Net change in Dead stock value vs the previous "
-                "calendar month. Negative = shrank (cleared/sold — "
-                "good); positive = grew (more SKUs went dead). A NET "
-                "figure, not a sales total — it doesn't distinguish "
-                f"'sold off' from 'newly gone dead'. Prev month "
-                f"({_dprev_date}): {_fmt_money(_dprev_v)}."))
         if _ddelta < 0:
             _darrow, _dcolour, _dverb = (
                 "↓", "#16a34a", "down vs prev month (cleared)")
@@ -10691,21 +10824,28 @@ if page == "Overview":
         else:
             _darrow, _dcolour, _dverb = (
                 "→", "#6b7280", "unchanged vs prev month")
-        sh4.markdown(
-            f"<small style='color:{_dcolour};'>{_darrow} {_dverb}"
-            "</small>", unsafe_allow_html=True)
-    else:
-        sh4.metric("Dead stock — moved this month", "—",
-                     help="Appears once a snapshot exists from last "
-                          "month (one snapshot per day from the "
-                          "daily engine recompute).")
+        sh5.markdown(
+            f"<small style='color:{_dcolour};'>{_darrow} "
+            f"{_fmt_money(abs(_ddelta))} {_dverb} · prev "
+            f"{_dprev_date}: {_fmt_money(_dprev_v)}</small>",
+            unsafe_allow_html=True)
+
+    # Per-class strip (A/B/C/D) so the goal is legible at a glance.
+    if _dead_data_available and _health_cc.get("by_class"):
+        _cls_bits = []
+        for _c in _health_cc["by_class"]:
+            _cov = _c.get("days_cover")
+            _cls_bits.append(
+                f"**{_c['class']}** {_fmt_money(_c['current_value'])} now → "
+                f"{_fmt_money(_c['goal_value'])} goal"
+                + (f" ({_cov:.0f}d cover)" if _cov else ""))
+        st.caption(" · ".join(_cls_bits).replace("$", "\\$"))
     st.caption(
-        "Target/Current/Dead figures above use the same definitions "
-        "as the Ordering page tiles. See **🪫 Slow-mover stock "
-        "reduction** below for the broader dormancy-based (velocity-"
-        "drop) clearance figure — a different, larger population "
-        "than Dead stock, tracked separately because it catches SKUs "
-        "that slowed down without going to zero.")
+        "Goal / Reorder level / Excess / Dead use one shared definition "
+        "(Stock Optimisation → 'How these figures are defined'). See "
+        "**🪫 Slow-mover stock reduction** below for the broader "
+        "dormancy-based (velocity-drop) clearance figure — a different, "
+        "larger population than Dead stock.")
 
     st.divider()
 
@@ -14607,6 +14747,19 @@ elif page == "Ordering":
         all_supplier_df["freight_mode"] = _applied_sw.apply(lambda x: x["freight_mode"])
         all_supplier_df["excess_units"] = _applied_sw.apply(lambda x: x["excess_units"])
         all_supplier_df["excess_value"] = _applied_sw.apply(lambda x: x["excess_value"])
+        all_supplier_df["goal_units"] = _applied_sw.apply(lambda x: x["goal_units"])
+        all_supplier_df["goal_value"] = _applied_sw.apply(lambda x: x["goal_value"])
+        all_supplier_df["unit_cost_for_goal"] = _applied_sw.apply(
+            lambda x: x["unit_cost_for_goal"])
+        all_supplier_df["range_floor_units"] = _applied_sw.apply(
+            lambda x: x["range_floor_units"])
+        # Dropship rows: no goal, and their stock is never excess (RULES 5.4)
+        if dropship_skus:
+            _ds_sw = all_supplier_df["SKU"].astype(str).isin(dropship_skus)
+            all_supplier_df.loc[_ds_sw, ["target_stock", "goal_units",
+                                         "goal_value", "excess_units",
+                                         "excess_value"]] = 0
+            all_supplier_df["excess_exempt"] = _ds_sw
         all_supplier_df["Status"] = all_supplier_df.apply(_status, axis=1)
 
     # --- Apply per-SKU freight overrides (team buyers can flip per row)
@@ -14904,14 +15057,22 @@ elif page == "Ordering":
             s_df = live_s_df
             ordering_supplier_snapshot_used = False
 
-    # Supplier-wide totals (unfiltered) — the "real" supplier picture
-    sw_skus = len(all_supplier_df)
-    sw_stock_value = float(all_supplier_df["OnHandValue"].sum())
-    sw_excess_value = float(all_supplier_df["excess_value"].sum())
-    sw_dead_value = float(
-        all_supplier_df.loc[all_supplier_df["Status"] == "💀 Dead stock",
-                            "OnHandValue"].sum()
-    )
+    # Supplier-wide totals (unfiltered) — the "real" supplier picture.
+    # 2026-09-03: same function as the Stock Optimisation headline and
+    # the Command Centre (engine/stock_goal.stock_health_summary),
+    # filtered to this supplier's rows, so the per-vendor figures add
+    # up to the company-wide ones. Previously Excess here came from
+    # whichever excess column had been written last (engine baseline
+    # = above 12mo demand, or Ordering = above reorder level) and Dead
+    # used the Status label — three definitions on one screen.
+    _sw_health = stock_health_summary(all_supplier_df, scope=str(sel_sup))
+    sw_skus = int(_sw_health["sku_count"])
+    sw_stock_value = float(_sw_health["current_value"])
+    sw_goal_value = float(_sw_health["goal_value"])
+    sw_reorder_level_value = float(_sw_health["reorder_level_value"] or 0.0)
+    sw_excess_value = float(_sw_health["excess_value"])
+    sw_understock_value = float(_sw_health["understock_value"])
+    sw_dead_value = float(_sw_health["dead_value"])
 
     # Count non-masters hidden from this supplier (for transparency)
     all_supplier_including_variants = engine_df[
@@ -14924,16 +15085,29 @@ elif page == "Ordering":
                 f"(showing **{sw_skus:,} master/orderable SKUs**; "
                 f"{non_master_count:,} assembled variants hidden and "
                 f"rolled up to their masters):")
-    sw1, sw2, sw3, sw4 = st.columns(4)
+    sw1, sw2, sw3, sw4, sw5, sw6 = st.columns(6)
     sw1.metric("SKUs we source from them", _fmt_number(sw_skus))
-    sw2.metric("Current stock value (all)",
-               _fmt_money(sw_stock_value))
-    sw3.metric("Excess stock (all)",
+    sw2.metric("Current stock value",
+               _fmt_money(sw_stock_value),
+               help="Sum of OnHandValue for this supplier's master SKUs.")
+    sw3.metric("Stock goal",
+               _fmt_money(sw_goal_value),
+               delta=f"{sw_goal_value - sw_stock_value:+,.0f} vs current",
+               delta_color="off",
+               help=("Class days-of-cover, never below the reorder level "
+                     f"({_fmt_money(sw_reorder_level_value)} for this "
+                     "supplier), at least one unit/pack of every live SKU. "
+                     "Same definition as Stock Optimisation and the "
+                     "Command Centre."))
+    sw4.metric("Excess (above goal)",
                _fmt_money(sw_excess_value),
                delta=(f"{sw_excess_value/sw_stock_value*100:.1f}% of current"
                       if sw_stock_value else None),
                delta_color="inverse")
-    sw4.metric("Dead stock", _fmt_money(sw_dead_value))
+    sw5.metric("Understock (below goal)", _fmt_money(sw_understock_value))
+    sw6.metric("Dead stock", _fmt_money(sw_dead_value),
+               help=f"{_sw_health['dead_sku_count']:,} SKUs, zero visible "
+                    "12-month demand, holding stock.")
 
     # --- Filtered PO summary strip ---
     st.markdown("---")
@@ -19052,74 +19226,26 @@ elif page == "Stock Optimisation":
     # logging. NOT shown as the headline tile.
     total_onhand_value_with_fallback = float(engine_df["OnHandValue"].sum())
 
-    # Optimum / target: master SKUs only (non-masters have target=0).
-    total_target_value = float(master_only["TargetValue"].sum())
-
-    # Excess — two-part definition:
-    #   Masters: OnHandValue above TargetValue (classic overstock)
-    #   Non-masters: OnHandValue ONLY IF direct sales == 0 (true dead
-    #     physical cuts; cuts with their own direct sales are treated
-    #     as working inventory, not excess)
-    def _row_excess_value(r):
-        if bool(r.get("is_non_master_tube")):
-            if float(r.get("units_12mo") or 0) == 0:
-                return float(r.get("OnHandValue") or 0)
-            return 0.0  # has direct sales → working inventory
-        # Master
-        ohv = float(r.get("OnHandValue") or 0)
-        tv = float(r.get("TargetValue") or 0)
-        return max(0.0, ohv - tv)
-
-    engine_df["row_excess_value"] = engine_df.apply(
-        _row_excess_value, axis=1)
-    total_excess_value = float(engine_df["row_excess_value"].sum())
-
-    # v2.67.282 — Understock counterpart. "Excess" floors every SKU
-    # at zero, so it only counts SKUs OVER target and never nets the
-    # ones UNDER it. Without this half the tiles look contradictory:
-    # Current − Optimum (a NET figure) never equals Excess (a GROSS
-    # one). Understock = master SKUs below TargetValue, summed — the
-    # cash you'd redeploy bringing them up to target.
-    def _row_understock_value(r):
-        if bool(r.get("is_non_master_tube")):
-            return 0.0  # non-masters roll up; target = 0
-        ohv = float(r.get("OnHandValue") or 0)
-        tv = float(r.get("TargetValue") or 0)
-        return max(0.0, tv - ohv)
-
-    engine_df["row_understock_value"] = engine_df.apply(
-        _row_understock_value, axis=1)
-    total_understock_value = float(
-        engine_df["row_understock_value"].sum())
-    # Master-only overstock for the EXACT reconciliation identity:
-    #   master_overstock − understock == master_onhand − optimum.
-    master_overstock_value = float(
-        engine_df.loc[~engine_df["is_non_master_tube"],
-                       "row_excess_value"].sum())
+    # 2026-09-03 — one calculation for every stock-health figure.
+    # engine/stock_goal.stock_health_summary() returns Current, Goal,
+    # Reorder level, Excess, Understock and Dead from the SAME engine
+    # rows; the Command Centre reads the persisted copy of this dict
+    # and the per-vendor tiles call the same function filtered to a
+    # supplier, so the numbers agree everywhere by construction.
+    _health = stock_health_summary(engine_df, scope="all")
+    total_target_value = float(_health["reorder_level_value"] or 0.0)
+    total_goal_value = float(_health["goal_value"])
+    total_excess_value = float(_health["excess_value"])
+    total_understock_value = float(_health["understock_value"])
+    dead_value = float(_health["dead_value"])
     master_onhand_value = float(master_only["OnHandValue"].sum())
-    net_over_position = master_overstock_value - total_understock_value
 
-    # Dead stock: zero effective demand AND physical stock held.
-    # For masters, use the engine's Status flag. For non-masters,
-    # also include them if they have physical stock but zero direct sales.
-    dead_master_value = float(
-        master_only.loc[master_only["Status"] == "💀 Dead stock",
-                         "OnHandValue"].sum()
-    )
-    dead_cut_value = float(
-        engine_df.loc[
-            engine_df["is_non_master_tube"]
-            & (engine_df["units_12mo"] == 0)
-            & (engine_df["OnHandValue"] > 0),
-            "OnHandValue",
-        ].sum()
-    )
-    dead_value = dead_master_value + dead_cut_value
-
-    # v2.67.381 — persist the aggregate totals so Overview can show
-    # Target stock without needing this page to have run in-session.
-    # Cheap (one upsert); best-effort — a write failure here must
-    # never break the Ordering page itself.
+    # Persist the aggregate so the Command Centre shows today's figures
+    # without this page having run in-session. Best-effort.
+    try:
+        db.record_stock_goal_snapshot(_health, source="ordering_page")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         db.record_ordering_target_snapshot(
             len(master_only), total_target_value, master_onhand_value,
@@ -19127,165 +19253,111 @@ elif page == "Stock Optimisation":
     except Exception:  # noqa: BLE001
         pass
 
-    # Cost-coverage diagnostics across MASTERS (what drives optimum)
+    # Cost-coverage diagnostics across MASTERS (what drives the goal)
     cov = master_only["CostBasisDetail"].value_counts().to_dict()
     direct_c = cov.get("direct", 0)
     fam_c = cov.get("family-median", 0)
     cat_c = cov.get("category-median", 0)
     unk_c = cov.get("unknown", 0)
-
-    # v2.67.305 — tucked into a collapsed expander. Pre-cleanup
-    # the cost-basis caption sat between the section header and
-    # the five metric tiles as a wall of small grey text, making
-    # the page feel busy and pushing the tiles below the fold on
-    # smaller laptops. Staff don't need this detail at first
-    # glance — it's a finance-trust note. One click to expand.
     with st.expander(
-            "ℹ️ Cost basis coverage & scope notes",
+            "ℹ️ How these figures are defined (cost basis & scope)",
             expanded=False):
         st.markdown(
-            f"**Cost basis coverage (masters, drives Optimum)**: "
-            f"direct CIN7 cost on **{direct_c:,}**; "
-            f"family-median fallback on {fam_c:,}; "
-            f"category-median fallback on {cat_c:,}; "
-            f"no cost info (contribute $0 to Optimum) on "
+            f"**Stock goal** = per SKU, the larger of (a) class days of "
+            f"cover × daily rate — A {DEFAULT_COVER_DAYS['A']:g}d, "
+            f"B {DEFAULT_COVER_DAYS['B']:g}d, C {DEFAULT_COVER_DAYS['C']:g}d, "
+            f"D (no 12-month demand) 0 — (b) the reorder level and "
+            f"(c) one unit/pack for any live SKU. Dropship, archived and "
+            f"discontinued SKUs have no goal.\n\n"
+            f"**Reorder level** = the engine's order-up-to target "
+            f"(lead time × daily rate × (1 + safety%) + review-period "
+            f"demand + holiday cover). It drives POs; it is *not* a "
+            f"stock budget.\n\n"
+            f"**Excess** = stock above goal, per SKU, summed (gross). "
+            f"**Understock** = goal not yet on the shelf. "
+            f"Excess − Understock = net cash you could actually free.\n\n"
+            f"**Cost basis coverage (masters)**: direct CIN7 cost on "
+            f"**{direct_c:,}**; family-median fallback on {fam_c:,}; "
+            f"category-median fallback on {cat_c:,}; no cost info on "
             f"**{unk_c:,}**.\n\n"
-            f"**Scope note**: Current value sums across all "
-            f"{len(engine_df):,} SKUs (real physical dollars); "
-            f"Optimum across {len(master_only):,} masters only "
-            f"(non-masters roll up to their masters)."
+            f"**Scope**: Current value sums CIN7 FIFO across all "
+            f"{len(engine_df):,} SKUs; Goal/Reorder level across "
+            f"{len(master_only):,} masters (non-masters roll up)."
         )
 
-    oc1, oc2, oc3, oc4, oc5 = st.columns(5)
-    # v2.67.37 — headline now ties to Overview + Monthly Metrics.
-    # Help text spells out the tie-out so the buyer trusts it.
+    oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
     _fallback_delta = total_onhand_value_with_fallback - total_onhand_value
     oc1.metric("Current stock value",
                _fmt_money(total_onhand_value),
-               help=(
-                   "CIN7's FIFO inventory value (sum of StockOnHand "
-                   "across all SKUs). MATCHES the Overview page's "
-                   "'Stock value (FIFO, CIN7)' tile and the Monthly "
-                   "Metrics report (commissions reference). v2.67.37 "
-                   "unified the three so they tie out exactly. "
-                   f"For internal diagnostics, an OnHand × cost-chain "
-                   f"fallback estimate would add "
-                   f"~{_fmt_money(_fallback_delta)} for SKUs where "
-                   "CIN7 hasn't published a FIFO number — that "
-                   "estimate is used for per-SKU excess/optimum "
-                   "math, NOT the headline."))
-    oc2.metric("Optimum stock value",
+               help=("CIN7's FIFO inventory value (sum of StockOnHand "
+                     "across all SKUs). Matches the Command Centre and "
+                     "Monthly Metrics. Per-SKU goal/excess math uses a "
+                     f"cost-chain fallback adding ~{_fmt_money(_fallback_delta)} "
+                     "for SKUs where CIN7 has no FIFO value."))
+    oc2.metric("Stock goal",
+               _fmt_money(total_goal_value),
+               delta=(f"{total_goal_value - total_onhand_value:+,.0f} vs current"),
+               delta_color="off",
+               help=("What the business should carry: class days-of-"
+                     "cover, never below the reorder level, at least one "
+                     "unit/pack of every live SKU. See the definitions "
+                     "expander above."))
+    oc3.metric("Reorder level (order-up-to)",
                _fmt_money(total_target_value),
-               help="Sum of target_stock × AverageCost per SKU. "
-                    "This is what your working capital should be at. "
-                    "⚠️ Sanity-check this against the turns/days-on-"
-                    "hand cross-check further down this page — if "
-                    "Optimum implies fewer turns-days than your real "
-                    "supplier lead times support, it's calibrated too "
-                    "tight and Excess (right) will read high.")
-    oc3.metric("Excess (cash to free up)",
+               help=("Sum of the engine's target_stock × cost. The level "
+                     "each SKU is topped up to when a PO is raised — the "
+                     "buying trigger, not the stock budget. Previously "
+                     "labelled 'Optimum stock value'."))
+    oc4.metric("Excess (above goal)",
                _fmt_money(total_excess_value),
-               delta=f"{total_excess_value/total_onhand_value*100:.1f}% of current"
-                     if total_onhand_value else None,
+               delta=(f"{total_excess_value/total_onhand_value*100:.1f}% of current"
+                      if total_onhand_value else None),
                delta_color="inverse",
-               help="OnHand beyond target stock, by SKU, summed. "
-                    "The money sitting on shelves that doesn't need to "
-                    "be — AS MEASURED AGAINST Optimum (left). If "
-                    "Optimum is too tight, this number is inflated; "
-                    "see the turns/cover check below before acting on "
-                    "it at face value.")
-    oc4.metric("Understock (cash to redeploy)",
+               help="OnHand beyond the SKU goal, summed. Gross figure.")
+    oc5.metric("Understock (below goal)",
                _fmt_money(total_understock_value),
-               help="Master SKUs sitting BELOW target stock, by "
-                    "SKU, summed — the working capital you'd "
-                    "redeploy to bring them up to target. The "
-                    "counterpart to Excess: netting the two "
-                    "(Excess − Understock) gives your TRUE "
-                    "over-position, which Current − Optimum on "
-                    "its own doesn't reveal.")
-    oc5.metric("Dead stock (zero demand, holding stock)",
+               help="Goal value not on the shelf — cash you'd redeploy "
+                    "bringing under-goal SKUs up to goal.")
+    oc6.metric("Dead stock (no demand, holding stock)",
                _fmt_money(dead_value),
-               help="Two buckets combined: "
-                    "(1) MASTER SKUs with zero effective 12-month demand "
-                    "(direct + migrated + rolled-up) AND physical stock. "
-                    "(2) Non-master variants with physical stock AND zero "
-                    "direct sales. "
-                    "Non-masters that HAVE direct sales are treated as "
-                    "working inventory, not dead.")
+               help=f"{_health['dead_sku_count']:,} SKUs with zero visible "
+                    "12-month demand (direct + migrated + rolled-up) and "
+                    "physical stock. Goal is $0 by definition; this is a "
+                    "clearance problem, not a buying one.")
 
-    # v2.67.305 — reconciliation moved into a collapsed expander.
-    # Pre-cleanup this was 6+ lines of small math text directly
-    # under the tile row — useful for finance, noise for buying
-    # staff. Top-line takeaway lives in the expander label so the
-    # reader sees the key number without expanding.
-    _net_cash_freeable = (
-        total_excess_value - total_understock_value)
+    _net_cash_freeable = total_excess_value - total_understock_value
     with st.expander(
             f"📐 How these tiles reconcile · net cash you "
-            f"could actually free ≈ "
-            f"{_fmt_money(_net_cash_freeable)}",
+            f"could actually free ≈ {_fmt_money(_net_cash_freeable)}",
             expanded=False):
-        # v2.67.386 — same LaTeX gotcha as the glide-path progress
-        # text below (a bare `$...$` pair in Streamlit markdown
-        # renders as inline math): this block has 7 `_fmt_money()`
-        # calls, so it was rendering as garbled equation fragments
-        # instead of dollar figures. Escape after building the string.
         _reconcile_md = (
-            f"**Excess ({_fmt_money(total_excess_value)})** is "
-            f"the GROSS cash recoverable by selling every "
-            f"over-target SKU down to target. **Understock "
-            f"({_fmt_money(total_understock_value)})** is what "
-            f"you'd re-spend bringing under-target SKUs UP to "
-            f"target.\n\n"
-            f"Across master SKUs: overstock "
-            f"{_fmt_money(master_overstock_value)} − understock "
-            f"{_fmt_money(total_understock_value)} = "
-            f"**{_fmt_money(net_over_position)}** genuinely tied "
-            f"up above target (this equals master on-hand "
-            f"{_fmt_money(master_onhand_value)} − Optimum).\n\n"
-            f"That's why Excess is larger than Current − Optimum "
-            f"({_fmt_money(total_onhand_value - total_target_value)}) "
-            f"— Excess never nets the under-stocked SKUs back in. "
-            f"**Net working capital you could actually free ≈ "
-            f"{_fmt_money(_net_cash_freeable)}**.\n\n"
-            f"Current value is higher again because it spans ALL "
-            f"SKUs at CIN7 FIFO cost, while Optimum / Excess / "
-            f"Understock are master-SKU figures using cost-chain "
-            f"fallbacks.")
+            f"**Excess ({_fmt_money(total_excess_value)})** is the GROSS "
+            f"cash recoverable by selling every over-goal SKU down to its "
+            f"goal. **Understock ({_fmt_money(total_understock_value)})** "
+            f"is what you'd re-spend bringing under-goal SKUs UP to goal. "
+            f"Net ≈ **{_fmt_money(_net_cash_freeable)}**.\n\n"
+            f"Current ({_fmt_money(total_onhand_value)}) − Goal "
+            f"({_fmt_money(total_goal_value)}) = "
+            f"{_fmt_money(total_onhand_value - total_goal_value)} is the "
+            f"headline gap; it differs from the net above only by the "
+            f"cost-chain fallback on SKUs without a CIN7 FIFO value.\n\n"
+            f"Dead stock ({_fmt_money(dead_value)}) is included in Excess "
+            f"(its goal is $0)."
+        )
         st.markdown(_reconcile_md.replace("$", "\\$"))
 
-    # v2.67.381 — Turns / days-on-hand cross-check + a third dead-stock
-    # tier ("sold, but slow cover") + an ABC now-vs-target table. Added
-    # after comparing our bottom-up (per-SKU target) reasoning against
-    # an external top-down inventory analysis (turns-based, ABC-bucket
-    # composition). Deliberately does NOT introduce a second hardcoded
-    # "target turns" number — v2.67.178 already replaced a hardcoded
-    # $600k target with the engine-derived Optimum, and a hardcoded
-    # turns target would reopen the same problem. Instead, turns/DOH
-    # are shown as two readings of the SAME numbers already on this
-    # page (Current vs Optimum), just in the units buyers and finance
-    # actually reason in.
-    trailing_12mo_cogs = float(master_only["annual_value"].sum())
-    master_turns_current = (
-        trailing_12mo_cogs / master_onhand_value
-        if master_onhand_value else None)
-    master_turns_optimum = (
-        trailing_12mo_cogs / total_target_value
-        if total_target_value else None)
-    doh_current = (365.0 / master_turns_current
-                   if master_turns_current else None)
-    doh_optimum = (365.0 / master_turns_optimum
-                   if master_turns_optimum else None)
-    # v2.67.382 — `over_12mo_cover` is new; guard direct indexing so a
-    # snapshot written by the warm job BEFORE it shipped (no such
-    # column yet) shows "—" here instead of crashing the whole
-    # Ordering page with a bare KeyError. Same fix as the Slow Movers
-    # page's "Also carrying >12mo cover" tile.
+    # --- Turns & cover, current vs goal --------------------------------
+    trailing_12mo_cogs = float(_health.get("annual_cogs") or 0.0)
+    turns_current = (trailing_12mo_cogs / total_onhand_value
+                     if total_onhand_value else None)
+    turns_goal = (trailing_12mo_cogs / total_goal_value
+                  if total_goal_value else None)
+    doh_current = (365.0 / turns_current) if turns_current else None
+    doh_goal = (365.0 / turns_goal) if turns_goal else None
     _cover_col_available = "over_12mo_cover" in master_only.columns
     if _cover_col_available:
         over_12mo_cover_value = float(
-            master_only.loc[
-                master_only["over_12mo_cover"], "OnHandValue"].sum())
+            master_only.loc[master_only["over_12mo_cover"], "OnHandValue"].sum())
         over_12mo_cover_count = int(master_only["over_12mo_cover"].sum())
     else:
         over_12mo_cover_value, over_12mo_cover_count = 0.0, 0
@@ -19299,193 +19371,108 @@ elif page == "Stock Optimisation":
     def _doh_text(d):
         return f"{d:.0f}d" if d else "—"
 
-    tc1.metric(
-        "Inventory turns — current → optimum",
-        f"{_turns_text(master_turns_current)} → "
-        f"{_turns_text(master_turns_optimum)}",
-        help=(
-            "Trailing-12mo COGS ÷ stock value, masters only (same "
-            "population + cost basis as Optimum/Excess/Understock "
-            "above). COGS = sum of effective_units_12mo × "
-            "AverageCost across master SKUs — the same per-SKU cost "
-            "the engine already uses, not a blended margin estimate. "
-            "'Optimum' reading swaps the denominator for the "
-            "engine's TargetValue sum, i.e. the turns rate you'd be "
-            "running AT the engine's own lead-time-derived target — "
-            "not an independent hardcoded turns goal."))
-    tc2.metric(
-        "Days on hand — current → optimum",
-        f"{_doh_text(doh_current)} → {_doh_text(doh_optimum)}",
-        help="365 ÷ turns, same two readings as the turns tile.")
-    if _cover_col_available:
-        tc3.metric(
-            "Sold, but >12mo cover",
-            _fmt_money(over_12mo_cover_value),
-            help=(
-                f"{over_12mo_cover_count:,} master SKUs with real 12mo "
-                "demand (not Dead stock) but more than a year of cover "
-                "at current sell-through. A LEVEL signal, distinct from "
-                "the dormancy flag driving Slow Movers (a VELOCITY-drop "
-                "signal) — a flat, low-velocity SKU never trips "
-                "dormancy but can still carry 18+ months of stock. "
-                "Not a subset of Dead stock or Excess above; check "
-                "separately."))
-    else:
-        tc3.metric(
-            "Sold, but >12mo cover", "—",
-            help="The engine snapshot the app is currently serving "
-                 "predates this tile — it doesn't have the "
-                 "`over_12mo_cover` column yet. Updates automatically "
-                 "on the next background engine recompute.")
+    tc1.metric("Inventory turns — current → goal",
+               f"{_turns_text(turns_current)} → {_turns_text(turns_goal)}",
+               help=("Trailing-12mo COGS ÷ stock value. COGS = "
+                     "effective_units_12mo × AverageCost summed over the "
+                     "engine rows (includes some rollup double-count, so "
+                     "treat as ±0.2 turns). 'Goal' swaps the denominator "
+                     "for the Stock goal."))
+    tc2.metric("Days on hand — current → goal",
+               f"{_doh_text(doh_current)} → {_doh_text(doh_goal)}",
+               help="365 ÷ turns for the same two readings.")
+    tc3.metric("Sold, but >12mo cover",
+               _fmt_money(over_12mo_cover_value) if _cover_col_available else "—",
+               help=(f"{over_12mo_cover_count:,} master SKUs with real 12mo "
+                     "demand but more than a year of stock at their run "
+                     "rate. Not dead, not dormant — just slow cash. "
+                     "Included in Excess where above goal."))
 
-    # v2.67.385 — data-driven caution, not a static claim. Fires only
-    # when the numbers actually disagree. Threshold (6.0x) is
-    # Viktor's own reasoning from his inventory memo: 6 turns implies
-    # a stock level tight enough to risk stockouts on A-items given
-    # this business's real lead times (94% fill rate, up to ~60-day
-    # sea receipt on the largest supplier line); 4-4.5x is the
-    # defensible band he recommended. This does NOT mean any single
-    # SKU's own target_stock is below its own lead-time demand — the
-    # per-SKU formula (lead_time_demand + safety + review + holiday)
-    # guarantees that by construction. It means the DOLLAR-WEIGHTED
-    # BLEND across all SKUs is tighter than a sanity-checked turns
-    # rate would suggest — worth a look at whether safety%/review-day
-    # defaults or supplier lead-time configs are calibrated thin
-    # across the board, not evidence of a single bug.
-    if master_turns_optimum and master_turns_optimum > 6.0:
-        st.warning(
-            f"⚠️ The engine's own Optimum implies "
-            f"**{master_turns_optimum:.1f}× turns / "
-            f"{doh_optimum:.0f} days of cover** — above the "
-            "6× ceiling Viktor's memo flagged as stockout-risk "
-            "territory for this business's lead-time profile "
-            "(4–4.5× was his recommended band). This doesn't mean "
-            "any individual SKU is under-covered for its own lead "
-            "time — the per-SKU formula guarantees that — but the "
-            "dollar-weighted blend across all SKUs is unusually "
-            "tight. The 'Excess (cash to free up)' tile above is "
-            "measured against this Optimum, so it may be "
-            "overstated. Check the ABC table below for which class "
-            "the tightness concentrates in, and consider reviewing "
-            "supplier lead-time / safety% / review-day settings in "
-            "Supplier Setup before acting on Excess at face value.")
-
-    # --- ABC now-vs-target composition -----------------------------
-    _abc_summary = (
-        master_only.groupby("ABC")
-        .agg(SKUs=("SKU", "count"),
-             **{"Now $": ("OnHandValue", "sum"),
-                "Target $": ("TargetValue", "sum"),
-                "12mo COGS": ("annual_value", "sum")})
-        .reindex(["A", "B", "C"])
-        .fillna(0)
-    )
-    _abc_summary["Move needed"] = (
-        _abc_summary["Target $"] - _abc_summary["Now $"])
-    # Implied days of cover the Target $ represents for that class,
-    # given that class's own trailing-12mo COGS. The direct diagnostic
-    # for "which ABC class is the engine target too thin for" — e.g.
-    # A-items showing 18 days here against a 60-day sea lead time is
-    # the concrete, per-class version of the caution above.
-    _abc_summary["Target cover (days)"] = _abc_summary.apply(
-        lambda r: (r["Target $"] / (r["12mo COGS"] / 365.0))
-        if r["12mo COGS"] > 0 else None,
-        axis=1)
-    _abc_summary = _abc_summary.drop(columns=["12mo COGS"])
-    _abc_summary = _abc_summary.reset_index()
-    with st.expander(
-            "📋 ABC composition — now vs. optimum target", expanded=False):
+    # --- Class composition: now vs goal --------------------------------
+    _cls_rows = []
+    for _c in _health["by_class"]:
+        _cover_days_now = _c["days_cover"]
+        _goal_days = (365.0 * _c["goal_value"] / _c["annual_cogs"]
+                      if _c["annual_cogs"] > 0 else None)
+        _cls_rows.append({
+            "Class": _c["class"],
+            "SKUs": _c["sku_count"],
+            "Now $": _c["current_value"],
+            "Goal $": _c["goal_value"],
+            "Excess $": _c["excess_value"],
+            "Understock $": _c["understock_value"],
+            "Cover now (days)": _cover_days_now,
+            "Cover at goal (days)": _goal_days,
+        })
+    with st.expander("📋 Class composition — now vs goal (A/B/C/D)",
+                     expanded=True):
         st.caption(
-            "Masters only, same scope as the tiles above. 'Move "
-            "needed' > 0 means that class is under its engine "
-            "target in aggregate (fund it); < 0 means it's over "
-            "(the class is carrying more than its own SKUs need). "
-            "'Target cover (days)' is that class's Target $ expressed "
-            "as days of that class's own trailing-12mo COGS — compare "
-            "against your suppliers' actual lead times (Supplier "
-            "Setup) to see whether the target itself looks thin, "
-            "independent of what's currently on the shelf.")
+            "D = no visible 12-month demand (the engine's cumulative-"
+            "value ABC puts these in C; splitting them out shows the "
+            "active-C over-cover). 'Cover' = that class's stock as days "
+            "of its own trailing-12mo COGS; D has no COGS so no cover.")
         st.dataframe(
-            _abc_summary,
-            hide_index=True,
+            pd.DataFrame(_cls_rows), hide_index=True,
             column_config={
                 "SKUs": st.column_config.NumberColumn(format="%d"),
                 "Now $": st.column_config.NumberColumn(format="$%.0f"),
-                "Target $": st.column_config.NumberColumn(format="$%.0f"),
-                "Target cover (days)": st.column_config.NumberColumn(
-                    format="%.0f"),
-                "Move needed": st.column_config.NumberColumn(
-                    format="$%.0f"),
+                "Goal $": st.column_config.NumberColumn(format="$%.0f"),
+                "Excess $": st.column_config.NumberColumn(format="$%.0f"),
+                "Understock $": st.column_config.NumberColumn(format="$%.0f"),
+                "Cover now (days)": st.column_config.NumberColumn(format="%.0f"),
+                "Cover at goal (days)": st.column_config.NumberColumn(format="%.0f"),
             })
 
-    # v2.67.178 — Glide path to engine-derived optimum (replaces
-    # the old hard-coded $600k target). The engine's Optimum tile
-    # above is the goal; this strip shows the gap + projection.
-    #
-    # Projection: at the trailing-90-day rate of slow-mover
-    # clearance, how many months until current → optimum?
-    # Anchors on the "Slow movers cleared" math used by the
-    # Slow Movers page so the figures are tied together.
-    _optimum = max(1.0, float(total_target_value))
-    _gap = total_onhand_value - _optimum
-    _pct_of_optimum = (total_onhand_value / _optimum * 100
-                          if _optimum else 0)
+    # --- Glide path to goal ---------------------------------------------
+    _goal_floor = max(1.0, total_goal_value)
+    _gap = total_onhand_value - _goal_floor
+    _pct_of_goal = (total_onhand_value / _goal_floor * 100) if _goal_floor else 0
     if _gap > 0:
-        # Above target — show projection-to-optimum based on
-        # recent slow-mover clearance velocity.
         try:
             _warns_proj = db.get_dormancy_warnings() or {}
-        except Exception:
+        except Exception:  # noqa: BLE001
             _warns_proj = {}
         try:
             _today = pd.Timestamp(datetime.now().date())
             _ninety = _today - pd.Timedelta(days=90)
             _clr = _compute_slow_mover_clearance(
-                stock, sale_lines, products, _warns_proj,
-                _ninety, _today)
-            _monthly_clearance = float(
-                _clr.get("cost_value") or 0) / 3.0
-        except Exception:
+                stock, sale_lines, products, _warns_proj, _ninety, _today)
+            _monthly_clearance = float(_clr.get("cost_value") or 0) / 3.0
+        except Exception:  # noqa: BLE001
             _monthly_clearance = 0.0
         if _monthly_clearance > 0:
-            _months_to_optimum = _gap / _monthly_clearance
             _eta_text = (
-                f" · at trailing-90d clearance rate of "
-                f"${_monthly_clearance:,.0f}/mo, gap closes in "
-                f"~{_months_to_optimum:.1f} months")
+                f" · at the trailing-90d slow-mover clearance rate of "
+                f"${_monthly_clearance:,.0f}/mo the gap closes in "
+                f"~{_gap / _monthly_clearance:.1f} months")
         else:
-            _eta_text = (
-                " · no slow-mover sales in trailing 90d — "
-                "ETA can't be computed; lean on AI-Assistant + "
-                "promotions to drive clearance")
-        # v2.67.386 — st.progress's `text` still runs through
-        # Streamlit's markdown/LaTeX text renderer even though it
-        # doesn't support **bold** — a bare `$...$` pair gets read as
-        # inline LaTeX math (same gotcha already documented + fixed
-        # at v2.67.208 for a caption elsewhere on this page). Three
-        # dollar signs here meant the text between the 1st and 2nd
-        # got silently rendered as an equation. Escape every literal
-        # `$` as `\$` right before handing the string to st.progress.
+            _eta_text = (" · no slow-mover sales in trailing 90d — ETA "
+                         "can't be computed")
         _progress_text = (
-            f"Current stock is "
-            f"${_gap:,.0f} above optimum "
-            f"(${_optimum:,.0f}) "
-            f"— {_pct_of_optimum:.0f}% of "
-            f"optimum{_eta_text}")
-        st.progress(min(1.0, _optimum / total_onhand_value),
-                     text=_progress_text.replace("$", "\\$"))
+            f"Current stock is ${_gap:,.0f} above goal "
+            f"(${_goal_floor:,.0f}) — {_pct_of_goal:.0f}% of goal{_eta_text}")
+        st.progress(min(1.0, _goal_floor / total_onhand_value),
+                    text=_progress_text.replace("$", "\\$"))
     else:
         _progress_text = (
-            f"Current stock is "
-            f"{_pct_of_optimum:.0f}% of "
-            f"optimum (${_optimum:,.0f}) "
-            f"— you're under by "
-            f"${-_gap:,.0f}. Keep ordering "
+            f"Current stock is {_pct_of_goal:.0f}% of goal "
+            f"(${_goal_floor:,.0f}) — under by ${-_gap:,.0f}. Keep ordering "
             f"per the recommendations above.")
-        st.progress(min(1.0, _pct_of_optimum / 100),
-                     text=_progress_text.replace("$", "\\$"))
+        st.progress(min(1.0, _pct_of_goal / 100),
+                    text=_progress_text.replace("$", "\\$"))
 
-
+    # Weekly glide-path history (from the daily snapshots)
+    try:
+        _hist = db.list_stock_goal_snapshots(limit=400)
+    except Exception:  # noqa: BLE001
+        _hist = []
+    if len(_hist) >= 2:
+        _hdf = pd.DataFrame(_hist)
+        _hdf["snapshot_date"] = pd.to_datetime(_hdf["snapshot_date"])
+        _hdf = _hdf.sort_values("snapshot_date").set_index("snapshot_date")
+        with st.expander("📈 Glide path — current vs goal over time",
+                         expanded=False):
+            st.line_chart(_hdf[["current_value", "goal_value", "dead_value"]])
 
 # ---------------------------------------------------------------------------
 # Page: Supplier Setup (split out of Ordering -- lead times, MOQ/MOV,

@@ -177,8 +177,29 @@ def warm() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         ordering_snapshot = {"error": repr(exc)}
 
+    # 2026-09-03 — daily stock-goal snapshot (engine/stock_goal.py) so
+    # the Command Centre's Goal / Excess / Dead tiles refresh every
+    # warm run instead of only when someone opens Ordering. The
+    # Reorder level needs supplier config the warm job doesn't load,
+    # so it is left NULL here; the Ordering page fills it in the same
+    # row later (db.record_stock_goal_snapshot keeps the page's value).
+    goal_snapshot = {}
+    try:
+        from engine.stock_goal import stock_health_summary
+        import db as _db_goal
+        summary = stock_health_summary(result_df, scope="all")
+        _db_goal.record_stock_goal_snapshot(summary, source="warm_engine")
+        goal_snapshot = {
+            "current_value": summary.get("current_value"),
+            "goal_value": summary.get("goal_value"),
+            "dead_value": summary.get("dead_value"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        goal_snapshot = {"error": repr(exc)}
+
     return {
         "rows": int(len(result_df)) if hasattr(result_df, "__len__") else None,
+        "goal_snapshot": goal_snapshot,
         "cached_at": _dt.datetime.utcnow().isoformat() + "Z",
         "sources": bundle["_source_paths"],
         "ordering_snapshot": ordering_snapshot,
