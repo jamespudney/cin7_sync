@@ -66,4 +66,11 @@ if [ -n "${SHOPIFY_DOMAIN:-}" ] && [ -n "${SHOPIFY_ACCESS_TOKEN:-}" ]; then
       echo "[$(stamp)] shopify_orders FAILED (continuing)" >> "$LOG"
 fi
 
+# 2026-09-03 — publish every data CSV to the shared DB so the Slack
+# worker reads the same bytes (dataset_mirror.py). Only changed files
+# upload. Never affects the CIN7 RC.
+echo "[$(stamp)] dataset_mirror publish" >> "$LOG"
+python dataset_mirror.py publish >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] dataset_mirror publish FAILED (continuing)" >> "$LOG"
+
 exit "$RC"

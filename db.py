@@ -541,6 +541,23 @@ CREATE TABLE IF NOT EXISTS engine_snapshot_rows (
     PRIMARY KEY (snapshot_key, sku)
 );
 
+-- 2026-09-03 — mirrored raw data files (dataset_mirror.py). The
+-- dashboard publishes every sync CSV here (gzip); the Slack worker
+-- pulls them onto its disk instead of running its own CIN7 /
+-- ShipStation / Shopify syncs, so both services read identical bytes.
+-- One row per logical file (timestamp stripped from the name).
+CREATE TABLE IF NOT EXISTS dataset_files (
+    key             TEXT PRIMARY KEY,
+    filename        TEXT NOT NULL,
+    mtime           REAL,
+    size_bytes      INTEGER,
+    gz_bytes        INTEGER,
+    sha256          TEXT,
+    payload         BLOB,
+    publisher       TEXT,
+    published_at    TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- =========================================================================
 -- PO draft persistence (legacy v1 — single anonymous draft per supplier)
 -- =========================================================================
@@ -4525,6 +4542,21 @@ _PG_POST_CUTOVER_TABLES = [
           PRIMARY KEY (snapshot_key, sku)
       );
       """),
+    # 2026-09-03 — mirrored raw data files (see _SCHEMA note).
+    ("dataset_files",
+      """
+      CREATE TABLE IF NOT EXISTS dataset_files (
+          key             TEXT PRIMARY KEY,
+          filename        TEXT NOT NULL,
+          mtime           DOUBLE PRECISION,
+          size_bytes      BIGINT,
+          gz_bytes        BIGINT,
+          sha256          TEXT,
+          payload         BYTEA,
+          publisher       TEXT,
+          published_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
     # v2.67.394 — manual override for the BOM-rollup demand-zeroing
     # heuristic (see _global_is_master in app.py). NULL = use the
     # automatic component-count heuristic; TRUE = force "count this
@@ -5502,6 +5534,80 @@ def load_engine_snapshot_rows(snapshot_key: Optional[str] = None) -> list[dict]:
         except Exception:  # noqa: BLE001
             continue
     return out
+
+
+# ---------------------------------------------------------------------------
+# Mirrored raw data files (dataset_mirror.py, 2026-09-03)
+# ---------------------------------------------------------------------------
+def list_dataset_files() -> list[dict]:
+    """Metadata for every mirrored file (no payload)."""
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT key, filename, mtime, size_bytes, gz_bytes, sha256,
+                   publisher, published_at
+              FROM dataset_files
+             ORDER BY key
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_dataset_file_payload(key: str) -> Optional[bytes]:
+    with connect() as c:
+        row = c.execute(
+            "SELECT payload FROM dataset_files WHERE key = ?", (key,)
+        ).fetchone()
+    if not row:
+        return None
+    payload = row["payload"]
+    return bytes(payload) if payload is not None else None
+
+
+def put_dataset_file(key: str, *, filename: str, mtime: float,
+                     size_bytes: int, sha256: str, payload: bytes,
+                     publisher: str = "") -> None:
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO dataset_files
+                (key, filename, mtime, size_bytes, gz_bytes, sha256,
+                 payload, publisher, published_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                filename = excluded.filename,
+                mtime = excluded.mtime,
+                size_bytes = excluded.size_bytes,
+                gz_bytes = excluded.gz_bytes,
+                sha256 = excluded.sha256,
+                payload = excluded.payload,
+                publisher = excluded.publisher,
+                published_at = datetime('now')
+            """,
+            (key, filename, float(mtime), int(size_bytes), len(payload),
+             sha256, payload, publisher),
+        )
+
+
+def touch_dataset_file(key: str, *, filename: str, mtime: float,
+                       publisher: str = "") -> None:
+    """Same bytes republished under a new sync stamp: update name/mtime
+    only, so the worker renames rather than re-downloads."""
+    with connect() as c:
+        c.execute(
+            """
+            UPDATE dataset_files
+               SET filename = ?, mtime = ?, publisher = ?,
+                   published_at = datetime('now')
+             WHERE key = ?
+            """,
+            (filename, float(mtime), publisher, key),
+        )
+
+
+def delete_dataset_file(key: str) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM dataset_files WHERE key = ?", (key,))
 
 
 # ---------------------------------------------------------------------------

@@ -260,6 +260,14 @@ derived figure shown in the app must be computed in the engine (or
 `engine/stock_goal.py`) and read by the bot — not re-derived in
 `ai_tools.py`.
 
+**Raw data too (2026-09-03, `dataset_mirror.py`).** Only the dashboard
+service syncs CIN7 / ShipStation / Shopify orders. After every nearsync and
+daily sync it publishes each data CSV to Postgres `dataset_files`; the
+worker pulls them onto its own disk with identical names and mtimes
+(`WORKER_DATA_FROM_DB=1`, default) and its own CIN7/ShipStation/Shopify-order
+syncs are disabled. Never add a second sync of the same source to the
+worker — add the file pattern to `MIRROR_PATTERNS` instead.
+
 ---
 
 ## 5. Freight & Supplier Rules
