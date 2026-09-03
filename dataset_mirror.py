@@ -208,6 +208,20 @@ def pull(output_dir: Path = OUTPUT_DIR) -> dict:
         tmp.replace(target)
         written.append(filename)
         _prune_siblings(output_dir, key, keep=filename, removed=removed)
+    # Local files in the mirrored families that the dashboard does NOT
+    # have (e.g. a wide backfill the worker once ran itself) would let
+    # the two services diverge again — drop them, but only once the DB
+    # clearly holds a complete publish (products + stock present).
+    db_keys = {r["key"] for r in rows}
+    if {"products.csv", "stock_on_hand.csv"} <= db_keys:
+        for key, path in local_candidates(output_dir).items():
+            if key not in db_keys:
+                for sib in _local_siblings(output_dir, key):
+                    try:
+                        sib.unlink()
+                        removed.append(sib.name)
+                    except OSError:
+                        pass
     _write_pull_marker(output_dir)
     log.info("dataset_mirror: pulled %d files (%d unchanged, %d stale removed)",
              len(written), len(unchanged), len(removed))

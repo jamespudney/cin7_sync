@@ -112,6 +112,19 @@ class MirrorTests(unittest.TestCase):
             sorted(p.name for p in self.worker_dir.glob("stock_on_hand_*.csv")),
             ["stock_on_hand_2026-09-03_103000.csv"])
 
+    def test_worker_only_windows_are_removed_once_db_is_complete(self) -> None:
+        _write(self.app_dir, "products_2026-09-03_020000.csv", "SKU\nA\n", 1_700_000_000)
+        _write(self.app_dir, "stock_on_hand_2026-09-03_020000.csv", "SKU\nA\n", 1_700_000_000)
+        _write(self.app_dir, "sale_lines_last_30d_2026-09-03_020000.csv", "SKU\nA\n", 1_700_000_000)
+        dm.publish(self.app_dir, publisher="test")
+        # Worker once backfilled a 1825d window the dashboard never had.
+        _write(self.worker_dir, "sale_lines_last_1825d_2026-05-01_000000.csv",
+               "SKU\nOLD\n", 1_680_000_000)
+        _write(self.worker_dir, "slack_loop.log", "keep me", 1)
+        out = dm.pull(self.worker_dir)
+        self.assertIn("sale_lines_last_1825d_2026-05-01_000000.csv", out["removed"])
+        self.assertTrue((self.worker_dir / "slack_loop.log").exists())
+
     def test_pull_reports_unavailable_when_db_empty(self) -> None:
         out = dm.pull(self.worker_dir)
         self.assertFalse(out["available"])
