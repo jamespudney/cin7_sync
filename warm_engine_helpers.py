@@ -177,6 +177,21 @@ def warm() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         ordering_snapshot = {"error": repr(exc)}
 
+    # 2026-09-03 — FULL engine snapshot for the Slack bot worker (no
+    # disk → no engine_output.csv). Lets the bot quote the dashboard's
+    # exact ABC / dormancy / goal / excess figures instead of its own.
+    engine_snapshot = {}
+    try:
+        import db as _db_full
+        engine_snapshot = _db_full.replace_engine_snapshot(
+            result_df,
+            source_path=str(out_path),
+            source_mtime=out_path.stat().st_mtime,
+            source="warm_engine",
+        )
+    except Exception as exc:  # noqa: BLE001
+        engine_snapshot = {"error": repr(exc)}
+
     # 2026-09-03 — daily stock-goal snapshot (engine/stock_goal.py) so
     # the Command Centre's Goal / Excess / Dead tiles refresh every
     # warm run instead of only when someone opens Ordering. The
@@ -203,6 +218,7 @@ def warm() -> dict[str, Any]:
         "cached_at": _dt.datetime.utcnow().isoformat() + "Z",
         "sources": bundle["_source_paths"],
         "ordering_snapshot": ordering_snapshot,
+        "engine_snapshot": engine_snapshot,
     }
 
 

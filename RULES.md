@@ -248,6 +248,18 @@ The warm job writes `stock_goal_snapshots` daily (reorder level NULL —
 needs supplier config); the Ordering/Stock Optimisation page overwrites the
 same day's row with the full figures. Glide path runs to the goal.
 
+**4.5 One engine, one database (James, 2026-09-03: "the bot should match
+whatever the app's data is").** Every figure the Slack bot quotes about a
+SKU (ABC, dormancy, dead, goal, excess, understock, trend) must come from
+the dashboard's own engine rows, never from a re-computation. The warm job
+writes the full `_abc_engine` frame to Postgres `engine_snapshot_rows`;
+`slack_listener` and `bot_engine_lookup` read that (CSV first if the
+service has the disk, DB otherwise). `worker_engine.compute_engine_signals`
+is a last-resort fallback only and must log a warning when used. Any new
+derived figure shown in the app must be computed in the engine (or
+`engine/stock_goal.py`) and read by the bot — not re-derived in
+`ai_tools.py`.
+
 ---
 
 ## 5. Freight & Supplier Rules

@@ -1536,6 +1536,49 @@ def _get_data_for_listener() -> Tuple[Any, Any]:
         else:
             engine_df = pd.DataFrame()
 
+        # 2026-09-03 — the worker has no disk, so engine_output.csv is
+        # never there and the bot used to recompute a simplified engine
+        # (different ABC / dormancy / excess from the dashboard). The
+        # warm job now also writes the FULL engine frame to Postgres
+        # (engine_snapshot_rows); read that first so the bot quotes the
+        # dashboard's numbers. James 2026-09-03: "The bot should match
+        # whatever the app's data is."
+        if engine_df is None or engine_df.empty:
+            try:
+                import db as _db_engine
+                _meta = _db_engine.get_latest_engine_snapshot_meta()
+                _rows = _db_engine.load_engine_snapshot_rows(
+                    _meta.get("snapshot_key")) if _meta else []
+                if _rows:
+                    engine_df = pd.DataFrame(_rows)
+                    ensure_storage_dim_column(engine_df)
+                    log.info(
+                        "Listener loaded canonical engine from DB "
+                        "snapshot %s (%d rows, built %s)",
+                        _meta.get("snapshot_key"), len(engine_df),
+                        _meta.get("built_at"))
+                    del _rows
+                else:
+                    log.warning(
+                        "No engine snapshot in DB yet — falling back to "
+                        "worker_engine (figures may differ from the "
+                        "dashboard until the next warm run)")
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not load engine snapshot from DB: %s",
+                            exc)
+                engine_df = pd.DataFrame()
+
+        # Canonical engine frames (CSV or DB) have no Bin / Stock
+        # locator column — attach it from the stock snapshot so
+        # "where is X" answers keep working.
+        if engine_df is not None and not engine_df.empty:
+            try:
+                import worker_engine as _we
+                engine_df = _we.attach_stock_locator(engine_df, stock)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Could not attach stock locator to engine: %s",
+                            exc)
+
         # v2.67.69 — full engine intelligence on the worker.
         # Earlier versions merged products+stock for a slim engine_df
         # with no ABC, no dormancy flag, no excess columns — bot's

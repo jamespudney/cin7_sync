@@ -130,6 +130,30 @@ def _normalise_bin_aliases(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def attach_stock_locator(engine_df: pd.DataFrame,
+                         stock: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Add the Bin (CIN7 Stock locator) column to a dashboard engine
+    frame. The dashboard's _abc_engine output carries no shelf locator,
+    so when the listener uses the canonical engine (CSV or DB snapshot)
+    instead of compute_engine_signals it still needs this for
+    "where is X" answers. Never uses Location / Default location."""
+    if engine_df is None or engine_df.empty:
+        return engine_df
+    if stock is None or stock.empty or "SKU" not in stock.columns:
+        return _normalise_bin_aliases(engine_df)
+    loc_cols = [c for c in _STOCK_LOCATOR_COLUMNS if c in stock.columns]
+    if not loc_cols:
+        return _normalise_bin_aliases(engine_df)
+    sv = stock[["SKU", *loc_cols]].copy()
+    sv["SKU"] = sv["SKU"].astype(str)
+    sv = sv.drop_duplicates(subset=["SKU"], keep="last")
+    sv = sv.rename(columns={c: f"{c}_stock" for c in loc_cols})
+    engine_df = engine_df.copy()
+    engine_df["SKU"] = engine_df["SKU"].astype(str)
+    engine_df = engine_df.merge(sv, on="SKU", how="left")
+    return _normalise_bin_aliases(engine_df)
+
+
 def _is_discontinued(name: object, status: object) -> bool:
     text = f"{name or ''} {status or ''}".lower()
     status_s = str(status or "").strip().lower()
