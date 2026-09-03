@@ -18255,11 +18255,12 @@ elif page == "Ordering":
     # savings opportunities. Sums footage across colors when the family's
     # aggregation rule is sum_across_colors; per-color otherwise.
     _tier_supplier = sel_sup
-    _has_pricing = bool(db.all_family_color_pricing(supplier=_tier_supplier))
+    # One DB read, not two: this used to call all_family_color_pricing()
+    # once just to test truthiness and again for the rows themselves.
+    _pricing_rows = db.all_family_color_pricing(supplier=_tier_supplier)
+    _has_pricing = bool(_pricing_rows)
     if _has_pricing:
         _opp_rows = []
-        # Pull all pricing rows for this supplier and group by family
-        _pricing_rows = db.all_family_color_pricing(supplier=_tier_supplier)
         _families_for_supplier = sorted({r["family"] for r in _pricing_rows})
 
         # Index pricing for quick lookup: pricing_idx[family][color] = sorted list of (tier_qty, unit_price)
@@ -18279,26 +18280,40 @@ elif page == "Ordering":
             _qty_col = ("reorder_qty" if "reorder_qty" in all_supplier_df.columns
                          else "Suggest" if "Suggest" in all_supplier_df.columns
                          else None)
+            # This used to walk the WHOLE supplier table once per pricing
+            # family, re-parsing every SKU each time — O(families × rows)
+            # regex parses on every rerun of the page, and the page reruns
+            # on every widget click. Walk the rows once instead and bucket
+            # the footage by family; the per-family loop below then just
+            # reads its bucket. Row order (and therefore float accumulation
+            # order) inside each family/color is unchanged, so the numbers
+            # are identical.
+            _family_color_ft: dict = {}  # family -> {color -> ft}
+            for _, row in all_supplier_df.iterrows():
+                sku = str(row.get("SKU") or "")
+                parsed = _parse_tube_sku(sku, str(row.get("Name") or ""))
+                if not parsed:
+                    continue
+                _fam = parsed.get("Family")
+                if _fam not in _pricing_idx:
+                    continue
+                qty = float(row.get(_qty_col, 0) or 0) if _qty_col else 0
+                if qty <= 0:
+                    continue
+                length_mm = parsed.get("LengthMM")
+                if not length_mm:
+                    continue
+                length_ft = length_mm * 0.00328084
+                color_norm = "White" if str(parsed.get("Color")) == "W" \
+                    else "Black" if str(parsed.get("Color")) == "B" \
+                    else str(parsed.get("Color"))
+                _fam_bucket = _family_color_ft.setdefault(_fam, {})
+                _fam_bucket[color_norm] = (
+                    _fam_bucket.get(color_norm, 0) + qty * length_ft)
+
             for fam in _families_for_supplier:
-                # Collect per-color footage for this family from the draft
-                _color_ft: dict = {}  # color -> ft
-                for _, row in all_supplier_df.iterrows():
-                    sku = str(row.get("SKU") or "")
-                    parsed = _parse_tube_sku(sku, str(row.get("Name") or ""))
-                    if not parsed or parsed.get("Family") != fam:
-                        continue
-                    qty = float(row.get(_qty_col, 0) or 0) if _qty_col else 0
-                    if qty <= 0:
-                        continue
-                    length_mm = parsed.get("LengthMM")
-                    if not length_mm:
-                        continue
-                    length_ft = length_mm * 0.00328084
-                    color_norm = "White" if str(parsed.get("Color")) == "W" \
-                        else "Black" if str(parsed.get("Color")) == "B" \
-                        else str(parsed.get("Color"))
-                    _color_ft[color_norm] = (
-                        _color_ft.get(color_norm, 0) + qty * length_ft)
+                # Per-color footage for this family from the draft
+                _color_ft: dict = _family_color_ft.get(fam, {})
                 if not _color_ft:
                     continue
 
