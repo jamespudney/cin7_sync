@@ -278,14 +278,21 @@ def excess_and_understock(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     the goal value not yet on the shelf. Non-masters with their own
     direct sales are working inventory (RULES 4.2) → never excess.
     """
-    onhand = pd.to_numeric(df.get("OnHand", 0), errors="coerce").fillna(0)
-    goal = pd.to_numeric(df.get("goal_units", 0), errors="coerce").fillna(0)
-    cost = pd.to_numeric(df.get("unit_cost_for_goal", 0), errors="coerce").fillna(0)
+    def _series(name):
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce").fillna(0)
+        return pd.Series(0.0, index=df.index)
+    onhand = _series("OnHand")
+    goal = _series("goal_units")
+    cost = _series("unit_cost_for_goal")
     excess_units = (onhand - goal).clip(lower=0)
     under_units = (goal - onhand).clip(lower=0)
     if "is_non_master_tube" in df.columns:
         non_master = df["is_non_master_tube"].fillna(False).astype(bool)
-        direct = pd.to_numeric(df.get("units_12mo", 0), errors="coerce").fillna(0)
+        # Direct sales of the cut itself; fall back to effective demand
+        # when the frame has no raw units_12mo column (worker engine).
+        direct = _series("units_12mo" if "units_12mo" in df.columns
+                         else "effective_units_12mo")
         working_cut = non_master & (direct > 0)
         excess_units = excess_units.where(~working_cut, 0.0)
     if "excess_exempt" in df.columns:
@@ -319,7 +326,9 @@ def stock_health_summary(df: pd.DataFrame, *, scope: str = "all") -> dict:
         df["goal_value"] = (
             pd.to_numeric(df["goal_units"], errors="coerce").fillna(0)
             * pd.to_numeric(df["unit_cost_for_goal"], errors="coerce").fillna(0))
-    onhand_value = pd.to_numeric(df.get("OnHandValue", 0), errors="coerce").fillna(0)
+    onhand_value = (pd.to_numeric(df["OnHandValue"], errors="coerce").fillna(0)
+                    if "OnHandValue" in df.columns
+                    else pd.Series(0.0, index=df.index))
     excess, under = excess_and_understock(df)
     cost = pd.to_numeric(df["unit_cost_for_goal"], errors="coerce").fillna(0)
     if "target_stock" in df.columns:
@@ -330,9 +339,12 @@ def stock_health_summary(df: pd.DataFrame, *, scope: str = "all") -> dict:
     if "is_dead" in df.columns:
         dead_mask = df["is_dead"].fillna(False).astype(bool)
     else:
-        onh = pd.to_numeric(df.get("OnHand", 0), errors="coerce").fillna(0)
+        onh = (pd.to_numeric(df["OnHand"], errors="coerce").fillna(0)
+               if "OnHand" in df.columns else pd.Series(0.0, index=df.index))
         dead_mask = (df["ABCD"] == "D") & (onh > 0)
-    annual = pd.to_numeric(df.get("annual_value", 0), errors="coerce").fillna(0)
+    annual = (pd.to_numeric(df["annual_value"], errors="coerce").fillna(0)
+              if "annual_value" in df.columns
+              else pd.Series(0.0, index=df.index))
 
     by_class = []
     for cls in ("A", "B", "C", "D"):

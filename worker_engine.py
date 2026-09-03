@@ -55,8 +55,9 @@ Output columns added to engine_df:
 - units_prior_45d           float — own-SKU demand, 45-90 days ago
 - annual_value              effective_units_12mo × AverageCost
 - is_dormant                bool — 12mo activity > 0 AND 90d ≤ 20% of 12mo rate
-- excess_units              max(0, OnHand - effective_units_12mo)
-- excess_value              excess_units × AverageCost
+- goal_units / goal_value   stock goal (engine/stock_goal.py, RULES 4.4)
+- excess_units              max(0, OnHand - goal_units) (was: above 12mo demand)
+- excess_value              excess vs goal; understock_value the mirror
 - OnHandValue               OnHand × AverageCost (fallback for stock value)
 - trend_flag                'Stable' | '📈 Trend' | '📉 Decline' | '(unknown)'
 - is_non_master_tube        bool — heuristic: SKU has per-foot suffix
@@ -590,12 +591,36 @@ def compute_engine_signals(products: pd.DataFrame,
     df["OnHand"] = on_hand
     df["OnHandValue"] = on_hand * avg_cost
 
-    # 8. excess_units / excess_value.
-    # excess = max(0, OnHand - effective_units_12mo)
-    # i.e. units held beyond the past year's full demand.
-    df["excess_units"] = (on_hand - df["effective_units_12mo"]
-                            ).clip(lower=0)
-    df["excess_value"] = df["excess_units"] * avg_cost
+    # 8. excess_units / excess_value — 2026-09-03: same stock-goal
+    # model as the dashboard (engine/stock_goal.py, RULES 4.4) so the
+    # bot quotes the figures the Command Centre / Ordering tiles show.
+    # Was: max(0, OnHand - effective_units_12mo) (stock above a full
+    # year of demand), which under-reported excess ~3x vs the app.
+    # The worker has no supplier config, so target_stock (reorder
+    # level) is absent here: goal = class cover x 12mo rate, at least
+    # one unit for any live SKU, zero for D / discontinued /
+    # do-not-reorder / non-master cuts.
+    df["avg_daily_base"] = df["effective_units_12mo"] / 365.0
+    df["avg_daily"] = df["avg_daily_base"]
+    _zero_goal: set = set()
+    try:
+        import db as _db
+        _zero_goal |= {str(x) for x in _db.all_do_not_reorder_skus()}
+    except Exception as exc:  # noqa: BLE001
+        log.debug("worker_engine: do-not-reorder list unavailable: %r", exc)
+    _name_col = df.get("Name", pd.Series("", index=df.index))
+    _status_col = df.get("Status", pd.Series("", index=df.index))
+    for _sku, _n, _st in zip(df["SKU"], _name_col, _status_col):
+        if _is_discontinued(_n, _st):
+            _zero_goal.add(str(_sku))
+    from engine.stock_goal import compute_stock_goal, excess_and_understock
+    df = compute_stock_goal(df, zero_goal_skus=_zero_goal)
+    _exc_val, _under_val = excess_and_understock(df)
+    _cost = _to_num(df["unit_cost_for_goal"]).replace(0, pd.NA)
+    df["excess_value"] = _exc_val
+    df["understock_value"] = _under_val
+    df["excess_units"] = (_exc_val / _cost).fillna(
+        (on_hand - _to_num(df["goal_units"])).clip(lower=0)).astype(float)
 
     # 9. trend_flag — simplified. Compares 90d rate vs 12mo rate.
     # Real engine has 5 categories and uses monthly buckets; this
