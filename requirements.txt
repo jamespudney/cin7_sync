@@ -1,27 +1,48 @@
-requests>=2.31.0
-python-dotenv>=1.0.0
-streamlit>=1.35.0
-pandas>=2.2.0
-plotly>=5.20.0
-duckdb>=1.0.0
-streamlit-sortables>=0.3.1
-reportlab>=4.0.0
+# Direct dependencies, pinned exactly.
+#
+# Why pins: until 2026-09-03 every line here was a `>=` floor, so each
+# Render rebuild silently installed whatever was newest on PyPI. Between
+# the 2026-08-27 and 2026-09-02 deploys — with no code change — the app
+# moved from streamlit 1.62.0 to 1.63.0, anthropic 1.1.0 to 1.3.0 and
+# psycopg 3.3.4 to 3.3.5. That makes "it worked yesterday" impossible to
+# reason about and is a likely contributor to intermittent breakage.
+#
+# The versions below are exactly what the live 2026-09-02 build installed
+# (dep-dac4u0navr4c73bep1fg), so this change is behaviour-neutral: the next
+# deploy installs the same set that is running right now.
+#
+# constraints.txt freezes the transitive tree the same way. Bump versions
+# deliberately, one at a time, and let CI run the test suite against them.
+-c constraints.txt
+
+requests==2.34.2
+python-dotenv==1.2.3
+streamlit==1.63.0
+pandas==3.0.5
+plotly==7.0.0
+duckdb==1.5.5
+streamlit-sortables==0.3.1
+reportlab==5.0.1
+
 # Anthropic Claude SDK — powers the AI Assistant page (ai_tools.py +
 # the "AI Assistant" page in app.py). Tool-use loop sends questions
 # to Claude with access to engine_df / sale_lines via local Python
 # tools. Cost: ~$0.50-2/day for typical team usage at this volume.
-anthropic>=0.40.0
+anthropic==1.3.0
+
 # v2.67.126 — Fernet symmetric encryption for storing Slack user
 # OAuth tokens at rest (Viktor bridge: dashboard posts to Slack
 # on the user's behalf so Viktor sees a real human message, not a
 # bot). See slack_oauth.py for the encryption helpers.
-cryptography>=42.0.0
+cryptography==50.0.1
+
 # v2.67.162 — Postgres driver. Used by migrate_to_pg.py for the
 # cross-service drift fix (single shared DB instead of two SQLite
 # copies on isolated Render disks). psycopg[binary] ships the
 # precompiled libpq so no system-level apt install is needed.
-psycopg[binary]>=3.1.0
+psycopg[binary]==3.3.5
+
 # v2.67.xxx — chart generation for the Monthly Metrics per-section pie
 # charts (both the live dashboard and monthly_metrics_report.py's
 # PDF). Headless (Agg backend), no system binaries needed.
-matplotlib>=3.8.0
+matplotlib==3.11.1
