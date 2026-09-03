@@ -57,17 +57,56 @@ stamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 # underlying sync takes.
 #
 # Usage: _run_bg <name> <cmd...>
-#   name: short identifier used for /tmp/<name>.pid lock file
+#   name: short identifier used for the PID lock file
 #   cmd:  the command + args to run (quoted as one arg, eval'd)
-_run_bg() {
-    local name="$1"
-    local cmd="$2"
-    local pidfile="/tmp/${name}.pid"
-    if [ -e "$pidfile" ] \
-            && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-        echo "[$(stamp)] [$name] still running (pid=$(cat "$pidfile")); skipping" >> "$LOG"
-        return
-    fi
+#
+# 2026-09-03 — admission control. Every `last_*_epoch` counter starts at 0,
+# so on boot ~27 of these fire in the same loop iteration, each starting its
+# own Python process that imports pandas before doing any work. On the 2 GB
+# worker that reliably exceeded the memory limit; the OOM killed the
+# container mid-run, it restarted, all 27 fired again — a permanent crash
+# loop (6 kills in 8 minutes on 2026-09-03 after the fablab stock-alert job
+# became the 28th). The jobs themselves were fine; launching them all at
+# once was not.
+#
+# So _run_bg no longer launches unconditionally. A job starts only if fewer
+# than BG_MAX_JOBS are already running AND MemAvailable is above
+# BG_MIN_AVAILABLE_MB. Otherwise it goes on a queue and _bg_drain (called
+# once per loop iteration) starts it as soon as there is room. Nothing is
+# dropped and no call site changes — the herd is simply spread out.
+BG_PID_DIR="${BG_PID_DIR:-/tmp/slack_loop_bg}"
+BG_QUEUE="${BG_PID_DIR}/queue"
+BG_MAX_JOBS="${BG_MAX_JOBS:-2}"
+BG_MIN_AVAILABLE_MB="${BG_MIN_AVAILABLE_MB:-500}"
+mkdir -p "$BG_PID_DIR"
+: > "$BG_QUEUE"
+
+# Linux MemAvailable in MB. Prints a large number if unreadable, so a
+# missing /proc never blocks work.
+_bg_available_mb() {
+    awk '/^MemAvailable:/ {print int($2/1024); found=1}
+         END {if (!found) print 999999}' /proc/meminfo 2>/dev/null \
+        || echo 999999
+}
+
+# Count live background jobs, cleaning up stale PID files as we go.
+_bg_running_count() {
+    local n=0 pf pid
+    for pf in "$BG_PID_DIR"/*.pid; do
+        [ -e "$pf" ] || continue
+        pid="$(cat "$pf" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            n=$((n + 1))
+        else
+            rm -f "$pf"
+        fi
+    done
+    echo "$n"
+}
+
+_bg_launch() {
+    local name="$1" cmd="$2"
+    local pidfile="${BG_PID_DIR}/${name}.pid"
     (
         echo "[$(stamp)] [bg-$name] start" >> "$LOG"
         eval "$cmd" >> "$LOG" 2>&1 || true
@@ -75,6 +114,55 @@ _run_bg() {
         rm -f "$pidfile"
     ) &
     echo $! > "$pidfile"
+}
+
+# Queue a job, unless the same name is already waiting.
+_bg_enqueue() {
+    local name="$1" cmd="$2"
+    if grep -q "^${name}"$'\t' "$BG_QUEUE" 2>/dev/null; then
+        return
+    fi
+    printf '%s\t%s\n' "$name" "$cmd" >> "$BG_QUEUE"
+    echo "[$(stamp)] [bg-$name] queued (running=$(_bg_running_count)," \
+         "avail=$(_bg_available_mb)MB)" >> "$LOG"
+}
+
+# Start queued jobs while there is capacity. Called once per loop iteration.
+_bg_drain() {
+    local name cmd rest
+    while [ -s "$BG_QUEUE" ]; do
+        if [ "$(_bg_running_count)" -ge "$BG_MAX_JOBS" ]; then
+            return
+        fi
+        if [ "$(_bg_available_mb)" -lt "$BG_MIN_AVAILABLE_MB" ]; then
+            return
+        fi
+        IFS=$'\t' read -r name cmd < "$BG_QUEUE"
+        rest="$(tail -n +2 "$BG_QUEUE")"
+        printf '%s' "$rest" > "$BG_QUEUE"
+        [ -n "$rest" ] && printf '\n' >> "$BG_QUEUE"
+        [ -n "${name:-}" ] || continue
+        echo "[$(stamp)] [bg-$name] dequeued" >> "$LOG"
+        _bg_launch "$name" "$cmd"
+    done
+}
+
+_run_bg() {
+    local name="$1"
+    local cmd="$2"
+    local pidfile="${BG_PID_DIR}/${name}.pid"
+    if [ -e "$pidfile" ] \
+            && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+        echo "[$(stamp)] [$name] still running (pid=$(cat "$pidfile")); skipping" >> "$LOG"
+        return
+    fi
+    rm -f "$pidfile"
+    if [ "$(_bg_running_count)" -ge "$BG_MAX_JOBS" ] \
+            || [ "$(_bg_available_mb)" -lt "$BG_MIN_AVAILABLE_MB" ]; then
+        _bg_enqueue "$name" "$cmd"
+        return
+    fi
+    _bg_launch "$name" "$cmd"
 }
 
 echo "" >> "$LOG"
@@ -205,6 +293,9 @@ last_shopify_sync_epoch=0  # v2.67.274 Shopify content sync fallback
 
 while true; do
     now_epoch=$(date -u +%s)
+    # Start anything that was queued because memory or the concurrency
+    # limit was tight last time round.
+    _bg_drain
     minutes_since_sync=$(( (now_epoch - last_data_sync_epoch) / 60 ))
 
     # Periodic data refresh (NearSync-style — last 1 day)
@@ -254,13 +345,24 @@ while true; do
     #   - A PID file at /tmp/dim_refresh.pid prevents double-runs
     #     in the unlikely case the timing check misfires.
     seconds_since_dim_refresh=$(( now_epoch - last_dim_refresh_epoch ))
-    DIM_REFRESH_PID_FILE=/tmp/dim_refresh.pid
+    # 2026-09-03 — PID file now lives in BG_PID_DIR so this chain counts
+    # towards _bg_running_count like every other background job. It is the
+    # heaviest thing the worker runs (products + 365d sales + line items)
+    # and it also starts at boot, so it must not run alongside the rest of
+    # the boot catch-up herd.
+    DIM_REFRESH_PID_FILE="${BG_PID_DIR}/dim_refresh.pid"
     if [ "$seconds_since_dim_refresh" -ge 86400 ]; then
         # Skip if a previous backgrounded refresh is still running
         if [ -e "$DIM_REFRESH_PID_FILE" ] \
-                && kill -0 "$(cat "$DIM_REFRESH_PID_FILE")" \
+                && kill -0 "$(cat "$DIM_REFRESH_PID_FILE" 2>/dev/null)" \
                                 2>/dev/null; then
             echo "[$(stamp)] daily refresh still running (pid=$(cat "$DIM_REFRESH_PID_FILE")); skipping" >> "$LOG"
+        elif [ "$(_bg_running_count)" -ge "$BG_MAX_JOBS" ] \
+                || [ "$(_bg_available_mb)" -lt "$BG_MIN_AVAILABLE_MB" ]; then
+            # Deferred, NOT stamped: last_dim_refresh_epoch stays where it
+            # is so the next loop iteration retries once there is room.
+            echo "[$(stamp)] daily refresh deferred (running=$(_bg_running_count)," \
+                 "avail=$(_bg_available_mb)MB)" >> "$LOG"
         else
             echo "[$(stamp)] launching daily worker data refresh chain in BACKGROUND" >> "$LOG"
             last_dim_refresh_epoch=$(date -u +%s)
