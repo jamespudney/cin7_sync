@@ -342,24 +342,22 @@ class CoatingWorkOrderTests(unittest.TestCase):
             image_lookup={},
         )
         lines = result["lines"]
-        service_summary = result["service_summary"]
+        service_lines = result["service_lines"]
 
         self.assertEqual(len(lines), 1)
         row = lines.iloc[0]
         self.assertEqual(row["Finished SKU"], "LED-AL-PL55B-FL-1")
-        self.assertEqual(row["Coating type"], "Powder coating")
+        self.assertEqual(row["Process"], "Powder coating")
         self.assertEqual(row["Send qty"], 5)
-        self.assertEqual(row["Service qty"], 15)
-        self.assertIn("LED-AL-PL55-FL-1", row["Raw component(s)"])
-        self.assertEqual(row["Raw status"], "Raw available")
-        self.assertIn("Powder Coating Vendor", row["Coating vendor"])
+        self.assertIn("LED-AL-PL55-FL-1", row["Raw profile/part"])
+        self.assertEqual(row["Stock ready?"], "Raw available")
+        self.assertIn("Powder Coating Vendor", row["Vendor"])
 
-        self.assertEqual(len(service_summary), 1)
-        self.assertEqual(
-            service_summary.iloc[0]["Service SKU"],
-            "OSC-POWDERCOAT-BK-LRG-FT",
-        )
-        self.assertEqual(service_summary.iloc[0]["Service_qty"], 15)
+        self.assertEqual(len(service_lines), 1)
+        service_row = service_lines.iloc[0]
+        self.assertEqual(service_row["Service SKU"], "OSC-POWDERCOAT-BK-LRG-FT")
+        self.assertEqual(service_row["Service qty"], 15)
+        self.assertEqual(service_row["Process"], "Powder coating")
 
     def test_anodizing_service_component_is_detected(self) -> None:
         boms = pd.DataFrame([{
@@ -384,8 +382,8 @@ class CoatingWorkOrderTests(unittest.TestCase):
             image_lookup={},
         )
 
-        self.assertEqual(result["lines"].iloc[0]["Coating type"], "Anodizing")
-        self.assertEqual(result["lines"].iloc[0]["Service qty"], 8)
+        self.assertEqual(result["lines"].iloc[0]["Process"], "Anodizing")
+        self.assertEqual(result["service_lines"].iloc[0]["Service qty"], 8)
 
 
 class PageConfigTests(unittest.TestCase):
