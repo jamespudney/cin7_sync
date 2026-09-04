@@ -15,6 +15,7 @@ receiving checklist for the manual CIN7 stock adjustment.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 import pandas as pd
@@ -122,7 +123,9 @@ def build_planner_table(
             "effective_units_12mo", eng.get("units_12mo", 0)))
         monthly_demand = units_12mo / 12.0
         target_for_window = monthly_demand * (weeks_cover / 4.345)
-        suggested = max(0.0, target_for_window - on_hand)
+        # 2026-09-04 (James): whole units only — round UP so the batch
+        # always covers the window (you can't build 0.3 of a part).
+        suggested = float(math.ceil(max(0.0, target_for_window - on_hand) - 1e-9))
 
         buildable, material_bits, components = _buildable_from_stock(
             sku, bom_parents, stock_map)
@@ -146,7 +149,7 @@ def build_planner_table(
             "Status": eng.get("Status") or "",
             "On hand": round(on_hand, 1),
             "Monthly demand": round(monthly_demand, 2),
-            "Suggested batch": round(suggested, 1),
+            "Suggested batch": int(suggested),
             "Buildable from stock": round(buildable, 1),
             "Materials status": status,
             "Materials": "\n".join(material_bits),
@@ -821,10 +824,10 @@ def render_fablab_work_orders(
         column_config={
             "On hand": st.column_config.NumberColumn(format="%.1f"),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
-            "Suggested batch": st.column_config.NumberColumn(format="%.1f"),
+            "Suggested batch": st.column_config.NumberColumn(format="%d"),
             "Buildable from stock": st.column_config.NumberColumn(format="%.1f"),
             "Batch qty": st.column_config.NumberColumn(
-                "✏ Batch qty", format="%.1f",
+                "✏ Batch qty", format="%d", step=1,
                 help="Edit to override the suggested batch quantity."),
         },
     )
