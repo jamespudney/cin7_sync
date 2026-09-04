@@ -235,6 +235,36 @@ def format_pick_list(per_sku: list, totals: dict,
     return "\n".join(out)
 
 
+CIN7_MEMO_MAX = 1024
+
+
+def compact_po_memo(lines: dict, assembly_numbers: Optional[dict],
+                    total_units: float, header: str = "") -> str:
+    """Short PO memo that fits CIN7's 1024-char Memo limit.
+
+    One line per finished SKU: '[FG-xxxx] SKU x qty'. The full pick list
+    (BOM components, stock locators) lives on the CIN7 assemblies and in the
+    Slack post, so the memo only needs to point at them. Truncates with a
+    '+N more' marker if even the compact form is too long.
+    """
+    head = (f"{header} — {total_units:g} units. Assemblies AUTHORISED in "
+            f"CIN7; pick lists on each assembly + Slack.")
+    rows = []
+    for sku, qty in lines.items():
+        tag = f"[{assembly_numbers[sku]}] " if assembly_numbers and assembly_numbers.get(sku) else ""
+        rows.append(f"{tag}{sku} x {qty:g}")
+    out = head
+    for i, row in enumerate(rows):
+        remaining = len(rows) - i
+        candidate = out + "\n" + row
+        marker = f"\n+{remaining} more (see assemblies)"
+        if len(candidate) + (len(marker) if remaining > 1 else 0) > CIN7_MEMO_MAX:
+            out += marker
+            break
+        out = candidate
+    return out[:CIN7_MEMO_MAX]
+
+
 def _post_finished_goods(headers: dict, *, product_id: str, qty: float,
                          status: str, notes: str, location: str,
                          log_=None, last_call: float = 0.0):
@@ -401,6 +431,9 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
                 f"{draft['name']} — {total_units:g} units. "
                 f"Assemblies are AUTHORISED in CIN7 (pick lists there)."))
     res["memo"] = memo
+    po_memo = compact_po_memo(
+        lines, assembly_numbers, total_units,
+        header=f"865FabLab corner assembly — order #{draft_id} {draft['name']}")
     po_lines = []
     for ssku, sq in svc_totals.items():
         prod, price = resolved[ssku], svc_price[ssku]
@@ -411,7 +444,7 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
             "Total": round(sq * price, 2)})
     push = cin7_post_po.push_po_draft(
         draft_id, actor=actor, apply=apply, require_mov=False,
-        default_location=location, lines_override=po_lines, memo=memo)
+        default_location=location, lines_override=po_lines, memo=po_memo)
     res["po_lines"] = po_lines
     res["labor_price"] = svc_price.get(LABOR_SKU) or next(iter(svc_price.values()), None)
     res["warnings"].extend(push.warnings)

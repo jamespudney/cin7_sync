@@ -212,3 +212,16 @@ class ComponentNotesTest(unittest.TestCase):
         self.assertNotIn("SHORT", notes["LED-76650038-0609"])
         txt = fa.format_pick_list([], totals, notes=notes)
         self.assertIn("LED-G2000820-0609 x 10  (BOM 9.496)  [loc F35", txt)
+
+
+def test_compact_po_memo_fits_cin7_limit():
+    import fablab_assemblies as fa
+    lines = {f"LED-SKU-{i:03d}-INSIDE90": i + 1 for i in range(60)}
+    nums = {k: f"FG-{53000 + i}" for i, k in enumerate(lines)}
+    memo = fa.compact_po_memo(lines, nums, sum(lines.values()), header="order #7 test")
+    assert len(memo) <= fa.CIN7_MEMO_MAX
+    assert memo.startswith("order #7 test")
+    assert "[FG-53000] LED-SKU-000-INSIDE90 x 1" in memo
+    assert "more (see assemblies)" in memo
+    small = fa.compact_po_memo({"A": 2}, {"A": "FG-1"}, 2, header="h")
+    assert "[FG-1] A x 2" in small and "more" not in small
