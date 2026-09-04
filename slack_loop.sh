@@ -166,6 +166,20 @@ _run_bg() {
     _bg_launch "$name" "$cmd"
 }
 
+# Fast lane: light, latency-sensitive jobs (a couple of API calls) that
+# must not wait behind the big syncs in the bounded queue. Still guarded
+# by the pidfile so the same job never overlaps itself.
+_run_fast() {
+    local name="$1" cmd="$2"
+    local pidfile="${BG_PID_DIR}/${name}.pid"
+    if [ -e "$pidfile" ] \
+            && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+        return
+    fi
+    rm -f "$pidfile"
+    _bg_launch "$name" "timeout 240 $cmd"
+}
+
 echo "" >> "$LOG"
 echo "============================================================" >> "$LOG"
 echo "[$(stamp)] slack_loop starting" >> "$LOG"
@@ -663,13 +677,13 @@ while true; do
     seconds_since_fablab_assembly_po=$(( now_epoch - last_fablab_assembly_po_epoch ))
     if [ "$seconds_since_fablab_assembly_po" -ge 300 ]; then
         last_fablab_assembly_po_epoch=$(date -u +%s)
-        _run_bg "fablab_assembly_check_po" \
+        _run_fast "fablab_assembly_check_po" \
             "python fablab_assemblies.py check-po"
     fi
     seconds_since_fablab_assembly_replies=$(( now_epoch - last_fablab_assembly_replies_epoch ))
     if [ "$seconds_since_fablab_assembly_replies" -ge 180 ]; then
         last_fablab_assembly_replies_epoch=$(date -u +%s)
-        _run_bg "fablab_assembly_check_replies" \
+        _run_fast "fablab_assembly_check_replies" \
             "python fablab_assemblies.py check-replies"
     fi
 

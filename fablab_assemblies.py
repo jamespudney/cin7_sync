@@ -131,9 +131,61 @@ def build_pick_list(lines: dict, bom_parents: dict,
     return per_sku, totals
 
 
+def _locator_of(product_map: dict, sku: str) -> str:
+    row = (product_map or {}).get(sku, {}) or {}
+    for key in ("StockLocator", "Stock Locator", "Stock locator",
+                "stock_locator"):
+        val = row.get(key)
+        if val is not None and str(val).strip().lower() not in (
+                "", "nan", "none", "null"):
+            return str(val).strip()
+    return ""
+
+
+def component_notes(totals: dict, bom_parents: dict, product_map: dict,
+                    stock_map: Optional[dict] = None) -> dict:
+    """Per-component picker hints for the TOTALS block:
+    stock locator + on-hand, and — when the component is itself an
+    auto-assembly with too little on hand — the master item to cut it
+    from (e.g. 609 mm channel cut 0.333 x from the 2 m length)."""
+    notes: dict = {}
+    for csku, total in (totals or {}).items():
+        bits = []
+        loc = _locator_of(product_map, csku)
+        if loc:
+            bits.append(f"loc {loc}")
+        stk = (stock_map or {}).get(csku)
+        on_hand = None
+        if stk is not None:
+            on_hand = _num(stk.get("OnHand", stk.get("Available", 0)))
+            bits.append(f"on hand {on_hand:g}")
+        prow = (product_map or {}).get(csku, {}) or {}
+        auto = str(prow.get("AutoAssembly", "")).strip().lower() == "true"
+        need = math.ceil(round(_num(total), 3))
+        short = (on_hand is None and auto) or (
+            on_hand is not None and on_hand < need)
+        if auto and short:
+            for comp in bom_parents.get(csku, []) or []:
+                msku = str(comp.get("ComponentSKU") or "").strip()
+                per = _num(comp.get("Quantity"))
+                if not msku or per <= 0 or msku.upper() == LABOR_SKU:
+                    continue
+                gap = need if on_hand is None else max(need - on_hand, 0)
+                mloc = _locator_of(product_map, msku)
+                hint = (f"SHORT: cut {gap:g} from master {msku} "
+                        f"({per:g} each = {math.ceil(gap * per - 1e-9):g} "
+                        f"length(s))")
+                if mloc:
+                    hint += f" loc {mloc}"
+                bits.append(hint)
+        if bits:
+            notes[csku] = " | ".join(bits)
+    return notes
+
+
 def format_pick_list(per_sku: list, totals: dict,
                      assembly_numbers: Optional[dict] = None,
-                     header: str = "") -> str:
+                     header: str = "", notes: Optional[dict] = None) -> str:
     out = [header] if header else []
     for row in per_sku:
         tag = ""
@@ -150,7 +202,8 @@ def format_pick_list(per_sku: list, totals: dict,
         for csku, total in sorted(totals.items()):
             whole = int(math.ceil(round(total, 3)))
             exact = f"  (BOM {total:g})" if abs(whole - total) > 1e-9 else ""
-            out.append(f"  {csku} x {whole}{exact}")
+            note = f"  [{notes[csku]}]" if notes and notes.get(csku) else ""
+            out.append(f"  {csku} x {whole}{exact}{note}")
     return "\n".join(out)
 
 
@@ -181,7 +234,8 @@ def _post_finished_goods(headers: dict, *, product_id: str, qty: float,
 
 def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
                 actor: str, apply: bool = False,
-                location: str = "Main Warehouse") -> dict:
+                location: str = "Main Warehouse",
+                stock_map: Optional[dict] = None) -> dict:
     """Create AUTHORISED assemblies for every order line, then the
     labor-only Draft PO. Idempotent per SKU (skips SKUs that already
     have a live assembly on this order) and per PO (push_po_draft's own
@@ -289,6 +343,7 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
     per_sku, totals = build_pick_list(lines, bom_parents, product_map)
     memo = format_pick_list(
         per_sku, totals, assembly_numbers,
+        notes=component_notes(totals, bom_parents, product_map, stock_map),
         header=(f"865FabLab corner assembly — order #{draft_id} "
                 f"{draft['name']} — {total_units:g} units. "
                 f"Assemblies are AUTHORISED in CIN7 (pick lists there)."))

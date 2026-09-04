@@ -450,7 +450,8 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
 
 
 def _render_place_order(draft_id: int, bom_parents: dict,
-                        product_map: dict, actor: str) -> None:
+                        product_map: dict, actor: str,
+                        stock_map: Optional[dict] = None) -> None:
     """Place the order: one AUTHORISED CIN7 assembly per line + one
     labor-only Draft PO to 865FabLab (fablab_assemblies.place_order).
     Preview first, then explicit confirm."""
@@ -488,7 +489,10 @@ def _render_place_order(draft_id: int, bom_parents: dict,
             f"Labor PO line: {fa.LABOR_SKU} × {total_units:g} at the "
             "865FabLab fixed price in CIN7.")
         with st.expander("PO memo / pick list preview"):
-            st.code(fa.format_pick_list(per_sku, totals), language=None)
+            st.code(fa.format_pick_list(
+                per_sku, totals,
+                notes=fa.component_notes(totals, bom_parents, product_map,
+                                         stock_map)), language=None)
 
         confirm = st.checkbox(
             "I've checked the quantities — create the assemblies and the "
@@ -506,7 +510,7 @@ def _render_place_order(draft_id: int, bom_parents: dict,
             with st.spinner("Creating assemblies and labor PO in CIN7…"):
                 res = fa.place_order(
                     draft_id, bom_parents, product_map, actor=actor,
-                    apply=True)
+                    apply=True, stock_map=stock_map)
             for w in res.get("warnings", []):
                 st.warning(w)
             if res.get("ok"):
@@ -1005,7 +1009,8 @@ def render_fablab_work_orders(
     if draft_id and can_edit and saved_lines:
         st.info("**Step 3** — review below and place the order with "
                 "865FabLab.", icon="\U0001f680")
-        _render_place_order(draft_id, bom_parents, product_map, current_user)
+        _render_place_order(draft_id, bom_parents, product_map, current_user,
+                            stock_map=_stock_by_sku(stock))
 
     # ── Materials shortfall ──────────────────────────────────────────────
     st.divider()

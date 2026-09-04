@@ -190,3 +190,25 @@ class CompleteAssemblyTests(_TempDb):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComponentNotesTest(unittest.TestCase):
+    def test_short_auto_assembly_points_to_master(self):
+        import fablab_assemblies as fa
+        totals = {"LED-G2000820-0609": 9.496, "LED-76650038-0609": 7.659}
+        bom_parents = {"LED-G2000820-0609": [
+            {"ComponentSKU": "LED-G2000620-2", "Quantity": 0.333}]}
+        product_map = {
+            "LED-G2000820-0609": {"StockLocator": "F35", "AutoAssembly": "True"},
+            "LED-G2000620-2": {"StockLocator": "R1"},
+            "LED-76650038-0609": {"StockLocator": "C7"}}
+        stock_map = {"LED-G2000820-0609": {"OnHand": 4},
+                     "LED-76650038-0609": {"OnHand": 50}}
+        notes = fa.component_notes(totals, bom_parents, product_map, stock_map)
+        self.assertIn("loc F35", notes["LED-G2000820-0609"])
+        self.assertIn("cut 6 from master LED-G2000620-2", notes["LED-G2000820-0609"])
+        self.assertIn("2 length(s)", notes["LED-G2000820-0609"])
+        self.assertIn("loc R1", notes["LED-G2000820-0609"])
+        self.assertNotIn("SHORT", notes["LED-76650038-0609"])
+        txt = fa.format_pick_list([], totals, notes=notes)
+        self.assertIn("LED-G2000820-0609 x 10  (BOM 9.496)  [loc F35", txt)
