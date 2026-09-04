@@ -9722,8 +9722,9 @@ def record_stock_goal_snapshot(summary: dict, source: str = "") -> None:
     One row per calendar date, last-write-wins. The warm job writes a
     row without reorder_level_value (None); the Ordering page writes
     the full row later the same day and wins — unless the warm job
-    runs again afterwards, in which case keep the page's reorder
-    level rather than overwriting it with NULL."""
+    runs again afterwards, in which case the partial (no reorder level)
+    write is skipped entirely: a complete row is never downgraded to
+    provisional goal/excess figures (2026-09-04)."""
     import json as _json
     by_class = _json.dumps(summary.get("by_class") or [], default=str)
     rl = summary.get("reorder_level_value")
@@ -9751,6 +9752,8 @@ def record_stock_goal_snapshot(summary: dict, source: str = "") -> None:
                 by_class_json       = excluded.by_class_json,
                 source              = excluded.source,
                 captured_at         = excluded.captured_at
+            WHERE excluded.reorder_level_value IS NOT NULL
+               OR stock_goal_snapshots.reorder_level_value IS NULL
             """,
             (int(summary.get("sku_count") or 0),
              float(summary.get("current_value") or 0),

@@ -10745,15 +10745,42 @@ if page == "Overview":
         _goal_snap = db.get_latest_stock_goal_snapshot()
     except Exception:  # noqa: BLE001
         _goal_snap = {}
+    # 2026-09-04 — ONE figure everywhere. The engine frame the app is
+    # serving only carries target_stock (reorder level) after Ordering /
+    # Stock Optimisation has loaded the supplier config; without it the
+    # goal is provisional (no reorder-level lift, no cost fallback) and
+    # came out ~$70K lower than the page figure on first deploy. So:
+    # prefer the engine frame when it is COMPLETE (has target_stock);
+    # else prefer the latest persisted complete snapshot (written by
+    # the Ordering page, protected from partial overwrites in
+    # db.record_stock_goal_snapshot); only fall back to the provisional
+    # compute when neither exists — and say so.
     _health_cc = {}
-    if (not _engine_for_health.empty
-            and "goal_units" in _engine_for_health.columns):
+    _health_provisional = False
+    _health_asof = ""
+    _engine_complete = (not _engine_for_health.empty
+                        and "goal_units" in _engine_for_health.columns
+                        and "target_stock" in _engine_for_health.columns)
+    if _engine_complete:
         try:
             _health_cc = stock_health_summary(_engine_for_health, scope="all")
         except Exception:  # noqa: BLE001
             _health_cc = {}
+    if (not _health_cc and _goal_snap
+            and _goal_snap.get("reorder_level_value") is not None):
+        _health_cc = dict(_goal_snap)
+        _health_asof = str(_goal_snap.get("captured_at") or "")[:16]
+    if (not _health_cc and not _engine_for_health.empty
+            and "goal_units" in _engine_for_health.columns):
+        try:
+            _health_cc = stock_health_summary(_engine_for_health, scope="all")
+            _health_provisional = True
+        except Exception:  # noqa: BLE001
+            _health_cc = {}
     if not _health_cc and _goal_snap:
         _health_cc = dict(_goal_snap)
+        _health_provisional = True
+        _health_asof = str(_goal_snap.get("captured_at") or "")[:16]
     _dead_data_available = bool(_health_cc)
     _dead_value_ov = float(_health_cc.get("dead_value") or 0.0)
     _dead_skus_ov = int(_health_cc.get("dead_sku_count") or 0)
@@ -10766,7 +10793,7 @@ if page == "Overview":
     _excess_cc = float(_health_cc.get("excess_value") or 0.0)
     _under_cc = float(_health_cc.get("understock_value") or 0.0)
 
-    sh1, sh2, sh3, sh4, sh5 = st.columns(5)
+    sh1, sh2, sh3, sh4, sh4b, sh5 = st.columns(6)
     if _dead_data_available:
         sh1.metric(
             "Stock goal",
@@ -10807,14 +10834,20 @@ if page == "Overview":
                    help="Appears once Ordering or Stock Optimisation has "
                         "run since this version was deployed.")
     if _dead_data_available:
+        # Two tiles, not "$x · $y" in one: Streamlit renders text between
+        # two $ signs as LaTeX (seen live 2026-09-04).
         sh4.metric(
-            "Excess above goal · Understock",
-            f"{_fmt_money(_excess_cc)} · {_fmt_money(_under_cc)}",
+            "Excess above goal",
+            _fmt_money(_excess_cc),
             delta=f"net freeable ≈ {_fmt_money(_excess_cc - _under_cc)}",
             delta_color="off",
-            help=("Excess = stock above each SKU's goal (gross). "
-                  "Understock = goal not on the shelf. Dead stock is "
-                  "part of Excess (its goal is $0)."))
+            help=("Stock above each SKU's goal (gross). Dead stock is "
+                  "part of Excess (its goal is $0). Net freeable = "
+                  "Excess − Understock."))
+        sh4b.metric(
+            "Understock (below goal)",
+            _fmt_money(_under_cc),
+            help="Goal not on the shelf, summed per SKU.")
         sh5.metric(
             "Dead stock (zero 12mo demand, holding stock)",
             _fmt_money(_dead_value_ov),
@@ -10826,7 +10859,8 @@ if page == "Overview":
                 "distinct from the dormancy-based 'Slow stock' panel "
                 "below, which is a VELOCITY-drop signal."))
     else:
-        sh4.metric("Excess above goal · Understock", "—")
+        sh4.metric("Excess above goal", "—")
+        sh4b.metric("Understock (below goal)", "—")
         sh5.metric("Dead stock (zero 12mo demand, holding stock)", "—",
                    help="Waiting on the next background engine recompute.")
 
@@ -10864,6 +10898,15 @@ if page == "Overview":
                 f"{_fmt_money(_c['goal_value'])} goal"
                 + (f" ({_cov:.0f}d cover)" if _cov else ""))
         st.caption(" · ".join(_cls_bits).replace("$", "\\$"))
+    if _dead_data_available and _health_provisional:
+        st.caption(
+            ":warning: Provisional — supplier lead-time config is not "
+            "loaded yet, so the reorder-level lift is not applied. Open "
+            "Ordering or Stock Optimisation once and this panel switches "
+            "to the complete figure.")
+    elif _health_asof:
+        st.caption(f"Complete figure from the last Ordering / Stock "
+                   f"Optimisation run — as of {_health_asof}.")
     st.caption(
         "Goal / Reorder level / Excess / Dead use one shared definition "
         "(Stock Optimisation → 'How these figures are defined'). See "
