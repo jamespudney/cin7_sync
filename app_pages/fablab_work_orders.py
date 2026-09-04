@@ -876,14 +876,18 @@ def render_fablab_work_orders(
 
     planner_df = planner_df.copy()
     # Batch qty = what is on the order if saved, else the suggestion.
+    # Ticks made before an order existed (or before saving) are remembered
+    # in the session so creating/switching an order does not lose them.
+    remembered: dict = st.session_state.get("fablab_ticked", {})
     planner_df["Batch qty"] = [
-        float(saved_lines.get(sku, sug if pd.notna(sug) else 0))
+        float(saved_lines.get(
+            sku, remembered.get(sku, sug if pd.notna(sug) else 0)))
         for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])
     ]
-    # Include = on the order. Saved lines are ticked; everything else
-    # starts unticked unless "Pre-tick all suggested" is on.
+    # Include = on the order. Saved or remembered ticks are ticked;
+    # everything else starts unticked unless "Pre-tick all suggested" is on.
     planner_df["Include"] = [
-        (sku in saved_lines)
+        (sku in saved_lines) or (sku in remembered)
         or (pretick_all and pd.notna(sug) and float(sug) > 0)
         for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])
     ]
@@ -933,6 +937,15 @@ def render_fablab_work_orders(
 
     included = edited_planner[edited_planner["Include"].fillna(False)
                               .astype(bool)]
+    if qty_editable:
+        # Remember ticks for visible rows; keep remembered ticks for rows
+        # hidden by the search/filter.
+        visible = set(edited_planner["SKU"])
+        remembered = {k: v for k, v in remembered.items() if k not in visible}
+        remembered.update(
+            {r["SKU"]: float(_num(r.get("Batch qty", 0)))
+             for _, r in included.iterrows()})
+        st.session_state["fablab_ticked"] = remembered
     n_short = int((included["Materials status"] == "Raw short").sum())
     mcol1, mcol2, mcol3 = st.columns(3)
     mcol1.metric("Flagged SKUs", fmt_number(len(planner_df)))
@@ -942,20 +955,54 @@ def render_fablab_work_orders(
         f"{len(included)} SKUs")
     mcol3.metric("Raw short (included)", fmt_number(n_short))
 
+    def _save_ticks(target_draft: int) -> int:
+        n = 0
+        for _, row in edited_planner.iterrows():
+            qty = _num(row.get("Batch qty", 0))
+            if bool(row.get("Include", False)) and qty > 0:
+                db.upsert_po_draft_line(
+                    target_draft, row["SKU"], qty, current_user)
+                n += 1
+            elif row["SKU"] in saved_lines:
+                db.delete_po_draft_line(target_draft, row["SKU"])
+        st.session_state["fablab_ticked"] = {}
+        return n
+
+    n_ticked = len(included)
     if draft_id is None:
-        st.info("Pick or create an order above, then save these quantities "
-                "to it.", icon="\U0001f4e6")
+        if n_ticked == 0:
+            st.info("**Step 1** — tick the SKUs to build in the ✔ Include "
+                    "column above.", icon="\U0001f4cb")
+        else:
+            st.info(f"**Step 2** — {n_ticked} SKU(s) ticked. Name the order "
+                    "and create it; the ticked items go straight onto it.",
+                    icon="\U0001f4e6")
+            nc1, nc2 = st.columns([3, 2])
+            with nc1:
+                new_name = st.text_input(
+                    "Order name", key="fablab_quick_order_name",
+                    placeholder="e.g. September corner batch")
+            with nc2:
+                st.write("")
+                if st.button("\U0001f4e6 Create order with ticked items",
+                             key="fablab_quick_create", type="primary",
+                             disabled=not new_name.strip()):
+                    new_draft = db.create_po_draft(
+                        supplier=FABLAB_SUPPLIER, name=new_name.strip(),
+                        actor=current_user)
+                    n = _save_ticks(new_draft)
+                    st.session_state["fablab_active_draft"] = new_draft
+                    st.success(f"Order #{new_draft} created with {n} SKU(s).")
+                    st.rerun()
     elif can_edit:
+        if not saved_lines:
+            st.info("**Step 2** — tick items, then save them to this order.",
+                    icon="\U0001f4e6")
         if st.button("\U0001f4be Save ticked items to this order",
-                     key=f"fablab_save_{draft_id}", type="primary"):
-            for _, row in edited_planner.iterrows():
-                qty = _num(row.get("Batch qty", 0))
-                if bool(row.get("Include", False)) and qty > 0:
-                    db.upsert_po_draft_line(
-                        draft_id, row["SKU"], qty, current_user)
-                elif row["SKU"] in saved_lines:
-                    db.delete_po_draft_line(draft_id, row["SKU"])
-            st.success("Order quantities saved.")
+                     key=f"fablab_save_{draft_id}", type="primary",
+                     disabled=(n_ticked == 0 and not saved_lines)):
+            n = _save_ticks(draft_id)
+            st.success(f"Saved {n} SKU(s) to the order.")
             st.rerun()
 
     if draft_id and saved_lines:
@@ -967,6 +1014,8 @@ def render_fablab_work_orders(
                  "Qty": qty} for sku, qty in saved_lines.items()]),
                 use_container_width=True, hide_index=True)
     if draft_id and can_edit and saved_lines:
+        st.info("**Step 3** — review below and place the order with "
+                "865FabLab.", icon="\U0001f680")
         _render_place_order(draft_id, bom_parents, product_map, current_user)
 
     # ── Materials shortfall ──────────────────────────────────────────────
