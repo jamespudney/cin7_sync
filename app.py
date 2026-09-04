@@ -11044,11 +11044,6 @@ if page == "Overview":
             f"{_verb} ({_prev_date}: {_fmt_money(_prev_v)})"
             "</small>",
             unsafe_allow_html=True)
-    else:
-        sm2.caption(
-            "_Previous-month comparison will appear once we have "
-            "a snapshot from last month (one snapshot per day "
-            "from the daily engine recompute)._")
     sm3.metric(
         "Cleared this month — value",
         _fmt_money(_mtd_clear["cost_value"]),
@@ -11134,28 +11129,6 @@ if page == "Overview":
                             "45d units", format="%.2f"),
                     },
                 )
-
-    # Stock positions
-    if not stock.empty:
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.subheader("Stock distribution by location")
-            by_loc = (
-                stock.assign(OnHand=_to_num(stock["OnHand"]))
-                     .groupby("Location", dropna=False)["OnHand"]
-                     .agg(["count", "sum"])
-                     .rename(columns={"count": "SKUs", "sum": "Units"})
-                     .sort_values("Units", ascending=False)
-            )
-            st.dataframe(by_loc, width="stretch")
-
-        with col_right:
-            st.subheader("Zero-stock & low-stock flags")
-            on_hand = _to_num(stock["OnHand"]).fillna(0)
-            zero = (on_hand <= 0).sum()
-            low = ((on_hand > 0) & (on_hand < 5)).sum()
-            st.metric("SKU-locations at zero stock", _fmt_number(zero))
-            st.metric("SKU-locations below 5 units", _fmt_number(low))
 
     # --- Today + Month-to-Date vs same-period prior years ---------------
     if not sale_lines.empty and "InvoiceDate" in sale_lines.columns:
