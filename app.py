@@ -8221,7 +8221,7 @@ def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
         return pd.DataFrame()
     snapshot = _load_engine_output_snapshot()
     if not snapshot.empty:
-        return snapshot
+        return _ensure_goal_columns(snapshot)
     _start_background_engine_refresh("engine snapshot requested but missing")
     if os.environ.get("ABC_ALLOW_FOREGROUND_COMPUTE") != "1":
         return pd.DataFrame()
@@ -8232,6 +8232,30 @@ def _get_engine_df_cached(snapshot_mtime: Optional[float]) -> "pd.DataFrame":
     return _normalise_engine_snapshot(_abc_engine(
         products, stock, sale_lines, purchase_lines,
         assemblies_df=assemblies, demand_overrides=_demand_overrides))
+
+
+def _ensure_goal_columns(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Add the stock-goal columns to an engine snapshot that predates
+    them (2026-09-04: first deploy of the goal model showed "—" on the
+    Command Centre until warm_engine had rewritten engine_output.csv).
+    Same inputs as the warm job, so the figures are identical."""
+    if df.empty or "goal_units" in df.columns:
+        return df
+    try:
+        _zg = _zero_goal_sku_set(products)
+    except Exception:  # noqa: BLE001
+        _zg = {"zero_goal": set(), "dropship": set()}
+    try:
+        _packs = {str(r["sku"]): (r.get("eoq_qty") or r.get("pack_qty") or 0)
+                  for r in db.all_sku_pack()}
+    except Exception:  # noqa: BLE001
+        _packs = {}
+    try:
+        return compute_stock_goal(df, pack_qty_by_sku=_packs,
+                                  zero_goal_skus=_zg["zero_goal"],
+                                  no_excess_skus=_zg["dropship"])
+    except Exception:  # noqa: BLE001
+        return df
 
 
 def _get_engine_df() -> "pd.DataFrame":
