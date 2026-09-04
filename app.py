@@ -22546,47 +22546,55 @@ elif page == "Monthly Metrics":
             if not any(v for v in stock_vals if v):
                 return
             import plotly.graph_objects as go
+            # Goal: the latest suggested goal, drawn as one flat
+            # reference line across the whole chart (a single Sep-2026
+            # point was invisible and confusing).
+            _goal_now = None
+            for m in reversed(months):
+                if _goal_by_month.get(m):
+                    _goal_now = float(_goal_by_month[m])
+                    break
             fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=xs, y=stock_vals, name="Stock value",
-                mode="lines+markers", line=dict(color="#2f6fed", width=3),
-                hovertemplate="%{x}<br>Stock value $%{y:,.0f}"
-                              "<extra></extra>"))
-            fig.add_trace(go.Scatter(
-                x=xs, y=goal_vals, name="Stock goal",
-                mode="lines+markers", connectgaps=True,
-                line=dict(color="#3aa76d", width=2, dash="dash"),
-                hovertemplate="%{x}<br>Goal $%{y:,.0f}<extra></extra>"))
             fig.add_trace(go.Bar(
                 x=xs, y=slow_vals, name="Slow stock",
-                marker_color="rgba(232,131,58,0.55)",
+                marker_color="rgba(232,131,58,0.6)",
                 hovertemplate="%{x}<br>Slow stock $%{y:,.0f}"
                               "<extra></extra>"))
             fig.add_trace(go.Bar(
                 x=xs, y=dead_vals, name="Dead stock",
-                marker_color="rgba(201,79,79,0.65)",
+                marker_color="rgba(201,79,79,0.7)",
                 hovertemplate="%{x}<br>Dead stock $%{y:,.0f}"
                               "<extra></extra>"))
+            fig.add_trace(go.Scatter(
+                x=xs, y=stock_vals, name="Total stock value",
+                mode="lines+markers", line=dict(color="#2f6fed", width=3),
+                hovertemplate="%{x}<br>Stock value $%{y:,.0f}"
+                              "<extra></extra>"))
+            if _goal_now:
+                fig.add_hline(
+                    y=_goal_now, line_dash="dash", line_color="#3aa76d",
+                    line_width=2,
+                    annotation_text=f"Goal ${_goal_now:,.0f}",
+                    annotation_position="top left",
+                    annotation_font_color="#3aa76d")
             fig.update_layout(
-                barmode="group", height=340,
-                margin=dict(l=0, r=0, t=30, b=0),
-                title=dict(text="Stock optimisation progress",
-                           font=dict(size=15)),
+                barmode="group", height=360,
+                margin=dict(l=0, r=0, t=10, b=0),
+                xaxis=dict(type="category"),
                 yaxis=dict(title="", tickprefix="$", separatethousands=True,
                            rangemode="tozero"),
-                legend=dict(orientation="h", y=1.12, x=0),
+                legend=dict(orientation="h", yanchor="top", y=-0.15, x=0),
             )
+            st.markdown("**Stock optimisation progress**")
             st.plotly_chart(fig, width="stretch",
                             config={"displayModeBar": False})
-            _n_meas = sum(1 for m in months
-                          if m in _measured and m != current_month)
             st.caption(
-                "Stock value: measured daily from Sep 2026 onwards "
-                "(" + str(_n_meas + 1) + " month(s) so far); earlier months "
-                "are modelled, as in the Avg Inventory Value row. Slow and "
-                "dead stock bars appear from the first month they were "
-                "recorded. Goal = dashed line; progress = the solid line "
-                "falling towards it while the bars shrink.")
+                "Blue line = total stock value (measured daily from Sep "
+                "2026; earlier months modelled, as in the Avg Inventory "
+                "Value row). Green dashed line = current suggested stock "
+                "goal. Bars = slow and dead stock, shown from the month "
+                "they were first recorded. Progress = the blue line "
+                "falling to the green line while the bars shrink.")
 
         _seen_sections: list = []
         for section in _section_order:
