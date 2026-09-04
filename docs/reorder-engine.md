@@ -66,6 +66,16 @@ Where:
   carry through to the next review.
 - `safety_pct` is the class-specific buffer.
 
+## Target is a reorder level, not a stock budget
+
+`target_stock` is the order-up-to level. The stock the business
+*should carry* is the **Stock goal** (`engine/stock_goal.py`,
+RULES 4.4): class days-of-cover, never below the reorder level, at
+least one unit/pack of any live SKU. Excess/Understock on every page
+are measured against the goal. The **range floor** lifts
+`target_stock` to one unit/pack for live A/B/C SKUs (not Project rows
+or bulk-roll masters).
+
 ## Special cases
 
 - **Recently migrated successor SKU** — its daily_velocity is the

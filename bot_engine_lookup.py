@@ -48,7 +48,8 @@ log = logging.getLogger("bot_engine_lookup")
 _CACHE_TTL_S = 300
 _STALE_HOURS = 24
 
-_cache: dict = {"frame": None, "loaded_at": 0.0, "path": None}
+_cache: dict = {"frame": None, "loaded_at": 0.0, "path": None,
+                "built_at": None}
 
 
 def _engine_csv_candidates() -> list:
@@ -72,20 +73,42 @@ def _load_engine_df() -> Optional[pd.DataFrame]:
             and now - _cache["loaded_at"] < _CACHE_TTL_S):
         return _cache["frame"]
     cands = _engine_csv_candidates()
-    if not cands:
-        log.info("No engine_output CSV found in %s", DATA_DIR)
-        return None
-    # Prefer the freshest file.
-    path = max(cands, key=lambda p: p.stat().st_mtime)
+    if cands:
+        # Prefer the freshest file.
+        path = max(cands, key=lambda p: p.stat().st_mtime)
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:
+            log.error("Failed to read engine CSV %s: %s", path, exc)
+            return None
+        _cache["frame"] = df
+        _cache["loaded_at"] = now
+        _cache["path"] = str(path)
+        _cache["built_at"] = None
+        log.info("Loaded engine_df from %s (%d rows)", path, len(df))
+        return df
+    # 2026-09-03 — no CSV (the Slack worker has no disk): read the
+    # dashboard's full engine snapshot from the shared Postgres DB so
+    # the bot quotes exactly the dashboard's figures.
     try:
-        df = pd.read_csv(path)
-    except Exception as exc:
-        log.error("Failed to read engine CSV %s: %s", path, exc)
+        import db as _db
+        meta = _db.get_latest_engine_snapshot_meta()
+        rows = _db.load_engine_snapshot_rows(
+            meta.get("snapshot_key")) if meta else []
+    except Exception as exc:  # noqa: BLE001
+        log.error("Failed to read engine snapshot from DB: %s", exc)
         return None
+    if not rows:
+        log.info("No engine_output CSV in %s and no DB engine snapshot",
+                 DATA_DIR)
+        return None
+    df = pd.DataFrame(rows)
     _cache["frame"] = df
     _cache["loaded_at"] = now
-    _cache["path"] = str(path)
-    log.info("Loaded engine_df from %s (%d rows)", path, len(df))
+    _cache["path"] = None
+    _cache["built_at"] = meta.get("built_at")
+    log.info("Loaded engine_df from DB snapshot %s (%d rows)",
+             meta.get("snapshot_key"), len(df))
     return df
 
 
@@ -230,7 +253,22 @@ def freshness_status() -> dict:
         return {"available": False}
     path = _cache.get("path")
     if not path:
-        return {"available": True, "stale_hours": None}
+        built = _cache.get("built_at")
+        if built is None:
+            return {"available": True, "stale_hours": None}
+        try:
+            built_ts = pd.Timestamp(built)
+            if built_ts.tzinfo is None:
+                built_ts = built_ts.tz_localize("UTC")
+            age_s = (pd.Timestamp.now(tz="UTC") - built_ts).total_seconds()
+        except Exception:  # noqa: BLE001
+            return {"available": True, "stale_hours": None}
+        return {
+            "available": True,
+            "stale_hours": round(age_s / 3600.0, 1),
+            "is_stale": age_s > _STALE_HOURS * 3600,
+            "path": "db:engine_snapshot_rows",
+        }
     try:
         age_s = time.time() - Path(path).stat().st_mtime
     except OSError:

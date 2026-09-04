@@ -225,6 +225,11 @@ python housekeeping_audit.py --verbose \
   --log "${DATA_DIR}/output/housekeeping.log" >> "$LOG" 2>&1 || \
   echo "[$(stamp)] housekeeping_audit FAILED (continuing)" >> "$LOG"
 
+# 2026-09-03 — publish the day's CSVs to the shared DB for the worker.
+echo "[$(stamp)] dataset_mirror publish" >> "$LOG"
+python dataset_mirror.py publish >> "$LOG" 2>&1 || \
+  echo "[$(stamp)] dataset_mirror publish FAILED (continuing)" >> "$LOG"
+
 verify_critical_csv "sales_last_30d_*.csv" "sales_last_30d CSV"
 verify_critical_csv "sale_lines_last_30d_*.csv" "sale_lines_last_30d CSV"
 verify_critical_csv "assemblies_last_30d_*.csv" "assemblies_last_30d CSV"

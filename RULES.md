@@ -6,7 +6,7 @@
 
 **Versioning.** When you add or change a rule, bump the top-of-file date and mark which page / function it affects. When a rule becomes obsolete, strike it through — don't delete — so the reasoning stays visible.
 
-Last updated: 2026-07-02
+Last updated: 2026-09-03
 
 ---
 
@@ -215,6 +215,58 @@ The `calc_trace` transparency panel always shows the full breakdown when the fla
 **4.2 Excess for non-masters.** Only flag as excess if **zero direct sales**. A variant with sales is fulfilling real demand even if it's above "target" — the target doesn't apply to it the same way.
 
 **4.3 Dead stock** = holding stock AND zero visible/effective demand. Must use effective units plus visible lineage/display demand, not direct-only sales — a master tube that only sells via its variants isn't dead. If `lineage_units_12mo` / `display_units_12mo` is >0 while `effective_units_12mo` is zero, report it as historical/project movement excluded from auto-reorder, not as steady demand. Oversold SKUs (`Available < 0`) always show Reorder now before any dead/no-demand label.
+
+**4.4 Stock goal vs reorder level (2026-09-03, `engine/stock_goal.py`).**
+The engine's `target_stock` is an *order-up-to reorder level* (the buying
+trigger). It is NOT the stock budget: summed over the business it came to
+~$165k / 24 days of cover, because anything selling <~10 units/yr rounded to
+a target below one unit and the model assumes weekly fractional buys. The
+app therefore carries three named figures, all from one function
+(`stock_health_summary`) so the Command Centre, Stock Optimisation headline,
+per-vendor tiles and daily snapshots agree by construction:
+
+- **Reorder level (order-up-to)** — `target_stock × cost`. Was labelled
+  "Optimum stock value"; do not call it Optimum again.
+- **Stock goal** — per SKU the LARGEST of class days-of-cover × planning rate
+  (`DEFAULT_COVER_DAYS`: A 50, B 75, C 150, D 0), the reorder level, and the
+  range floor. Zero for dropship, do-not-reorder, discontinued and non-master
+  rows. Planning rate = unadjusted 12mo rate (`avg_daily_base`), clamped to 0
+  when nothing moved in 90 days. Valued at the Ordering `EffectiveUnitCost`
+  chain (FIFO/unit → AverageCost → family/category median).
+- **Excess** = `max(0, OnHand − goal) × cost` (gross); **Understock** =
+  `max(0, goal − OnHand) × cost`. Dropship stock and non-master cuts with
+  their own direct sales are never excess. Dead stock (D with stock) is
+  inside Excess.
+- **ABCD** — D = ABC "C" with zero visible 12mo demand. The cumulative-value
+  ABC put ~5,300 no-demand SKUs into C and hid the active-C over-cover.
+- **Range floor** — a live A/B/C SKU (planning rate > 0) targets at least
+  one unit, or one pack/EOQ when set. Exempt: Project rows, bulk-roll
+  masters. This DOES lift `target_stock`, so a dormant-but-still-selling
+  C SKU at zero stock now suggests a reorder of one unit/pack.
+
+The warm job writes `stock_goal_snapshots` daily (reorder level NULL —
+needs supplier config); the Ordering/Stock Optimisation page overwrites the
+same day's row with the full figures. Glide path runs to the goal.
+
+**4.5 One engine, one database (James, 2026-09-03: "the bot should match
+whatever the app's data is").** Every figure the Slack bot quotes about a
+SKU (ABC, dormancy, dead, goal, excess, understock, trend) must come from
+the dashboard's own engine rows, never from a re-computation. The warm job
+writes the full `_abc_engine` frame to Postgres `engine_snapshot_rows`;
+`slack_listener` and `bot_engine_lookup` read that (CSV first if the
+service has the disk, DB otherwise). `worker_engine.compute_engine_signals`
+is a last-resort fallback only and must log a warning when used. Any new
+derived figure shown in the app must be computed in the engine (or
+`engine/stock_goal.py`) and read by the bot — not re-derived in
+`ai_tools.py`.
+
+**Raw data too (2026-09-03, `dataset_mirror.py`).** Only the dashboard
+service syncs CIN7 / ShipStation / Shopify orders. After every nearsync and
+daily sync it publishes each data CSV to Postgres `dataset_files`; the
+worker pulls them onto its own disk with identical names and mtimes
+(`WORKER_DATA_FROM_DB=1`, default) and its own CIN7/ShipStation/Shopify-order
+syncs are disabled. Never add a second sync of the same source to the
+worker — add the file pattern to `MIRROR_PATTERNS` instead.
 
 ---
 

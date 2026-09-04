@@ -4,9 +4,10 @@
 #
 # Designed to run as a Render Background Worker. The worker has its
 # OWN persistent disk (Render disks are exclusive to one service).
-# That means it needs its own copy of the CIN7/ShipStation/Shopify
-# data — which this script bootstraps on first boot and keeps fresh
-# via in-loop NearSync calls.
+# Since 2026-09-03 the data on it is a MIRROR of the dashboard's
+# (dataset_mirror.py pull from the shared Postgres), not a second
+# CIN7/ShipStation/Shopify sync — see WORKER_DATA_FROM_DB below.
+# The legacy own-sync path remains as a fallback.
 #
 # Lifecycle:
 #   1. First boot: if /data is empty, run a data bootstrap
@@ -190,7 +191,48 @@ fi
 # lookup, 30 days of line-level transaction detail for worker memory/API
 # cost. Older SO detail can then be fetched live from CIN7 once the SO
 # header resolves to a SaleID.
+# ----------------------------------------------------------------------
+# 2026-09-03 — ONE copy of the raw data. The dashboard service is the
+# only one that syncs CIN7 / ShipStation / Shopify; it publishes every
+# CSV to Postgres (dataset_mirror.py publish) and this worker PULLS
+# them onto its disk with identical names/mtimes. All the glob-based
+# loaders below keep working, they just read the dashboard's bytes —
+# so the bot and the app can't disagree on on-hand, demand or "last
+# sold". James: "the bot should match whatever the app's data is."
+#
+# WORKER_DATA_FROM_DB=1 (default) — pull from DB; the worker's own
+#   CIN7/ShipStation/Shopify-orders syncs are disabled.
+# WORKER_DATA_FROM_DB=0 — legacy: worker syncs its own copies.
+# If the DB has no datasets yet (dashboard not deployed with the
+# publisher), the legacy syncs run so nothing goes dark.
+# ----------------------------------------------------------------------
+WORKER_DATA_FROM_DB="${WORKER_DATA_FROM_DB:-1}"
+MIRROR_OK=0
+# Re-checked once per loop iteration (one short python start), so the
+# many _mirror_available calls below are free.
+_mirror_check() {
+    if [ "$WORKER_DATA_FROM_DB" = "1" ] \
+            && python dataset_mirror.py status >/dev/null 2>&1; then
+        MIRROR_OK=1
+    else
+        MIRROR_OK=0
+    fi
+}
+_mirror_available() { [ "$MIRROR_OK" = "1" ]; }
+_mirror_pull() {
+    echo "[$(stamp)] dataset_mirror pull" >> "$LOG"
+    python dataset_mirror.py pull >> "$LOG" 2>&1 || \
+        echo "[$(stamp)] dataset_mirror pull FAILED" >> "$LOG"
+}
+
 needs_bootstrap=0
+_mirror_check
+if _mirror_available; then
+    echo "[$(stamp)] data source = shared DB (dataset_mirror)" >> "$LOG"
+    _mirror_pull
+else
+    echo "[$(stamp)] data source = worker's own syncs (WORKER_DATA_FROM_DB=${WORKER_DATA_FROM_DB}, mirror empty or disabled)" >> "$LOG"
+fi
 if ! ls "${DATA_DIR}"/output/products_*.csv >/dev/null 2>&1; then
     needs_bootstrap=1
 fi
@@ -198,6 +240,10 @@ if ! ls "${DATA_DIR}"/output/stock_on_hand_*.csv >/dev/null 2>&1; then
     needs_bootstrap=1
 fi
 
+if [ "$needs_bootstrap" = "1" ] && _mirror_available; then
+    echo "[$(stamp)] products/stock still missing after mirror pull — dashboard has not published yet; waiting for next pull rather than syncing CIN7 here" >> "$LOG"
+    needs_bootstrap=0
+fi
 if [ "$needs_bootstrap" = "1" ]; then
     echo "[$(stamp)] === FIRST-BOOT BOOTSTRAP (30-day data sync) ===" >> "$LOG"
     echo "[$(stamp)] This takes ~20-40 min. Bot will be silent on" >> "$LOG"
@@ -293,6 +339,7 @@ last_shopify_sync_epoch=0  # v2.67.274 Shopify content sync fallback
 
 while true; do
     now_epoch=$(date -u +%s)
+    _mirror_check
     # Start anything that was queued because memory or the concurrency
     # limit was tight last time round.
     _bg_drain
@@ -301,17 +348,22 @@ while true; do
     # Periodic data refresh (NearSync-style — last 1 day)
     if [ "$minutes_since_sync" -ge "$DATA_SYNC_INTERVAL_MIN" ]; then
         echo "[$(stamp)] data refresh (${minutes_since_sync}min since last)" >> "$LOG"
-        if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
-            python cin7_sync.py nearsync --days 1 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] nearsync FAILED" >> "$LOG"
-        fi
-        if [ -n "${SHIPSTATION_API_KEY:-}" ]; then
-            python shipstation_sync.py recent --days 1 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] shipstation 1d FAILED" >> "$LOG"
-        fi
-        if [ -n "${SHOPIFY_DOMAIN:-}" ]; then
-            python shopify_sync.py --orders-recent 1 >> "$LOG" 2>&1 || \
-                echo "[$(stamp)] shopify 1d FAILED" >> "$LOG"
+        if _mirror_available; then
+            # 2026-09-03 — read the dashboard's copies, don't re-sync.
+            _mirror_pull
+        else
+            if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
+                python cin7_sync.py nearsync --days 1 >> "$LOG" 2>&1 || \
+                    echo "[$(stamp)] nearsync FAILED" >> "$LOG"
+            fi
+            if [ -n "${SHIPSTATION_API_KEY:-}" ]; then
+                python shipstation_sync.py recent --days 1 >> "$LOG" 2>&1 || \
+                    echo "[$(stamp)] shipstation 1d FAILED" >> "$LOG"
+            fi
+            if [ -n "${SHOPIFY_DOMAIN:-}" ]; then
+                python shopify_sync.py --orders-recent 1 >> "$LOG" 2>&1 || \
+                    echo "[$(stamp)] shopify 1d FAILED" >> "$LOG"
+            fi
         fi
         last_data_sync_epoch=$(date -u +%s)
     fi
@@ -367,7 +419,9 @@ while true; do
             echo "[$(stamp)] launching daily worker data refresh chain in BACKGROUND" >> "$LOG"
             last_dim_refresh_epoch=$(date -u +%s)
             (
-                if [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
+                if _mirror_available; then
+                    echo "[$(stamp)] [bg] cin7/shipstation refresh skipped — data comes from shared DB" >> "$LOG"
+                elif [ -n "${CIN7_ACCOUNT_ID:-}" ]; then
                     # v2.67.370 — refresh products here because NearSync
                     # deliberately skips master data. This keeps Slack's
                     # local products_*.csv aligned with dashboard fixes for
@@ -385,7 +439,7 @@ while true; do
                     python cin7_sync.py purchaselines --days 30 \
                         >> "$LOG" 2>&1 || true
                 fi
-                if [ -n "${SHIPSTATION_API_KEY:-}" ]; then
+                if ! _mirror_available && [ -n "${SHIPSTATION_API_KEY:-}" ]; then
                     echo "[$(stamp)] [bg] shipstation 30d" >> "$LOG"
                     python shipstation_sync.py recent --days 30 \
                         >> "$LOG" 2>&1 || true
@@ -480,6 +534,7 @@ while true; do
     # 7 days — BOMs change rarely.
     seconds_since_bom=$(( now_epoch - last_bom_sync_epoch ))
     if [ "$seconds_since_bom" -ge 604800 ] \
+            && ! _mirror_available \
             && [ -n "${CIN7_ACCOUNT_ID:-}" ] \
             && [ -n "${CIN7_APPLICATION_KEY:-}" ]; then
         last_bom_sync_epoch=$(date -u +%s)
@@ -511,6 +566,7 @@ while true; do
     fi
     if [ "$day_of_month" -eq 1 ] \
             && [ "$this_month" != "$last_worker_salelines_backfill_month" ] \
+            && ! _mirror_available \
             && [ -n "${CIN7_ACCOUNT_ID:-}" ] \
             && [ -n "${CIN7_APPLICATION_KEY:-}" ]; then
         echo "$this_month" > "$worker_salelines_backfill_marker"

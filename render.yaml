@@ -11,7 +11,13 @@
 #
 #   cin7-sync-slack-bot  (background worker, srv-d7u8vpd0lvsc73er0mvg)
 #     Runs slack_loop.sh: Slack AI bot + CIN7 write-backs + dropship
-#     tracking. No disk — reads shared Postgres DB.
+#     tracking. Has its own 5 GB disk at /data (dsk-d7u8vpl0lvsc73er0n70)
+#     but, since 2026-09-03, the data CSVs on it are a MIRROR pulled
+#     from the shared Postgres (dataset_mirror.py) — the dashboard is
+#     the only service that syncs CIN7 / ShipStation / Shopify orders.
+#     Set WORKER_DATA_FROM_DB=0 on the worker to fall back to its own
+#     syncs. The engine frame itself is also read from Postgres
+#     (engine_snapshot_rows), so the bot quotes the dashboard's numbers.
 #
 # Shared env group
 # ----------------
@@ -28,8 +34,8 @@
 #   WARM_ENGINE_BOOT_DELAY_MIN, WARM_ENGINE_MIN_AVAILABLE_MB
 #
 # Render disks can't be shared across services — each disk attaches to
-# exactly one service. The app service owns /data; the worker reads
-# shared state via the Postgres DATABASE_URL.
+# exactly one service. Each service owns its own /data; everything the
+# two must agree on travels through the Postgres DATABASE_URL.
 #
 # Streamlit must be the foreground process so Render's health check
 # can reach it on $PORT.

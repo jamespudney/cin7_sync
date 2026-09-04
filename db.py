@@ -520,6 +520,44 @@ CREATE TABLE IF NOT EXISTS ordering_supplier_rows (
 CREATE INDEX IF NOT EXISTS idx_ordering_supplier_rows_supplier
     ON ordering_supplier_rows(snapshot_key, supplier);
 
+-- 2026-09-03 — FULL engine snapshot (every SKU, every engine column)
+-- written by the warm job alongside engine_output.csv. The Slack bot
+-- worker has no disk, so it could never see engine_output.csv and
+-- recomputed its own simplified engine (worker_engine.py) — different
+-- ABC, dormancy, excess. Now it reads this table and quotes exactly
+-- the dashboard's numbers. Only the newest snapshot is kept.
+CREATE TABLE IF NOT EXISTS engine_snapshots (
+    snapshot_key    TEXT PRIMARY KEY,
+    source_path     TEXT,
+    source_mtime    REAL,
+    row_count       INTEGER NOT NULL DEFAULT 0,
+    source          TEXT,
+    built_at        TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS engine_snapshot_rows (
+    snapshot_key    TEXT NOT NULL,
+    sku             TEXT NOT NULL,
+    row_json        TEXT NOT NULL,
+    PRIMARY KEY (snapshot_key, sku)
+);
+
+-- 2026-09-03 — mirrored raw data files (dataset_mirror.py). The
+-- dashboard publishes every sync CSV here (gzip); the Slack worker
+-- pulls them onto its disk instead of running its own CIN7 /
+-- ShipStation / Shopify syncs, so both services read identical bytes.
+-- One row per logical file (timestamp stripped from the name).
+CREATE TABLE IF NOT EXISTS dataset_files (
+    key             TEXT PRIMARY KEY,
+    filename        TEXT NOT NULL,
+    mtime           REAL,
+    size_bytes      INTEGER,
+    gz_bytes        INTEGER,
+    sha256          TEXT,
+    payload         BLOB,
+    publisher       TEXT,
+    published_at    TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- =========================================================================
 -- PO draft persistence (legacy v1 — single anonymous draft per supplier)
 -- =========================================================================
@@ -835,6 +873,29 @@ CREATE TABLE IF NOT EXISTS ordering_target_snapshots (
     excess_value           REAL,
     understock_value       REAL,
     captured_at            TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 2026-09-03 — daily snapshot of the stock-goal model
+-- (engine/stock_goal.py): Current / Goal / Reorder level / Excess /
+-- Understock / Dead plus the per-class breakdown as JSON. Written by
+-- the warm job (reorder_level_value NULL — it needs supplier config)
+-- and overwritten by the Ordering/Stock Optimisation page when it
+-- runs (full figures). Read by the Command Centre and the glide-path
+-- chart. One row per calendar date, last-write-wins.
+CREATE TABLE IF NOT EXISTS stock_goal_snapshots (
+    snapshot_date        DATE PRIMARY KEY,
+    sku_count            INTEGER,
+    current_value        REAL,
+    goal_value           REAL,
+    reorder_level_value  REAL,
+    excess_value         REAL,
+    understock_value     REAL,
+    dead_value           REAL,
+    dead_sku_count       INTEGER,
+    annual_cogs          REAL,
+    by_class_json        TEXT,
+    source               TEXT,
+    captured_at          TIMESTAMP NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ============================================================
@@ -4440,6 +4501,62 @@ _PG_POST_CUTOVER_TABLES = [
           captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       """),
+    # 2026-09-03 — stock-goal model daily snapshot (see _SCHEMA note).
+    ("stock_goal_snapshots",
+      """
+      CREATE TABLE IF NOT EXISTS stock_goal_snapshots (
+          snapshot_date        DATE PRIMARY KEY,
+          sku_count            INTEGER,
+          current_value        DOUBLE PRECISION,
+          goal_value           DOUBLE PRECISION,
+          reorder_level_value  DOUBLE PRECISION,
+          excess_value         DOUBLE PRECISION,
+          understock_value     DOUBLE PRECISION,
+          dead_value           DOUBLE PRECISION,
+          dead_sku_count       INTEGER,
+          annual_cogs          DOUBLE PRECISION,
+          by_class_json        TEXT,
+          source               TEXT,
+          captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    # 2026-09-03 — full engine snapshot for the Slack bot worker
+    # (see _SCHEMA note on engine_snapshot_rows).
+    ("engine_snapshots",
+      """
+      CREATE TABLE IF NOT EXISTS engine_snapshots (
+          snapshot_key    TEXT PRIMARY KEY,
+          source_path     TEXT,
+          source_mtime    DOUBLE PRECISION,
+          row_count       INTEGER NOT NULL DEFAULT 0,
+          source          TEXT,
+          built_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
+    ("engine_snapshot_rows",
+      """
+      CREATE TABLE IF NOT EXISTS engine_snapshot_rows (
+          snapshot_key    TEXT NOT NULL,
+          sku             TEXT NOT NULL,
+          row_json        TEXT NOT NULL,
+          PRIMARY KEY (snapshot_key, sku)
+      );
+      """),
+    # 2026-09-03 — mirrored raw data files (see _SCHEMA note).
+    ("dataset_files",
+      """
+      CREATE TABLE IF NOT EXISTS dataset_files (
+          key             TEXT PRIMARY KEY,
+          filename        TEXT NOT NULL,
+          mtime           DOUBLE PRECISION,
+          size_bytes      BIGINT,
+          gz_bytes        BIGINT,
+          sha256          TEXT,
+          payload         BYTEA,
+          publisher       TEXT,
+          published_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
     # v2.67.394 — manual override for the BOM-rollup demand-zeroing
     # heuristic (see _global_is_master in app.py). NULL = use the
     # automatic component-count heuristic; TRUE = force "count this
@@ -5306,6 +5423,191 @@ def get_ordering_supplier_snapshot_rows(
         except Exception:  # noqa: BLE001
             continue
     return out
+
+
+def replace_engine_snapshot(
+    rows: Any,
+    *,
+    source_path: str = "",
+    source_mtime: Optional[float] = None,
+    snapshot_key: Optional[str] = None,
+    source: str = "warm_engine",
+) -> dict:
+    """Replace the FULL engine snapshot (every SKU row from _abc_engine).
+
+    Companion to replace_ordering_supplier_snapshot (masters with a
+    supplier only). This one is for the Slack bot worker, which has no
+    disk and therefore no engine_output.csv: it must quote the same
+    ABC / dormancy / goal / excess figures the dashboard shows, so it
+    reads the dashboard's own rows instead of recomputing.
+    ~2.5 KB JSON per row, ~20 MB per snapshot; only the newest is kept.
+    """
+    records = _ordering_records(rows)
+    if not snapshot_key:
+        if source_mtime:
+            snapshot_key = f"engine:{int(float(source_mtime))}"
+        else:
+            snapshot_key = (
+                "engine:" + datetime.utcnow().strftime("%Y%m%d%H%M%S"))
+    payload = []
+    seen: set = set()
+    for row in records:
+        sku = str(row.get("SKU") or row.get("sku") or "").strip()
+        if not sku or sku in seen:
+            continue
+        seen.add(sku)
+        safe_row = {str(k): _ordering_jsonable(v) for k, v in row.items()}
+        safe_row["SKU"] = sku
+        payload.append((snapshot_key, sku,
+                        json.dumps(safe_row, separators=(",", ":"))))
+    if not payload:
+        return {"snapshot_key": snapshot_key, "rows": 0, "written": False}
+    with connect() as c:
+        c.execute("DELETE FROM engine_snapshot_rows WHERE snapshot_key = ?",
+                  (snapshot_key,))
+        c.executemany(
+            """
+            INSERT INTO engine_snapshot_rows (snapshot_key, sku, row_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(snapshot_key, sku) DO UPDATE SET
+                row_json = excluded.row_json
+            """,
+            payload,
+        )
+        c.execute(
+            """
+            INSERT INTO engine_snapshots
+                (snapshot_key, source_path, source_mtime, row_count, source)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(snapshot_key) DO UPDATE SET
+                source_path = excluded.source_path,
+                source_mtime = excluded.source_mtime,
+                row_count = excluded.row_count,
+                source = excluded.source,
+                built_at = datetime('now')
+            """,
+            (snapshot_key, source_path, source_mtime, len(payload), source),
+        )
+        # Newest only; metadata row is written before the old rows go,
+        # so a concurrent reader always finds a complete snapshot.
+        c.execute("DELETE FROM engine_snapshot_rows WHERE snapshot_key <> ?",
+                  (snapshot_key,))
+        c.execute("DELETE FROM engine_snapshots WHERE snapshot_key <> ?",
+                  (snapshot_key,))
+    return {"snapshot_key": snapshot_key, "rows": len(payload),
+            "written": True}
+
+
+def get_latest_engine_snapshot_meta() -> dict:
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT * FROM engine_snapshots
+             ORDER BY built_at DESC
+             LIMIT 1
+            """
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def load_engine_snapshot_rows(snapshot_key: Optional[str] = None) -> list[dict]:
+    """All rows of the newest (or given) full engine snapshot as dicts.
+    Empty list when none has been written yet."""
+    if not snapshot_key:
+        meta = get_latest_engine_snapshot_meta()
+        snapshot_key = meta.get("snapshot_key") if meta else None
+    if not snapshot_key:
+        return []
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT row_json FROM engine_snapshot_rows
+             WHERE snapshot_key = ?
+             ORDER BY sku
+            """,
+            (snapshot_key,),
+        ).fetchall()
+    out: list[dict] = []
+    for row in rows:
+        try:
+            out.append(json.loads(row["row_json"]))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Mirrored raw data files (dataset_mirror.py, 2026-09-03)
+# ---------------------------------------------------------------------------
+def list_dataset_files() -> list[dict]:
+    """Metadata for every mirrored file (no payload)."""
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT key, filename, mtime, size_bytes, gz_bytes, sha256,
+                   publisher, published_at
+              FROM dataset_files
+             ORDER BY key
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_dataset_file_payload(key: str) -> Optional[bytes]:
+    with connect() as c:
+        row = c.execute(
+            "SELECT payload FROM dataset_files WHERE key = ?", (key,)
+        ).fetchone()
+    if not row:
+        return None
+    payload = row["payload"]
+    return bytes(payload) if payload is not None else None
+
+
+def put_dataset_file(key: str, *, filename: str, mtime: float,
+                     size_bytes: int, sha256: str, payload: bytes,
+                     publisher: str = "") -> None:
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO dataset_files
+                (key, filename, mtime, size_bytes, gz_bytes, sha256,
+                 payload, publisher, published_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                filename = excluded.filename,
+                mtime = excluded.mtime,
+                size_bytes = excluded.size_bytes,
+                gz_bytes = excluded.gz_bytes,
+                sha256 = excluded.sha256,
+                payload = excluded.payload,
+                publisher = excluded.publisher,
+                published_at = datetime('now')
+            """,
+            (key, filename, float(mtime), int(size_bytes), len(payload),
+             sha256, payload, publisher),
+        )
+
+
+def touch_dataset_file(key: str, *, filename: str, mtime: float,
+                       publisher: str = "") -> None:
+    """Same bytes republished under a new sync stamp: update name/mtime
+    only, so the worker renames rather than re-downloads."""
+    with connect() as c:
+        c.execute(
+            """
+            UPDATE dataset_files
+               SET filename = ?, mtime = ?, publisher = ?,
+                   published_at = datetime('now')
+             WHERE key = ?
+            """,
+            (filename, float(mtime), publisher, key),
+        )
+
+
+def delete_dataset_file(key: str) -> None:
+    with connect() as c:
+        c.execute("DELETE FROM dataset_files WHERE key = ?", (key,))
 
 
 # ---------------------------------------------------------------------------
@@ -9413,6 +9715,96 @@ def record_ordering_target_snapshot(master_sku_count: int,
              float(onhand_value_masters), float(excess_value),
              float(understock_value)),
         )
+
+
+def record_stock_goal_snapshot(summary: dict, source: str = "") -> None:
+    """Persist one stock_health_summary() dict (engine/stock_goal.py).
+    One row per calendar date, last-write-wins. The warm job writes a
+    row without reorder_level_value (None); the Ordering page writes
+    the full row later the same day and wins — unless the warm job
+    runs again afterwards, in which case keep the page's reorder
+    level rather than overwriting it with NULL."""
+    import json as _json
+    by_class = _json.dumps(summary.get("by_class") or [], default=str)
+    rl = summary.get("reorder_level_value")
+    with connect() as c:
+        c.execute(
+            """
+            INSERT INTO stock_goal_snapshots
+                (snapshot_date, sku_count, current_value, goal_value,
+                 reorder_level_value, excess_value, understock_value,
+                 dead_value, dead_sku_count, annual_cogs, by_class_json,
+                 source, captured_at)
+            VALUES
+                (date('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(snapshot_date) DO UPDATE SET
+                sku_count           = excluded.sku_count,
+                current_value       = excluded.current_value,
+                goal_value          = excluded.goal_value,
+                reorder_level_value = COALESCE(excluded.reorder_level_value,
+                                               stock_goal_snapshots.reorder_level_value),
+                excess_value        = excluded.excess_value,
+                understock_value    = excluded.understock_value,
+                dead_value          = excluded.dead_value,
+                dead_sku_count      = excluded.dead_sku_count,
+                annual_cogs         = excluded.annual_cogs,
+                by_class_json       = excluded.by_class_json,
+                source              = excluded.source,
+                captured_at         = excluded.captured_at
+            """,
+            (int(summary.get("sku_count") or 0),
+             float(summary.get("current_value") or 0),
+             float(summary.get("goal_value") or 0),
+             (float(rl) if rl is not None else None),
+             float(summary.get("excess_value") or 0),
+             float(summary.get("understock_value") or 0),
+             float(summary.get("dead_value") or 0),
+             int(summary.get("dead_sku_count") or 0),
+             float(summary.get("annual_cogs") or 0),
+             by_class, str(source or "")),
+        )
+
+
+def get_latest_stock_goal_snapshot() -> dict:
+    """Most recent stock_goal_snapshots row (by_class decoded), or {}."""
+    import json as _json
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT snapshot_date, sku_count, current_value, goal_value,
+                   reorder_level_value, excess_value, understock_value,
+                   dead_value, dead_sku_count, annual_cogs, by_class_json,
+                   source, captured_at
+              FROM stock_goal_snapshots
+             ORDER BY snapshot_date DESC
+             LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return {}
+    out = dict(row)
+    try:
+        out["by_class"] = _json.loads(out.pop("by_class_json") or "[]")
+    except (TypeError, ValueError):
+        out["by_class"] = []
+    return out
+
+
+def list_stock_goal_snapshots(limit: int = 400) -> list:
+    """Oldest→newest rows for the glide-path chart."""
+    with connect() as c:
+        rows = c.execute(
+            """
+            SELECT snapshot_date, current_value, goal_value,
+                   reorder_level_value, excess_value, understock_value,
+                   dead_value
+              FROM stock_goal_snapshots
+             ORDER BY snapshot_date DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
 
 
 def get_latest_ordering_target_snapshot() -> dict:
