@@ -817,8 +817,9 @@ def render_fablab_work_orders(
     st.info(
         "**Toll-manufactured accessory corners — you supply raw "
         "materials, 865FabLab supplies labor.** Pick or create an order, "
-        "adjust the Batch qty column (pre-filled with the suggestion), "
-        "save, check raw materials, place the order. Each SKU becomes a "
+        "tick Include on the SKUs you want (Batch qty is pre-filled with "
+        "the suggestion — edit if needed), save, check raw materials, "
+        "place the order. Each SKU becomes a "
         "CIN7 assembly; when 865FabLab hands a batch back, reply `done` "
         "in its Slack thread and stock updates itself.",
         icon="ℹ️",
@@ -858,6 +859,11 @@ def render_fablab_work_orders(
         action_only = st.checkbox(
             "Action needed only", value=True, key="fablab_action_only",
             help="Hide SKUs with no suggested batch and nothing on the order.")
+        pretick_all = st.checkbox(
+            "Pre-tick all suggested", value=False,
+            key=f"fablab_pretick_{draft_id or 'none'}",
+            help="Tick every SKU with a suggested batch. Otherwise tick "
+                 "the ones you want by hand in the Include column.")
     with pc3:
         search = st.text_input(
             "Search SKU, name, or rule", key="fablab_planner_search")
@@ -874,6 +880,15 @@ def render_fablab_work_orders(
         float(saved_lines.get(sku, sug if pd.notna(sug) else 0))
         for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])
     ]
+    # Include = on the order. Saved lines are ticked; everything else
+    # starts unticked unless "Pre-tick all suggested" is on.
+    planner_df["Include"] = [
+        (sku in saved_lines)
+        or (pretick_all and pd.notna(sug) and float(sug) > 0)
+        for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])
+    ]
+    cols = ["Include"] + [c for c in planner_df.columns if c != "Include"]
+    planner_df = planner_df[cols]
 
     view = planner_df
     if action_only:
@@ -896,12 +911,14 @@ def render_fablab_work_orders(
         st.caption("Take the lock above to edit quantities.")
     edited_planner = st.data_editor(
         view,
-        key=f"fablab_planner_editor_{draft_id or 'none'}",
+        key=f"fablab_planner_editor_{draft_id or 'none'}_{int(pretick_all)}",
         use_container_width=True,
         hide_index=True,
         disabled=[c for c in view.columns
-                  if c != "Batch qty" or not qty_editable],
+                  if c not in ("Batch qty", "Include") or not qty_editable],
         column_config={
+            "Include": st.column_config.CheckboxColumn(
+                "✔ Include", help="Tick to put this SKU on the order."),
             "On hand": st.column_config.NumberColumn(format="%.1f"),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
@@ -914,23 +931,26 @@ def render_fablab_work_orders(
         },
     )
 
-    n_short = int((edited_planner["Materials status"] == "Raw short").sum())
+    included = edited_planner[edited_planner["Include"].fillna(False)
+                              .astype(bool)]
+    n_short = int((included["Materials status"] == "Raw short").sum())
     mcol1, mcol2, mcol3 = st.columns(3)
     mcol1.metric("Flagged SKUs", fmt_number(len(planner_df)))
     mcol2.metric(
-        "Units on this order",
-        fmt_number(edited_planner["Batch qty"].fillna(0).sum()))
-    mcol3.metric("Raw short", fmt_number(n_short))
+        "On this order",
+        f"{fmt_number(included['Batch qty'].fillna(0).sum())} units · "
+        f"{len(included)} SKUs")
+    mcol3.metric("Raw short (included)", fmt_number(n_short))
 
     if draft_id is None:
         st.info("Pick or create an order above, then save these quantities "
                 "to it.", icon="\U0001f4e6")
     elif can_edit:
-        if st.button("\U0001f4be Save quantities to this order",
+        if st.button("\U0001f4be Save ticked items to this order",
                      key=f"fablab_save_{draft_id}", type="primary"):
             for _, row in edited_planner.iterrows():
                 qty = _num(row.get("Batch qty", 0))
-                if qty > 0:
+                if bool(row.get("Include", False)) and qty > 0:
                     db.upsert_po_draft_line(
                         draft_id, row["SKU"], qty, current_user)
                 elif row["SKU"] in saved_lines:
@@ -957,10 +977,12 @@ def render_fablab_work_orders(
     # only override with an edit for rows currently visible in the
     # editor -- otherwise filtering the view would silently drop
     # hidden SKUs' raw-material needs from the rollup below.
-    batch_qtys = dict(
-        zip(planner_df["SKU"], planner_df["Batch qty"].fillna(0)))
-    batch_qtys.update(
-        zip(edited_planner["SKU"], edited_planner["Batch qty"].fillna(0)))
+    def _order_qtys(df: pd.DataFrame) -> dict:
+        inc = df["Include"].fillna(False).astype(bool)
+        return dict(zip(df["SKU"],
+                        df["Batch qty"].fillna(0).where(inc, 0.0)))
+    batch_qtys = _order_qtys(planner_df)
+    batch_qtys.update(_order_qtys(edited_planner))
     stock_map = _stock_by_sku(stock)
     rollup_df = build_materials_rollup(
         flagged_skus, batch_qtys, bom_parents, stock_map)
