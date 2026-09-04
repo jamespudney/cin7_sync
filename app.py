@@ -21623,6 +21623,52 @@ elif page == "Monthly Metrics":
                  if _avg_inv(m) else 0.0)),
              fmt="num1")
 
+        # 2026-09-04 (James) — suggested stock goal as a line in the
+        # Inventory section. Source: stock_goal_snapshots (one row per
+        # day, written by the Ordering page / warm job — see
+        # engine/stock_goal.py). Per month we take the LATEST snapshot
+        # in that month; months before snapshots began show "—".
+        # The gap row uses the modelled end-of-month stock value above
+        # (current month = live headline stock value, so it ties to the
+        # Command Centre "Over goal by" tile).
+        try:
+            _goal_rows_mm = db.list_stock_goal_snapshots(limit=800) or []
+        except Exception:  # noqa: BLE001
+            _goal_rows_mm = []
+        # Prefer COMPLETE rows (reorder level present = supplier lead
+        # times applied); a provisional warm-job row is only used for
+        # a month that has no complete row at all.
+        _goal_by_month: dict = {}
+        _goal_month_complete: dict = {}
+        for _gr in _goal_rows_mm:  # oldest -> newest, so last wins
+            try:
+                _gd = pd.to_datetime(_gr.get("snapshot_date"),
+                                     errors="coerce")
+                _gv = float(_gr.get("goal_value") or 0)
+                if pd.isna(_gd) or _gv <= 0:
+                    continue
+                _gm = pd.Period(_gd, freq="M")
+                _complete = float(_gr.get("reorder_level_value") or 0) > 0
+                if _complete or not _goal_month_complete.get(_gm):
+                    _goal_by_month[_gm] = _gv
+                    _goal_month_complete[_gm] = _complete
+            except Exception:  # noqa: BLE001
+                continue
+
+        def _goal_for(m):
+            return _goal_by_month.get(m)  # None -> "—"
+
+        def _gap_vs_goal(m):
+            g = _goal_for(m)
+            if g is None:
+                return None
+            return end_of_month_inv.get(m, inv_value_now) - g
+
+        _row("4. Inventory [App]", "Stock Goal (suggested)",
+             _per_month(_goal_for))
+        _row("4. Inventory [App]", "Stock Over / (Short of) Goal",
+             _per_month(_gap_vs_goal))
+
         # v2.67.178 — Slow-mover progress rows (management
         # dashboard signal). Two complementary metrics:
         #   1. "Slow Stock SOLD" — clearance per month (the
@@ -21854,6 +21900,18 @@ elif page == "Monthly Metrics":
             ("4. Inventory [App]", "Stock Turn (annualised)"):
                 "(COGS for the month × 12) ÷ Avg Inventory Value for "
                 "the month — annualised inventory turnover rate.",
+            ("4. Inventory [App]", "Stock Goal (suggested)"):
+                "How much stock (at cost) we should be holding: enough "
+                "of each live item to cover its class's target days "
+                "(A 50 / B 75 / C 150) at its recent sales rate, "
+                "never below its reorder level; dead items count as "
+                "$0. Latest saved goal in each month; \"—\" before "
+                "goal tracking began (Sep 2026).",
+            ("4. Inventory [App]", "Stock Over / (Short of) Goal"):
+                "End-of-month stock value minus the Stock Goal. "
+                "Positive = holding more than the goal; negative = "
+                "under it. Current month uses today's live stock "
+                "value, so it matches the Command Centre tile.",
             ("4. Inventory [App]", "Slow Stock Cleared"):
                 "Quantity × AverageCost, by month, for SKUs currently "
                 "flagged as slow-moving — $ of slow stock sold (uses "
