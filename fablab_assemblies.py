@@ -300,11 +300,26 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
     if missing:
         res["errors"].append(f"Not found in CIN7: {', '.join(missing)}")
         return res
+    # A BOM line may name a service SKU that no longer exists in CIN7
+    # (e.g. the cached BOM CSV still says -LABOR after the rename to
+    # -JOINT). Fold it into LABOR_SKU instead of failing the order.
     missing_svc = [s for s in svc_totals if s not in resolved]
     if missing_svc:
-        res["errors"].append(
-            f"Service SKU not found in CIN7: {', '.join(missing_svc)}")
-        return res
+        for s_old in missing_svc:
+            svc_totals[LABOR_SKU] = round(
+                svc_totals.get(LABOR_SKU, 0.0) + svc_totals.pop(s_old), 3)
+        if LABOR_SKU not in resolved:
+            more, last_call = _resolve_products([LABOR_SKU], headers, log=log,
+                                                last_call=last_call)
+            resolved.update(more)
+        if LABOR_SKU not in resolved:
+            res["errors"].append(
+                f"Service SKU not found in CIN7: {', '.join(missing_svc)} "
+                f"(and fallback {LABOR_SKU} missing too)")
+            return res
+        res["warnings"].append(
+            f"BOM service SKU {', '.join(missing_svc)} not in CIN7 (stale "
+            f"BOM cache?) — charged as {LABOR_SKU} instead.")
     if no_service:
         res["warnings"].append(
             f"No 865FabLab service line in BOM for {', '.join(no_service)}; "
