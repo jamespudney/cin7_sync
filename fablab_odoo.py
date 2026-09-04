@@ -111,6 +111,18 @@ class OdooClient:
 
     # -- the flow --------------------------------------------------------
 
+    def _salesperson(self) -> dict:
+        """{'user_id': id} for ODOO_SALESPERSON (default Luke Fletcher);
+        empty dict if not found so creation never fails on this."""
+        login = os.environ.get("ODOO_SALESPERSON", "luke@865fablab.com")
+        try:
+            rows = self.search_read("res.users", [["login", "=", login]],
+                                    ["id"], limit=1)
+            return {"user_id": rows[0]["id"]} if rows else {}
+        except Exception:  # noqa: BLE001
+            log.warning("Odoo salesperson %s not found", login)
+            return {}
+
     def create_lead_and_quote(
             self, *, po_number: str, total_qty: float,
             description_html: str, unit_price: Optional[float] = None,
@@ -123,6 +135,7 @@ class OdooClient:
             "name": lead_name,
             "type": "opportunity",
             "partner_id": partner_id,
+            **self._salesperson(),
             "description": description_html,
         })
         line = {"product_id": product_id, "product_uom_qty": float(total_qty),
@@ -131,6 +144,7 @@ class OdooClient:
             line["price_unit"] = float(unit_price)
         quote_id = self.create("sale.order", {
             "partner_id": partner_id,
+            **self._salesperson(),
             "opportunity_id": lead_id,
             "origin": po_number,
             "client_order_ref": po_number,
