@@ -320,6 +320,8 @@ last_merchant_epoch=0      # v2.67.118 Google Merchant Center
 last_fablab_autotag_epoch=0  # 2026-09-01 865FabLab corner auto-tag
 last_fablab_stock_alert_epoch=0       # 2026-09-01 865FabLab stock-drop alerts
 last_fablab_alert_replies_epoch=0     # 2026-09-02 865FabLab Slack-reply approval poll
+last_fablab_assembly_po_epoch=0        # 2026-09-04 865FabLab labor-PO authorised watch
+last_fablab_assembly_replies_epoch=0   # 2026-09-04 865FabLab assembly `done` replies
 last_po_dispatch_epoch=0   # v2.67.130 PO dispatch reminders
 last_dropship_epoch=0      # v2.67.138 dropship backorder warnings
 last_bis_arrivals_epoch=0  # v2.67.140 back-in-stock arrival reminders
@@ -652,6 +654,23 @@ while true; do
         last_fablab_alert_replies_epoch=$(date -u +%s)
         _run_bg "fablab_alert_check_replies" \
             "python fablab_stock_alert.py check-replies"
+    fi
+
+    # 2026-09-04 865FabLab assembly flow (fablab_assemblies.py):
+    # (a) once a labor PO is authorised in CIN7, post one Slack message
+    # per assembly + Odoo lead/quote; (b) complete assemblies from
+    # `done` replies in those threads. Both idempotent via DB tables.
+    seconds_since_fablab_assembly_po=$(( now_epoch - last_fablab_assembly_po_epoch ))
+    if [ "$seconds_since_fablab_assembly_po" -ge 300 ]; then
+        last_fablab_assembly_po_epoch=$(date -u +%s)
+        _run_bg "fablab_assembly_check_po" \
+            "python fablab_assemblies.py check-po"
+    fi
+    seconds_since_fablab_assembly_replies=$(( now_epoch - last_fablab_assembly_replies_epoch ))
+    if [ "$seconds_since_fablab_assembly_replies" -ge 180 ]; then
+        last_fablab_assembly_replies_epoch=$(date -u +%s)
+        _run_bg "fablab_assembly_check_replies" \
+            "python fablab_assemblies.py check-replies"
     fi
 
     # v2.67.130 PO dispatch reminders — when a PO transitions to

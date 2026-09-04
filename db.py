@@ -658,6 +658,71 @@ CREATE TABLE IF NOT EXISTS fablab_finished_goods_pushes (
 CREATE INDEX IF NOT EXISTS ix_fablab_finished_goods_pushes_draft
     ON fablab_finished_goods_pushes(draft_id);
 
+-- 2026-09-04 — 865FabLab assembly-driven toll manufacturing flow
+-- (see fablab_assemblies.py). One row per CIN7 Finished Goods task
+-- the app created for an 865FabLab order line. Remainder tasks created
+-- on a partial receipt point at the original via parent_task_id.
+CREATE TABLE IF NOT EXISTS fablab_assemblies (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id          INTEGER NOT NULL,
+    sku               TEXT    NOT NULL,
+    quantity          REAL    NOT NULL,
+    cin7_task_id      TEXT,
+    assembly_number   TEXT,
+    status            TEXT    NOT NULL DEFAULT 'authorised',
+                        -- authorised | completed | voided | failed
+    completed_qty     REAL    NOT NULL DEFAULT 0,
+    parent_task_id    TEXT,
+    slack_channel     TEXT,
+    slack_ts          TEXT,
+    last_reply_ts     TEXT,
+    response_json     TEXT,
+    created_at        TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    created_by        TEXT,
+    completed_at      TIMESTAMP,
+    completed_by      TEXT,
+    FOREIGN KEY (draft_id) REFERENCES po_drafts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_fablab_assemblies_draft
+    ON fablab_assemblies(draft_id);
+
+-- BOM-expected vs actually-picked component quantities per completed
+-- assembly, so the BOM can be corrected when reality keeps differing.
+CREATE TABLE IF NOT EXISTS fablab_pick_variance (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    assembly_id       INTEGER NOT NULL,
+    draft_id          INTEGER,
+    sku               TEXT    NOT NULL,
+    component_sku     TEXT    NOT NULL,
+    finished_qty      REAL    NOT NULL,
+    bom_qty           REAL    NOT NULL,
+    actual_qty        REAL    NOT NULL,
+    recorded_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    recorded_by       TEXT
+);
+
+-- One row per 865FabLab labor PO once its CIN7 authorisation has been
+-- seen and the Slack/Odoo notifications fired (idempotency).
+CREATE TABLE IF NOT EXISTS fablab_po_notifications (
+    draft_id          INTEGER PRIMARY KEY,
+    cin7_po_number    TEXT,
+    notified_at       TIMESTAMP NOT NULL DEFAULT (datetime('now')),
+    slack_channel     TEXT,
+    slack_ts          TEXT,
+    odoo_lead_id      INTEGER,
+    odoo_quote_id     INTEGER,
+    odoo_quote_name   TEXT,
+    odoo_error        TEXT
+);
+
+-- Small key/value store for 865FabLab flow settings (labor unit price…).
+CREATE TABLE IF NOT EXISTS fablab_settings (
+    key      TEXT PRIMARY KEY,
+    value    TEXT,
+    set_by   TEXT,
+    set_at   TIMESTAMP NOT NULL DEFAULT (datetime('now'))
+);
+
 -- AI Q&A audit log. Every question the AI Assistant page processes
 -- gets a row here: prompt, what tools it called, what it answered,
 -- how confident it was, and any thumbs-up/down feedback the user gave.
@@ -4587,6 +4652,70 @@ _PG_POST_CUTOVER_TABLES = [
       CREATE INDEX IF NOT EXISTS ix_fablab_finished_goods_pushes_draft
           ON fablab_finished_goods_pushes(draft_id);
       """),
+    # 2026-09-04 — 865FabLab assembly flow (see fablab_assemblies.py).
+    ("fablab_assemblies",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_assemblies (
+          id                BIGSERIAL PRIMARY KEY,
+          draft_id          BIGINT NOT NULL,
+          sku               TEXT   NOT NULL,
+          quantity          DOUBLE PRECISION NOT NULL,
+          cin7_task_id      TEXT,
+          assembly_number   TEXT,
+          status            TEXT   NOT NULL DEFAULT 'authorised',
+          completed_qty     DOUBLE PRECISION NOT NULL DEFAULT 0,
+          parent_task_id    TEXT,
+          slack_channel     TEXT,
+          slack_ts          TEXT,
+          last_reply_ts     TEXT,
+          response_json     TEXT,
+          created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          created_by        TEXT,
+          completed_at      TIMESTAMPTZ,
+          completed_by      TEXT
+      );
+      """),
+    ("fablab_assemblies_index",
+      "CREATE INDEX IF NOT EXISTS ix_fablab_assemblies_draft "
+      "ON fablab_assemblies(draft_id);"),
+    ("fablab_pick_variance",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_pick_variance (
+          id                BIGSERIAL PRIMARY KEY,
+          assembly_id       BIGINT NOT NULL,
+          draft_id          BIGINT,
+          sku               TEXT   NOT NULL,
+          component_sku     TEXT   NOT NULL,
+          finished_qty      DOUBLE PRECISION NOT NULL,
+          bom_qty           DOUBLE PRECISION NOT NULL,
+          actual_qty        DOUBLE PRECISION NOT NULL,
+          recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          recorded_by       TEXT
+      );
+      """),
+    ("fablab_po_notifications",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_po_notifications (
+          draft_id          BIGINT PRIMARY KEY,
+          cin7_po_number    TEXT,
+          notified_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          slack_channel     TEXT,
+          slack_ts          TEXT,
+          odoo_lead_id      BIGINT,
+          odoo_quote_id     BIGINT,
+          odoo_quote_name   TEXT,
+          odoo_error        TEXT
+      );
+      """),
+    ("fablab_settings",
+      """
+      CREATE TABLE IF NOT EXISTS fablab_settings (
+          key      TEXT PRIMARY KEY,
+          value    TEXT,
+          set_by   TEXT,
+          set_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      """),
     # 2026-09-01 — 865FabLab stock-drop alerts (see _SCHEMA for the
     # SQLite-side definition and the module docstring in
     # fablab_stock_alert.py).
@@ -7748,6 +7877,180 @@ def list_fablab_finished_goods_pushes(draft_id: int) -> List[sqlite3.Row]:
             "ORDER BY pushed_at DESC",
             (draft_id,),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# 865FabLab assembly flow (2026-09-04) — see fablab_assemblies.py
+# ---------------------------------------------------------------------------
+
+def fablab_setting_get(key: str, default: Optional[str] = None) -> Optional[str]:
+    with connect() as c:
+        row = c.execute(
+            "SELECT value FROM fablab_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row and row["value"] is not None else default
+
+
+def fablab_setting_set(key: str, value: str, actor: str) -> None:
+    with connect() as c:
+        c.execute(
+            "INSERT INTO fablab_settings (key, value, set_by, set_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "set_by = excluded.set_by, set_at = excluded.set_at",
+            (key, str(value), actor))
+
+
+def create_fablab_assembly(
+        draft_id: int, sku: str, quantity: float, *, status: str,
+        cin7_task_id: Optional[str], assembly_number: Optional[str],
+        response: Optional[dict], actor: str,
+        parent_task_id: Optional[str] = None) -> int:
+    with connect() as c:
+        cur = c.execute(
+            "INSERT INTO fablab_assemblies (draft_id, sku, quantity, "
+            "cin7_task_id, assembly_number, status, parent_task_id, "
+            "response_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (draft_id, sku, float(quantity), cin7_task_id, assembly_number,
+             status, parent_task_id,
+             json.dumps(response) if response is not None else None, actor))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("fablab_assembly.create", actor, f"{draft_id}/{sku}",
+             f"status={status} task={cin7_task_id} "
+             f"assembly={assembly_number} qty={quantity}"))
+        return cur.lastrowid
+
+
+def list_fablab_assemblies(draft_id: Optional[int] = None,
+                           status: Optional[str] = None) -> List[sqlite3.Row]:
+    sql = "SELECT * FROM fablab_assemblies WHERE 1=1"
+    args: list = []
+    if draft_id is not None:
+        sql += " AND draft_id = ?"
+        args.append(draft_id)
+    if status:
+        sql += " AND status = ?"
+        args.append(status)
+    sql += " ORDER BY id"
+    with connect() as c:
+        return c.execute(sql, tuple(args)).fetchall()
+
+
+def get_fablab_assembly(assembly_id: int) -> Optional[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM fablab_assemblies WHERE id = ?",
+            (assembly_id,)).fetchone()
+
+
+def get_fablab_assembly_by_slack(channel: str, ts: str) -> Optional[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM fablab_assemblies WHERE slack_channel = ? "
+            "AND slack_ts = ?", (channel, ts)).fetchone()
+
+
+def set_fablab_assembly_slack(assembly_id: int, channel: str, ts: str) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE fablab_assemblies SET slack_channel = ?, slack_ts = ?, "
+            "last_reply_ts = ? WHERE id = ?",
+            (channel, ts, ts, assembly_id))
+
+
+def set_fablab_assembly_last_reply(assembly_id: int, ts: str) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE fablab_assemblies SET last_reply_ts = ? WHERE id = ?",
+            (ts, assembly_id))
+
+
+def mark_fablab_assembly_completed(
+        assembly_id: int, completed_qty: float, actor: str,
+        response: Optional[dict] = None) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE fablab_assemblies SET status = 'completed', "
+            "completed_qty = ?, completed_at = datetime('now'), "
+            "completed_by = ?, response_json = COALESCE(?, response_json) "
+            "WHERE id = ?",
+            (float(completed_qty), actor,
+             json.dumps(response) if response is not None else None,
+             assembly_id))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("fablab_assembly.complete", actor, str(assembly_id),
+             f"completed_qty={completed_qty}"))
+
+
+def set_fablab_assembly_status(assembly_id: int, status: str,
+                               actor: str) -> None:
+    with connect() as c:
+        c.execute(
+            "UPDATE fablab_assemblies SET status = ? WHERE id = ?",
+            (status, assembly_id))
+        c.execute(
+            "INSERT INTO audit_log (event, actor, target, detail) "
+            "VALUES (?, ?, ?, ?)",
+            ("fablab_assembly.status", actor, str(assembly_id), status))
+
+
+def record_fablab_pick_variance(
+        assembly_id: int, draft_id: Optional[int], sku: str,
+        finished_qty: float, rows: list, actor: str) -> None:
+    """rows: [(component_sku, bom_qty, actual_qty), ...]"""
+    if not rows:
+        return
+    with connect() as c:
+        c.executemany(
+            "INSERT INTO fablab_pick_variance (assembly_id, draft_id, sku, "
+            "component_sku, finished_qty, bom_qty, actual_qty, recorded_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(assembly_id, draft_id, sku, comp, float(finished_qty),
+              float(bom_q), float(act_q), actor)
+             for comp, bom_q, act_q in rows])
+
+
+def fablab_pick_variance_summary(min_batches: int = 1) -> List[sqlite3.Row]:
+    """Per (sku, component): batches, BOM-implied total, actual total."""
+    with connect() as c:
+        return c.execute(
+            "SELECT sku, component_sku, COUNT(*) AS batches, "
+            "SUM(finished_qty) AS finished_units, "
+            "SUM(bom_qty) AS bom_total, SUM(actual_qty) AS actual_total "
+            "FROM fablab_pick_variance GROUP BY sku, component_sku "
+            "HAVING COUNT(*) >= ? ORDER BY sku, component_sku",
+            (min_batches,)).fetchall()
+
+
+def fablab_po_notification_get(draft_id: int) -> Optional[sqlite3.Row]:
+    with connect() as c:
+        return c.execute(
+            "SELECT * FROM fablab_po_notifications WHERE draft_id = ?",
+            (draft_id,)).fetchone()
+
+
+def fablab_po_notification_upsert(draft_id: int, **fields) -> None:
+    allowed = {"cin7_po_number", "slack_channel", "slack_ts", "odoo_lead_id",
+               "odoo_quote_id", "odoo_quote_name", "odoo_error"}
+    bad = set(fields) - allowed
+    if bad:
+        raise ValueError(f"unknown fields {bad}")
+    cols = list(fields)
+    with connect() as c:
+        if cols:
+            sets = ", ".join(f"{k} = excluded.{k}" for k in cols)
+            c.execute(
+                f"INSERT INTO fablab_po_notifications (draft_id, {', '.join(cols)}) "
+                f"VALUES (?, {', '.join('?' for _ in cols)}) "
+                f"ON CONFLICT(draft_id) DO UPDATE SET {sets}",
+                (draft_id, *[fields[k] for k in cols]))
+        else:
+            c.execute(
+                "INSERT INTO fablab_po_notifications (draft_id) VALUES (?) "
+                "ON CONFLICT(draft_id) DO NOTHING", (draft_id,))
 
 
 # ---------------------------------------------------------------------------

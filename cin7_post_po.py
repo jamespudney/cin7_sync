@@ -616,11 +616,18 @@ def push_po_draft(draft_id: int, *,
                    unit_cost_override: Optional[dict] = None,
                    rate_s: float = DEFAULT_RATE_S,
                    retry_lines_only: bool = False,
+                   lines_override: Optional[list] = None,
+                   memo: Optional[str] = None,
                    ) -> PushResult:
     """End-to-end push of a local po_drafts row to CIN7.
     Returns a PushResult — always check .ok before .cin7_po_number.
     Set apply=False for a dry-run that validates and prints the bodies
-    without sending."""
+    without sending.
+
+    lines_override (2026-09-04, 865FabLab assembly flow): pre-built PO
+    line dicts (same shape _build_lines emits) to send INSTEAD of the
+    draft's own lines — used to raise a labor-only PO whose draft lines
+    are the finished corner SKUs. memo: replaces the default Memo."""
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     log = _setup_log(stamp)
 
@@ -690,13 +697,21 @@ def push_po_draft(draft_id: int, *,
     # Pass supplier_id/name so each line uses CIN7's own per-supplier
     # Cost — that's the rule the user gave us: "don't overwrite the
     # unit cost CIN7 maintains when we input the SKU".
-    line_items = _build_lines(
-        lines_rows, resolved,
-        supplier_id=cin7_supplier.get("ID") if cin7_supplier else None,
-        supplier_name=(cin7_supplier.get("Name")
-                        if cin7_supplier else None),
-        freight_overrides=freight_overrides,
-        unit_cost_override=unit_cost_override)
+    if lines_override is not None:
+        line_items = list(lines_override)
+        for line in line_items:
+            bad = set(line.keys()) - ALLOWED_LINE_KEYS
+            if bad:
+                raise RuntimeError(
+                    f"Override line has disallowed keys {bad}.")
+    else:
+        line_items = _build_lines(
+            lines_rows, resolved,
+            supplier_id=cin7_supplier.get("ID") if cin7_supplier else None,
+            supplier_name=(cin7_supplier.get("Name")
+                            if cin7_supplier else None),
+            freight_overrides=freight_overrides,
+            unit_cost_override=unit_cost_override)
     if not line_items:
         result.errors.append("No resolvable line items.")
         return result
@@ -803,7 +818,7 @@ def push_po_draft(draft_id: int, *,
     order_body = {
         "TaskID": cin7_po_id,
         "CombineAdditionalCharges": False,
-        "Memo": f"Wired4Signs draft #{draft_id}",
+        "Memo": memo if memo is not None else f"Wired4Signs draft #{draft_id}",
         "Status": "DRAFT",   # NEVER auto-AUTHORISE — buyer reviews in CIN7
         "Lines": line_items,
     }

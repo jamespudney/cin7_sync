@@ -446,23 +446,6 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
                          use_container_width=True):
                 db.release_po_draft_lock(active_id, actor)
                 st.rerun()
-    with info_cols[2]:
-        if not is_submitted and i_hold_lock:
-            with st.popover("\U0001f4e4 Mark placed", use_container_width=True):
-                st.markdown("**Record this order as placed with 865FabLab**")
-                st.caption(
-                    "865FabLab isn't set up as a CIN7 supplier yet, so "
-                    "this just records your own reference (invoice #, "
-                    "email confirmation, etc.) and locks the order as "
-                    "placed.")
-                ref = st.text_input(
-                    "Your reference (optional)", key=f"fablab_ref_{active_id}")
-                if st.button("Confirm", key=f"fablab_submit_{active_id}",
-                             type="primary"):
-                    db.mark_po_draft_submitted(
-                        active_id, actor, cin7_po_number=ref.strip())
-                    st.success("Marked as placed.")
-                    st.rerun()
     with info_cols[3]:
         if not is_submitted and i_hold_lock:
             with st.popover("\U0001f5d1️ Cancel", use_container_width=True):
@@ -480,77 +463,193 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
     return active_id, can_edit, is_submitted
 
 
-def _render_push_po_to_cin7(draft_id: int, actor: str) -> None:
-    """Push this draft to CIN7 as a real Draft Advanced Purchase, using
-    the same validated flow as the main Ordering page
-    (cin7_post_po.push_po_draft) -- resolves SKUs to CIN7 ProductIDs,
-    stops at CIN7 status DRAFT (never auto-authorises; a human reviews
-    in CIN7 first). Only usable now that 865FabLab is a real CIN7
-    supplier (2026-09-01) -- before that, CIN7's supplier resolution
-    would have failed with 'not found'."""
+def _render_place_order(draft_id: int, bom_parents: dict,
+                        product_map: dict, actor: str) -> None:
+    """Place the order: one AUTHORISED CIN7 assembly per line + one
+    labor-only Draft PO to 865FabLab (fablab_assemblies.place_order).
+    Preview first, then explicit confirm."""
     import db
+    import fablab_assemblies as fa
 
     saved = db.get_po_draft_lines(draft_id)
     if not saved:
         return
 
-    st.markdown("#### \U0001f4e4 Push order to CIN7")
-    st.caption(
-        "Creates a real Draft Purchase in CIN7 for supplier 865FabLab "
-        "-- stays in DRAFT status, never auto-authorised. Review "
-        "pricing in CIN7 before authorising: these SKUs don't have a "
-        "per-unit 865FabLab labor cost set on their Supplier link yet, "
-        "so CIN7 will fall back to each product's AverageCost, which "
-        "is likely NOT what 865FabLab actually charges for the build.")
-
-    show_key = f"fablab_po_push_show_{draft_id}"
-    if st.button("\U0001f4e4 Push to CIN7 as Draft PO",
-                 key=f"fablab_po_push_btn_{draft_id}"):
+    show_key = f"fablab_place_show_{draft_id}"
+    if st.button("\U0001f680 Place order with 865FabLab",
+                 key=f"fablab_place_btn_{draft_id}", type="primary"):
         st.session_state[show_key] = True
     if not st.session_state.get(show_key):
         return
 
-    with st.expander(f"Push order #{draft_id} to CIN7?", expanded=True):
-        dry_run = st.checkbox(
-            "Dry-run (validate + preview only, don't post)",
-            value=True, key=f"fablab_po_push_dry_{draft_id}")
-        ack = st.checkbox(
-            "I understand this creates a real Draft PO in CIN7 and "
-            "will review/fix pricing there before authorising.",
-            key=f"fablab_po_push_ack_{draft_id}")
-        if st.button("Confirm push", type="primary",
-                     disabled=(not ack) and not dry_run,
-                     key=f"fablab_po_push_confirm_{draft_id}"):
-            from cin7_post_po import push_po_draft
-            with st.spinner("Talking to CIN7 — this can take "
-                             "10-60 seconds..."):
-                result = push_po_draft(
-                    draft_id, actor=actor, apply=not dry_run,
-                    require_mov=False)
-            if result.ok:
-                if dry_run:
-                    st.success(
-                        f"Dry-run passed at stage `{result.stage}`. "
-                        "Uncheck dry-run and confirm again to actually "
-                        "push.")
-                    with st.expander("Lines that would be sent"):
-                        st.json(
-                            (result.order_response or {}).get(
-                                "lines", []))
-                else:
-                    st.success(
-                        f"CIN7 PO **#{result.cin7_po_number}** created "
-                        "in DRAFT status. Review and AUTHORISE in "
-                        "CIN7 to send to 865FabLab.")
-                    st.session_state[show_key] = False
-                    st.rerun()
+    with st.expander(f"Place order #{draft_id}?", expanded=True):
+        st.markdown(
+            "**What happens:** one CIN7 assembly (Finished Goods, "
+            "*authorised*) per SKU below — CIN7 builds each pick list from "
+            "the BOM — plus one Draft PO to 865FabLab for "
+            f"`{fa.LABOR_SKU}` × total units. When that PO is authorised "
+            "in CIN7, each assembly is posted to the 865 corner channel "
+            "and the Odoo lead + quote are created.")
+        lines = {k: _num(v) for k, v in saved.items() if _num(v) > 0}
+        per_sku, totals = fa.build_pick_list(lines, bom_parents, product_map)
+        total_units = sum(lines.values())
+        st.dataframe(pd.DataFrame([
+            {"SKU": r["sku"], "Name": r["name"], "Qty": int(r["qty"]),
+             "Components (BOM)": ", ".join(
+                 f"{c} × {t:g}" for c, _n, t in r["components"])}
+            for r in per_sku]), use_container_width=True, hide_index=True)
+        st.caption(
+            f"Labor PO line: {fa.LABOR_SKU} × {total_units:g} at the "
+            "865FabLab fixed price in CIN7.")
+        with st.expander("PO memo / pick list preview"):
+            st.code(fa.format_pick_list(per_sku, totals), language=None)
+
+        confirm = st.checkbox(
+            "I've checked the quantities — create the assemblies and the "
+            "labor PO now", key=f"fablab_place_confirm_{draft_id}")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            go = st.button("Confirm — place order",
+                           key=f"fablab_place_go_{draft_id}",
+                           type="primary", disabled=not confirm)
+        with c2:
+            if st.button("Cancel", key=f"fablab_place_cancel_{draft_id}"):
+                st.session_state[show_key] = False
+                st.rerun()
+        if go:
+            with st.spinner("Creating assemblies and labor PO in CIN7…"):
+                res = fa.place_order(
+                    draft_id, bom_parents, product_map, actor=actor,
+                    apply=True)
+            for w in res.get("warnings", []):
+                st.warning(w)
+            if res.get("ok"):
+                st.success(
+                    f"Placed. Labor PO **{res['po_number']}** created in "
+                    "CIN7 (DRAFT — authorise it there to notify 865FabLab). "
+                    "Assemblies: "
+                    + ", ".join(f"{a['assembly_number']} ({a['sku']} × "
+                                f"{_num(a['qty']):g})"
+                                for a in res["assemblies"]))
+                st.session_state[show_key] = False
+                st.rerun()
             else:
-                st.error(f"Push did not complete. Stopped at stage "
-                         f"`{result.stage}`.")
-                for err in result.errors:
-                    st.error(f"• {err}")
-            for warning in result.warnings:
-                st.warning(warning)
+                for e in res.get("errors", []):
+                    st.error(e)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _preview_completion(assembly_id: int, qty: float) -> dict:
+    import fablab_assemblies as fa
+    return fa.complete_assembly(assembly_id, qty_received=qty,
+                                actor="preview", apply=False)
+
+
+def _render_assembly_receiving(draft_id: int, actor: str) -> bool:
+    """Per-assembly receiving for orders placed through the assembly
+    flow. Returns True if the order has assemblies (legacy fallback
+    otherwise)."""
+    import db
+    import fablab_assemblies as fa
+
+    rows = db.list_fablab_assemblies(draft_id)
+    if not rows:
+        return False
+
+    status_df = pd.DataFrame([{
+        "Assembly": r["assembly_number"] or "—",
+        "SKU": r["sku"],
+        "Qty": _num(r["quantity"]),
+        "Status": r["status"],
+        "Received": _num(r["completed_qty"]),
+        "Slack": "posted" if r["slack_ts"] else "—",
+    } for r in rows])
+    done = sum(1 for r in rows if r["status"] == "completed")
+    st.markdown(f"**Assemblies — {done} of {len(rows)} received**")
+    st.dataframe(status_df, use_container_width=True, hide_index=True)
+    st.caption(
+        "Normal path: reply `done` (or `done 35`) in the assembly's Slack "
+        "thread. Use the form below only if Slack isn't handy.")
+
+    open_rows = [r for r in rows if r["status"] == "authorised"]
+    if not open_rows:
+        return True
+    labels = {f"{r['assembly_number']} · {r['sku']} × {_num(r['quantity']):g}": r
+              for r in open_rows}
+    pick = st.selectbox("Complete an assembly", list(labels),
+                        key=f"fablab_recv_pick_{draft_id}")
+    a = labels[pick]
+    qty = st.number_input(
+        "Quantity received", min_value=1, max_value=int(_num(a["quantity"])),
+        value=int(_num(a["quantity"])), step=1,
+        key=f"fablab_recv_qty_{a['id']}")
+    preview = _preview_completion(a["id"], float(qty))
+    if preview["errors"]:
+        for e in preview["errors"]:
+            st.error(e)
+        return True
+    pick_df = pd.DataFrame([
+        {"Component": p["component"], "BOM qty": p["bom_qty"],
+         "Actual used": p["actual_qty"]} for p in preview["picks"]])
+    edited = st.data_editor(
+        pick_df, key=f"fablab_recv_picks_{a['id']}_{qty}",
+        disabled=["Component", "BOM qty"], hide_index=True,
+        use_container_width=True,
+        column_config={"Actual used": st.column_config.NumberColumn(
+            min_value=0.0, help="Set to what was really consumed "
+            "(offcut used → 0).")})
+    if st.button(f"✅ Complete {a['assembly_number']}",
+                 key=f"fablab_recv_go_{a['id']}", type="primary"):
+        overrides = {row["Component"]: _num(row["Actual used"])
+                     for _, row in edited.iterrows()}
+        with st.spinner("Completing in CIN7…"):
+            r = fa.complete_assembly(a["id"], qty_received=float(qty),
+                                     pick_overrides=overrides,
+                                     actor=actor, apply=True)
+        for w in r.get("warnings", []):
+            st.warning(w)
+        if r["ok"]:
+            msg = f"{a['assembly_number']} completed — {qty} into stock."
+            if r.get("remainder"):
+                msg += (f" Remainder {r['remainder']['qty']:g} → "
+                        f"{r['remainder']['assembly_number']}.")
+            if a["slack_ts"]:
+                import fablab_slack
+                fablab_slack.post(
+                    f":white_check_mark: *{a['assembly_number']}* completed "
+                    f"from the app by {actor} — {qty} × `{a['sku']}` into stock.",
+                    channel_id=a["slack_channel"], thread_ts=a["slack_ts"])
+            st.success(msg)
+            st.rerun()
+        else:
+            for e in r["errors"]:
+                st.error(e)
+    return True
+
+
+def _render_bom_reality_check() -> None:
+    import db
+
+    rows = db.fablab_pick_variance_summary(min_batches=1)
+    if not rows:
+        return
+    with st.expander("\U0001f9ee BOM reality check (actual vs BOM usage)"):
+        st.caption(
+            "From completed assemblies. If 'Actual per unit' keeps landing "
+            "below the BOM, adjust the BOM in CIN7 so stock stops drifting.")
+        df = pd.DataFrame([{
+            "SKU": r["sku"], "Component": r["component_sku"],
+            "Batches": int(r["batches"]),
+            "Units built": _num(r["finished_units"]),
+            "BOM per unit": round(_num(r["bom_total"]) /
+                                  max(_num(r["finished_units"]), 1e-9), 3),
+            "Actual per unit": round(_num(r["actual_total"]) /
+                                     max(_num(r["finished_units"]), 1e-9), 3),
+            "Variance %": round(
+                (_num(r["actual_total"]) - _num(r["bom_total"])) /
+                max(_num(r["bom_total"]), 1e-9) * 100, 1),
+        } for r in rows])
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def _render_finished_goods_push(
@@ -649,9 +748,9 @@ def _render_receiving_checklist(
 
     st.markdown("### \U0001f4e5 Receiving checklist")
     st.caption(
-        "When a batch physically comes back from 865FabLab, pick the "
-        "order below for the exact numbers to enter in CIN7's manual "
-        "stock adjustment: + finished SKU, − raw materials consumed."
+        "When a batch comes back from 865FabLab: orders placed through "
+        "the assembly flow are completed per assembly (Slack `done` reply "
+        "or the form here); older orders use the finished-goods push."
     )
     placed = [
         d for d in db.list_po_drafts(supplier=FABLAB_SUPPLIER, include_archived=True)
@@ -665,6 +764,9 @@ def _render_receiving_checklist(
     picked = st.selectbox(
         "Order", list(opt_to_id.keys()), key="fablab_receiving_picker")
     draft_id = opt_to_id[picked]
+    if _render_assembly_receiving(draft_id, actor):
+        _render_bom_reality_check()
+        return
     lines = db.get_po_draft_lines(draft_id)
     if not lines:
         st.warning("This order has no lines.")
@@ -716,8 +818,9 @@ def render_fablab_work_orders(
         "**Toll-manufactured accessory corners — you supply raw "
         "materials, 865FabLab supplies labor.** Pick or create an order, "
         "adjust the Batch qty column (pre-filled with the suggestion), "
-        "save, check raw materials, push to CIN7. Use the receiving "
-        "checklist below when the batch comes back.",
+        "save, check raw materials, place the order. Each SKU becomes a "
+        "CIN7 assembly; when 865FabLab hands a batch back, reply `done` "
+        "in its Slack thread and stock updates itself.",
         icon="ℹ️",
     )
 
@@ -844,7 +947,7 @@ def render_fablab_work_orders(
                  "Qty": qty} for sku, qty in saved_lines.items()]),
                 use_container_width=True, hide_index=True)
     if draft_id and can_edit and saved_lines:
-        _render_push_po_to_cin7(draft_id, current_user)
+        _render_place_order(draft_id, bom_parents, product_map, current_user)
 
     # ── Materials shortfall ──────────────────────────────────────────────
     st.divider()
