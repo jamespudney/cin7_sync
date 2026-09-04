@@ -373,36 +373,22 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
         f"**\U0001f4cb 865FabLab orders** — {len(drafts)} active"
         + (f", {len(archived)} archived" if archived else ""))
 
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        default_idx = 0
-        if active_id:
-            for label, did in opt_to_id.items():
-                if did == active_id:
-                    default_idx = opts.index(label)
-                    break
-        picked = st.selectbox(
-            "Active order", opts, index=default_idx,
-            key="fablab_draft_picker")
-        new_id = opt_to_id.get(picked)
-        if new_id != active_id:
-            st.session_state[state_key] = new_id
-            st.rerun()
-        active_id = new_id
-    with c2:
-        with st.popover("➕ New order", use_container_width=True):
-            name = st.text_input(
-                "Name", key="fablab_new_name",
-                placeholder="e.g. August corner batch")
-            note = st.text_input("Note (optional)", key="fablab_new_note")
-            if st.button("Create", key="fablab_new_create", type="primary",
-                         disabled=not name.strip()):
-                new_draft_id = db.create_po_draft(
-                    supplier=FABLAB_SUPPLIER, name=name.strip(),
-                    actor=actor, note=note)
-                st.session_state[state_key] = new_draft_id
-                st.success(f"Created order #{new_draft_id}")
-                st.rerun()
+    default_idx = 0
+    if active_id:
+        for label, did in opt_to_id.items():
+            if did == active_id:
+                default_idx = opts.index(label)
+                break
+    picked = st.selectbox(
+        "Active order", opts, index=default_idx,
+        key="fablab_draft_picker",
+        help="Pick an existing order, or leave on 'No active order' and "
+             "create one from the ticked items below the table.")
+    new_id = opt_to_id.get(picked)
+    if new_id != active_id:
+        st.session_state[state_key] = new_id
+        st.rerun()
+    active_id = new_id
 
     if not active_id:
         return None, False, False
@@ -972,28 +958,31 @@ def render_fablab_work_orders(
     if draft_id is None:
         if n_ticked == 0:
             st.info("**Step 1** — tick the SKUs to build in the ✔ Include "
-                    "column above.", icon="\U0001f4cb")
+                    "column above, then name and create the order.",
+                    icon="\U0001f4cb")
         else:
             st.info(f"**Step 2** — {n_ticked} SKU(s) ticked. Name the order "
                     "and create it; the ticked items go straight onto it.",
                     icon="\U0001f4e6")
-            nc1, nc2 = st.columns([3, 2])
-            with nc1:
-                new_name = st.text_input(
-                    "Order name", key="fablab_quick_order_name",
-                    placeholder="e.g. September corner batch")
-            with nc2:
-                st.write("")
-                if st.button("\U0001f4e6 Create order with ticked items",
-                             key="fablab_quick_create", type="primary",
-                             disabled=not new_name.strip()):
-                    new_draft = db.create_po_draft(
-                        supplier=FABLAB_SUPPLIER, name=new_name.strip(),
-                        actor=current_user)
-                    n = _save_ticks(new_draft)
-                    st.session_state["fablab_active_draft"] = new_draft
-                    st.success(f"Order #{new_draft} created with {n} SKU(s).")
-                    st.rerun()
+        nc1, nc2 = st.columns([3, 2])
+        with nc1:
+            new_name = st.text_input(
+                "Order name", key="fablab_quick_order_name",
+                placeholder="e.g. September corner batch")
+        with nc2:
+            st.write("")
+            label = ("\U0001f4e6 Create order with "
+                     f"{n_ticked} ticked item(s)" if n_ticked
+                     else "\U0001f4e6 Create empty order")
+            if st.button(label, key="fablab_quick_create", type="primary",
+                         disabled=not new_name.strip()):
+                new_draft = db.create_po_draft(
+                    supplier=FABLAB_SUPPLIER, name=new_name.strip(),
+                    actor=current_user)
+                n = _save_ticks(new_draft)
+                st.session_state["fablab_active_draft"] = new_draft
+                st.success(f"Order #{new_draft} created with {n} SKU(s).")
+                st.rerun()
     elif can_edit:
         if not saved_lines:
             st.info("**Step 2** — tick items, then save them to this order.",

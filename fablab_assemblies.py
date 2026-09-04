@@ -41,6 +41,7 @@ CLI:
 
 from __future__ import annotations
 
+import math
 import argparse
 import logging
 import os
@@ -145,9 +146,11 @@ def format_pick_list(per_sku: list, totals: dict,
                        + (f" ({cname})" if cname else ""))
     if totals:
         out.append("")
-        out.append("TOTALS TO PICK:")
+        out.append("TOTALS TO PICK (rounded up to whole lengths):")
         for csku, total in sorted(totals.items()):
-            out.append(f"  {csku} x {total:g}")
+            whole = int(math.ceil(round(total, 3)))
+            exact = f"  (BOM {total:g})" if abs(whole - total) > 1e-9 else ""
+            out.append(f"  {csku} x {whole}{exact}")
     return "\n".join(out)
 
 
