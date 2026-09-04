@@ -68,7 +68,11 @@ class OdooClient:
                          fields=fields, limit=limit)
 
     def create(self, model, vals) -> int:
-        return int(self.call(model, "create", [vals]))
+        res = self.call(model, "create", [vals])
+        # Odoo 17+ returns a list of ids for create(); older returns an int.
+        if isinstance(res, list):
+            res = res[0]
+        return int(res)
 
     # -- lookups ---------------------------------------------------------
 

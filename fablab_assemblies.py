@@ -431,7 +431,15 @@ def check_po_authorised(apply: bool = True) -> dict:
               if d["status"] in ("submitted", "finalized") and d["cin7_po_id"]]
     last_call = 0.0
     for d in drafts:
-        if db.fablab_po_notification_get(d["id"]):
+        note = db.fablab_po_notification_get(d["id"])
+        if note:
+            # Slack already announced; retry only a failed Odoo step
+            # (e.g. transient API error) so the lead/quote is not lost.
+            if (apply and note["slack_ts"] and not note["odoo_lead_id"]
+                    and note["odoo_error"]
+                    and note["odoo_error"] != "PO voided"
+                    and _odoo_configured()):
+                last_call = _odoo_retry(d, note, headers, last_call, stats)
             continue
         assemblies = db.list_fablab_assemblies(d["id"], status="authorised")
         if not assemblies:
@@ -498,38 +506,83 @@ def check_po_authorised(apply: bool = True) -> dict:
             slack_channel=CORNER_CHANNEL_ID, slack_ts=hts)
         stats["notified"] += 1
 
-        # Odoo (env-gated)
-        try:
-            import fablab_odoo
-            if fablab_odoo.is_configured():
-                client = fablab_odoo.OdooClient()
-                labor_price = None
-                for ln in order.get("Lines") or []:
-                    if str(ln.get("SKU") or "").upper() == LABOR_SKU:
-                        labor_price = _num(ln.get("Price")) or None
-                info = client.create_lead_and_quote(
-                    po_number=po_number, total_qty=total,
-                    description_html="<br/>".join(desc_lines),
-                    unit_price=labor_price)
-                db.fablab_po_notification_upsert(
-                    d["id"], odoo_lead_id=info["lead_id"],
-                    odoo_quote_id=info["quote_id"],
-                    odoo_quote_name=info["quote_name"])
-                fablab_slack.post(
-                    f":white_check_mark: Odoo: lead + quote *{info['quote_name']}* "
-                    f"created for {po_number}.",
-                    channel_id=CORNER_CHANNEL_ID, thread_ts=hts)
-            else:
-                db.fablab_po_notification_upsert(
-                    d["id"], odoo_error="ODOO_API_KEY not configured")
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Odoo step failed for order #%s", d["id"])
-            db.fablab_po_notification_upsert(d["id"], odoo_error=str(exc)[:500])
-            fablab_slack.post(
-                f":warning: Odoo lead/quote for {po_number} failed: "
-                f"{str(exc)[:300]}", channel_id=CORNER_CHANNEL_ID,
-                thread_ts=hts)
+        _odoo_step(d, po_number, total, desc_lines, order, hts, apply=True)
     return stats
+
+
+def _odoo_configured() -> bool:
+    try:
+        import fablab_odoo
+        return bool(fablab_odoo.is_configured())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _odoo_step(d, po_number, total, desc_lines, order, hts, *, apply):
+    """Create the Odoo lead + quote for an announced order; records the
+    result (or error) on fablab_po_notifications and echoes to the Slack
+    thread. Never raises."""
+    if not apply:
+        return
+    try:
+        import fablab_odoo
+        if not fablab_odoo.is_configured():
+            db.fablab_po_notification_upsert(
+                d["id"], odoo_error="ODOO_API_KEY not configured")
+            return
+        client = fablab_odoo.OdooClient()
+        labor_price = None
+        for ln in (order or {}).get("Lines") or []:
+            if str(ln.get("SKU") or "").upper() == LABOR_SKU:
+                labor_price = _num(ln.get("Price")) or None
+        info = client.create_lead_and_quote(
+            po_number=po_number, total_qty=total,
+            description_html="<br/>".join(desc_lines),
+            unit_price=labor_price)
+        db.fablab_po_notification_upsert(
+            d["id"], odoo_lead_id=info["lead_id"],
+            odoo_quote_id=info["quote_id"],
+            odoo_quote_name=info["quote_name"], odoo_error=None)
+        fablab_slack.post(
+            f":white_check_mark: Odoo: lead + quote *{info['quote_name']}* "
+            f"created for {po_number}.",
+            channel_id=CORNER_CHANNEL_ID, thread_ts=hts)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Odoo step failed for order #%s", d["id"])
+        db.fablab_po_notification_upsert(d["id"], odoo_error=str(exc)[:500])
+        fablab_slack.post(
+            f":warning: Odoo lead/quote for {po_number} failed: "
+            f"{str(exc)[:300]}", channel_id=CORNER_CHANNEL_ID,
+            thread_ts=hts)
+
+
+def _odoo_retry(d, note, headers, last_call, stats):
+    """Rebuild the assembly description from CIN7 tasks and re-run the
+    Odoo step for an order whose Slack announcement already went out."""
+    assemblies = db.list_fablab_assemblies(d["id"])
+    po_number = note["cin7_po_number"] or d["cin7_po_number"] or "?"
+    resp, last_call = _http("GET", f"{BASE_URL}/advanced-purchase", headers,
+                            params={"ID": d["cin7_po_id"]}, log=log,
+                            rate_s=DEFAULT_RATE_S, last_call=last_call)
+    order = {}
+    if resp is not None and resp.status_code == 200:
+        po = resp.json() or {}
+        order = po.get("Order") if isinstance(po.get("Order"), dict) else {}
+    total = sum(_num(a["quantity"]) for a in assemblies)
+    desc_lines = []
+    for a in assemblies:
+        task, last_call = _get_task(headers, a["cin7_task_id"], last_call)
+        task = task or {"ProductName": "", "OrderLines": []}
+        desc_lines.append(
+            f"<b>{a['assembly_number']}</b> {a['sku']} × "
+            f"{_num(a['quantity']):g} — {task.get('ProductName') or ''}")
+        for code, name, _per, tot, _pid in _task_components(task):
+            desc_lines.append(f"&nbsp;&nbsp;• {code} × {tot:g} {name}")
+    log.info("retrying Odoo step for order #%s (%s)", d["id"], po_number)
+    _odoo_step(d, po_number, total, desc_lines, order, note["slack_ts"],
+               apply=True)
+    stats["odoo_retried"] = stats.get("odoo_retried", 0) + 1
+    return last_call
 
 
 # ---------------------------------------------------------------------------
