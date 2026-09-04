@@ -77,9 +77,4 @@ def render_attention_queue(
         "—" if slow_count is None else fmt_number(slow_count),
     )
 
-    st.caption(
-        "Start here for the daily pulse: data freshness, open buying work, "
-        "stock exceptions, and slow-moving inventory. The detailed pages "
-        "remain the source of truth for each workflow."
-    )
 

@@ -10542,7 +10542,8 @@ if page == "Overview":
                     f"({_gap_skus:,} SKUs · estimated value "
                     f"{_fmt_money(_gap_value)}). Headline stays "
                     f"FIFO-only for commissions consistency.")
-                st.caption(_diag.replace("$", "\\$"))
+                _fold_note(_diag.replace("$", "\\$"),
+                           title="ℹ️ Stock value note")
     except Exception:
         # Diagnostic must never break the tile.
         pass
