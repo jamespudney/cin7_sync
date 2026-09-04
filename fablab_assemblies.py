@@ -50,6 +50,8 @@ import sys
 from datetime import datetime
 from typing import Optional
 
+import pandas as pd
+
 import db
 import fablab_slack
 from cin7_post_finishedgoods import (
@@ -63,7 +65,7 @@ from cin7_post_po import _resolve_products
 log = logging.getLogger("fablab_assemblies")
 
 FABLAB_SUPPLIER = "865FabLab"
-LABOR_SKU = "OSC-865FABLAB-LABOR"
+LABOR_SKU = "OSC-865FABLAB-JOINT"   # fallback service SKU when a BOM has none
 LABOR_PREFIX = "OSC-865FABLAB"   # any 865FabLab service SKU (e.g. -JOINT) is labor, not material
 
 
@@ -145,6 +147,27 @@ def _locator_of(product_map: dict, sku: str) -> str:
                 "", "nan", "none", "null"):
             return str(val).strip()
     return ""
+
+
+def service_totals(lines: dict, bom_parents: dict) -> tuple[dict, list]:
+    """Per-each 865FabLab service SKUs (OSC-865FABLAB-*) summed from the
+    BOMs: {service_sku: total_units}. SKUs whose BOM has no service line
+    fall back to LABOR_SKU × 1 and are returned in `no_service`."""
+    totals: dict = {}
+    no_service = []
+    for sku, qty in lines.items():
+        qty = _num(qty)
+        found = False
+        for comp in bom_parents.get(sku, []):
+            csku = str(comp.get("ComponentSKU") or "").strip().upper()
+            per = _num(comp.get("Quantity"))
+            if csku and per > 0 and _is_labor(csku):
+                totals[csku] = round(totals.get(csku, 0.0) + qty * per, 3)
+                found = True
+        if not found:
+            totals[LABOR_SKU] = round(totals.get(LABOR_SKU, 0.0) + qty, 3)
+            no_service.append(sku)
+    return totals, no_service
 
 
 def component_notes(totals: dict, bom_parents: dict, product_map: dict,
@@ -270,26 +293,36 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
 
     existing = {r["sku"]: r for r in db.list_fablab_assemblies(draft_id)
                 if r["status"] in ("authorised", "completed")}
+    svc_totals, no_service = service_totals(lines, bom_parents)
     resolved, last_call = _resolve_products(
-        list(lines) + [LABOR_SKU], headers, log=log)
+        list(lines) + list(svc_totals), headers, log=log)
     missing = [s for s in lines if s not in resolved]
     if missing:
         res["errors"].append(f"Not found in CIN7: {', '.join(missing)}")
         return res
-    labor = resolved.get(LABOR_SKU)
-    if not labor:
-        res["errors"].append(f"Labor SKU {LABOR_SKU} not found in CIN7.")
+    missing_svc = [s for s in svc_totals if s not in resolved]
+    if missing_svc:
+        res["errors"].append(
+            f"Service SKU not found in CIN7: {', '.join(missing_svc)}")
         return res
-
-    # Labor price: 865FabLab Fixed Price on the labor SKU.
-    price = None
-    for s in labor.get("Suppliers") or []:
-        if str(s.get("SupplierName") or "").lower() == FABLAB_SUPPLIER.lower():
-            price = _num(s.get("FixedCost")) or _num(s.get("Cost")) or None
-    if price is None:
-        price = _num(db.fablab_setting_get("labor_unit_price")) or DEFAULT_LABOR_PRICE
+    if no_service:
         res["warnings"].append(
-            f"No 865FabLab Fixed Price on {LABOR_SKU}; using ${price:.2f}.")
+            f"No 865FabLab service line in BOM for {', '.join(no_service)}; "
+            f"charged as {LABOR_SKU} × 1 each.")
+
+    # Service prices: 865FabLab Fixed Price on each service SKU.
+    svc_price: dict = {}
+    for ssku in svc_totals:
+        price = None
+        for sp in resolved[ssku].get("Suppliers") or []:
+            if str(sp.get("SupplierName") or "").lower() == FABLAB_SUPPLIER.lower():
+                price = (_num(sp.get("FixedCost")) or _num(sp.get("FixedPrice"))
+                         or _num(sp.get("Cost")) or None)
+        if price is None:
+            price = _num(db.fablab_setting_get("labor_unit_price")) or DEFAULT_LABOR_PRICE
+            res["warnings"].append(
+                f"No 865FabLab Fixed Price on {ssku}; using ${price:.2f}.")
+        svc_price[ssku] = price
 
     # ---- assemblies
     assembly_numbers: dict = {}
@@ -353,21 +386,19 @@ def place_order(draft_id: int, bom_parents: dict, product_map: dict, *,
                 f"{draft['name']} — {total_units:g} units. "
                 f"Assemblies are AUTHORISED in CIN7 (pick lists there)."))
     res["memo"] = memo
-    line = {
-        "ProductID": labor.get("ID"),
-        "SKU": labor.get("SKU"),
-        "Name": labor.get("Name"),
-        "Quantity": float(total_units),
-        "Price": float(price),
-        "Discount": 0,
-        "Tax": 0,
-        "Total": round(total_units * price, 2),
-    }
+    po_lines = []
+    for ssku, sq in svc_totals.items():
+        prod, price = resolved[ssku], svc_price[ssku]
+        po_lines.append({
+            "ProductID": prod.get("ID"), "SKU": prod.get("SKU"),
+            "Name": prod.get("Name"), "Quantity": float(sq),
+            "Price": float(price), "Discount": 0, "Tax": 0,
+            "Total": round(sq * price, 2)})
     push = cin7_post_po.push_po_draft(
         draft_id, actor=actor, apply=apply, require_mov=False,
-        default_location=location, lines_override=[line], memo=memo)
-    res["po_lines"] = [line]
-    res["labor_price"] = price
+        default_location=location, lines_override=po_lines, memo=memo)
+    res["po_lines"] = po_lines
+    res["labor_price"] = svc_price.get(LABOR_SKU) or next(iter(svc_price.values()), None)
     res["warnings"].extend(push.warnings)
     if not push.ok:
         res["errors"].extend(push.errors or ["Labor PO push failed."])
@@ -406,8 +437,45 @@ def _task_components(task: dict) -> list:
     return out
 
 
-def _assembly_message(a, task: dict, po_number: str) -> str:
+def _picker_maps() -> tuple[dict, dict, dict]:
+    """(product_map, stock_map, bom_parents) from the worker's CSVs for
+    locator/on-hand hints; empty dicts if the CSVs are not present."""
+    try:
+        import glob
+        import fablab_stock_alert as fs
+        prod = sorted(glob.glob(str(fs.OUTPUT_DIR / "products_*.csv")))
+        stk = sorted(glob.glob(str(fs.OUTPUT_DIR / "stock_on_hand_*.csv")))
+        boms = sorted(glob.glob(str(fs.OUTPUT_DIR / "boms_*.csv")))
+        if not prod:
+            return {}, {}, {}
+        products = pd.read_csv(prod[-1], low_memory=False)
+        product_map = (products.drop_duplicates("SKU", keep="last")
+                       .set_index("SKU").to_dict(orient="index")
+                       if "SKU" in products.columns else {})
+        stock_map: dict = {}
+        if stk:
+            stock = pd.read_csv(stk[-1], low_memory=False)
+            if "SKU" in stock.columns:
+                for col in ("OnHand", "Available"):
+                    if col not in stock.columns:
+                        stock[col] = 0
+                    stock[col] = pd.to_numeric(stock[col], errors="coerce").fillna(0)
+                stock_map = (stock.groupby("SKU")[["OnHand", "Available"]]
+                             .sum().to_dict(orient="index"))
+        bom_parents = (fs._build_bom_parents(pd.read_csv(boms[-1], low_memory=False))
+                       if boms else {})
+        return product_map, stock_map, bom_parents
+    except Exception as exc:  # noqa: BLE001
+        log.warning("picker maps unavailable: %s", exc)
+        return {}, {}, {}
+
+
+def _assembly_message(a, task: dict, po_number: str,
+                      maps: Optional[tuple] = None) -> str:
     comps = _task_components(task)
+    product_map, stock_map, bom_parents = maps or ({}, {}, {})
+    notes = component_notes({c[0]: c[3] for c in comps}, bom_parents,
+                            product_map, stock_map)
     lines = [
         f":hammer_and_wrench: *{a['assembly_number']}* · `{a['sku']}` × "
         f"*{_num(a['quantity']):g}* — {task.get('ProductName') or ''}",
@@ -418,12 +486,50 @@ def _assembly_message(a, task: dict, po_number: str) -> str:
         qty = _ceil_qty(total)
         if qty != f"{total:g}":
             qty = f"{qty}  (BOM {total:g})"
-        lines.append(f"• `{code}` × {qty}" + (f" — {name}" if name else ""))
+        line = f"• `{code}` × {qty}" + (f" — {name}" if name else "")
+        if notes.get(code):
+            line += f"\n      ↳ _{notes[code]}_"
+        lines.append(line)
     lines.append(
         "_When the batch is back, reply here `done` (or `done 35` for a "
         "partial). Used less material than the BOM? Add lines like "
         "`LED-G2000820-0609 = 0`._")
     return "\n".join(lines)
+
+
+def _handle_voided(d, note, assemblies, headers, last_call, stats):
+    """Labor PO was voided in CIN7: void any still-open FG tasks, mark the
+    app's assemblies voided, cancel the Odoo quote, tell the Slack thread."""
+    po_number = (note and note["cin7_po_number"]) or d["cin7_po_number"] or "?"
+    voided = []
+    for a in assemblies:
+        task, last_call = _get_task(headers, a["cin7_task_id"], last_call)
+        st = str((task or {}).get("Status") or "").upper()
+        if task and st not in ("VOIDED", "COMPLETED"):
+            _r, last_call = _http("DELETE", f"{BASE_URL}/finishedGoods", headers,
+                                  params={"ID": a["cin7_task_id"], "Void": "true"},
+                                  log=log, rate_s=DEFAULT_RATE_S,
+                                  last_call=last_call)
+        if st != "COMPLETED":
+            db.set_fablab_assembly_status(a["id"], "voided", "worker")
+            voided.append(a["assembly_number"] or a["sku"])
+    if note and note["odoo_quote_id"] and _odoo_configured():
+        try:
+            import fablab_odoo
+            fablab_odoo.OdooClient().call(
+                "sale.order", "action_cancel", [int(note["odoo_quote_id"])])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Odoo cancel failed for quote %s: %s",
+                        note["odoo_quote_id"], exc)
+    db.fablab_po_notification_upsert(d["id"], odoo_error="PO voided")
+    if note and note["slack_ts"]:
+        fablab_slack.post(
+            f":no_entry_sign: {po_number} was voided in CIN7 — assemblies "
+            f"{', '.join(voided) or 'none'} voided; Odoo quote cancelled.",
+            channel_id=CORNER_CHANNEL_ID, thread_ts=note["slack_ts"])
+    stats["voided"] = stats.get("voided", 0) + 1
+    log.info("order #%s %s voided → %s", d["id"], po_number, voided)
+    return last_call
 
 
 def check_po_authorised(apply: bool = True) -> dict:
@@ -438,8 +544,10 @@ def check_po_authorised(apply: bool = True) -> dict:
                                            include_archived=True)
               if d["status"] in ("submitted", "finalized") and d["cin7_po_id"]]
     last_call = 0.0
+    maps = None  # picker maps loaded lazily on first notification
     for d in drafts:
         note = db.fablab_po_notification_get(d["id"])
+        assemblies = db.list_fablab_assemblies(d["id"], status="authorised")
         if note:
             # Slack already announced; retry only a failed Odoo step
             # (e.g. transient API error) so the lead/quote is not lost.
@@ -448,8 +556,18 @@ def check_po_authorised(apply: bool = True) -> dict:
                     and note["odoo_error"] != "PO voided"
                     and _odoo_configured()):
                 last_call = _odoo_retry(d, note, headers, last_call, stats)
+            # PO voided in CIN7 after announcement → close out open assemblies.
+            if apply and assemblies and note["odoo_error"] != "PO voided":
+                resp, last_call = _http(
+                    "GET", f"{BASE_URL}/advanced-purchase", headers,
+                    params={"ID": d["cin7_po_id"]}, log=log,
+                    rate_s=DEFAULT_RATE_S, last_call=last_call)
+                if (resp is not None and resp.status_code == 200 and
+                        str((resp.json() or {}).get("Status") or "").upper()
+                        == "VOIDED"):
+                    last_call = _handle_voided(d, note, assemblies, headers,
+                                               last_call, stats)
             continue
-        assemblies = db.list_fablab_assemblies(d["id"], status="authorised")
         if not assemblies:
             continue  # legacy order (no assemblies) — nothing to announce
         stats["checked"] += 1
@@ -473,7 +591,11 @@ def check_po_authorised(apply: bool = True) -> dict:
             continue
         if status == "VOIDED":
             db.fablab_po_notification_upsert(
-                d["id"], cin7_po_number=po_number, odoo_error="PO voided")
+                d["id"], cin7_po_number=po_number)
+            if apply:
+                last_call = _handle_voided(
+                    d, db.fablab_po_notification_get(d["id"]), assemblies,
+                    headers, last_call, stats)
             continue
         if not apply:
             log.info("[DRY] would notify for order #%s (%s %s)",
@@ -497,7 +619,9 @@ def check_po_authorised(apply: bool = True) -> dict:
             task, last_call = _get_task(headers, a["cin7_task_id"], last_call)
             task = task or {"ProductName": "", "OrderLines": [],
                             "Quantity": a["quantity"]}
-            ts, err = fablab_slack.post(_assembly_message(a, task, po_number),
+            if maps is None:
+                maps = _picker_maps()
+            ts, err = fablab_slack.post(_assembly_message(a, task, po_number, maps),
                                         channel_id=CORNER_CHANNEL_ID)
             if ts:
                 db.set_fablab_assembly_slack(a["id"], CORNER_CHANNEL_ID, ts)
@@ -551,14 +675,17 @@ def _odoo_step(d, po_number, total, desc_lines, order, hts, *, apply):
                 d["id"], odoo_error="ODOO_API_KEY not configured")
             return
         client = fablab_odoo.OdooClient()
-        labor_price = None
-        for ln in (order or {}).get("Lines") or []:
-            if str(ln.get("SKU") or "").upper() == LABOR_SKU:
-                labor_price = _num(ln.get("Price")) or None
+        services = [
+            {"code": str(ln.get("SKU")), "name": str(ln.get("Name") or ""),
+             "qty": _num(ln.get("Quantity")), "price": _num(ln.get("Price"))}
+            for ln in (order or {}).get("Lines") or []
+            if _is_labor(ln.get("SKU")) and _num(ln.get("Quantity")) > 0]
+        if not services:  # PO unreadable — fall back to one labor line
+            services = [{"code": LABOR_SKU, "name": "", "qty": total,
+                         "price": None}]
         info = client.create_lead_and_quote(
-            po_number=po_number, total_qty=total,
-            description_html="<br/>".join(desc_lines),
-            unit_price=labor_price)
+            po_number=po_number, services=services,
+            description_html="<br/>".join(desc_lines))
         db.fablab_po_notification_upsert(
             d["id"], odoo_lead_id=info["lead_id"],
             odoo_quote_id=info["quote_id"],

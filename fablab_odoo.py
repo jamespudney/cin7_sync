@@ -34,7 +34,7 @@ log = logging.getLogger("fablab_odoo")
 
 DEFAULT_URL = "https://www.865fablab.com"
 DEFAULT_DB = "865fablab"
-DEFAULT_LABOR_CODE = "OSC-865FABLAB-LABOR"
+DEFAULT_LABOR_CODE = "OSC-865FABLAB-JOINT"
 DEFAULT_LABOR_NAME = "865FabLab - Corner Assembly Labor (per unit)"
 DEFAULT_CUSTOMER = "Wired4Signs USA"
 
@@ -88,26 +88,30 @@ class OdooClient:
             raise RuntimeError(f"Odoo customer {name!r} not found")
         return int(rows[0]["id"])
 
-    def labor_product_id(self) -> int:
-        code = os.environ.get("ODOO_LABOR_PRODUCT_CODE", DEFAULT_LABOR_CODE)
+    def service_product_id(self, code: str, name: str = "",
+                           price: Optional[float] = None) -> int:
+        """product.product id for a per-each service SKU (created as a
+        service product if missing, mirroring the CIN7 SKU/name)."""
         rows = self.search_read(
             "product.product", [["default_code", "=", code]], ["id"], limit=1)
         if rows:
             return int(rows[0]["id"])
-        price = float(os.environ.get("ODOO_LABOR_UNIT_PRICE", "10") or 10)
         tmpl_id = self.create("product.template", {
-            "name": DEFAULT_LABOR_NAME,
-            "default_code": code,
-            "type": "service",
-            "sale_ok": True,
-            "purchase_ok": False,
-            "list_price": price,
+            "name": name or code, "default_code": code, "type": "service",
+            "sale_ok": True, "purchase_ok": False,
+            "list_price": float(price if price is not None else
+                                os.environ.get("ODOO_LABOR_UNIT_PRICE", 10)),
         })
         rows = self.search_read(
             "product.product", [["product_tmpl_id", "=", tmpl_id]],
             ["id"], limit=1)
-        log.info("Created Odoo labor product %s (template %s)", code, tmpl_id)
+        log.info("Created Odoo service product %s (template %s)", code, tmpl_id)
         return int(rows[0]["id"])
+
+    def labor_product_id(self) -> int:
+        return self.service_product_id(
+            os.environ.get("ODOO_LABOR_PRODUCT_CODE", DEFAULT_LABOR_CODE),
+            DEFAULT_LABOR_NAME)
 
     # -- the flow --------------------------------------------------------
 
@@ -124,12 +128,12 @@ class OdooClient:
             return {}
 
     def create_lead_and_quote(
-            self, *, po_number: str, total_qty: float,
-            description_html: str, unit_price: Optional[float] = None,
+            self, *, po_number: str, services: list,
+            description_html: str,
     ) -> dict:
-        """Returns {'lead_id', 'quote_id', 'quote_name'}."""
+        """services: [{code, name, qty, price}] — one quote line each.
+        Returns {'lead_id', 'quote_id', 'quote_name'}."""
         partner_id = self.customer_id()
-        product_id = self.labor_product_id()
         lead_name = f"{po_number} — Wired4Signs corner assembly"
         lead_id = self.create("crm.lead", {
             "name": lead_name,
@@ -138,10 +142,15 @@ class OdooClient:
             **self._salesperson(),
             "description": description_html,
         })
-        line = {"product_id": product_id, "product_uom_qty": float(total_qty),
-                "name": f"Corner assembly labor — {po_number}"}
-        if unit_price is not None:
-            line["price_unit"] = float(unit_price)
+        order_lines = []
+        for svc in services:
+            pid = self.service_product_id(svc["code"], svc.get("name") or "",
+                                          svc.get("price"))
+            line = {"product_id": pid, "product_uom_qty": float(svc["qty"]),
+                    "name": f"{svc.get('name') or svc['code']} — {po_number}"}
+            if svc.get("price") is not None:
+                line["price_unit"] = float(svc["price"])
+            order_lines.append([0, 0, line])
         quote_id = self.create("sale.order", {
             "partner_id": partner_id,
             **self._salesperson(),
@@ -149,7 +158,7 @@ class OdooClient:
             "origin": po_number,
             "client_order_ref": po_number,
             "note": description_html,
-            "order_line": [[0, 0, line]],
+            "order_line": order_lines,
         })
         rows = self.search_read("sale.order", [["id", "=", quote_id]],
                                 ["name"], limit=1)

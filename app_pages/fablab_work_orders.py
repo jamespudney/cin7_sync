@@ -473,8 +473,8 @@ def _render_place_order(draft_id: int, bom_parents: dict,
         st.markdown(
             "**What happens:** one CIN7 assembly (Finished Goods, "
             "*authorised*) per SKU below — CIN7 builds each pick list from "
-            "the BOM — plus one Draft PO to 865FabLab for "
-            f"`{fa.LABOR_SKU}` × total units. When that PO is authorised "
+            "the BOM — plus one Draft PO to 865FabLab with one line per "
+            "service SKU (`OSC-865FABLAB-*`) from the BOMs. When that PO is authorised "
             "in CIN7, each assembly is posted to the 865 corner channel "
             "and the Odoo lead + quote are created.")
         lines = {k: _num(v) for k, v in saved.items() if _num(v) > 0}
@@ -485,9 +485,10 @@ def _render_place_order(draft_id: int, bom_parents: dict,
              "Components (BOM)": ", ".join(
                  f"{c} × {t:g}" for c, _n, t in r["components"])}
             for r in per_sku]), use_container_width=True, hide_index=True)
-        st.caption(
-            f"Labor PO line: {fa.LABOR_SKU} × {total_units:g} at the "
-            "865FabLab fixed price in CIN7.")
+        svc_totals, _ns = fa.service_totals(lines, bom_parents)
+        st.caption("PO lines: " + ", ".join(
+            f"{k} × {v:g}" for k, v in svc_totals.items())
+            + f" ({total_units:g} units) at the 865FabLab fixed price in CIN7.")
         with st.expander("PO memo / pick list preview"):
             st.code(fa.format_pick_list(
                 per_sku, totals,
