@@ -8133,51 +8133,13 @@ def _abc_engine(products: pd.DataFrame,
                 # is enough; quiet operation.
         except Exception:  # noqa: BLE001
             pass
-        # v2.67.42 — also snapshot the slow-stock VALUE on shelf
-        # so the Overview tile can render a month-over-month delta
-        # caption. Filter to in-stock + parents only to match the
-        # actionable definition the rest of the page uses.
+        # 2026-09-04 — slow-mover + dead-stock value snapshots moved to
+        # engine/value_snapshots.py (shared with the warm job, which
+        # logs the result). The inline version silently stopped
+        # writing after 2026-06-23.
         try:
-            _value_snap_df = df.loc[
-                df["is_dormant"].fillna(False).astype(bool)
-                & (df.get("OnHand", pd.Series(0)).fillna(0) > 0)
-                & (~df.get("is_non_master_tube",
-                            pd.Series(False)).fillna(False))
-            ]
-            _v_skus_count = int(len(_value_snap_df))
-            _v_units = float(
-                _value_snap_df.get("OnHand",
-                                    pd.Series(dtype=float))
-                .fillna(0).sum())
-            # v2.67.53 — use engine OnHandValue (NOT StockOnHand).
-            # Aligns with the new unified _compute_slow_stock_holding
-            # helper that Overview + Slow Movers page now both use.
-            # Earlier code used StockOnHand here to mirror the
-            # Overview tile, but Overview itself is now reading
-            # OnHandValue via the helper. Snapshots written before
-            # this change will show a small one-time discontinuity
-            # when the MoM caption compares them — accept it since
-            # the new definition is the canonical one going forward.
-            _v_value = float(
-                _value_snap_df.get("OnHandValue",
-                                    pd.Series(dtype=float))
-                .fillna(0).sum())
-            db.record_slow_mover_value_snapshot(
-                _v_skus_count, _v_units, _v_value)
-        except Exception:  # noqa: BLE001
-            pass
-        # v2.67.381 — same snapshot pattern for DEAD stock (`is_dead`
-        # above), a separate population from the dormancy set. Powers
-        # the "Dead stock" tile's month-over-month caption on Overview.
-        try:
-            _dead_snap_df = df.loc[df["is_dead"].fillna(False).astype(bool)]
-            db.record_dead_stock_value_snapshot(
-                int(len(_dead_snap_df)),
-                float(_dead_snap_df.get(
-                    "OnHand", pd.Series(dtype=float)).fillna(0).sum()),
-                float(_dead_snap_df.get(
-                    "OnHandValue", pd.Series(dtype=float)).fillna(0).sum()),
-            )
+            from engine.value_snapshots import record_value_snapshots
+            record_value_snapshots(df, db)
         except Exception:  # noqa: BLE001
             pass
     except Exception:  # noqa: BLE001
@@ -10786,24 +10748,6 @@ if page == "Overview":
     st.divider()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Products", _fmt_number(len(products)))
-    c2.metric("Stock rows", _fmt_number(len(stock)))
-    c3.metric("Active suppliers (90d)",
-              _fmt_number(purchase_lines["SupplierID"].nunique()
-                          if not purchase_lines.empty else 0))
-    customer_count = 0
-    if customers_file:
-        try:
-            # customers file is big — just count rows fast
-            customer_count = sum(1 for _ in open(customers_file, "r",
-                                                encoding="utf-8")) - 1
-        except Exception:
-            customer_count = 0
-    c4.metric("Customers", _fmt_number(customer_count))
-
-    st.divider()
-
-    c1, c2, c3, c4 = st.columns(4)
     # v2.67.37 — single source of truth helper. Same number on
     # Overview / Ordering / Monthly Metrics so commissions tie out.
     stock_value = _headline_stock_value(stock, products)
@@ -11431,6 +11375,24 @@ if page == "Overview":
                          labels={"Revenue": "Revenue (base currency)"})
             fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig, width="stretch")
+
+    # Data counts — moved to the bottom 2026-09-04 per James.
+    st.divider()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Products", _fmt_number(len(products)))
+    c2.metric("Stock rows", _fmt_number(len(stock)))
+    c3.metric("Active suppliers (90d)",
+              _fmt_number(purchase_lines["SupplierID"].nunique()
+                          if not purchase_lines.empty else 0))
+    customer_count = 0
+    if customers_file:
+        try:
+            # customers file is big — just count rows fast
+            customer_count = sum(1 for _ in open(customers_file, "r",
+                                                encoding="utf-8")) - 1
+        except Exception:  # noqa: BLE001
+            customer_count = 0
+    c4.metric("Customers", _fmt_number(customer_count))
 
     # Daily attention queue — moved to the bottom 2026-09-04 per James.
     st.divider()
@@ -21734,15 +21696,18 @@ elif page == "Monthly Metrics":
                 continue
         # Override current month with live value if engine
         # signals available right now.
+        # NB: `engine_df` is not defined on this page (it is a local of
+        # the Ordering context) — the old reference raised NameError
+        # inside this try and the current month silently showed $0.
         try:
             _live_holding = _compute_slow_stock_holding(
-                engine_df, _warns_mm)
+                _get_engine_df(), _warns_mm)
             _snap_by_month[current_month] = float(
                 _live_holding.get("value_held") or 0)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         _row("4. Inventory [App]", "Slow Stock Value (EOM)",
-             _per_month(lambda m: _snap_by_month.get(m, 0.0)))
+             _per_month(lambda m: _snap_by_month.get(m)))
 
         # --- Render as a DataFrame -----------------------------------
         # Build output table: metric label + one col per month label.
@@ -22542,6 +22507,87 @@ elif page == "Monthly Metrics":
             "8. Shipping Detail [QuickBooks]",
             "9. Order Counts [Cin7/DEAR]",
         ]
+        # 2026-09-04 (James) — stock-optimisation progress chart under
+        # the Inventory section: stock value vs goal, with slow and
+        # dead stock as the part we are trying to shrink.
+        def _latest_per_month(rows, value_key):
+            out = {}
+            for r in rows or []:
+                try:
+                    d_ = pd.to_datetime(r.get("snapshot_date"),
+                                        errors="coerce")
+                    if pd.isna(d_):
+                        continue
+                    v_ = float(r.get(value_key) or 0)
+                    if v_ > 0:
+                        out[pd.Period(d_, freq="M")] = v_
+                except Exception:  # noqa: BLE001
+                    continue
+            return out
+
+        def _render_stock_progress_chart() -> None:
+            # Stock value: measured daily snapshot where we have one,
+            # otherwise the modelled end-of-month value from the row
+            # above (current month = live).
+            _measured = _latest_per_month(_goal_rows_mm, "current_value")
+            _measured[current_month] = float(inv_value_now)
+            try:
+                _dead_rows = db.list_dead_stock_snapshots(limit=800) or []
+            except Exception:  # noqa: BLE001
+                _dead_rows = []
+            _dead_by_month = _latest_per_month(_dead_rows,
+                                               "value_on_shelf")
+            xs = [str(m) for m in months]
+            stock_vals = [_measured.get(m, end_of_month_inv.get(m))
+                          for m in months]
+            goal_vals = [_goal_by_month.get(m) for m in months]
+            slow_vals = [_snap_by_month.get(m) for m in months]
+            dead_vals = [_dead_by_month.get(m) for m in months]
+            if not any(v for v in stock_vals if v):
+                return
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=xs, y=stock_vals, name="Stock value",
+                mode="lines+markers", line=dict(color="#2f6fed", width=3),
+                hovertemplate="%{x}<br>Stock value $%{y:,.0f}"
+                              "<extra></extra>"))
+            fig.add_trace(go.Scatter(
+                x=xs, y=goal_vals, name="Stock goal",
+                mode="lines+markers", connectgaps=True,
+                line=dict(color="#3aa76d", width=2, dash="dash"),
+                hovertemplate="%{x}<br>Goal $%{y:,.0f}<extra></extra>"))
+            fig.add_trace(go.Bar(
+                x=xs, y=slow_vals, name="Slow stock",
+                marker_color="rgba(232,131,58,0.55)",
+                hovertemplate="%{x}<br>Slow stock $%{y:,.0f}"
+                              "<extra></extra>"))
+            fig.add_trace(go.Bar(
+                x=xs, y=dead_vals, name="Dead stock",
+                marker_color="rgba(201,79,79,0.65)",
+                hovertemplate="%{x}<br>Dead stock $%{y:,.0f}"
+                              "<extra></extra>"))
+            fig.update_layout(
+                barmode="group", height=340,
+                margin=dict(l=0, r=0, t=30, b=0),
+                title=dict(text="Stock optimisation progress",
+                           font=dict(size=15)),
+                yaxis=dict(title="", tickprefix="$", separatethousands=True,
+                           rangemode="tozero"),
+                legend=dict(orientation="h", y=1.12, x=0),
+            )
+            st.plotly_chart(fig, width="stretch",
+                            config={"displayModeBar": False})
+            _n_meas = sum(1 for m in months
+                          if m in _measured and m != current_month)
+            st.caption(
+                "Stock value: measured daily from Sep 2026 onwards "
+                "(" + str(_n_meas + 1) + " month(s) so far); earlier months "
+                "are modelled, as in the Avg Inventory Value row. Slow and "
+                "dead stock bars appear from the first month they were "
+                "recorded. Goal = dashed line; progress = the solid line "
+                "falling towards it while the bars shrink.")
+
         _seen_sections: list = []
         for section in _section_order:
             sect_df = display_table[
@@ -22571,6 +22617,8 @@ elif page == "Monthly Metrics":
                     "for details.")
             _render_metrics_table_html(sect_df)
             _render_section_pie(section)
+            if section == "4. Inventory [App]":
+                _render_stock_progress_chart()
         # Catch-all: render any section not in the explicit order
         # (in call-order of first appearance), so a future code
         # change adding a section doesn't accidentally make rows

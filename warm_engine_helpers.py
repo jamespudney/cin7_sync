@@ -212,9 +212,19 @@ def warm() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         goal_snapshot = {"error": repr(exc)}
 
+    # 2026-09-04 — slow-mover / dead-stock value history (Monthly
+    # Metrics rows + progress chart). Errors are surfaced in the log.
+    try:
+        from engine.value_snapshots import record_value_snapshots
+        import db as _db_vals
+        value_snapshots = record_value_snapshots(result_df, _db_vals)
+    except Exception as exc:  # noqa: BLE001
+        value_snapshots = {"error": repr(exc)}
+
     return {
         "rows": int(len(result_df)) if hasattr(result_df, "__len__") else None,
         "goal_snapshot": goal_snapshot,
+        "value_snapshots": value_snapshots,
         "cached_at": _dt.datetime.utcnow().isoformat() + "Z",
         "sources": bundle["_source_paths"],
         "ordering_snapshot": ordering_snapshot,

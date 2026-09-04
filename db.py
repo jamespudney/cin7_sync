@@ -9647,6 +9647,21 @@ def record_dead_stock_value_snapshot(skus_count: int,
         )
 
 
+def list_dead_stock_snapshots(limit: int = 730) -> list:
+    """Oldest-first rows from dead_stock_value_snapshots (Monthly
+    Metrics progress chart)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT snapshot_date, skus_count, units_on_hand, "
+            "       value_on_shelf "
+            "FROM dead_stock_value_snapshots "
+            "ORDER BY snapshot_date ASC "
+            "LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_previous_month_dead_stock_value() -> dict:
     """Most-recent snapshot from the calendar month preceding today's,
     or {} if none. Used by the Overview Dead-stock tile to render a
