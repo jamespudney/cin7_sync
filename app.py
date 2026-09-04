@@ -10349,6 +10349,105 @@ st.sidebar.caption(
     f"🔹 **{APP_VERSION}** · deployed {APP_DEPLOYED}")
 
 
+def _fold_note(text, title="ℹ️ Notes", **kwargs):
+    """Explanatory paragraph folded away by default (2026-09-04 UX pass:
+    users found pages too busy). Same signature as st.caption."""
+    with st.expander(title, expanded=False):
+        st.caption(text, **kwargs)
+
+def _render_stock_health_tiles(*, current, goal, excess, understock,
+                               dead, dead_skus, reorder_level=None,
+                               reorder_asof=None, scope="all stock",
+                               goal_help=None, detail_title=None,
+                               detail_fn=None):
+    """Four plain tiles + one folded detail panel. Used by the Command
+    Centre, Stock Optimisation and every vendor on Ordering so the
+    same numbers look the same everywhere (2026-09-04, James: "make
+    things simpler"; users: "too busy, too much fuss").
+
+    Row: Current · Goal · Over/under goal (NET) · Dead.
+    Folded: Excess (gross) · Understock (gross) · Reorder level, with
+    one sentence explaining why both gross figures can be large at
+    once. Returns the four tile columns so callers can add a line
+    under a tile (e.g. month-on-month dead-stock change)."""
+    current = float(current or 0.0)
+    goal = float(goal or 0.0)
+    excess = float(excess or 0.0)
+    understock = float(understock or 0.0)
+    dead = float(dead or 0.0)
+    gap = current - goal
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current stock", _fmt_money(current),
+              help=f"What we're holding right now ({scope}), at cost, "
+                   "per CIN7.")
+    c2.metric("Stock goal", _fmt_money(goal),
+              help=goal_help or (
+                  "How much we should be holding, at cost. Enough to "
+                  f"cover {DEFAULT_COVER_DAYS['A']:g} days of sales for A "
+                  f"items, {DEFAULT_COVER_DAYS['B']:g} for B, "
+                  f"{DEFAULT_COVER_DAYS['C']:g} for C, nothing for items "
+                  "that haven't sold in 12 months. Never below the "
+                  "reorder level; every live SKU gets at least one "
+                  "unit/pack. Same method on every page."))
+    if gap >= 0:
+        c3.metric("Over goal by", _fmt_money(gap),
+                  delta=(f"{gap / current * 100:.0f}% of current"
+                         if current else None),
+                  delta_color="inverse",
+                  help="Current stock minus goal. Positive = we hold "
+                       "more than we should overall. Open the detail "
+                       "panel below to see the over/short split.")
+    else:
+        c3.metric("Short of goal by", _fmt_money(-gap),
+                  delta=(f"{-gap / goal * 100:.0f}% of goal"
+                         if goal else None),
+                  delta_color="inverse",
+                  help="Goal minus current stock. We hold less than we "
+                       "should overall. Open the detail panel below to "
+                       "see the over/short split.")
+    c4.metric("Dead stock", _fmt_money(dead),
+              help=f"{_fmt_number(dead_skus)} SKUs that haven't sold a "
+                   "single unit in 12 months but are still on the "
+                   "shelf. Their goal is zero, so this is a clearance "
+                   "job, not a buying one.")
+    with st.expander(detail_title or "🔍 Detail — what's over, what's "
+                     "short, reorder level", expanded=False):
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Over-stocked items", _fmt_money(excess),
+                  help="Added up per SKU: for every item above its goal, "
+                       "the value above the goal. Includes dead stock.")
+        d2.metric("Short items", _fmt_money(understock),
+                  help="Added up per SKU: what it would cost to bring "
+                       "every item below its goal up to goal.")
+        if reorder_level is not None:
+            d3.metric("Reorder level", _fmt_money(float(reorder_level)),
+                      help="The level each SKU is topped up to when we "
+                           "place a PO — lead time plus a safety margin, "
+                           "until the next order. Tells you WHEN to buy; "
+                           "it sits below the goal and does not change "
+                           "the reorder suggestions."
+                           + (f" As of {reorder_asof}." if reorder_asof
+                              else ""))
+        else:
+            d3.metric("Reorder level", "—",
+                      help="Appears once Ordering or Stock Optimisation "
+                           "has run.")
+        # Two $ in one caption render as LaTeX — escape them.
+        st.caption((
+            f"Both can be large at once: some items are "
+            f"{_fmt_money(excess)} over their goal while others are "
+            f"{_fmt_money(understock)} short. The difference "
+            f"({_fmt_money(abs(excess - understock))}) is the "
+            f"'{'over' if gap >= 0 else 'short of'} goal' figure above "
+            f"(small differences come from SKUs with no CIN7 cost). "
+            f"Selling the over-stocked items down to goal frees "
+            f"{_fmt_money(excess)}; topping up the short ones costs "
+            f"{_fmt_money(understock)}.").replace("$", "\\$"))
+        if detail_fn is not None:
+            detail_fn()
+    return c1, c2, c3, c4
+
+
 if page == "Overview":
     st.header(":bar_chart: Overview")
     render_attention_queue(
@@ -10728,7 +10827,7 @@ if page == "Overview":
     # drop) set, not Dead (zero-demand) stock — so there was
     # previously no reliable place to see these four numbers together,
     # or to answer "how much dead stock have we moved" at all.
-    st.subheader("📦 Stock health: goal vs. current vs. dead")
+    st.subheader("📦 Stock health")
     # 2026-09-03 — figures come from engine/stock_goal.stock_health_summary,
     # the same function the Stock Optimisation headline and the
     # per-vendor tiles use. Prefer a live compute on the engine
@@ -10793,88 +10892,49 @@ if page == "Overview":
     _excess_cc = float(_health_cc.get("excess_value") or 0.0)
     _under_cc = float(_health_cc.get("understock_value") or 0.0)
 
-    sh1, sh2, sh3, sh4, sh4b, sh5 = st.columns(6)
     if _dead_data_available:
-        sh1.metric(
-            "Stock goal",
-            _fmt_money(_goal_value_cc),
-            delta=f"{_goal_value_cc - stock_value:+,.0f} vs current",
-            delta_color="off",
-            help=(
-                "How much stock we should be holding in total, at cost. "
-                "Worked out SKU by SKU: enough to cover "
-                f"{DEFAULT_COVER_DAYS['A']:g} days of sales for A items, "
-                f"{DEFAULT_COVER_DAYS['B']:g} days for B, "
-                f"{DEFAULT_COVER_DAYS['C']:g} days for C, and nothing for items "
-                "that haven't sold in 12 months. Never set below the "
-                "reorder level; every live SKU gets at least one "
-                "unit/pack. Same number as Stock Optimisation and the "
-                "vendor tiles on Ordering added together."))
+        def _cc_health_detail():
+            if _health_cc.get("by_class"):
+                _cls_bits = []
+                for _c in _health_cc["by_class"]:
+                    _cov = _c.get("days_cover")
+                    _cls_bits.append(
+                        f"**{_c['class']}** "
+                        f"{_fmt_money(_c['current_value'])} now → "
+                        f"{_fmt_money(_c['goal_value'])} goal"
+                        + (f" ({_cov:.0f}d cover)" if _cov else ""))
+                st.caption("By class: " + " · ".join(_cls_bits)
+                           .replace("$", "\\$"))
+            if _health_asof and not _health_provisional:
+                st.caption(f"Complete figure from the last Ordering / "
+                           f"Stock Optimisation run — as of {_health_asof}.")
+            st.caption(
+                "Same definitions as Stock Optimisation. **🪫 Slow-mover "
+                "stock reduction** below is a different, larger group: "
+                "items still selling, but far slower than before.")
+
+        _sh_cols = _render_stock_health_tiles(
+            current=stock_value, goal=_goal_value_cc,
+            excess=_excess_cc, understock=_under_cc,
+            dead=_dead_value_ov, dead_skus=_dead_skus_ov,
+            reorder_level=_reorder_level_cc, reorder_asof=_reorder_asof,
+            detail_fn=_cc_health_detail)
+        sh5 = _sh_cols[3]
+        if _health_provisional:
+            st.caption(
+                ":warning: Provisional — supplier lead-time config is not "
+                "loaded yet. Open Ordering or Stock Optimisation once and "
+                "this panel switches to the complete figure.")
     else:
-        sh1.metric("Stock goal", "—",
-                   help="No engine snapshot with goal columns yet — "
-                        "appears after the next background engine "
-                        "recompute.")
-    sh2.metric(
-        "Current stock value", _fmt_money(stock_value),
-        help="What we're holding right now, at cost, per CIN7. Same "
-             "number as the stock value tile above.")
-    if _reorder_level_cc is not None:
-        sh3.metric(
-            "Reorder level (order-up-to)",
-            _fmt_money(float(_reorder_level_cc)),
-            help=(
-                "The stock level each SKU gets topped up to when we place "
-                "a PO — enough to last through the supplier's lead time "
-                "plus a safety margin, until the next order. It tells you "
-                "WHEN to buy; it is not how much we should hold on "
-                "average, so it sits below the Stock goal. (Used to be "
-                "labelled 'Target stock (Optimum)'.) Refreshes when "
-                "Ordering or Stock Optimisation runs"
-                + (f" — as of {_reorder_asof}." if _reorder_asof else ".")))
-    else:
-        sh3.metric("Reorder level (order-up-to)", "—",
-                   help="Appears once Ordering or Stock Optimisation has "
-                        "run since this version was deployed.")
-    if _dead_data_available:
-        # Two tiles, not "$x · $y" in one: Streamlit renders text between
-        # two $ signs as LaTeX (seen live 2026-09-04).
-        sh4.metric(
-            "Excess above goal",
-            _fmt_money(_excess_cc),
-            delta=f"net freeable ≈ {_fmt_money(_excess_cc - _under_cc)}",
-            delta_color="off",
-            help=("Cash tied up in items we have too many of: for every "
-                  "SKU above its goal, the value above the goal, added up. "
-                  "Dead stock is included (its goal is zero). 'Net "
-                  "freeable' is this minus Understock — the cash we'd "
-                  "actually get back after topping up the short items."))
-        sh4b.metric(
-            "Understock (below goal)",
-            _fmt_money(_under_cc),
-            help="Cash we'd need to spend to bring the items we're short "
-                 "of up to their goal.")
-        sh5.metric(
-            "Dead stock (zero 12mo demand, holding stock)",
-            _fmt_money(_dead_value_ov),
-            help=(
-                f"{_fmt_number(_dead_skus_ov)} SKUs that haven't sold a "
-                "single unit in 12 months but are still on the shelf. "
-                "Their goal is zero, so this is a clearance job, not a "
-                "buying one. Different from the 'Slow stock' panel below, "
-                "which is about items still selling but much slower than "
-                "they used to."))
-    else:
-        sh4.metric("Excess above goal", "—")
-        sh4b.metric("Understock (below goal)", "—")
-        sh5.metric("Dead stock (zero 12mo demand, holding stock)", "—",
-                   help="Waiting on the next background engine recompute.")
+        sh5 = None
+        st.caption("Stock health appears after the next background "
+                   "engine recompute.")
 
     try:
         _dead_prev_month = db.get_previous_month_dead_stock_value()
     except Exception:  # noqa: BLE001
         _dead_prev_month = {}
-    if (_dead_data_available and _dead_prev_month
+    if (_dead_data_available and sh5 is not None and _dead_prev_month
             and _dead_prev_month.get("value_on_shelf") is not None):
         _dprev_v = float(_dead_prev_month["value_on_shelf"] or 0)
         _ddelta = _dead_value_ov - _dprev_v
@@ -10894,31 +10954,6 @@ if page == "Overview":
             f"{_dprev_date}: {_fmt_money(_dprev_v)}</small>",
             unsafe_allow_html=True)
 
-    # Per-class strip (A/B/C/D) so the goal is legible at a glance.
-    if _dead_data_available and _health_cc.get("by_class"):
-        _cls_bits = []
-        for _c in _health_cc["by_class"]:
-            _cov = _c.get("days_cover")
-            _cls_bits.append(
-                f"**{_c['class']}** {_fmt_money(_c['current_value'])} now → "
-                f"{_fmt_money(_c['goal_value'])} goal"
-                + (f" ({_cov:.0f}d cover)" if _cov else ""))
-        st.caption(" · ".join(_cls_bits).replace("$", "\\$"))
-    if _dead_data_available and _health_provisional:
-        st.caption(
-            ":warning: Provisional — supplier lead-time config is not "
-            "loaded yet, so the reorder-level lift is not applied. Open "
-            "Ordering or Stock Optimisation once and this panel switches "
-            "to the complete figure.")
-    elif _health_asof:
-        st.caption(f"Complete figure from the last Ordering / Stock "
-                   f"Optimisation run — as of {_health_asof}.")
-    st.caption(
-        "These tiles use exactly the same definitions as Stock "
-        "Optimisation (see 'How these figures are defined' there). "
-        "**🪫 Slow-mover stock reduction** below is a different, larger "
-        "group: items still selling, but far slower than before.")
-
     st.divider()
 
     # v2.67.38 — slow-mover stock-reduction panel. Surfaces what we
@@ -10927,7 +10962,7 @@ if page == "Overview":
     # this its own visible block on the front page so the team sees
     # it every day.
     st.divider()
-    st.subheader("🪫 Slow-mover stock reduction (dormancy / velocity-drop)")
+    st.subheader("🪫 Slow-mover stock reduction")
     try:
         _dormancy_w = db.get_dormancy_warnings()
     except Exception:  # noqa: BLE001
@@ -11031,15 +11066,6 @@ if page == "Overview":
               "(margin retained even on slow stock)."))
     # Placeholder for AI-attribution — coming in v2.67.39+ when
     # we wire a salesperson→AI-query→sale signal source.
-    st.caption(
-        "💡 _AI-attributed clearance (sales triggered by the AI "
-        "Assistant surfacing slow movers) — coming in v2.67.39+. "
-        "We need a signal source linking sales to AI queries; the "
-        "infrastructure (`sku_dormancy_log`, ai_audit_logs) is "
-        "already in place for it._  See the dedicated **Slow "
-        "Movers** page for the full SKU-level breakdown and "
-        "manual dismiss controls."
-    )
     _slow_detail_df = _slow_holding.get("detail_df")
     if isinstance(_slow_detail_df, pd.DataFrame) and not _slow_detail_df.empty:
         with st.expander("Why did slow-stock value move?", expanded=False):
@@ -11134,13 +11160,12 @@ if page == "Overview":
     # --- Today + Month-to-Date vs same-period prior years ---------------
     if not sale_lines.empty and "InvoiceDate" in sale_lines.columns:
         st.divider()
-        st.subheader(":calendar: Today & Month-to-date vs prior years")
-        st.caption(
-            "**Today's comparison uses the matching weekday 52 weeks ago** "
+        st.subheader(":calendar: Today & Month-to-date vs prior years",
+                     help=("**Today's comparison uses the matching weekday 52 weeks ago** "
             "(Shopify-style), not the same calendar date — keeps "
             "weekday-driven sales patterns aligned (Tue vs Tue, not Tue "
             "vs Sat). MTD comparison uses the same calendar date range "
-            "across years.")
+            "across years."))
 
         # df = sale_lines for UNITS/orders. We deliberately use
         # line-level for unit counts because order-level headers
@@ -11448,7 +11473,7 @@ if page == "Overview":
 
 elif page == "LED Tubes":
     st.header(":bulb: LED Tubes & Mounting Plates")
-    st.caption(
+    _fold_note(
         "Tube families, size/MP variants, migration forecast for retiring "
         "lines (Smokies38 / Cascade38 → Sierra38), and shared component "
         "tracking (Yukon mounting plate etc.)."
@@ -11612,7 +11637,7 @@ elif page == "LED Tubes":
 
     # --- Variant matrix per family ---------------------------------------
     st.markdown("### :1234: Variant matrix — where the velocity lives")
-    st.caption(
+    _fold_note(
         "Each family shows a grid of size (rows) × color+MP (columns). "
         "Cell values are units sold in the selected window. Highlight "
         "where the demand is concentrated and where gaps exist."
@@ -11805,7 +11830,7 @@ elif page == "LED Tubes":
     if include_migrations:
         st.markdown("#### 📈 Projected MASTER TUBE "
                      f"demand — what we order from supplier")
-        st.caption(
+        _fold_note(
             f"One row per master tube (purchased from supplier per rule "
             f"`Logic: Purchased full length`). Demand for each master is "
             f"the sum of `variant demand × source fraction` across every "
@@ -12566,7 +12591,7 @@ elif page == "LED Tubes":
                 "Edit 'Order qty' and 'Include?' columns below. "
                 "Line value auto-recomputes on save."
             )
-            st.caption(
+            _fold_note(
                 "ℹ️ **Suggested reorder uses the ABC engine's "
                 "trailing-12-month methodology** (same as the Ordering "
                 "page) — including 🎯 Project / 💤 Dormant suppression, "
@@ -12758,7 +12783,7 @@ elif page == "LED Tubes":
 
     # --- Yukon mounting plate tracker (dedicated spot) -------------------
     st.markdown("### 📐 Yukon mounting plate — Minalex")
-    st.caption(
+    _fold_note(
         "LED-YUKON-* SKUs supplied by Minalex, with BOM-driven consumption "
         "aggregated from every tube that uses them. Build a draft Minalex "
         "PO for the Yukon range directly."
@@ -13033,7 +13058,7 @@ elif page == "LED Tubes":
 
     # --- Critical components (team-designated) ---------------------------
     st.markdown("### 🚨 Critical components per family")
-    st.caption(
+    _fold_note(
         "Team-designated components to watch per tube family (e.g. Yukon "
         "mounting plate used across Sierra38 + Sierra65; Oslo heat plate "
         "for Oslo variants). Long supplier lead times make these reorder "
@@ -13236,7 +13261,7 @@ elif page == "LED Tubes":
             ), axis=1,
         )
 
-        st.caption(
+        _fold_note(
             f"Components consumed by tubes in your selection. "
             f"Sorted to surface shared components (used across multiple "
             f"families) — these are your reorder-priority watches because "
@@ -13287,7 +13312,7 @@ elif page == "Supplier Pricing":
     # All explicit team decisions, fully auditable. Drives the
     # tier-optimisation cues that surface in the Ordering page.
     st.header(":moneybag: Supplier Pricing & Pack Rules")
-    st.caption(
+    _fold_note(
         "Curated team-input that drives the engine's reorder math. "
         "Tier prices, setup fees, family aggregation rules, per-SKU "
         "pack quantities. All edits are logged to the audit trail.")
@@ -13305,7 +13330,7 @@ elif page == "Supplier Pricing":
     # ===== Tab 1: Tier Pricing =====
     with pricing_tab:
         st.subheader("Family-color tier prices")
-        st.caption(
+        _fold_note(
             "One row per (family, color, supplier, tier qty). "
             "tier_qty is the MINIMUM qty at which this row's "
             "unit_price applies. The tier the buyer qualifies for "
@@ -13394,7 +13419,7 @@ elif page == "Supplier Pricing":
     # ===== Tab 2: Setup Fees =====
     with fees_tab:
         st.subheader("Setup / changeover fees")
-        st.caption(
+        _fold_note(
             "Fees that fire under specific PO conditions — the "
             "Reeves $750 color-change fee is the canonical example. "
             "fee_type='color_change' triggers when a single PO "
@@ -13459,7 +13484,7 @@ elif page == "Supplier Pricing":
     # ===== Tab 3: Aggregation Rules =====
     with rules_tab:
         st.subheader("Family aggregation rules & nag thresholds")
-        st.caption(
+        _fold_note(
             "How tier qualification rolls up for each family. "
             "**sum_across_colors** = total demand across all colors "
             "qualifies the tier; cross-color POs incur the color "
@@ -13537,7 +13562,7 @@ elif page == "Supplier Pricing":
     # ===== Tab 4: SKU Buying Settings =====
     with packs_tab:
         st.subheader("Per-SKU buying settings")
-        st.caption(
+        _fold_note(
             "SKU-level Lead time, MOQ, and EOQ override the supplier "
             "defaults when present. Ordering and Product Detail use this "
             "same table, so quick row edits and deeper SKU edits stay in "
@@ -13625,7 +13650,7 @@ elif page == "Supplier Pricing":
     # ===== Tab 5: Quick Seed =====
     with seed_tab:
         st.subheader("Seed Reeves SIERRA tiers from supplier quotes")
-        st.caption(
+        _fold_note(
             "One-click load of the Reeves SIERRA38/SIERRA65 White/Black "
             "tier prices from the work-instruction quotes "
             "(WI LED-SIERRA38 030626, WI LED-SIERRA65 042125). "
@@ -13706,7 +13731,7 @@ elif page == "Migrations":
     #     SMOKIES → SIERRA family successors)
     # All paths lead through db.set_migration() so audit/log is consistent.
     st.header("📜 Migrations registry")
-    st.caption(
+    _fold_note(
         "Predecessor → successor mappings. The reorder engine uses these "
         "to roll a retiring SKU's historical sales into its successor's "
         "demand forecast — so the new SKU is reordered for the WHOLE "
@@ -13885,7 +13910,7 @@ elif page == "Migrations":
             st.markdown(
                 f"#### :bulb: Suggested predecessors from IP notes "
                 f"({len(suggested_high)} high-confidence)")
-            st.caption(
+            _fold_note(
                 "These are SKU references found in your team's IP notes "
                 "with REPLACEMENT-style intent words. Review and add "
                 "them as migrations to feed their sales into the "
@@ -14081,7 +14106,7 @@ elif page == "Sales Recent":
 # ---------------------------------------------------------------------------
 
 elif page == "Ordering":
-    st.header("🛒 Ordering — ABC-driven reorder workbench")
+    st.header("🛒 Ordering")
     with st.expander("Page notes", expanded=False):
         st.caption(
             "Unified buying workspace. ABC classification on 12-month "
@@ -15157,37 +15182,17 @@ elif page == "Ordering":
                 f"(showing **{sw_skus:,} master/orderable SKUs**; "
                 f"{non_master_count:,} assembled variants hidden and "
                 f"rolled up to their masters):")
-    sw1, sw2, sw3, sw4, sw5, sw6 = st.columns(6)
-    sw1.metric("SKUs we source from them", _fmt_number(sw_skus))
-    sw2.metric("Current stock value",
-               _fmt_money(sw_stock_value),
-               help="What we're holding of this supplier's products right "
-                    "now, at cost.")
-    sw3.metric("Stock goal",
-               _fmt_money(sw_goal_value),
-               delta=f"{sw_goal_value - sw_stock_value:+,.0f} vs current",
-               delta_color="off",
-               help=("How much of this supplier's stock we should be "
-                     "holding: days of cover by A/B/C class, never below "
-                     "the reorder level "
-                     f"({_fmt_money(sw_reorder_level_value)} for this "
-                     "supplier), at least one unit/pack of every live SKU. "
-                     "Same method as Stock Optimisation and the Command "
-                     "Centre."))
-    sw4.metric("Excess (above goal)",
-               _fmt_money(sw_excess_value),
-               delta=(f"{sw_excess_value/sw_stock_value*100:.1f}% of current"
-                      if sw_stock_value else None),
-               delta_color="inverse",
-               help="Cash tied up above goal on this supplier's items — "
-                    "the value we have too much of, added up per SKU.")
-    sw5.metric("Understock (below goal)", _fmt_money(sw_understock_value),
-               help="Cash needed to bring this supplier's short items up "
-                    "to their goal.")
-    sw6.metric("Dead stock", _fmt_money(sw_dead_value),
-               help=f"{_sw_health['dead_sku_count']:,} of this supplier's "
-                    "SKUs that haven't sold in 12 months but are still on "
-                    "the shelf.")
+    _render_stock_health_tiles(
+        current=sw_stock_value, goal=sw_goal_value,
+        excess=sw_excess_value, understock=sw_understock_value,
+        dead=sw_dead_value, dead_skus=_sw_health["dead_sku_count"],
+        reorder_level=sw_reorder_level_value,
+        scope=f"{sel_sup} products",
+        goal_help=("How much of this supplier's stock we should be "
+                   "holding: days of cover by A/B/C class, never below "
+                   "the reorder level, at least one unit/pack of every "
+                   "live SKU. Same method as Stock Optimisation and the "
+                   "Command Centre."))
 
     # --- Filtered PO summary strip ---
     st.markdown("---")
@@ -19380,71 +19385,6 @@ elif page == "Stock Optimisation":
             f"master so nothing is counted twice)."
         )
 
-    oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
-    _fallback_delta = total_onhand_value_with_fallback - total_onhand_value
-    oc1.metric("Current stock value",
-               _fmt_money(total_onhand_value),
-               help=("What we're holding right now, at cost, per CIN7. "
-                     "Same number as the Command Centre and Monthly "
-                     "Metrics. (For the goal/excess maths, SKUs with no "
-                     "CIN7 cost get an estimated one — that adds about "
-                     f"{_fmt_money(_fallback_delta)} to the per-SKU totals.)"))
-    oc2.metric("Stock goal",
-               _fmt_money(total_goal_value),
-               delta=(f"{total_goal_value - total_onhand_value:+,.0f} vs current"),
-               delta_color="off",
-               help=("How much stock we should be holding in total, at "
-                     "cost — days of cover by A/B/C class, never below the "
-                     "reorder level, at least one unit/pack of every live "
-                     "SKU. Full explanation in the panel above."))
-    oc3.metric("Reorder level (order-up-to)",
-               _fmt_money(total_target_value),
-               help=("The level each SKU is topped up to when we place a "
-                     "PO (lead time + safety margin, until the next order). "
-                     "Tells you WHEN to buy — not how much to hold on "
-                     "average, so it sits below the goal. Used to be "
-                     "labelled 'Optimum stock value'."))
-    oc4.metric("Excess (above goal)",
-               _fmt_money(total_excess_value),
-               delta=(f"{total_excess_value/total_onhand_value*100:.1f}% of current"
-                      if total_onhand_value else None),
-               delta_color="inverse",
-               help="Cash tied up in items we have too many of — the value "
-                    "above goal, added up per SKU. Includes dead stock.")
-    oc5.metric("Understock (below goal)",
-               _fmt_money(total_understock_value),
-               help="Cash we'd need to spend to bring the items we're "
-                    "short of up to their goal.")
-    oc6.metric("Dead stock (no demand, holding stock)",
-               _fmt_money(dead_value),
-               help=f"{_health['dead_sku_count']:,} SKUs that haven't sold "
-                    "a single unit in 12 months but are still on the "
-                    "shelf. Their goal is zero — a clearance job, not a "
-                    "buying one.")
-
-    _net_cash_freeable = total_excess_value - total_understock_value
-    with st.expander(
-            f"📐 How the tiles add up · cash we could actually "
-            f"free ≈ {_fmt_money(_net_cash_freeable)}",
-            expanded=False):
-        _reconcile_md = (
-            f"If we sold every over-stocked item down to its goal we'd "
-            f"get back **{_fmt_money(total_excess_value)}** (Excess). "
-            f"Bringing every short item up to its goal would cost "
-            f"**{_fmt_money(total_understock_value)}** (Understock). "
-            f"The difference, about **{_fmt_money(_net_cash_freeable)}**, "
-            f"is the cash we could actually free.\n\n"
-            f"The simple gap — Current {_fmt_money(total_onhand_value)} "
-            f"minus Goal {_fmt_money(total_goal_value)} = "
-            f"{_fmt_money(total_onhand_value - total_goal_value)} — is a "
-            f"little different only because some SKUs have no CIN7 cost "
-            f"and get an estimated one in the per-SKU maths.\n\n"
-            f"Dead stock ({_fmt_money(dead_value)}) is part of Excess, "
-            f"because its goal is zero."
-        )
-        st.markdown(_reconcile_md.replace("$", "\\$"))
-
-    # --- Turns & cover, current vs goal --------------------------------
     trailing_12mo_cogs = float(_health.get("annual_cogs") or 0.0)
     turns_current = (trailing_12mo_cogs / total_onhand_value
                      if total_onhand_value else None)
@@ -19460,32 +19400,47 @@ elif page == "Stock Optimisation":
     else:
         over_12mo_cover_value, over_12mo_cover_count = 0.0, 0
 
-    st.markdown("#### 📊 Turns & cover check")
-    tc1, tc2, tc3 = st.columns(3)
-
     def _turns_text(t):
         return f"{t:.2f}×" if t else "—"
 
     def _doh_text(d):
         return f"{d:.0f}d" if d else "—"
 
-    tc1.metric("Inventory turns — current → goal",
-               f"{_turns_text(turns_current)} → {_turns_text(turns_goal)}",
-               help=("How many times a year we sell through our stock: "
-                     "last 12 months' cost of goods sold ÷ stock value. "
-                     "First number is at today's stock, second is what it "
-                     "would be at the goal. Treat as roughly ±0.2 — the "
-                     "cost-of-goods figure is an estimate from the engine."))
-    tc2.metric("Days on hand — current → goal",
-               f"{_doh_text(doh_current)} → {_doh_text(doh_goal)}",
-               help="How many days the stock would last at the current "
-                    "rate of sales — today's stock, then at the goal.")
-    tc3.metric("Sold, but >12mo cover",
-               _fmt_money(over_12mo_cover_value) if _cover_col_available else "—",
-               help=(f"{over_12mo_cover_count:,} SKUs that do sell, but "
-                     "we hold more than a year's worth at their current "
-                     "rate. Not dead — just cash that comes back slowly. "
-                     "Already counted in Excess where above goal."))
+    def _so_health_detail():
+        tc1, tc2, tc3 = st.columns(3)
+        tc1.metric("Inventory turns — now → at goal",
+                   f"{_turns_text(turns_current)} → {_turns_text(turns_goal)}",
+                   help=("How many times a year we sell through our "
+                         "stock: last 12 months' cost of goods sold ÷ "
+                         "stock value. Roughly ±0.2 — the cost-of-goods "
+                         "figure is an engine estimate."))
+        tc2.metric("Days of stock — now → at goal",
+                   f"{_doh_text(doh_current)} → {_doh_text(doh_goal)}",
+                   help="How many days the stock would last at the "
+                        "current rate of sales.")
+        tc3.metric("Sells, but >12 months' worth held",
+                   _fmt_money(over_12mo_cover_value)
+                   if _cover_col_available else "—",
+                   help=(f"{over_12mo_cover_count:,} SKUs that do sell, "
+                         "but we hold more than a year's worth. Not dead "
+                         "— just cash that comes back slowly. Already "
+                         "counted in the over-stocked figure."))
+        _fallback_delta = (total_onhand_value_with_fallback
+                           - total_onhand_value)
+        if abs(_fallback_delta) >= 1:
+            st.caption(
+                f"SKUs with no CIN7 cost get an estimated one in the "
+                f"per-SKU maths; that adds about "
+                f"{_fmt_money(_fallback_delta)} to the per-SKU totals "
+                f"versus the CIN7 stock value.".replace("$", "\\$"))
+
+    _render_stock_health_tiles(
+        current=total_onhand_value, goal=total_goal_value,
+        excess=total_excess_value, understock=total_understock_value,
+        dead=dead_value, dead_skus=_health["dead_sku_count"],
+        reorder_level=total_target_value,
+        detail_title="🔍 Detail — over vs short, reorder level, turns",
+        detail_fn=_so_health_detail)
 
     # --- Class composition: now vs goal --------------------------------
     _cls_rows = []
@@ -19504,7 +19459,7 @@ elif page == "Stock Optimisation":
             "Cover at goal (days)": _goal_days,
         })
     with st.expander("📋 Class composition — now vs goal (A/B/C/D)",
-                     expanded=True):
+                     expanded=False):
         st.caption(
             "A/B/C = the usual ABC classes by sales value. D = items with "
             "no sales in the last 12 months (the ABC calc normally lumps "
@@ -23843,7 +23798,7 @@ elif page == "Product Detail":
             fig_hist.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig_hist, width="stretch")
 
-            st.caption(
+            _fold_note(
                 ":warning: **Reconstruction caveat**: walks backward from "
                 "today's OnHand using direct sales and purchase receipts. "
                 "**Stock adjustments, transfers, assembly/disassembly events "
@@ -26877,8 +26832,8 @@ elif page == "865FabLab Production":
 # ---------------------------------------------------------------------------
 
 elif page == "Slow Movers":
-    st.header("🪫 Slow Movers — stock-reduction workspace")
-    st.caption(
+    st.header("🪫 Slow Movers")
+    _fold_note(
         "Parent / standalone SKUs the ABC engine has flagged as "
         "slow-moving AND that have actual stock on hand. Clear "
         "these via promotions, AI-Assistant surfacing, or supplier "
