@@ -410,7 +410,10 @@ def _assembly_message(a, task: dict, po_number: str) -> str:
         "*Pick list (BOM):*",
     ]
     for code, name, _per, total, _pid in comps:
-        lines.append(f"• `{code}` × {total:g}" + (f" — {name}" if name else ""))
+        qty = _ceil_qty(total)
+        if qty != f"{total:g}":
+            qty = f"{qty}  (BOM {total:g})"
+        lines.append(f"• `{code}` × {qty}" + (f" — {name}" if name else ""))
     lines.append(
         "_When the batch is back, reply here `done` (or `done 35` for a "
         "partial). Used less material than the BOM? Add lines like "
@@ -496,11 +499,7 @@ def check_po_authorised(apply: bool = True) -> dict:
             else:
                 stats["errors"].append(
                     f"Slack post failed for {a['assembly_number']}: {err}")
-            desc_lines.append(
-                f"<b>{a['assembly_number']}</b> {a['sku']} × "
-                f"{_num(a['quantity']):g} — {task.get('ProductName') or ''}")
-            for code, name, _per, tot, _pid in _task_components(task):
-                desc_lines.append(f"&nbsp;&nbsp;• {code} × {tot:g} {name}")
+            desc_lines.extend(_odoo_desc_lines(a, task))
         db.fablab_po_notification_upsert(
             d["id"], cin7_po_number=po_number,
             slack_channel=CORNER_CHANNEL_ID, slack_ts=hts)
@@ -508,6 +507,22 @@ def check_po_authorised(apply: bool = True) -> dict:
 
         _odoo_step(d, po_number, total, desc_lines, order, hts, apply=True)
     return stats
+
+
+def _ceil_qty(q) -> str:
+    q = _num(q)
+    n = math.ceil(q - 1e-9)
+    return f"{n}" if abs(n - q) > 1e-9 else f"{q:g}"
+
+
+def _odoo_desc_lines(a, task) -> list:
+    """Lead/quote description: bold end product, component lengths
+    rounded up to whole units (James, 2026-09-04)."""
+    lines = [f"<b>{a['assembly_number']} · {a['sku']} × "
+             f"{_num(a['quantity']):g} — {task.get('ProductName') or ''}</b>"]
+    for code, name, _per, tot, _pid in _task_components(task):
+        lines.append(f"&nbsp;&nbsp;• {code} × {_ceil_qty(tot)} {name}")
+    return lines
 
 
 def _odoo_configured() -> bool:
@@ -573,11 +588,7 @@ def _odoo_retry(d, note, headers, last_call, stats):
     for a in assemblies:
         task, last_call = _get_task(headers, a["cin7_task_id"], last_call)
         task = task or {"ProductName": "", "OrderLines": []}
-        desc_lines.append(
-            f"<b>{a['assembly_number']}</b> {a['sku']} × "
-            f"{_num(a['quantity']):g} — {task.get('ProductName') or ''}")
-        for code, name, _per, tot, _pid in _task_components(task):
-            desc_lines.append(f"&nbsp;&nbsp;• {code} × {tot:g} {name}")
+        desc_lines.extend(_odoo_desc_lines(a, task))
     log.info("retrying Odoo step for order #%s (%s)", d["id"], po_number)
     _odoo_step(d, po_number, total, desc_lines, order, note["slack_ts"],
                apply=True)
