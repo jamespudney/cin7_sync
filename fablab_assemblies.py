@@ -382,7 +382,9 @@ def check_po_authorised(apply: bool = True) -> dict:
         if not assemblies:
             continue  # legacy order (no assemblies) — nothing to announce
         stats["checked"] += 1
-        resp, last_call = _http("GET", f"{BASE_URL}/purchase", headers,
+        # NB: /purchase returns 400 for Advanced Purchase tasks — must use
+        # /advanced-purchase (same Order.Status / top-level Status shape).
+        resp, last_call = _http("GET", f"{BASE_URL}/advanced-purchase", headers,
                                 params={"ID": d["cin7_po_id"]}, log=log,
                                 rate_s=DEFAULT_RATE_S, last_call=last_call)
         if resp is None or resp.status_code != 200:
