@@ -23,6 +23,15 @@ import streamlit as st
 
 from engine.sku_rules import parse_corner_bom_rule
 
+# 865FabLab per-each service SKUs (OSC-865FABLAB-JOINT, -LABOR, ...) live in
+# the BOMs so the PO/quote can charge them, but they are not materials —
+# never count them in buildable / shortfall / consumed maths.
+_SERVICE_PREFIX = "OSC-865FABLAB"
+
+
+def _is_service(sku: str) -> bool:
+    return str(sku or "").strip().upper().startswith(_SERVICE_PREFIX)
+
 FABLAB_SUPPLIER = "865FabLab"
 FABLAB_FLAG_TYPE = "865FabLab build"
 
@@ -79,7 +88,7 @@ def _buildable_from_stock(
     for comp in components:
         comp_sku = str(comp.get("ComponentSKU") or "").strip()
         qty_per = _num(comp.get("Quantity"))
-        if not comp_sku or qty_per <= 0:
+        if not comp_sku or qty_per <= 0 or _is_service(comp_sku):
             continue
         comp_stk = stock_map.get(comp_sku, {})
         comp_avail = _num(comp_stk.get("Available", comp_stk.get("OnHand", 0)))
@@ -192,7 +201,7 @@ def build_materials_rollup(
         for comp in bom_parents.get(sku, []):
             comp_sku = str(comp.get("ComponentSKU") or "").strip()
             qty_per = _num(comp.get("Quantity"))
-            if not comp_sku or qty_per <= 0:
+            if not comp_sku or qty_per <= 0 or _is_service(comp_sku):
                 continue
             needed[comp_sku] = needed.get(comp_sku, 0.0) + qty * qty_per
 
@@ -787,7 +796,7 @@ def _render_receiving_checklist(
         for comp in bom_parents.get(sku, []):
             comp_sku = str(comp.get("ComponentSKU") or "").strip()
             qty_per = _num(comp.get("Quantity"))
-            if comp_sku and qty_per > 0:
+            if comp_sku and qty_per > 0 and not _is_service(comp_sku):
                 consumed[comp_sku] = consumed.get(comp_sku, 0.0) + qty * qty_per
 
     st.markdown("**Finished stock — add:**")
