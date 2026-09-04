@@ -64,6 +64,11 @@ log = logging.getLogger("fablab_assemblies")
 
 FABLAB_SUPPLIER = "865FabLab"
 LABOR_SKU = "OSC-865FABLAB-LABOR"
+LABOR_PREFIX = "OSC-865FABLAB"   # any 865FabLab service SKU (e.g. -JOINT) is labor, not material
+
+
+def _is_labor(sku) -> bool:
+    return str(sku or "").upper().startswith(LABOR_PREFIX)
 DEFAULT_LABOR_PRICE = 10.0
 CORNER_CHANNEL_ID = os.environ.get(
     "SLACK_FABLAB_CORNER_CHANNEL_ID", fablab_slack.FABLAB_CHANNEL_ID)
@@ -120,7 +125,7 @@ def build_pick_list(lines: dict, bom_parents: dict,
         for comp in bom_parents.get(sku, []):
             csku = str(comp.get("ComponentSKU") or "").strip()
             per = _num(comp.get("Quantity"))
-            if not csku or per <= 0 or csku.upper() == LABOR_SKU:
+            if not csku or per <= 0 or _is_labor(csku):
                 continue
             total = round(qty * per, 3)
             comps.append((csku, str(comp.get("ComponentName") or
@@ -168,7 +173,7 @@ def component_notes(totals: dict, bom_parents: dict, product_map: dict,
             for comp in bom_parents.get(csku, []) or []:
                 msku = str(comp.get("ComponentSKU") or "").strip()
                 per = _num(comp.get("Quantity"))
-                if not msku or per <= 0 or msku.upper() == LABOR_SKU:
+                if not msku or per <= 0 or _is_labor(msku):
                     continue
                 gap = need if on_hand is None else max(need - on_hand, 0)
                 mloc = _locator_of(product_map, msku)
@@ -393,7 +398,7 @@ def _task_components(task: dict) -> list:
     out = []
     for ol in task.get("OrderLines") or []:
         code = str(ol.get("ProductCode") or "")
-        if code.upper() == LABOR_SKU:
+        if _is_labor(code):
             continue
         total = _num(ol.get("TotalQuantity")) or _num(ol.get("Quantity"))
         out.append((code, str(ol.get("Name") or ""), total / qty, total,
@@ -676,7 +681,7 @@ def complete_assembly(assembly_id: int, *, qty_received: Optional[float] = None,
                                "Quantity": float(actual)})
     # Labor component (non-inventory) — keep CIN7's own line untouched
     for ol in task.get("OrderLines") or []:
-        if str(ol.get("ProductCode") or "").upper() == LABOR_SKU:
+        if _is_labor(ol.get("ProductCode")):
             lq = (_num(ol.get("TotalQuantity")) or _num(ol.get("Quantity")))
             lq = lq / (_num(task.get("Quantity")) or 1.0) * qty
             pick_lines.append({"ProductID": ol.get("ProductID"),
