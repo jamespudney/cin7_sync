@@ -480,52 +480,6 @@ def _render_draft_lifecycle(actor: str) -> tuple[Optional[int], bool, bool]:
     return active_id, can_edit, is_submitted
 
 
-def _render_line_editor(
-    draft_id: int, can_edit: bool, actor: str,
-    planner_df: pd.DataFrame, product_map: dict,
-) -> None:
-    import db
-
-    st.markdown("#### Order lines")
-    if can_edit and not planner_df.empty:
-        if st.button("⬇ Fill from planner batch quantities",
-                     key=f"fablab_fill_{draft_id}"):
-            for _, row in planner_df.iterrows():
-                qty = _num(row.get("Batch qty", 0))
-                if qty > 0:
-                    db.upsert_po_draft_line(draft_id, row["SKU"], qty, actor)
-            st.success("Filled order lines from planner.")
-            st.rerun()
-
-    saved = db.get_po_draft_lines(draft_id)
-    if not saved:
-        st.caption("No lines yet.")
-        return
-
-    lines_df = pd.DataFrame([
-        {"SKU": sku, "Name": product_map.get(sku, {}).get("Name", ""),
-         "Qty": qty}
-        for sku, qty in saved.items()
-    ])
-    if can_edit:
-        edited = st.data_editor(
-            lines_df, key=f"fablab_lines_editor_{draft_id}",
-            disabled=["SKU", "Name"], use_container_width=True,
-            hide_index=True)
-        if st.button("\U0001f4be Save line quantities",
-                     key=f"fablab_save_lines_{draft_id}"):
-            for _, row in edited.iterrows():
-                qty = _num(row["Qty"])
-                if qty > 0:
-                    db.upsert_po_draft_line(draft_id, row["SKU"], qty, actor)
-                else:
-                    db.delete_po_draft_line(draft_id, row["SKU"])
-            st.success("Saved.")
-            st.rerun()
-    else:
-        st.dataframe(lines_df, use_container_width=True, hide_index=True)
-
-
 def _render_push_po_to_cin7(draft_id: int, actor: str) -> None:
     """Push this draft to CIN7 as a real Draft Advanced Purchase, using
     the same validated flow as the main Ordering page
@@ -760,10 +714,10 @@ def render_fablab_work_orders(
     st.header("\U0001f3ed 865FabLab Production")
     st.info(
         "**Toll-manufactured accessory corners — you supply raw "
-        "materials, 865FabLab supplies labor.** Forecast a monthly "
-        "batch, confirm you have enough raw material on hand, place the "
-        "order, then use the receiving checklist below for the manual "
-        "CIN7 stock adjustment once the batch comes back.",
+        "materials, 865FabLab supplies labor.** Pick or create an order, "
+        "adjust the Batch qty column (pre-filled with the suggestion), "
+        "save, check raw materials, push to CIN7. Use the receiving "
+        "checklist below when the batch comes back.",
         icon="ℹ️",
     )
 
@@ -779,8 +733,17 @@ def render_fablab_work_orders(
             _render_build_list_manager(products, current_user, product_map)
         return
 
-    # ── Production planner (top — this is what a buyer opens the page for) ──
-    st.markdown("### \U0001f4cb Production planner")
+    # ── Plan & order (one section, 2026-09-04 per James) ─────────────────
+    # The planner table IS the order: pick/create an order, adjust the
+    # "Batch qty" column (pre-filled with the suggested batch, or with
+    # the quantities already saved on the order), then save. No separate
+    # "order lines" editor to copy into.
+    import db
+
+    st.markdown("### \U0001f4cb Plan & order")
+    draft_id, can_edit, is_submitted = _render_draft_lifecycle(current_user)
+    saved_lines: dict = db.get_po_draft_lines(draft_id) if draft_id else {}
+
     pc1, pc2, pc3 = st.columns([2, 2, 3])
     with pc1:
         weeks_cover = st.number_input(
@@ -791,7 +754,7 @@ def render_fablab_work_orders(
     with pc2:
         action_only = st.checkbox(
             "Action needed only", value=True, key="fablab_action_only",
-            help="Hide SKUs with no suggested batch this cycle.")
+            help="Hide SKUs with no suggested batch and nothing on the order.")
     with pc3:
         search = st.text_input(
             "Search SKU, name, or rule", key="fablab_planner_search")
@@ -802,9 +765,17 @@ def render_fablab_work_orders(
         st.warning("No data for flagged SKUs.")
         return
 
+    planner_df = planner_df.copy()
+    # Batch qty = what is on the order if saved, else the suggestion.
+    planner_df["Batch qty"] = [
+        float(saved_lines.get(sku, sug if pd.notna(sug) else 0))
+        for sku, sug in zip(planner_df["SKU"], planner_df["Suggested batch"])
+    ]
+
     view = planner_df
     if action_only:
-        view = view[view["Suggested batch"].fillna(0) > 0]
+        view = view[(view["Suggested batch"].fillna(0) > 0)
+                    | (view["Batch qty"].fillna(0) > 0)]
     if search:
         q = search.strip()
         mask = pd.Series(False, index=view.index)
@@ -812,23 +783,31 @@ def render_fablab_work_orders(
             mask |= view[col].astype(str).str.contains(
                 q, case=False, na=False)
         view = view[mask]
-
     view = view.copy()
-    view["Batch qty"] = view["Suggested batch"]
+
+    qty_editable = (draft_id is None) or can_edit
+    if draft_id and is_submitted:
+        st.caption("This order has already been placed — quantities are "
+                   "read-only.")
+    elif draft_id and not can_edit:
+        st.caption("Take the lock above to edit quantities.")
     edited_planner = st.data_editor(
         view,
-        key="fablab_planner_editor",
+        key=f"fablab_planner_editor_{draft_id or 'none'}",
         use_container_width=True,
         hide_index=True,
-        disabled=[c for c in view.columns if c != "Batch qty"],
+        disabled=[c for c in view.columns
+                  if c != "Batch qty" or not qty_editable],
         column_config={
             "On hand": st.column_config.NumberColumn(format="%.1f"),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
-            "Suggested batch": st.column_config.NumberColumn(format="%d"),
+            "Suggested batch": st.column_config.NumberColumn(
+                format="%d", help="Rounded up to whole units."),
             "Buildable from stock": st.column_config.NumberColumn(format="%.1f"),
             "Batch qty": st.column_config.NumberColumn(
-                "✏ Batch qty", format="%d", step=1,
-                help="Edit to override the suggested batch quantity."),
+                "✏ Batch qty (order)", format="%d", step=1, min_value=0,
+                help="What goes on the 865FabLab order. Pre-filled with the "
+                     "suggested batch; edit, then save."),
         },
     )
 
@@ -836,20 +815,47 @@ def render_fablab_work_orders(
     mcol1, mcol2, mcol3 = st.columns(3)
     mcol1.metric("Flagged SKUs", fmt_number(len(planner_df)))
     mcol2.metric(
-        "Units in this batch",
+        "Units on this order",
         fmt_number(edited_planner["Batch qty"].fillna(0).sum()))
     mcol3.metric("Raw short", fmt_number(n_short))
+
+    if draft_id is None:
+        st.info("Pick or create an order above, then save these quantities "
+                "to it.", icon="\U0001f4e6")
+    elif can_edit:
+        if st.button("\U0001f4be Save quantities to this order",
+                     key=f"fablab_save_{draft_id}", type="primary"):
+            for _, row in edited_planner.iterrows():
+                qty = _num(row.get("Batch qty", 0))
+                if qty > 0:
+                    db.upsert_po_draft_line(
+                        draft_id, row["SKU"], qty, current_user)
+                elif row["SKU"] in saved_lines:
+                    db.delete_po_draft_line(draft_id, row["SKU"])
+            st.success("Order quantities saved.")
+            st.rerun()
+
+    if draft_id and saved_lines:
+        with st.expander(
+                f"Lines saved on this order ({len(saved_lines)} SKUs)"):
+            st.dataframe(pd.DataFrame([
+                {"SKU": sku,
+                 "Name": product_map.get(sku, {}).get("Name", ""),
+                 "Qty": qty} for sku, qty in saved_lines.items()]),
+                use_container_width=True, hide_index=True)
+    if draft_id and can_edit and saved_lines:
+        _render_push_po_to_cin7(draft_id, current_user)
 
     # ── Materials shortfall ──────────────────────────────────────────────
     st.divider()
     st.markdown("### \U0001f9f1 Materials shortfall")
     # Base qty for every flagged SKU (including any hidden by the
-    # "Action needed only" / search filters above) is its suggested
-    # batch; only override with an edit for rows currently visible in
-    # the editor -- otherwise filtering the view would silently drop
+    # "Action needed only" / search filters above) is its batch qty;
+    # only override with an edit for rows currently visible in the
+    # editor -- otherwise filtering the view would silently drop
     # hidden SKUs' raw-material needs from the rollup below.
     batch_qtys = dict(
-        zip(planner_df["SKU"], planner_df["Suggested batch"].fillna(0)))
+        zip(planner_df["SKU"], planner_df["Batch qty"].fillna(0)))
     batch_qtys.update(
         zip(edited_planner["SKU"], edited_planner["Batch qty"].fillna(0)))
     stock_map = _stock_by_sku(stock)
@@ -866,16 +872,6 @@ def render_fablab_work_orders(
                 f"Short on {len(short_rollup)} component(s) — order "
                 "these before placing the 865FabLab batch:")
         st.dataframe(rollup_df, use_container_width=True, hide_index=True)
-
-    # ── Place order with 865FabLab ───────────────────────────────────────
-    st.divider()
-    st.markdown("### \U0001f4e6 Place order with 865FabLab")
-    draft_id, can_edit, _is_submitted = _render_draft_lifecycle(current_user)
-    if draft_id:
-        _render_line_editor(
-            draft_id, can_edit, current_user, edited_planner, product_map)
-        if can_edit:
-            _render_push_po_to_cin7(draft_id, current_user)
 
     # ── Receiving checklist ──────────────────────────────────────────────
     st.divider()
