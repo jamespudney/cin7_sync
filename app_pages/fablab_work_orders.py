@@ -96,9 +96,12 @@ def build_planner_table(
     engine_df: pd.DataFrame,
     bom_parents: dict,
     weeks_cover: float,
+    wip_map: Optional[dict] = None,
 ) -> pd.DataFrame:
-    """One row per flagged SKU: demand, on-hand, suggested batch, and
-    whether current raw-material stock covers that batch."""
+    """One row per flagged SKU: demand, on-hand, WIP already in production,
+    suggested batch (net of WIP), and whether raw-material stock covers it.
+    wip_map: {sku: {"qty": float, "refs": [..]}} from db.fablab_wip_by_sku()."""
+    wip_map = wip_map or {}
     stock_map = _stock_by_sku(stock)
     engine_map = _rows_by_sku(engine_df)
     product_map = _rows_by_sku(products)
@@ -125,12 +128,20 @@ def build_planner_table(
         target_for_window = monthly_demand * (weeks_cover / 4.345)
         # 2026-09-04 (James): whole units only — round UP so the batch
         # always covers the window (you can't build 0.3 of a part).
-        suggested = float(math.ceil(max(0.0, target_for_window - on_hand) - 1e-9))
+        # 2026-09-04 (James): units already in production at 865FabLab
+        # (open assemblies) count as covered, so we don't order them twice.
+        # If demand rises, only the extra shows up — as a new order.
+        wip = _num(wip_map.get(sku, {}).get("qty", 0))
+        wip_refs = ", ".join(wip_map.get(sku, {}).get("refs", []))
+        suggested = float(math.ceil(
+            max(0.0, target_for_window - on_hand - wip) - 1e-9))
 
         buildable, material_bits, components = _buildable_from_stock(
             sku, bom_parents, stock_map)
 
-        if suggested <= 0:
+        if suggested <= 0 and wip > 0:
+            status = "In production"
+        elif suggested <= 0:
             status = "No action"
         elif not components:
             status = "Check BOM"
@@ -148,6 +159,8 @@ def build_planner_table(
             "ABC": eng.get("ABC") or "",
             "Status": eng.get("Status") or "",
             "On hand": round(on_hand, 1),
+            "WIP": int(round(wip)),
+            "WIP ref": wip_refs,
             "Monthly demand": round(monthly_demand, 2),
             "Suggested batch": int(suggested),
             "Buildable from stock": round(buildable, 1),
@@ -859,8 +872,13 @@ def render_fablab_work_orders(
         search = st.text_input(
             "Search SKU, name, or rule", key="fablab_planner_search")
 
+    try:
+        wip_map = db.fablab_wip_by_sku()
+    except Exception:  # noqa: BLE001
+        wip_map = {}
     planner_df = build_planner_table(
-        flagged_skus, products, stock, engine_df, bom_parents, weeks_cover)
+        flagged_skus, products, stock, engine_df, bom_parents, weeks_cover,
+        wip_map=wip_map)
     if planner_df.empty:
         st.warning("No data for flagged SKUs.")
         return
@@ -888,7 +906,8 @@ def render_fablab_work_orders(
     view = planner_df
     if action_only:
         view = view[(view["Suggested batch"].fillna(0) > 0)
-                    | (view["Batch qty"].fillna(0) > 0)]
+                    | (view["Batch qty"].fillna(0) > 0)
+                    | (view["WIP"].fillna(0) > 0)]
     if search:
         q = search.strip()
         mask = pd.Series(False, index=view.index)
@@ -915,9 +934,16 @@ def render_fablab_work_orders(
             "Include": st.column_config.CheckboxColumn(
                 "✔ Include", help="Tick to put this SKU on the order."),
             "On hand": st.column_config.NumberColumn(format="%.1f"),
+            "WIP": st.column_config.NumberColumn(
+                "🏭 WIP", format="%d",
+                help="Already in production at 865FabLab (open assemblies "
+                     "not yet marked done in Slack). Counted as covered."),
+            "WIP ref": st.column_config.TextColumn(
+                "WIP ref", help="Assembly / order the WIP belongs to."),
             "Monthly demand": st.column_config.NumberColumn(format="%.2f"),
             "Suggested batch": st.column_config.NumberColumn(
-                format="%d", help="Rounded up to whole units."),
+                format="%d", help="Target − on hand − WIP, rounded up to "
+                                  "whole units."),
             "Buildable from stock": st.column_config.NumberColumn(format="%.1f"),
             "Batch qty": st.column_config.NumberColumn(
                 "✏ Batch qty (order)", format="%d", step=1, min_value=0,
@@ -928,6 +954,11 @@ def render_fablab_work_orders(
 
     included = edited_planner[edited_planner["Include"].fillna(False)
                               .astype(bool)]
+    n_wip = int((edited_planner["WIP"].fillna(0) > 0).sum())
+    if n_wip:
+        st.caption(f"🏭 {n_wip} SKU(s) have units in production at 865FabLab "
+                   "(WIP column). Those units are treated as covered; the "
+                   "suggested batch only shows what is needed on top.")
     if qty_editable:
         # Remember ticks for visible rows; keep remembered ticks for rows
         # hidden by the search/filter.

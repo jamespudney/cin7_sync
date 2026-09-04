@@ -7937,6 +7937,23 @@ def list_fablab_assemblies(draft_id: Optional[int] = None,
         return c.execute(sql, tuple(args)).fetchall()
 
 
+def fablab_wip_by_sku() -> dict:
+    """Open (authorised, not yet done/voided) 865FabLab assemblies summed
+    per end-product SKU: {sku: {"qty": float, "refs": [str, ...]}}."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT sku, quantity, assembly_number, draft_id "
+            "FROM fablab_assemblies WHERE status = 'authorised' "
+            "ORDER BY id").fetchall()
+    out: dict = {}
+    for r in rows:
+        ent = out.setdefault(str(r["sku"]), {"qty": 0.0, "refs": []})
+        ent["qty"] += float(r["quantity"] or 0)
+        ent["refs"].append(
+            f"{r['assembly_number'] or 'order #' + str(r['draft_id'])}")
+    return out
+
+
 def get_fablab_assembly(assembly_id: int) -> Optional[sqlite3.Row]:
     with connect() as c:
         return c.execute(
