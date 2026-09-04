@@ -10450,14 +10450,339 @@ def _render_stock_health_tiles(*, current, goal, excess, understock,
 
 if page == "Overview":
     st.header(":bar_chart: Overview")
-    render_attention_queue(
-        freshness=_freshness_from_output_dir(),
-        purchase_lines=purchase_lines,
-        db_module=db,
-        fmt_number=_fmt_number,
-        fmt_money=_fmt_money,
-        to_num=_to_num,
-    )
+    # --- Today + Month-to-Date vs same-period prior years ---------------
+    if not sale_lines.empty and "InvoiceDate" in sale_lines.columns:
+        st.subheader(":calendar: Today & Month-to-date vs prior years",
+                     help=("**Today's comparison uses the matching weekday 52 weeks ago** "
+            "(Shopify-style), not the same calendar date — keeps "
+            "weekday-driven sales patterns aligned (Tue vs Tue, not Tue "
+            "vs Sat). MTD comparison uses the same calendar date range "
+            "across years."))
+
+        # df = sale_lines for UNITS/orders. We deliberately use
+        # line-level for unit counts because order-level headers
+        # don't carry per-line quantities.
+        df = sale_lines.copy()
+        df["InvoiceDate"] = _to_date(df["InvoiceDate"]).dt.tz_localize(None)
+        df["Total"] = _to_num(df["Total"]).fillna(0)
+        df["Quantity"] = _to_num(df["Quantity"]).fillna(0)
+        df = df.dropna(subset=["InvoiceDate"])
+        # Exclude VOIDED/CREDITED/CANCELLED — matches CIN7's Revenue
+        # computation on its own dashboard. Rule §3.1 in RULES.md.
+        if "Status" in df.columns:
+            _bad_stat = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
+            df = df[~df["Status"].astype(str).str.upper().isin(_bad_stat)]
+
+        # hdf = sales headers for REVENUE $. Use the same CIN7
+        # General Dashboard basis as Overview/Cashflow weekly actuals:
+        # InvoiceDate + InvoiceAmount minus Tax, excluding voided /
+        # credited / cancelled sales. This keeps the headline MTD
+        # metric, YoY table and chart on one basis.
+        hdf, _mtd_rev_src, _mtd_rev_col = _sales_actuals_frame(
+            sales_full, sales_headers, sale_lines)
+        if not hdf.empty:
+            hdf["InvoiceDate"] = hdf["__sales_date"]
+            hdf["__rev"] = hdf["__sales_amount"]
+
+        def _period_order_count(frame: pd.DataFrame) -> int:
+            if frame.empty:
+                return 0
+            order_col = next(
+                (c for c in ("SaleID", "SaleNumber", "OrderNumber",
+                             "InvoiceNumber") if c in frame.columns),
+                None,
+            )
+            if order_col:
+                return int(frame[order_col].astype(str).nunique())
+            return int(len(frame))
+
+        def _rev_for_dates(date_mask) -> float:
+            """Sum revenue for dates matching the mask.
+
+            Header revenue is preferred because it matches CIN7's
+            General Dashboard. For older MTD comparison years, however,
+            we can have line-level sales history without matching
+            header rows. In that case, fall back for that period only
+            so prior-year revenue doesn't show as a missing tiny value.
+            """
+            line_win = df[date_mask(df)]
+            line_rev = float(line_win["Total"].sum())
+            if hdf.empty:
+                return line_rev
+
+            header_win = hdf[date_mask(hdf)]
+            header_rev = float(header_win["__rev"].sum())
+            line_orders = _period_order_count(line_win)
+            header_orders = _period_order_count(header_win)
+            if line_orders and header_orders:
+                coverage = header_orders / max(line_orders, 1)
+                if coverage < 0.5:
+                    return line_rev
+                if (line_rev > 1000
+                        and header_rev < line_rev * 0.1
+                        and coverage < 0.75):
+                    return line_rev
+            elif line_orders and not header_orders:
+                return line_rev
+            return header_rev
+
+        today = pd.Timestamp(datetime.now().date())
+        today_only = today.date()
+        today_weekday = today.strftime("%a")  # 'Mon', 'Tue', etc.
+
+        # Today — units from lines, revenue from headers
+        today_mask_lines = df["InvoiceDate"].dt.date == today_only
+        today_df = df[today_mask_lines]
+        today_orders = today_df["SaleID"].nunique()
+        today_units = float(today_df["Quantity"].sum())
+        today_rev = _rev_for_dates(
+            lambda d: d["InvoiceDate"].dt.date == today_only)
+
+        # Yesterday for delta context.
+        # v2.67.24 — also pull units/orders so Yesterday's tile reads
+        # symmetrically with Today's (the dashboard previously left
+        # Yesterday as a bare $-value with no day/qty context).
+        yesterday = today - pd.Timedelta(days=1)
+        yesterday_only = yesterday.date()
+        yest_weekday = yesterday.strftime("%a")
+        yest_mask_lines = df["InvoiceDate"].dt.date == yesterday_only
+        yest_df = df[yest_mask_lines]
+        yest_orders = yest_df["SaleID"].nunique()
+        yest_units = float(yest_df["Quantity"].sum())
+        yest_rev = _rev_for_dates(
+            lambda d: d["InvoiceDate"].dt.date == yesterday_only)
+
+        # v2.67.26 — OrderDate-vs-InvoiceDate breakdown for the
+        # Yesterday tile. The "71 orders Monday" headline is by
+        # InvoiceDate (when CIN7 finalised the invoice), so weekend
+        # orders that didn't get invoiced until Monday land in
+        # Monday's bucket. The breakdown below splits those orders
+        # by when the customer ACTUALLY placed them: same-day vs
+        # most-recent-weekend vs earlier. Surfaces the "is this
+        # really a big Monday or just delayed weekend posts"
+        # question without changing the headline number.
+        yest_breakdown = None
+        if not yest_df.empty and "OrderDate" in yest_df.columns:
+            yest_with_order = yest_df.copy()
+            yest_with_order["OrderDate"] = (
+                _to_date(yest_with_order["OrderDate"])
+                .dt.tz_localize(None))
+            order_date_per_sale = (
+                yest_with_order.dropna(subset=["OrderDate"])
+                .groupby("SaleID")["OrderDate"].first())
+            if not order_date_per_sale.empty:
+                ord_dates = order_date_per_sale.dt.date
+                # Most recent Sat/Sun before yesterday. Walk back up
+                # to 6 days to find any weekend dates strictly before
+                # yesterday's date — covers the common cases where
+                # yesterday was Mon (weekend = the immediately prior
+                # Sat/Sun) and where yesterday was a midweek day
+                # (weekend = the previous Sat/Sun).
+                weekend_dates = []
+                for back in range(1, 7):
+                    d = (yesterday - pd.Timedelta(days=back)).date()
+                    if d.weekday() in (5, 6):  # Sat=5, Sun=6
+                        weekend_dates.append(d)
+                same_day = int((ord_dates == yesterday_only).sum())
+                from_weekend = int(ord_dates.isin(weekend_dates).sum())
+                earlier = int(len(ord_dates)
+                                - same_day - from_weekend)
+                yest_breakdown = (same_day, from_weekend, earlier)
+
+        # Matching weekday 52 weeks ago (Shopify-style). 364 days = 52 × 7,
+        # so subtracting it gives the same day-of-week one year back.
+        # This avoids the Mon-vs-Sun mismatch you'd get from same-date YoY.
+        match_last = today - pd.Timedelta(days=364)
+        match_last_rev = _rev_for_dates(
+            lambda d: d["InvoiceDate"].dt.date == match_last.date())
+
+        # v2.67.24 — column order: Today → Same weekday last year
+        # → YoY % → Yesterday. The YoY % sits next to its two
+        # operands (Today and Same-weekday-last-year) so the
+        # comparison reads left-to-right; Yesterday goes last as
+        # supporting context, not part of the YoY chain.
+        tc1, tc2, tc3, tc4 = st.columns(4)
+        tc1.metric(f"Today ({today_weekday} {today_only.strftime('%b %d')})",
+                   _fmt_money(today_rev),
+                   delta=f"{today_orders} orders, {int(today_units)} units")
+        # Tighter label than the v2.67.23 wording. Was "Matching
+        # weekday last year (Tue May 06, 2025)" — long, and the
+        # relationship to Today was non-obvious. New label leads
+        # with what it IS (Same Tue, 1 yr ago) and shows the date
+        # in compact form. Full explanation stays in the help
+        # tooltip.
+        tc2.metric(
+            f"Same {today_weekday}, 1 yr ago "
+            f"({match_last.strftime('%b %d, ’%y')})",
+            _fmt_money(match_last_rev),
+            help="Same day-of-week, 52 weeks ago. Subtracts 364 days "
+                 "(52×7) so Tue→Tue, Sat→Sat — NOT calendar date. "
+                 "This is what the YoY column compares Today against.")
+        # YoY label spelled out: it compares Today vs the same
+        # weekday last year (the column to its left).
+        if match_last_rev > 0:
+            yoy_pct = (today_rev - match_last_rev) / match_last_rev * 100
+            tc3.metric(f"Today vs same {today_weekday}", f"{yoy_pct:+.1f}%")
+        else:
+            tc3.metric(f"Today vs same {today_weekday}", "—")
+        # Yesterday now mirrors Today's format (weekday + date in
+        # the label, orders/units in the delta line). Sits last so
+        # it doesn't break the Today → 1-yr-ago → YoY visual chain.
+        tc4.metric(
+            f"Yesterday ({yest_weekday} {yesterday_only.strftime('%b %d')})",
+            _fmt_money(yest_rev),
+            delta=f"{yest_orders} orders, {int(yest_units)} units")
+
+        # v2.67.26 — OrderDate breakdown caption. Tells the user
+        # "of the N orders invoiced yesterday, X were placed
+        # yesterday, Y came in over the weekend, Z were earlier".
+        # Only shows when there's a meaningful split (i.e. weekend
+        # orders > 0 OR earlier orders > 0); otherwise the
+        # invoice-date and order-date numbers match and the caption
+        # would just be noise.
+        if yest_breakdown:
+            sd, ww, er = yest_breakdown
+            if ww > 0 or er > 0:
+                _parts = [f"**{sd}** placed {yest_weekday}"]
+                if ww > 0:
+                    _parts.append(f"**{ww}** from the weekend")
+                if er > 0:
+                    _parts.append(f"**{er}** earlier")
+                st.caption(
+                    f"💡 _Of yesterday's {yest_orders} invoiced "
+                    f"orders: {', '.join(_parts)}._ "
+                    f"(Headline numbers use InvoiceDate to match "
+                    f"CIN7's dashboard — weekend orders that "
+                    f"posted Monday count under Monday.)")
+
+        # Month-to-date: from 1st of current month up to today.
+        # Revenue from headers (CIN7-aligned), units/orders from lines.
+        mtd_start = today.replace(day=1)
+        mtd_mask = (df["InvoiceDate"] >= mtd_start) & (df["InvoiceDate"] <= today)
+        mtd_df = df[mtd_mask]
+        mtd_orders = mtd_df["SaleID"].nunique()
+        mtd_units = float(mtd_df["Quantity"].sum())
+        mtd_rev = _rev_for_dates(
+            lambda d: (d["InvoiceDate"] >= mtd_start)
+                       & (d["InvoiceDate"] <= today))
+        day_of_month = today.day
+
+        st.markdown(f"**Month-to-date** — {today.strftime('%b 1')} to "
+                     f"{today.strftime('%b %d, %Y')} (day {day_of_month} of month)")
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Orders", _fmt_number(mtd_orders))
+        mc2.metric("Units", _fmt_number(mtd_units))
+        mc3.metric("Revenue", _fmt_money(mtd_rev))
+        mc4.metric("Avg daily revenue",
+                   _fmt_money(mtd_rev / max(day_of_month, 1)))
+
+        # YoY comparison: same MTD slice for 4 prior years
+        yoy_rows = []
+        for years_back in range(0, 5):
+            try:
+                y = today.year - years_back
+                start_y = mtd_start.replace(year=y)
+                end_y = today.replace(year=y)
+                mask = (df["InvoiceDate"] >= start_y) & (df["InvoiceDate"] <= end_y)
+                chunk = df[mask]
+                yoy_rows.append({
+                    "Period": f"{start_y.strftime('%b 1')} – "
+                              f"{end_y.strftime('%b %d')} {y}",
+                    "Year": y,
+                    "Orders": int(chunk["SaleID"].nunique()),
+                    "Units": int(chunk["Quantity"].sum()),
+                    "Revenue": _rev_for_dates(
+                        lambda d, sy=start_y, ey=end_y:
+                            (d["InvoiceDate"] >= sy)
+                            & (d["InvoiceDate"] <= ey)),
+                })
+            except ValueError:
+                continue
+
+        yoy_df = pd.DataFrame(yoy_rows)
+        if not yoy_df.empty:
+            # Year-over-year delta vs immediately previous year
+            yoy_df_sorted = yoy_df.sort_values("Year").reset_index(drop=True)
+            yoy_df_sorted["YoY Revenue %"] = (
+                yoy_df_sorted["Revenue"].pct_change() * 100
+            ).round(1)
+            yoy_df_display = yoy_df_sorted.sort_values(
+                "Year", ascending=False
+            ).drop(columns=["Year"])
+
+            st.dataframe(
+                yoy_df_display,
+                width="stretch", hide_index=True,
+                column_config={
+                    "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                    "YoY Revenue %":
+                        st.column_config.NumberColumn(format="%+.1f%%"),
+                },
+            )
+
+            # Chart: MTD revenue by year
+            if len(yoy_rows) > 1:
+                chart_df = pd.DataFrame(yoy_rows)
+                chart_df["YearLabel"] = chart_df["Year"].astype(str)
+                fig_yoy = px.bar(
+                    chart_df.sort_values("Year"),
+                    x="YearLabel", y="Revenue",
+                    title=f"MTD revenue ({today.strftime('%b 1–%d')}) "
+                          f"across years",
+                    labels={"YearLabel": "Year"},
+                    text_auto=".2s",
+                )
+                fig_yoy.update_layout(height=280,
+                                       margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig_yoy, width="stretch")
+
+    # Weekly revenue tiles (moved to top 2026-09-04 per James)
+    # Weekly actual sales for cashflow projection. These mirror the
+    # Google cashflow sheet's Monday-Sunday week buckets and use the
+    # same CIN7 Revenue basis as the Cashflow page: InvoiceDate plus
+    # InvoiceAmount minus tax, excluding voided/credited/cancelled
+    # sales.
+    _ov_actuals, _ov_actual_src, _ov_actual_amt_col = (
+        _sales_actuals_frame(sales_full, sales_headers, sale_lines))
+    _ov_today = pd.Timestamp(datetime.now().date())
+    _ov_this_monday = _ov_today - pd.Timedelta(
+        days=_ov_today.weekday())
+    _ov_prev_monday = _ov_this_monday - pd.Timedelta(days=7)
+    _ov_next_day = _ov_today + pd.Timedelta(days=1)
+    _ov_prev_sales, _ov_prev_count = _sales_actuals_in_window(
+        _ov_actuals, _ov_prev_monday, _ov_this_monday)
+    _ov_wtd_sales, _ov_wtd_count = _sales_actuals_in_window(
+        _ov_actuals, _ov_this_monday, _ov_next_day)
+
+    wk1, wk2 = st.columns(2)
+    wk1.metric(
+        "Revenue last week (Mon-Sun)",
+        _fmt_money(_ov_prev_sales),
+        delta=f"{_ov_prev_count:,} invoices",
+        delta_color="off",
+        help=f"{_sales_week_label(_ov_prev_monday)}. Uses CIN7 "
+             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount - Tax'}; "
+             "same Revenue basis used by Cashflow.")
+    wk2.metric(
+        "Revenue this week to date",
+        _fmt_money(_ov_wtd_sales),
+        delta=f"{_ov_wtd_count:,} invoices",
+        delta_color="off",
+        help=f"Week of {_sales_week_label(_ov_this_monday)} through "
+             f"{_ov_today.strftime('%b')} {_ov_today.day}. Uses CIN7 "
+             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount - Tax'}; "
+             "updates as the sales sync refreshes.")
+    if _ov_actuals.empty:
+        st.caption(
+            ":warning: Weekly revenue actuals are unavailable because "
+            "no sales history with InvoiceDate and InvoiceAmount was "
+            "loaded.")
+    elif _ov_actual_src:
+        st.caption(
+            f"Weekly cashflow revenue source: {_ov_actual_src} "
+            f"({_ov_actual_amt_col}).")
+
     st.divider()
 
     c1, c2, c3, c4 = st.columns(4)
@@ -10771,51 +11096,6 @@ if page == "Overview":
                     "covers (default 90d; weekend sync extends to 5yr).")
     c4.metric("Open PO value", _fmt_money(open_po_value),
                help="Sum of line Total for all open POs.")
-
-    # Weekly actual sales for cashflow projection. These mirror the
-    # Google cashflow sheet's Monday-Sunday week buckets and use the
-    # same CIN7 Revenue basis as the Cashflow page: InvoiceDate plus
-    # InvoiceAmount minus tax, excluding voided/credited/cancelled
-    # sales.
-    _ov_actuals, _ov_actual_src, _ov_actual_amt_col = (
-        _sales_actuals_frame(sales_full, sales_headers, sale_lines))
-    _ov_today = pd.Timestamp(datetime.now().date())
-    _ov_this_monday = _ov_today - pd.Timedelta(
-        days=_ov_today.weekday())
-    _ov_prev_monday = _ov_this_monday - pd.Timedelta(days=7)
-    _ov_next_day = _ov_today + pd.Timedelta(days=1)
-    _ov_prev_sales, _ov_prev_count = _sales_actuals_in_window(
-        _ov_actuals, _ov_prev_monday, _ov_this_monday)
-    _ov_wtd_sales, _ov_wtd_count = _sales_actuals_in_window(
-        _ov_actuals, _ov_this_monday, _ov_next_day)
-
-    wk1, wk2 = st.columns(2)
-    wk1.metric(
-        "Revenue last week (Mon-Sun)",
-        _fmt_money(_ov_prev_sales),
-        delta=f"{_ov_prev_count:,} invoices",
-        delta_color="off",
-        help=f"{_sales_week_label(_ov_prev_monday)}. Uses CIN7 "
-             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount - Tax'}; "
-             "same Revenue basis used by Cashflow.")
-    wk2.metric(
-        "Revenue this week to date",
-        _fmt_money(_ov_wtd_sales),
-        delta=f"{_ov_wtd_count:,} invoices",
-        delta_color="off",
-        help=f"Week of {_sales_week_label(_ov_this_monday)} through "
-             f"{_ov_today.strftime('%b')} {_ov_today.day}. Uses CIN7 "
-             f"InvoiceDate + {_ov_actual_amt_col or 'InvoiceAmount - Tax'}; "
-             "updates as the sales sync refreshes.")
-    if _ov_actuals.empty:
-        st.caption(
-            ":warning: Weekly revenue actuals are unavailable because "
-            "no sales history with InvoiceDate and InvoiceAmount was "
-            "loaded.")
-    elif _ov_actual_src:
-        st.caption(
-            f"Weekly cashflow revenue source: {_ov_actual_src} "
-            f"({_ov_actual_amt_col}).")
 
     st.divider()
 
@@ -11131,294 +11411,6 @@ if page == "Overview":
                     },
                 )
 
-    # --- Today + Month-to-Date vs same-period prior years ---------------
-    if not sale_lines.empty and "InvoiceDate" in sale_lines.columns:
-        st.divider()
-        st.subheader(":calendar: Today & Month-to-date vs prior years",
-                     help=("**Today's comparison uses the matching weekday 52 weeks ago** "
-            "(Shopify-style), not the same calendar date — keeps "
-            "weekday-driven sales patterns aligned (Tue vs Tue, not Tue "
-            "vs Sat). MTD comparison uses the same calendar date range "
-            "across years."))
-
-        # df = sale_lines for UNITS/orders. We deliberately use
-        # line-level for unit counts because order-level headers
-        # don't carry per-line quantities.
-        df = sale_lines.copy()
-        df["InvoiceDate"] = _to_date(df["InvoiceDate"]).dt.tz_localize(None)
-        df["Total"] = _to_num(df["Total"]).fillna(0)
-        df["Quantity"] = _to_num(df["Quantity"]).fillna(0)
-        df = df.dropna(subset=["InvoiceDate"])
-        # Exclude VOIDED/CREDITED/CANCELLED — matches CIN7's Revenue
-        # computation on its own dashboard. Rule §3.1 in RULES.md.
-        if "Status" in df.columns:
-            _bad_stat = ("VOIDED", "CREDITED", "CANCELLED", "CANCELED")
-            df = df[~df["Status"].astype(str).str.upper().isin(_bad_stat)]
-
-        # hdf = sales headers for REVENUE $. Use the same CIN7
-        # General Dashboard basis as Overview/Cashflow weekly actuals:
-        # InvoiceDate + InvoiceAmount minus Tax, excluding voided /
-        # credited / cancelled sales. This keeps the headline MTD
-        # metric, YoY table and chart on one basis.
-        hdf, _mtd_rev_src, _mtd_rev_col = _sales_actuals_frame(
-            sales_full, sales_headers, sale_lines)
-        if not hdf.empty:
-            hdf["InvoiceDate"] = hdf["__sales_date"]
-            hdf["__rev"] = hdf["__sales_amount"]
-
-        def _period_order_count(frame: pd.DataFrame) -> int:
-            if frame.empty:
-                return 0
-            order_col = next(
-                (c for c in ("SaleID", "SaleNumber", "OrderNumber",
-                             "InvoiceNumber") if c in frame.columns),
-                None,
-            )
-            if order_col:
-                return int(frame[order_col].astype(str).nunique())
-            return int(len(frame))
-
-        def _rev_for_dates(date_mask) -> float:
-            """Sum revenue for dates matching the mask.
-
-            Header revenue is preferred because it matches CIN7's
-            General Dashboard. For older MTD comparison years, however,
-            we can have line-level sales history without matching
-            header rows. In that case, fall back for that period only
-            so prior-year revenue doesn't show as a missing tiny value.
-            """
-            line_win = df[date_mask(df)]
-            line_rev = float(line_win["Total"].sum())
-            if hdf.empty:
-                return line_rev
-
-            header_win = hdf[date_mask(hdf)]
-            header_rev = float(header_win["__rev"].sum())
-            line_orders = _period_order_count(line_win)
-            header_orders = _period_order_count(header_win)
-            if line_orders and header_orders:
-                coverage = header_orders / max(line_orders, 1)
-                if coverage < 0.5:
-                    return line_rev
-                if (line_rev > 1000
-                        and header_rev < line_rev * 0.1
-                        and coverage < 0.75):
-                    return line_rev
-            elif line_orders and not header_orders:
-                return line_rev
-            return header_rev
-
-        today = pd.Timestamp(datetime.now().date())
-        today_only = today.date()
-        today_weekday = today.strftime("%a")  # 'Mon', 'Tue', etc.
-
-        # Today — units from lines, revenue from headers
-        today_mask_lines = df["InvoiceDate"].dt.date == today_only
-        today_df = df[today_mask_lines]
-        today_orders = today_df["SaleID"].nunique()
-        today_units = float(today_df["Quantity"].sum())
-        today_rev = _rev_for_dates(
-            lambda d: d["InvoiceDate"].dt.date == today_only)
-
-        # Yesterday for delta context.
-        # v2.67.24 — also pull units/orders so Yesterday's tile reads
-        # symmetrically with Today's (the dashboard previously left
-        # Yesterday as a bare $-value with no day/qty context).
-        yesterday = today - pd.Timedelta(days=1)
-        yesterday_only = yesterday.date()
-        yest_weekday = yesterday.strftime("%a")
-        yest_mask_lines = df["InvoiceDate"].dt.date == yesterday_only
-        yest_df = df[yest_mask_lines]
-        yest_orders = yest_df["SaleID"].nunique()
-        yest_units = float(yest_df["Quantity"].sum())
-        yest_rev = _rev_for_dates(
-            lambda d: d["InvoiceDate"].dt.date == yesterday_only)
-
-        # v2.67.26 — OrderDate-vs-InvoiceDate breakdown for the
-        # Yesterday tile. The "71 orders Monday" headline is by
-        # InvoiceDate (when CIN7 finalised the invoice), so weekend
-        # orders that didn't get invoiced until Monday land in
-        # Monday's bucket. The breakdown below splits those orders
-        # by when the customer ACTUALLY placed them: same-day vs
-        # most-recent-weekend vs earlier. Surfaces the "is this
-        # really a big Monday or just delayed weekend posts"
-        # question without changing the headline number.
-        yest_breakdown = None
-        if not yest_df.empty and "OrderDate" in yest_df.columns:
-            yest_with_order = yest_df.copy()
-            yest_with_order["OrderDate"] = (
-                _to_date(yest_with_order["OrderDate"])
-                .dt.tz_localize(None))
-            order_date_per_sale = (
-                yest_with_order.dropna(subset=["OrderDate"])
-                .groupby("SaleID")["OrderDate"].first())
-            if not order_date_per_sale.empty:
-                ord_dates = order_date_per_sale.dt.date
-                # Most recent Sat/Sun before yesterday. Walk back up
-                # to 6 days to find any weekend dates strictly before
-                # yesterday's date — covers the common cases where
-                # yesterday was Mon (weekend = the immediately prior
-                # Sat/Sun) and where yesterday was a midweek day
-                # (weekend = the previous Sat/Sun).
-                weekend_dates = []
-                for back in range(1, 7):
-                    d = (yesterday - pd.Timedelta(days=back)).date()
-                    if d.weekday() in (5, 6):  # Sat=5, Sun=6
-                        weekend_dates.append(d)
-                same_day = int((ord_dates == yesterday_only).sum())
-                from_weekend = int(ord_dates.isin(weekend_dates).sum())
-                earlier = int(len(ord_dates)
-                                - same_day - from_weekend)
-                yest_breakdown = (same_day, from_weekend, earlier)
-
-        # Matching weekday 52 weeks ago (Shopify-style). 364 days = 52 × 7,
-        # so subtracting it gives the same day-of-week one year back.
-        # This avoids the Mon-vs-Sun mismatch you'd get from same-date YoY.
-        match_last = today - pd.Timedelta(days=364)
-        match_last_rev = _rev_for_dates(
-            lambda d: d["InvoiceDate"].dt.date == match_last.date())
-
-        # v2.67.24 — column order: Today → Same weekday last year
-        # → YoY % → Yesterday. The YoY % sits next to its two
-        # operands (Today and Same-weekday-last-year) so the
-        # comparison reads left-to-right; Yesterday goes last as
-        # supporting context, not part of the YoY chain.
-        tc1, tc2, tc3, tc4 = st.columns(4)
-        tc1.metric(f"Today ({today_weekday} {today_only.strftime('%b %d')})",
-                   _fmt_money(today_rev),
-                   delta=f"{today_orders} orders, {int(today_units)} units")
-        # Tighter label than the v2.67.23 wording. Was "Matching
-        # weekday last year (Tue May 06, 2025)" — long, and the
-        # relationship to Today was non-obvious. New label leads
-        # with what it IS (Same Tue, 1 yr ago) and shows the date
-        # in compact form. Full explanation stays in the help
-        # tooltip.
-        tc2.metric(
-            f"Same {today_weekday}, 1 yr ago "
-            f"({match_last.strftime('%b %d, ’%y')})",
-            _fmt_money(match_last_rev),
-            help="Same day-of-week, 52 weeks ago. Subtracts 364 days "
-                 "(52×7) so Tue→Tue, Sat→Sat — NOT calendar date. "
-                 "This is what the YoY column compares Today against.")
-        # YoY label spelled out: it compares Today vs the same
-        # weekday last year (the column to its left).
-        if match_last_rev > 0:
-            yoy_pct = (today_rev - match_last_rev) / match_last_rev * 100
-            tc3.metric(f"Today vs same {today_weekday}", f"{yoy_pct:+.1f}%")
-        else:
-            tc3.metric(f"Today vs same {today_weekday}", "—")
-        # Yesterday now mirrors Today's format (weekday + date in
-        # the label, orders/units in the delta line). Sits last so
-        # it doesn't break the Today → 1-yr-ago → YoY visual chain.
-        tc4.metric(
-            f"Yesterday ({yest_weekday} {yesterday_only.strftime('%b %d')})",
-            _fmt_money(yest_rev),
-            delta=f"{yest_orders} orders, {int(yest_units)} units")
-
-        # v2.67.26 — OrderDate breakdown caption. Tells the user
-        # "of the N orders invoiced yesterday, X were placed
-        # yesterday, Y came in over the weekend, Z were earlier".
-        # Only shows when there's a meaningful split (i.e. weekend
-        # orders > 0 OR earlier orders > 0); otherwise the
-        # invoice-date and order-date numbers match and the caption
-        # would just be noise.
-        if yest_breakdown:
-            sd, ww, er = yest_breakdown
-            if ww > 0 or er > 0:
-                _parts = [f"**{sd}** placed {yest_weekday}"]
-                if ww > 0:
-                    _parts.append(f"**{ww}** from the weekend")
-                if er > 0:
-                    _parts.append(f"**{er}** earlier")
-                st.caption(
-                    f"💡 _Of yesterday's {yest_orders} invoiced "
-                    f"orders: {', '.join(_parts)}._ "
-                    f"(Headline numbers use InvoiceDate to match "
-                    f"CIN7's dashboard — weekend orders that "
-                    f"posted Monday count under Monday.)")
-
-        # Month-to-date: from 1st of current month up to today.
-        # Revenue from headers (CIN7-aligned), units/orders from lines.
-        mtd_start = today.replace(day=1)
-        mtd_mask = (df["InvoiceDate"] >= mtd_start) & (df["InvoiceDate"] <= today)
-        mtd_df = df[mtd_mask]
-        mtd_orders = mtd_df["SaleID"].nunique()
-        mtd_units = float(mtd_df["Quantity"].sum())
-        mtd_rev = _rev_for_dates(
-            lambda d: (d["InvoiceDate"] >= mtd_start)
-                       & (d["InvoiceDate"] <= today))
-        day_of_month = today.day
-
-        st.markdown(f"**Month-to-date** — {today.strftime('%b 1')} to "
-                     f"{today.strftime('%b %d, %Y')} (day {day_of_month} of month)")
-
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Orders", _fmt_number(mtd_orders))
-        mc2.metric("Units", _fmt_number(mtd_units))
-        mc3.metric("Revenue", _fmt_money(mtd_rev))
-        mc4.metric("Avg daily revenue",
-                   _fmt_money(mtd_rev / max(day_of_month, 1)))
-
-        # YoY comparison: same MTD slice for 4 prior years
-        yoy_rows = []
-        for years_back in range(0, 5):
-            try:
-                y = today.year - years_back
-                start_y = mtd_start.replace(year=y)
-                end_y = today.replace(year=y)
-                mask = (df["InvoiceDate"] >= start_y) & (df["InvoiceDate"] <= end_y)
-                chunk = df[mask]
-                yoy_rows.append({
-                    "Period": f"{start_y.strftime('%b 1')} – "
-                              f"{end_y.strftime('%b %d')} {y}",
-                    "Year": y,
-                    "Orders": int(chunk["SaleID"].nunique()),
-                    "Units": int(chunk["Quantity"].sum()),
-                    "Revenue": _rev_for_dates(
-                        lambda d, sy=start_y, ey=end_y:
-                            (d["InvoiceDate"] >= sy)
-                            & (d["InvoiceDate"] <= ey)),
-                })
-            except ValueError:
-                continue
-
-        yoy_df = pd.DataFrame(yoy_rows)
-        if not yoy_df.empty:
-            # Year-over-year delta vs immediately previous year
-            yoy_df_sorted = yoy_df.sort_values("Year").reset_index(drop=True)
-            yoy_df_sorted["YoY Revenue %"] = (
-                yoy_df_sorted["Revenue"].pct_change() * 100
-            ).round(1)
-            yoy_df_display = yoy_df_sorted.sort_values(
-                "Year", ascending=False
-            ).drop(columns=["Year"])
-
-            st.dataframe(
-                yoy_df_display,
-                width="stretch", hide_index=True,
-                column_config={
-                    "Revenue": st.column_config.NumberColumn(format="$%.0f"),
-                    "YoY Revenue %":
-                        st.column_config.NumberColumn(format="%+.1f%%"),
-                },
-            )
-
-            # Chart: MTD revenue by year
-            if len(yoy_rows) > 1:
-                chart_df = pd.DataFrame(yoy_rows)
-                chart_df["YearLabel"] = chart_df["Year"].astype(str)
-                fig_yoy = px.bar(
-                    chart_df.sort_values("Year"),
-                    x="YearLabel", y="Revenue",
-                    title=f"MTD revenue ({today.strftime('%b 1–%d')}) "
-                          f"across years",
-                    labels={"YearLabel": "Year"},
-                    text_auto=".2s",
-                )
-                fig_yoy.update_layout(height=280,
-                                       margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig_yoy, width="stretch")
-
     # --- Recent sales trend (full daily chart) --------------------------
     if not sale_lines.empty and "InvoiceDate" in sale_lines.columns:
         st.divider()
@@ -11439,6 +11431,17 @@ if page == "Overview":
                          labels={"Revenue": "Revenue (base currency)"})
             fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig, width="stretch")
+
+    # Daily attention queue — moved to the bottom 2026-09-04 per James.
+    st.divider()
+    render_attention_queue(
+        freshness=_freshness_from_output_dir(),
+        purchase_lines=purchase_lines,
+        db_module=db,
+        fmt_number=_fmt_number,
+        fmt_money=_fmt_money,
+        to_num=_to_num,
+    )
 
 
 # ---------------------------------------------------------------------------
